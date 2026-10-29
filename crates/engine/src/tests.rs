@@ -6537,6 +6537,22 @@ fn site_installs_skips_installed_and_newer() {
 }
 
 #[test]
+fn site_installs_skips_oversized_packages() {
+    let _g = crate::site::test_lock();
+    let dir = std::env::temp_dir().join(format!("site-big-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.rgplugin");
+    let file = std::fs::File::create(&big).unwrap();
+    file.set_len(rustgis_plugins::package::MAX_PACKAGE as u64 + 1).unwrap();
+    drop(file);
+    crate::site::set(crate::site::Site { install: vec![big], ..Default::default() });
+    let got = crate::cmd::plugins::site_installs();
+    crate::site::set(Default::default());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(got.is_empty());
+}
+
+#[test]
 fn site_installs_skips_missing_packages() {
     let _g = crate::site::test_lock();
     crate::site::set(crate::site::Site {

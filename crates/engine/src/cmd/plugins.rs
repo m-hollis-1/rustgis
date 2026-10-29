@@ -121,6 +121,18 @@ pub struct SiteInstall {
 pub fn site_installs() -> Vec<SiteInstall> {
     let mut out = Vec::new();
     for path in crate::site::current().install {
+        // Size-checked before reading: a huge file isn't read into memory.
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(error) => {
+                log::warn!("site package {} not read: {error}", path.display());
+                continue;
+            }
+        };
+        if len > rustgis_plugins::package::MAX_PACKAGE as u64 {
+            log::warn!("site package {} is larger than {} MB", path.display(), rustgis_plugins::package::MAX_PACKAGE / (1024 * 1024));
+            continue;
+        }
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {

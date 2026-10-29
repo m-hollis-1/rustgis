@@ -6484,6 +6484,27 @@ fn plugin_commands_run_like_commands() {
 }
 
 #[test]
+fn info_answers_site_settings_as_given() {
+    let _g = crate::site::test_lock();
+    crate::site::set(crate::site::Site {
+        build: Some("hlr-1".into()),
+        settings: [("eng-info".to_string(), json!({"portal": "https://x", "odd": [1]}))].into(),
+        ..Default::default()
+    });
+    let mut s = world();
+    plugin("eng-info", &[]);
+    let got = forward(&mut s, "eng-info", "host.info", json!({})).unwrap();
+    assert_eq!(got["build"], "hlr-1");
+    assert_eq!(got["site"], json!({"portal": "https://x", "odd": [1]}));
+    assert_eq!(got["plugin"], "eng-info");
+    crate::site::set(Default::default());
+    let got = forward(&mut s, "eng-info", "host.info", json!({})).unwrap();
+    assert_eq!(got["build"], Value::Null);
+    assert_eq!(got["site"], Value::Null);
+    rustgis_plugins::unload("eng-info");
+}
+
+#[test]
 fn plugin_edits_are_one_undo_step() {
     let mut s = world();
     plugin("eng-edit", &["edit"]);

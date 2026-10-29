@@ -551,11 +551,17 @@ impl Bridge<'_> {
     }
 }
 
+/// The answer to `host.info`: the version, the ABI, the plugin's id and permissions, the site's build label (or null) and the
+/// plugin's own site settings (or null).
+pub(crate) fn info_answer(m: &rustgis_plugins::Manifest) -> Value {
+    json!({"rustgis": rustgis_plugins::manifest::RUSTGIS_VERSION, "abi": rustgis_plugins::manifest::ABI,
+        "plugin": m.id, "permissions": m.permissions, "build": crate::site::current().build, "site": crate::site::plugin_settings(&m.id)})
+}
+
 impl Host for Bridge<'_> {
     fn call(&mut self, op: &str, params: &Value) -> Result<Value, String> {
         match op {
-            "host.info" => Ok(json!({"rustgis": rustgis_plugins::manifest::RUSTGIS_VERSION, "abi": rustgis_plugins::manifest::ABI,
-                "plugin": self.plugin.manifest.id, "permissions": self.plugin.manifest.permissions})),
+            "host.info" => Ok(info_answer(&self.plugin.manifest)),
             "host.layers" => Ok(self.layers()),
             "host.features" => self.features(params),
             "host.view" => {

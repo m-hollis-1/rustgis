@@ -120,6 +120,11 @@ pub fn current() -> Site {
     SITE.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
+/// The site's build label, if it sets one (a clone of just the label, for per-frame callers).
+pub fn build() -> Option<String> {
+    SITE.read().unwrap_or_else(|poisoned| poisoned.into_inner()).build.clone()
+}
+
 /// The site's default for preference `key`, if it sets one.
 pub fn pref_default(key: &str) -> Option<String> {
     SITE.read().unwrap_or_else(|poisoned| poisoned.into_inner()).prefs.get(key).cloned()
@@ -219,7 +224,9 @@ mod tests {
         assert_eq!(plugin_settings("p")["portal"], "https://x");
         assert_eq!(plugin_settings("other"), Value::Null);
         assert_eq!(version_label(), format!("{} hlr-1", rustgis_plugins::manifest::RUSTGIS_VERSION));
+        assert_eq!(build().as_deref(), Some("hlr-1"));
         set(Site::default());
+        assert_eq!(build(), None);
         assert_eq!(version_label(), rustgis_plugins::manifest::RUSTGIS_VERSION);
     }
 }

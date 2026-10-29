@@ -555,7 +555,7 @@ impl Bridge<'_> {
 /// plugin's own site settings (or null).
 pub(crate) fn info_answer(m: &rustgis_plugins::Manifest) -> Value {
     json!({"rustgis": rustgis_plugins::manifest::RUSTGIS_VERSION, "abi": rustgis_plugins::manifest::ABI,
-        "plugin": m.id, "permissions": m.permissions, "build": crate::site::current().build, "site": crate::site::plugin_settings(&m.id)})
+        "plugin": m.id, "permissions": m.permissions, "build": crate::site::build(), "site": crate::site::plugin_settings(&m.id)})
 }
 
 impl Host for Bridge<'_> {

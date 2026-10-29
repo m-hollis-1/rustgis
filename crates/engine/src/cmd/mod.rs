@@ -30,6 +30,7 @@ pub mod navigate;
 pub mod nldi;
 pub mod notebook;
 pub mod pg;
+pub mod plugin_browse;
 pub mod plugins;
 pub mod portals;
 pub mod presentation;

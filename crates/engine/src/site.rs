@@ -154,16 +154,19 @@ mod tests {
 
     #[test]
     fn parse_reads_every_key() {
-        let s = parse(
-            r#"{"build":"hlr-1","prefs":{"language":"de","n":7},
-            "plugins":{"install":["plugins/a.rgplugin","C:/abs/b.rgplugin"],"settings":{"p":{"portal":"https://x"}}}}"#,
-            Path::new("C:/site"),
-        )
-        .unwrap();
+        let base = std::env::temp_dir().join("site");
+        let absolute = std::env::temp_dir().join("b.rgplugin");
+        let text = json!({
+            "build": "hlr-1",
+            "prefs": {"language": "de", "n": 7},
+            "plugins": {"install": ["plugins/a.rgplugin", absolute.to_string_lossy()], "settings": {"p": {"portal": "https://x"}}},
+        })
+        .to_string();
+        let s = parse(&text, &base).unwrap();
         assert_eq!(s.build.as_deref(), Some("hlr-1"));
         assert_eq!(s.prefs.get("language").map(String::as_str), Some("de"));
         assert!(!s.prefs.contains_key("n"), "non-string prefs are ignored");
-        assert_eq!(s.install, vec![PathBuf::from("C:/site/plugins/a.rgplugin"), PathBuf::from("C:/abs/b.rgplugin")]);
+        assert_eq!(s.install, vec![base.join("plugins/a.rgplugin"), absolute]);
         assert_eq!(s.settings["p"]["portal"], "https://x");
     }
 
@@ -187,7 +190,9 @@ mod tests {
         assert_eq!(read(&dir.join("site.json")).unwrap(), Site::default());
         assert!(read(&dir).is_err(), "a folder is not a site file");
         std::fs::write(dir.join("big.json"), vec![b' '; MAX_BYTES + 1]).unwrap();
-        assert!(read(&dir.join("big.json")).unwrap_err().contains("1 MiB"));
+        let error = read(&dir.join("big.json")).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(error.contains("1 MiB"));
     }
 
     #[test]

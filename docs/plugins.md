@@ -424,7 +424,7 @@ Inside a request, `host::call(op, params)` sends one of these to RustGIS:
 
 | Request | Answer |
 |---|---|
-| `host.info` | `{rustgis, abi, plugin, permissions}`: version, ABI, plugin id and permissions |
+| `host.info` | `{rustgis, abi, plugin, permissions}`: version, ABI, plugin id and permissions (an organisation can add more: see [site settings](site-settings.md)) |
 | `host.layers` | `[{id, name, raster, visible, geometry, features, selected, active, fields: [{name, type}]}]` |
 | `host.features` `{layer, selected?, limit?}` | the layer's features as GeoJSON; each feature has its `row` |
 | `host.view` | `{center: [lon, lat], scale, projection}` |

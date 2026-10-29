@@ -17,6 +17,7 @@ pub mod s3_keys;
 #[cfg(test)]
 mod s3_saved_tests;
 pub mod sample;
+pub mod site;
 pub mod sources;
 #[cfg(test)]
 mod tests;

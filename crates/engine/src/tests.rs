@@ -6505,6 +6505,50 @@ fn info_answers_site_settings_as_given() {
 }
 
 #[test]
+fn site_installs_skips_installed_and_newer() {
+    let _g = crate::site::test_lock();
+    let dir = std::env::temp_dir().join(format!("site-inst-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, id: &str, version: &str| {
+        let mut m: Value = serde_json::from_str(&rustgis_plugins::testing::manifest(id, &[])).unwrap();
+        m["version"] = json!(version);
+        let bytes = rustgis_plugins::testing::zip_of(&[
+            ("plugin.json", m.to_string().as_bytes()),
+            ("plugin.wasm", &rustgis_plugins::testing::wasm()),
+        ]);
+        std::fs::write(dir.join(name), bytes).unwrap();
+        dir.join(name)
+    };
+    let new = write("new.rgplugin", "site-new", "1.0.0");
+    let same = write("same.rgplugin", "site-same", "1.0.0");
+    let older = write("older.rgplugin", "site-older", "0.9.0");
+    let newer = write("newer.rgplugin", "site-newer", "2.0.0");
+    for id in ["site-same", "site-older", "site-newer"] {
+        plugin(id, &[]); // installs version 1.0.0 of each
+    }
+    crate::site::set(crate::site::Site { install: vec![new, same, older, newer], ..Default::default() });
+    let got: Vec<(String, String)> = crate::cmd::plugins::site_installs().into_iter().map(|i| (i.id, i.version)).collect();
+    crate::site::set(Default::default());
+    for id in ["site-same", "site-older", "site-newer"] {
+        rustgis_plugins::unload(id);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got, vec![("site-new".to_string(), "1.0.0".to_string()), ("site-newer".to_string(), "2.0.0".to_string())]);
+}
+
+#[test]
+fn site_installs_skips_missing_packages() {
+    let _g = crate::site::test_lock();
+    crate::site::set(crate::site::Site {
+        install: vec![std::path::PathBuf::from("C:/nope/../x.rgplugin"), std::path::PathBuf::from("/also/missing.rgplugin")],
+        ..Default::default()
+    });
+    let got = crate::cmd::plugins::site_installs();
+    crate::site::set(Default::default());
+    assert!(got.is_empty());
+}
+
+#[test]
 fn plugin_edits_are_one_undo_step() {
     let mut s = world();
     plugin("eng-edit", &["edit"]);

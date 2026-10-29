@@ -137,6 +137,8 @@ fn screenshot_scale(size: egui::Vec2, value: f64, max_dimension: u32) -> Result<
 }
 
 fn main() {
+    // The site build label (`RUSTGIS_SITE_FILE`) shows in the window like the apps.
+    rustgis_engine::site::init();
     let path = std::env::args().nth(1).expect("usage: ui_shot script.jsonl");
     let script = std::fs::read_to_string(&path).expect("read script");
     let lines: Vec<serde_json::Value> =

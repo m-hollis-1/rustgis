@@ -1111,7 +1111,7 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(tl!("RustGIS")).font(semibold(20.0)));
-                    ui.label(egui::RichText::new(crate::i18n::fmt("Version {version}", &[("version", env!("CARGO_PKG_VERSION"))])).weak());
+                    ui.label(egui::RichText::new(crate::i18n::fmt("Version {version}", &[("version", &rustgis_engine::site::version_label())])).weak());
                 });
             });
             ui.add_space(8.0);

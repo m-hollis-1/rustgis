@@ -337,6 +337,10 @@ pub struct Manifest {
     /// [`crate::panel`]).
     #[serde(default)]
     pub panel: Option<crate::panel::PanelDecl>,
+    /// A section of its own in the Browser pane (optional): a tree the plugin lists lazily (see
+    /// [`crate::browser`]).
+    #[serde(default)]
+    pub browser: Option<crate::browser::BrowserDecl>,
     /// Skills for the AI assistant: folders in the package's `skills` folder, each holding a
     /// `SKILL.md`. The assistant offers them as `<plugin>:<name>` while the plugin is enabled.
     #[serde(default)]
@@ -594,6 +598,9 @@ impl Manifest {
                 );
             }
             panel.validate(&|c| self.commands.iter().any(|x| x.id == c))?;
+        }
+        if let Some(b) = &self.browser {
+            b.validate(&|c| self.commands.iter().any(|x| x.id == c))?;
         }
         if let Some(tab) = &self.tab {
             self.validate_tab(tab)?;

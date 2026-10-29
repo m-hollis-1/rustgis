@@ -15,6 +15,7 @@
 //! list shared by every session. See `docs/plugins.md` for the format and the ABI.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod browser;
 pub mod manifest;
 pub mod package;
 pub mod panel;
@@ -37,6 +38,7 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
 
+pub use browser::{BrowserDecl, BrowserNode, Listing};
 pub use manifest::{CommandDecl, Entry, GroupDecl, ItemDecl, Layout, Manifest, MenuDecl, Permission, Runtime, TabDecl, ToolDecl};
 pub use package::Package;
 pub use panel::{PanelDecl, PanelItemDecl, PanelState, TreeNode};

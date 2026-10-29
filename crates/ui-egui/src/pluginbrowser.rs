@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use egui::collapsing_header::CollapsingState;
 use egui::{Label, RichText, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::cmd::plugin_browse;
 use rustgis_engine::plugins::{self, BrowserDecl, BrowserNode, Listing, Plugin};
@@ -94,6 +95,11 @@ pub fn refresh(app: &mut RustGisApp, plugin: &str) {
     st.epoch += 1;
 }
 
+/// `name` when it is one of RustGIS's own icons.
+fn known_icon(name: &str) -> Option<&str> {
+    Some(name).filter(|n| icons::ALL.contains(n))
+}
+
 /// Whether plugin `id` is loaded, enabled and has a browser.
 fn listed(id: &str) -> bool {
     plugins::get(id).is_some_and(|p| p.enabled && p.manifest.browser.is_some())
@@ -108,20 +114,33 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     for (p, decl) in sections {
         let id = p.manifest.id.as_str();
         let title = p.manifest.translate(lang, &decl.label);
-        let shown = egui::CollapsingHeader::new(RichText::new(title).font(semibold(12.5)))
-            .id_salt(("pluginbrowser", id))
-            .default_open(false)
-            .show(ui, |ui| {
-                if decl.search {
-                    let query = app.ui.plugin_browser.query.entry(id.to_string()).or_default();
-                    if crate::widgets::search_field(ui, query, tl!("Search")).changed() {
-                        refresh(app, id);
-                    }
+        // The section's icon, then its title: a header of our own, as the connection tree's folders have.
+        let cid = ui.make_persistent_id(("pluginbrowser", id));
+        let state = CollapsingState::load_with_default_open(ui.ctx(), cid, false);
+        let was_open = state.is_open();
+        let mut clicked = false;
+        let mut header = state.show_header(ui, |ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(ICON, ICON), Sense::hover());
+            icons::paint(ui.painter(), r, known_icon(&decl.icon).unwrap_or("open"), t.icon, t.accent);
+            let title = Label::new(RichText::new(title).font(semibold(12.5))).sense(Sense::click());
+            let label = ui.add(title);
+            clicked = label.clicked();
+            label
+        });
+        if clicked {
+            header.set_open(!was_open);
+        }
+        let (_, label, _) = header.body(|ui| {
+            if decl.search {
+                let query = app.ui.plugin_browser.query.entry(id.to_string()).or_default();
+                if crate::widgets::search_field(ui, query, tl!("Search")).changed() {
+                    refresh(app, id);
                 }
-                level(app, ui, t, &p, &decl, lang, "", 0);
-            });
+            }
+            level(app, ui, t, &p, &decl, lang, "", 0);
+        });
         let (mut reload, mut collapse) = (false, false);
-        shown.header_response.context_menu(|ui| {
+        label.response.context_menu(|ui| {
             if ui.button(tl!("Refresh")).clicked() {
                 reload = true;
                 ui.close();
@@ -226,7 +245,7 @@ fn row(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, p: &Plugin, decl: &Browser
                 ui.painter().add(egui::Shape::convex_polygon(pts, t.text_dim, Stroke::NONE));
             }
             let (r, _) = ui.allocate_exact_size(vec2(ICON, ICON), Sense::hover());
-            let named = n.icon.as_deref().filter(|i| icons::ALL.contains(i));
+            let named = n.icon.as_deref().and_then(known_icon);
             icons::paint(ui.painter(), r, named.unwrap_or(if branch { "open" } else { "table" }), t.icon, t.accent);
             let label = ui.selectable_label(selected, n.label.as_str());
             if let Some(d) = &n.detail {
@@ -304,6 +323,31 @@ fn launch(app: &mut RustGisApp, ctx: &egui::Context, key: &Key) {
     st.running = Some(Running { key: key.clone(), epoch: st.epoch, slot });
 }
 
+/// Lands the answer of the read of level `key`, started in `epoch`. The plugin gone
+/// (`still_there` false) leaves no entry; an answer to a read begun before the entries were last
+/// dropped leaves the level `Loading`, to be asked again; otherwise the entry takes the listing
+/// or the error.
+pub(crate) fn land(state: &mut State, key: &Key, epoch: u64, still_there: bool, result: Result<Listing, String>) {
+    let stale = epoch != state.epoch;
+    match poll_drops_result(state, key, still_there) {
+        Some(Entry::Loading) if stale => {
+            state.entries.insert(key.clone(), Entry::Loading);
+        }
+        Some(Entry::Loading) => {
+            let entry = match result {
+                Ok(l) => Entry::Ready(Arc::new(l)),
+                Err(e) => Entry::Failed(e),
+            };
+            state.entries.insert(key.clone(), entry);
+        }
+        // Not waiting for it any more (dropped, or replaced since): the entry stays as it is.
+        Some(other) => {
+            state.entries.insert(key.clone(), other);
+        }
+        None => {}
+    }
+}
+
 /// Lands the answer of the read under way, and starts the next level waiting.
 pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     let st = &mut app.ui.plugin_browser;
@@ -321,24 +365,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     if let Some(result) = st.running.as_ref().and_then(|r| take(&r.slot))
         && let Some(run) = st.running.take()
     {
-        let stale = run.epoch != st.epoch;
-        match poll_drops_result(st, &run.key, listed(&run.key.0)) {
-            // Asked before the section was refreshed: asked again.
-            Some(Entry::Loading) if stale => {
-                st.entries.insert(run.key, Entry::Loading);
-            }
-            Some(Entry::Loading) => {
-                let entry = match result {
-                    Ok(l) => Entry::Ready(Arc::new(l)),
-                    Err(e) => Entry::Failed(e),
-                };
-                st.entries.insert(run.key, entry);
-            }
-            Some(other) => {
-                st.entries.insert(run.key, other);
-            }
-            None => {}
-        }
+        land(st, &run.key, run.epoch, listed(&run.key.0), result);
     }
     if st.running.is_none() {
         let next = st.entries.iter().filter(|(_, e)| matches!(e, Entry::Loading)).map(|(k, _)| k).min().cloned();
@@ -376,5 +403,39 @@ mod tests {
         assert!(!st.entries.contains_key(&key), "a plugin that went away leaves no entry");
         st.entries.insert(key.clone(), Entry::Loading);
         assert!(matches!(poll_drops_result(&mut st, &key, true), Some(Entry::Loading)));
+    }
+
+    fn key() -> Key {
+        ("p".to_string(), String::new())
+    }
+
+    #[test]
+    fn land_fills_the_entry_with_the_listing_or_the_error() {
+        let mut st = State::default();
+        st.entries.insert(key(), Entry::Loading);
+        let l = Listing { nodes: vec![node("a", false, vec![])], ..Default::default() };
+        land(&mut st, &key(), 0, true, Ok(l));
+        assert!(matches!(st.entries.get(&key()), Some(Entry::Ready(l)) if l.nodes.len() == 1));
+        st.entries.insert(key(), Entry::Loading);
+        land(&mut st, &key(), 0, true, Err("boom".into()));
+        assert!(matches!(st.entries.get(&key()), Some(Entry::Failed(e)) if e == "boom"));
+    }
+
+    #[test]
+    fn land_asks_again_when_the_answer_is_from_before_a_refresh() {
+        let mut st = State::default();
+        let started = st.epoch;
+        st.epoch += 1;
+        st.entries.insert(key(), Entry::Loading);
+        land(&mut st, &key(), started, true, Ok(Listing::default()));
+        assert!(matches!(st.entries.get(&key()), Some(Entry::Loading)), "the old answer is not applied");
+    }
+
+    #[test]
+    fn land_leaves_nothing_for_a_gone_plugin() {
+        let mut st = State::default();
+        st.entries.insert(key(), Entry::Loading);
+        land(&mut st, &key(), 0, false, Ok(Listing::default()));
+        assert!(st.entries.is_empty());
     }
 }

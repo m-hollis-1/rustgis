@@ -100,7 +100,13 @@ pub fn locate() -> Option<PathBuf> {
 /// Loads the site file for this process. Call once at start-up; a failure is logged and leaves
 /// the defaults.
 pub fn init() {
-    let site = match locate() {
+    init_from(locate());
+}
+
+/// Loads the site file at `path` (none: the defaults); a failure is logged and leaves the
+/// defaults.
+fn init_from(path: Option<PathBuf>) {
+    let site = match path {
         Some(path) => read(&path).unwrap_or_else(|error| {
             log::warn!("site settings: {error}");
             Site::default()
@@ -142,6 +148,70 @@ pub fn version_label() -> String {
         Some(build) => format!("{version} {build}"),
         None => version.to_string(),
     }
+}
+
+/// A package the site file offers that isn't installed yet, or is installed in an older version.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteInstall {
+    pub path: PathBuf,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// A process plugin: runs a program on the computer, not sandboxed.
+    pub process: bool,
+}
+
+/// The site file's packages (`current().install`) to offer: those not installed, or installed in
+/// an older version. A plugin loaded from a development folder is never offered over (the
+/// developer's copy wins). A package that can't be read or parsed is logged and skipped.
+pub fn site_installs() -> Vec<SiteInstall> {
+    let mut out = Vec::new();
+    for path in current().install {
+        // Size-checked before reading: a huge file isn't read into memory.
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(error) => {
+                log::warn!("site package {} not read: {error}", path.display());
+                continue;
+            }
+        };
+        if len > rustgis_plugins::package::MAX_PACKAGE as u64 {
+            log::warn!("site package {} is larger than {} MB", path.display(), rustgis_plugins::package::MAX_PACKAGE / (1024 * 1024));
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("site package {} not read: {error}", path.display());
+                continue;
+            }
+        };
+        let manifest = match rustgis_plugins::Package::from_zip(&bytes) {
+            Ok(package) => package.manifest,
+            Err(error) => {
+                log::warn!("site package {} is not a plugin package: {error}", path.display());
+                continue;
+            }
+        };
+        let pending = match rustgis_plugins::get(&manifest.id) {
+            None => true,
+            // A development folder (`plugin.install` of a folder) is the plugin's source.
+            Some(installed) if Path::new(&installed.source).is_dir() => false,
+            Some(installed) => {
+                rustgis_plugins::manifest::version_cmp(&installed.manifest.version, &manifest.version) == std::cmp::Ordering::Less
+            }
+        };
+        if pending {
+            out.push(SiteInstall {
+                path,
+                id: manifest.id,
+                name: manifest.name,
+                version: manifest.version,
+                process: manifest.runtime == rustgis_plugins::manifest::Runtime::Process,
+            });
+        }
+    }
+    out
 }
 
 /// Serialises tests that call [`set`], which changes a process-wide value. Public only so other
@@ -201,13 +271,24 @@ mod tests {
     }
 
     #[test]
-    fn site_unreadable_is_default_with_error() {
+    fn init_from_a_bad_or_missing_file_leaves_the_defaults() {
         let _g = test_lock();
-        // read() on a folder errs; init() must not panic and leaves defaults.
-        let dir = std::env::temp_dir();
-        assert!(read(&dir).is_err());
+        let dir = std::env::temp_dir().join(format!("site-init-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.json"), vec![b' '; MAX_BYTES + 1]).unwrap();
+        std::fs::write(dir.join("good.json"), r#"{"build": "hlr-1"}"#).unwrap();
+        let bad = [Some(dir.clone()), Some(dir.join("big.json")), Some(dir.join("missing.json")), None];
+        for path in bad {
+            set(Site { build: Some("stale".into()), ..Default::default() });
+            init_from(path.clone());
+            assert_eq!(current(), Site::default(), "{path:?}");
+        }
+        init_from(Some(dir.join("good.json")));
+        let got = current();
         set(Site::default());
-        assert_eq!(current(), Site::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got.build.as_deref(), Some("hlr-1"));
+        assert_eq!(got.path, Some(dir.join("good.json")));
     }
 
     #[test]
@@ -228,5 +309,113 @@ mod tests {
         set(Site::default());
         assert_eq!(build(), None);
         assert_eq!(version_label(), rustgis_plugins::manifest::RUSTGIS_VERSION);
+    }
+
+    /// Loads the test plugin `id` (version 1.0.0) from `source`.
+    fn load_plugin(id: &str, source: &str) {
+        let package = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::package(id, &[])).unwrap();
+        rustgis_plugins::load(package, source).unwrap();
+    }
+
+    /// Writes the test plugin `id` at `version` as `dir/name`.
+    fn write_package(dir: &Path, name: &str, id: &str, version: &str) -> PathBuf {
+        let mut manifest: Value = serde_json::from_str(&rustgis_plugins::testing::manifest(id, &[])).unwrap();
+        manifest["version"] = json!(version);
+        let bytes = rustgis_plugins::testing::zip_of(&[
+            ("plugin.json", manifest.to_string().as_bytes()),
+            ("plugin.wasm", &rustgis_plugins::testing::wasm()),
+        ]);
+        std::fs::write(dir.join(name), bytes).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn info_answers_site_settings_as_given() {
+        let _g = test_lock();
+        set(Site {
+            build: Some("hlr-1".into()),
+            settings: [("eng-info".to_string(), json!({"portal": "https://x", "odd": [1]}))].into(),
+            ..Default::default()
+        });
+        let mut s = crate::Session::new(crate::Project::default());
+        load_plugin("eng-info", "test");
+        // The test plugin's command `f` sends `op` to the host and answers with the reply.
+        let info = json!({"op": "host.info", "params": {}});
+        let got = s.run("plugin:eng-info/f", &info).unwrap();
+        assert_eq!(got["build"], "hlr-1");
+        assert_eq!(got["site"], json!({"portal": "https://x", "odd": [1]}));
+        assert_eq!(got["plugin"], "eng-info");
+        set(Site::default());
+        let got = s.run("plugin:eng-info/f", &info).unwrap();
+        rustgis_plugins::unload("eng-info");
+        assert_eq!(got["build"], Value::Null);
+        assert_eq!(got["site"], Value::Null);
+    }
+
+    #[test]
+    fn site_installs_skips_installed_and_newer() {
+        let _g = test_lock();
+        let dir = std::env::temp_dir().join(format!("site-inst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let new = write_package(&dir, "new.rgplugin", "site-new", "1.0.0");
+        let same = write_package(&dir, "same.rgplugin", "site-same", "1.0.0");
+        let older = write_package(&dir, "older.rgplugin", "site-older", "0.9.0");
+        let newer = write_package(&dir, "newer.rgplugin", "site-newer", "2.0.0");
+        for id in ["site-same", "site-older", "site-newer"] {
+            load_plugin(id, "test"); // version 1.0.0 of each
+        }
+        set(Site { install: vec![new, same, older, newer], ..Default::default() });
+        let got: Vec<(String, String)> = site_installs().into_iter().map(|i| (i.id, i.version)).collect();
+        set(Site::default());
+        for id in ["site-same", "site-older", "site-newer"] {
+            rustgis_plugins::unload(id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, vec![("site-new".to_string(), "1.0.0".to_string()), ("site-newer".to_string(), "2.0.0".to_string())]);
+    }
+
+    #[test]
+    fn site_installs_never_offers_over_a_development_folder() {
+        let _g = test_lock();
+        let dir = std::env::temp_dir().join(format!("site-dev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let newer = write_package(&dir, "dev.rgplugin", "site-dev", "2.0.0");
+        set(Site { install: vec![newer], ..Default::default() });
+        // Loaded from a folder, as `plugin.install` of a development folder does.
+        load_plugin("site-dev", &dir.display().to_string());
+        let from_folder = site_installs().len();
+        rustgis_plugins::unload("site-dev");
+        load_plugin("site-dev", &dir.join("site-dev.rgplugin").display().to_string());
+        let from_package = site_installs().len();
+        set(Site::default());
+        rustgis_plugins::unload("site-dev");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(from_folder, 0, "a development folder wins");
+        assert_eq!(from_package, 1, "an installed package is offered the newer version");
+    }
+
+    #[test]
+    fn site_installs_skips_oversized_packages() {
+        let _g = test_lock();
+        let dir = std::env::temp_dir().join(format!("site-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.rgplugin");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(rustgis_plugins::package::MAX_PACKAGE as u64 + 1).unwrap();
+        drop(file);
+        set(Site { install: vec![big], ..Default::default() });
+        let got = site_installs();
+        set(Site::default());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn site_installs_skips_missing_packages() {
+        let _g = test_lock();
+        set(Site { install: vec![PathBuf::from("C:/nope/../x.rgplugin"), PathBuf::from("/also/missing.rgplugin")], ..Default::default() });
+        let got = site_installs();
+        set(Site::default());
+        assert!(got.is_empty());
     }
 }

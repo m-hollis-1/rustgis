@@ -73,6 +73,7 @@ mod searchbox;
 mod serviceui;
 mod shortcutui;
 mod showme;
+mod siteui;
 mod sourcespane;
 mod sqlbox;
 mod sqlpane;
@@ -3950,7 +3951,7 @@ impl RustGisApp {
         chrome::about(self, &ctx);
         #[cfg(not(target_arch = "wasm32"))]
         agentthreads::windows(self, &ctx);
-        pluginsui::site_prompt(self, &ctx, &t);
+        siteui::site_prompt(self, &ctx, &t);
         chrome::notices(self, &ctx);
         // After every field is drawn: one right-clicked opens its menu.
         fieldmenu::show(self, &ctx);

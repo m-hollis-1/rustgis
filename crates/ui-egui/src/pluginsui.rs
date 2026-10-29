@@ -13,8 +13,6 @@ use rustgis_engine::plugins::{self as rp, Manifest, Package, registry::Entry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use rustgis_engine::cmd::plugins::{SiteInstall, site_installs};
-
 use crate::theme::{Tokens, semibold};
 use crate::{RustGisApp, Slot};
 
@@ -85,7 +83,7 @@ pub struct PluginsState {
     /// Python environments being made for plugins (desktop), by plugin id.
     envs: std::collections::HashMap<String, Arc<Mutex<EnvJob>>>,
     /// The site file's packages still to offer: `None` until the first frame has looked.
-    pub site_installs: Option<Vec<SiteInstall>>,
+    pub site_installs: Option<Vec<rustgis_engine::site::SiteInstall>>,
 }
 
 /// A plugin's Python environment being made on a background thread.
@@ -401,23 +399,29 @@ fn install_confirmed(app: &mut RustGisApp) {
                     list.push(entry);
                 }
             });
-            let mut text = crate::i18n::fmt(
-                "Installed {name} {version}. Find it on the Plugins tab; its tools are also in the Tools pane.",
-                &[("name", &p.manifest.name), ("version", &p.manifest.version)],
-            );
+            let mut text = installed(app, &p.manifest);
             if keeps_prefs() && !kept {
                 text = format!("{text} {}", tl!("It's too large to keep in the browser: install it again on your next visit."));
             }
             app.plugins.message = Some((true, text));
             app.plugins.tab = Tab::Installed;
-            // A Python plugin's environment is made now, in the background.
-            if env_ready(&p.manifest.id) == Some(false) {
-                prepare_env(app, &p.manifest.id);
-            }
-            app.session.revision = app.session.revision.wrapping_add(1);
         }
         Err(e) => app.plugins.message = Some((false, e)),
     }
+}
+
+/// What follows every install (the Plugin Manager's or the site prompt's): a Python plugin's
+/// environment is started in the background and the session is marked changed. Returns the
+/// notice to show.
+pub(crate) fn installed(app: &mut RustGisApp, m: &Manifest) -> String {
+    if env_ready(&m.id) == Some(false) {
+        prepare_env(app, &m.id);
+    }
+    app.session.revision = app.session.revision.wrapping_add(1);
+    crate::i18n::fmt(
+        "Installed {name} {version}. Find it on the Plugins tab; its tools are also in the Tools pane.",
+        &[("name", &m.name), ("version", &m.version)],
+    )
 }
 
 fn uninstall(app: &mut RustGisApp, id: &str) {
@@ -546,71 +550,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     }
 }
 
-/// Offers the packages the site file lists that aren't installed (or are older) as one prompt on
-/// the first frame: Install runs them all, Not now asks again next start. The site file exists
-/// on the desktop only.
-pub fn site_prompt(app: &mut RustGisApp, ctx: &egui::Context, t: &Tokens) {
-    if cfg!(target_arch = "wasm32") {
-        return;
-    }
-    let list = app.plugins.site_installs.get_or_insert_with(site_installs);
-    if list.is_empty() {
-        return;
-    }
-    let mut install = false;
-    let mut dismiss = false;
-    let screen = ctx.content_rect();
-    let width = (screen.width() - 48.0).clamp(220.0, 460.0);
-    let modal = egui::Modal::new(egui::Id::unique("site_install_prompt")).show(ctx, |ui| {
-        ui.set_width(width);
-        ui.label(egui::RichText::new(tl!("Plugins for this site")).font(semibold(15.0)));
-        ui.add_space(6.0);
-        for entry in list.iter() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(format!("{} {}", entry.name, entry.version)).font(semibold(12.5)));
-                if entry.process {
-                    chip(ui, t, tl!("Not sandboxed"), t.red);
-                }
-            });
-            if entry.process {
-                ui.label(
-                    egui::RichText::new(tl!(
-                        "This plugin runs as a program on your computer, outside RustGIS's sandbox. It can do anything you can: read and change your files, use the network and run other programs. Install it only if you trust its author."
-                    ))
-                    .size(11.5)
-                    .color(t.text_dim),
-                );
-            }
-            ui.add_space(4.0);
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if crate::widgets::primary_button(ui, tl!("Install"), true, vec2(80.0, 28.0)).clicked() {
-                install = true;
-            }
-            if ui.button(tl!("Not now")).clicked() {
-                dismiss = true;
-            }
-        });
-    });
-    if modal.should_close() {
-        dismiss = true;
-    }
-    if install {
-        let entries = std::mem::take(list);
-        for entry in entries {
-            let path = entry.path.display().to_string();
-            if let Err(error) = app.run("plugin.install", json!({"path": path})) {
-                let text = crate::i18n::fmt("Could not install {name}: {error}", &[("name", &entry.name), ("error", &error)]);
-                app.session.notify(text, true);
-            }
-        }
-    } else if dismiss {
-        list.clear();
-    }
-}
-
-fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, color: egui::Color32) -> egui::Response {
+pub(crate) fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, color: egui::Color32) -> egui::Response {
     egui::Frame::NONE
         .fill(color.gamma_multiply(0.14))
         .corner_radius(CornerRadius::same(4))

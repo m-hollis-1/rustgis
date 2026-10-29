@@ -52,5 +52,7 @@ Preferences replaces it. The site file is never written by RustGIS.
 On its first frame the desktop app offers the packages in `plugins.install` that aren't installed
 yet or are installed in an older version, in one prompt (Install or Not now; Not now asks again at
 the next start, and a process plugin is marked Not sandboxed). It installs only what the user
-approves. The command line and Python read the same file (for `build` and the defaults) but never
-install packages from it.
+approves. A plugin loaded from a development folder (installed as a folder) is never offered: the
+developer's copy wins. Only the desktop app and `rustgis-cli` read the site file; the command line
+uses it for `build` and plugin settings, but never installs packages from it. The
+Python package doesn't read it.

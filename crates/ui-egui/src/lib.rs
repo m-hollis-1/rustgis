@@ -3950,6 +3950,7 @@ impl RustGisApp {
         chrome::about(self, &ctx);
         #[cfg(not(target_arch = "wasm32"))]
         agentthreads::windows(self, &ctx);
+        pluginsui::site_prompt(self, &ctx, &t);
         chrome::notices(self, &ctx);
         // After every field is drawn: one right-clicked opens its menu.
         fieldmenu::show(self, &ctx);
@@ -3962,7 +3963,8 @@ impl RustGisApp {
         if let Some(url) = self.ui.open_url.take() {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
-        let title = format!("{}{} - RustGIS", self.session.project.name, if self.session.dirty() { " •" } else { "" });
+        let build = rustgis_engine::site::build().map(|b| format!(" {b}")).unwrap_or_default();
+        let title = format!("{}{} - RustGIS{build}", self.session.project.name, if self.session.dirty() { " •" } else { "" });
         if title != self.sent_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.sent_title = title;

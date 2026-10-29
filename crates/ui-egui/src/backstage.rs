@@ -174,7 +174,7 @@ fn card(ui: &mut Ui, t: &Tokens, title: &str, sub: &str, icon: &str) -> bool {
 fn about(ui: &mut Ui, t: &Tokens) {
     ui.label(egui::RichText::new(tl!("About RustGIS")).font(semibold(24.0)));
     ui.add_space(8.0);
-    ui.label(crate::i18n::fmt("Version {version}", &[("version", env!("CARGO_PKG_VERSION"))]));
+    ui.label(crate::i18n::fmt("Version {version}", &[("version", &rustgis_engine::site::version_label())]));
     ui.add_space(8.0);
     crate::i18n::paragraph(
         ui,

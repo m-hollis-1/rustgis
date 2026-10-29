@@ -687,6 +687,8 @@ fn mcp(s: &mut Session, args: &[String]) -> Result<(), String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else { return usage() };
+    // The site's settings are read even with `--no-plugins`.
+    rustgis_engine::site::init();
     if !args.iter().any(|a| a == "--no-plugins") {
         for e in rustgis_engine::cmd::plugins::load_installed() {
             eprintln!("rustgis-cli: warning: {e}");

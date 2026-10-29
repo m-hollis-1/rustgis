@@ -18,6 +18,8 @@
 //! out) and runs one frame (shots then catch the map mid-zoom),
 //! `{"plugin": path}` loads a `.rgplugin` or a plugin folder for the run (as `rustgis-cli run
 //! --plugin` does), and `{"testPlugin": "panel"}` the plugin tests use, with a panel,
+//! `{"sitePackage": "/abs/out.rgplugin"}` writes the test plugin's package there before the first frame
+//! (for a site file's `plugins.install`, see `RUSTGIS_SITE_FILE`),
 //! `{"titlebar": {"left_inset": 80, "height": 34}}`
 //! draws the header as a macOS unified title bar (`null` turns it off), and
 //! `{"width": w, "height": h}` on the first line sets the size (default 1480×900),
@@ -137,6 +139,8 @@ fn screenshot_scale(size: egui::Vec2, value: f64, max_dimension: u32) -> Result<
 }
 
 fn main() {
+    // The site build label (`RUSTGIS_SITE_FILE`) shows in the window like the apps.
+    rustgis_engine::site::init();
     let path = std::env::args().nth(1).expect("usage: ui_shot script.jsonl");
     let script = std::fs::read_to_string(&path).expect("read script");
     let lines: Vec<serde_json::Value> =
@@ -146,6 +150,12 @@ fn main() {
     let pixels_per_point = lines.iter().find_map(|l| l.get("pixelsPerPoint").and_then(|v| v.as_f64())).unwrap_or(2.0);
     let dt = lines.iter().find_map(|l| l.get("dt").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
     let ribbon_split = lines.first().and_then(|l| l.get("ribbonSplit")).and_then(Value::as_bool).unwrap_or(false);
+    // Before the first frame: the site's install prompt looks for the packages then.
+    for out in lines.iter().filter_map(|l| l.get("sitePackage").and_then(Value::as_str)) {
+        if let Err(e) = std::fs::write(out, rustgis_plugins::testing::package("shot-site", &[])) {
+            eprintln!("{out}: {e}");
+        }
+    }
     let mut split_showcase = RibbonSplitShowcase::default();
     let mut app = RustGisApp::with_sample();
     if let Some(dir) = lines.first().and_then(|l| l.get("recovery")).and_then(Value::as_str) {
@@ -244,6 +254,8 @@ fn main() {
             for _ in 0..3 {
                 harness.step();
             }
+        } else if l.get("sitePackage").is_some() {
+            // Written before the first frame.
         } else if let Some(which) = l.get("testPlugin").and_then(|v| v.as_str()) {
             let bytes = match which {
                 "panel" => rustgis_plugins::testing::panel_package("test-panel"),

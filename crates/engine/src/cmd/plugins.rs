@@ -105,6 +105,67 @@ pub fn install_bytes(bytes: &[u8]) -> Result<Arc<Plugin>, String> {
     }
 }
 
+/// A package the site file offers that isn't installed yet, or is installed in an older version.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteInstall {
+    pub path: std::path::PathBuf,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// A process plugin: runs a program on the computer, not sandboxed.
+    pub process: bool,
+}
+
+/// The site file's packages (`site::current().install`) to offer: those not installed, or
+/// installed in an older version. A package that can't be read or parsed is logged and skipped.
+pub fn site_installs() -> Vec<SiteInstall> {
+    let mut out = Vec::new();
+    for path in crate::site::current().install {
+        // Size-checked before reading: a huge file isn't read into memory.
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(error) => {
+                log::warn!("site package {} not read: {error}", path.display());
+                continue;
+            }
+        };
+        if len > rustgis_plugins::package::MAX_PACKAGE as u64 {
+            log::warn!("site package {} is larger than {} MB", path.display(), rustgis_plugins::package::MAX_PACKAGE / (1024 * 1024));
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("site package {} not read: {error}", path.display());
+                continue;
+            }
+        };
+        let manifest = match rustgis_plugins::Package::from_zip(&bytes) {
+            Ok(package) => package.manifest,
+            Err(error) => {
+                log::warn!("site package {} is not a plugin package: {error}", path.display());
+                continue;
+            }
+        };
+        let pending = match rustgis_plugins::get(&manifest.id) {
+            None => true,
+            Some(installed) => {
+                rustgis_plugins::manifest::version_cmp(&installed.manifest.version, &manifest.version) == std::cmp::Ordering::Less
+            }
+        };
+        if pending {
+            out.push(SiteInstall {
+                path,
+                id: manifest.id,
+                name: manifest.name,
+                version: manifest.version,
+                process: manifest.runtime == rustgis_plugins::manifest::Runtime::Process,
+            });
+        }
+    }
+    out
+}
+
 fn list(_: &mut Session, _: &Value) -> CmdResult {
     #[cfg(not(target_arch = "wasm32"))]
     let folder = rustgis_plugins::store::dir().map(|d| d.display().to_string());
@@ -551,11 +612,17 @@ impl Bridge<'_> {
     }
 }
 
+/// The answer to `host.info`: the version, the ABI, the plugin's id and permissions, the site's build label (or null) and the
+/// plugin's own site settings (or null).
+pub(crate) fn info_answer(m: &rustgis_plugins::Manifest) -> Value {
+    json!({"rustgis": rustgis_plugins::manifest::RUSTGIS_VERSION, "abi": rustgis_plugins::manifest::ABI,
+        "plugin": m.id, "permissions": m.permissions, "build": crate::site::build(), "site": crate::site::plugin_settings(&m.id)})
+}
+
 impl Host for Bridge<'_> {
     fn call(&mut self, op: &str, params: &Value) -> Result<Value, String> {
         match op {
-            "host.info" => Ok(json!({"rustgis": rustgis_plugins::manifest::RUSTGIS_VERSION, "abi": rustgis_plugins::manifest::ABI,
-                "plugin": self.plugin.manifest.id, "permissions": self.plugin.manifest.permissions})),
+            "host.info" => Ok(info_answer(&self.plugin.manifest)),
             "host.layers" => Ok(self.layers()),
             "host.features" => self.features(params),
             "host.view" => {

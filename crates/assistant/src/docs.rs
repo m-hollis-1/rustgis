@@ -43,6 +43,7 @@ pub const PAGES: &[Page] = pages![
     "python.md",
     "mcp.md",
     "plugins.md",
+    "site-settings.md",
     "i18n.md",
     "architecture.md",
     "contributing.md",

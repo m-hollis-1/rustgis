@@ -55,13 +55,21 @@ mod prefs {
         })
     }
 
+    /// The user's saved value, else the site's default for it (`site.json`).
+    pub fn load_pref_from(user: &Map<String, Value>, key: &str) -> Option<String> {
+        match user.get(key).and_then(Value::as_str) {
+            Some(value) => Some(value.to_string()),
+            None => rustgis_engine::site::pref_default(key),
+        }
+    }
+
     pub fn services() -> Services {
         let secrets: std::sync::Arc<dyn rustgis_engine::data::secrets::SecretStore> =
             std::sync::Arc::new(rustgis_keychain::Keychain::default());
         // The ChatGPT sign-in's tokens go to the same keychain (its accounts stay in the file).
         rustgis_assistant::chatgpt::set_secret_store(Some(secrets.clone()));
         Services {
-            load_pref: Some(Box::new(|key: &str| read().get(key).and_then(Value::as_str).map(str::to_string))),
+            load_pref: Some(Box::new(|key: &str| load_pref_from(&read(), key))),
             save_pref: Some(Box::new(|key: &str, value: &str| {
                 if let Err(error) = rustgis_engine::prefs::write(key, value) {
                     log::warn!("{error}");
@@ -69,6 +77,24 @@ mod prefs {
             })),
             secrets: Some(secrets),
             ..Services::default()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn load_pref_prefers_the_user_value() {
+            let _g = rustgis_engine::site::test_lock();
+            rustgis_engine::site::set(rustgis_engine::site::Site {
+                prefs: [("language".to_string(), "de".to_string())].into(),
+                ..Default::default()
+            });
+            let user: serde_json::Map<String, serde_json::Value> =
+                [("language".to_string(), serde_json::json!("fr"))].into_iter().collect();
+            assert_eq!(super::load_pref_from(&user, "language").as_deref(), Some("fr"));
+            assert_eq!(super::load_pref_from(&Default::default(), "language").as_deref(), Some("de"));
+            assert_eq!(super::load_pref_from(&Default::default(), "theme"), None);
+            rustgis_engine::site::set(Default::default());
         }
     }
 }
@@ -446,6 +472,8 @@ fn main() -> eframe::Result {
         .filter(|(i, a)| !(a.starts_with("--") || *i > 0 && args.get(i - 1).is_some_and(|p| p == "--backend")))
         .map(|(_, a)| a)
         .collect();
+    // The site's settings (`site.json`), before plugins and the first session read them.
+    rustgis_engine::site::init();
     // Installed plugins, before the first session lists commands and tools.
     let plugin_errors = rustgis_engine::cmd::plugins::load_installed();
     let app = if args.iter().any(|a| a == "--sample") || files.is_empty() {

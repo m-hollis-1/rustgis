@@ -57,6 +57,7 @@ mod navui;
 mod nldiui;
 mod opendataui;
 mod panes;
+mod pluginbrowser;
 mod pluginpanel;
 mod pluginsui;
 mod portalsui;
@@ -673,6 +674,7 @@ pub struct UiState {
     pub s3_chooser: connectionui::Chooser,
     /// The datasets saved connections list under Data Sources › Connections, and the selection.
     pub connection_tree: connectiontree::State,
+    pub plugin_browser: pluginbrowser::State,
     /// OpenStreetMap and Boundaries: their choices and the request under way.
     pub portals: portalsui::State,
     /// Overture Maps and Source Cooperative: choices, results and the request under way.
@@ -825,6 +827,7 @@ impl Default for UiState {
             connection: Default::default(),
             s3_chooser: Default::default(),
             connection_tree: Default::default(),
+            plugin_browser: Default::default(),
             portals: Default::default(),
             catalogs: Default::default(),
             opendata: Default::default(),
@@ -3746,6 +3749,7 @@ impl RustGisApp {
         s3ui::poll(self, ctx);
         connectionui::poll(self, ctx);
         connectiontree::poll(self, ctx);
+        pluginbrowser::poll(self, ctx);
         portalsui::poll(self, ctx);
         catalogsui::poll(self, ctx);
         opendataui::poll(self, ctx);

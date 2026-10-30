@@ -140,7 +140,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             level(app, ui, t, &p, &decl, lang, "", 0);
         });
         let (mut reload, mut collapse) = (false, false);
-        label.response.context_menu(|ui| {
+        label.inner.context_menu(|ui| {
             if ui.button(tl!("Refresh")).clicked() {
                 reload = true;
                 ui.close();

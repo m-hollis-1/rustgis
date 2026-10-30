@@ -493,9 +493,11 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
         return;
     }
     crate::modelbuilder::shortcuts(app, ctx);
-    // The search box was typed in until egui took its focus away on Escape: that Escape clears
-    // the box, not the tool.
-    let typing = ctx.egui_wants_keyboard_input() || crate::searchbox::had_focus(&app.ui.search, ctx.cumulative_pass_nr());
+    // The search box (or a table cell) was typed in until egui took its focus away on Escape:
+    // that Escape clears the box (leaves the cell as it was), not the tool.
+    let pass = ctx.cumulative_pass_nr();
+    let typing =
+        ctx.egui_wants_keyboard_input() || crate::searchbox::had_focus(&app.ui.search, pass) || crate::table::had_focus(&app.table, pass);
     // A text field focused, not any widget (a button reached with Tab): it has an undo of its own.
     let text_field = ctx.text_edit_focused();
     // An element selected in the open layout, for the layout's own keys.

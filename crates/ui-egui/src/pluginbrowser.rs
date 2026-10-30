@@ -335,7 +335,7 @@ fn row(
     label.context_menu(|ui| {
         for cmd in decl.menu_commands() {
             let name = p.manifest.commands.iter().find(|c| c.id == cmd).map_or(cmd.as_str(), |c| p.manifest.translate(lang, &c.label));
-            if ui.button(name).clicked() {
+            if ui.button(name.replace('\n', " ")).clicked() {
                 chosen = Some(cmd.clone());
                 ui.close();
             }

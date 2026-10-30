@@ -439,8 +439,8 @@ the folders and items of a web service. Declare it in `plugin.json`:
   missing or isn't one).
 - `browse` is the command RustGIS runs to list the children of a node. `open` is the command run
   when a leaf is double-clicked. `menu` lists commands for a node's context menu, shown with their
-  declared labels, at most 16; `open` comes first in the menu if it isn't in the list. Every name
-  must be one of the plugin's own commands.
+  declared labels, at most 16; `open` always comes first in the menu, once, whether or not
+  `menu` lists it. Every name must be one of the plugin's own commands.
 - `search: true` puts a search box above the section's nodes. What is typed goes with every
   `browse` request as `query`, and changing it drops the levels RustGIS has kept for the section.
   The plugin decides what the query means.
@@ -454,8 +454,10 @@ the text of the search box:
 "browser": { "node": "item:abc123", "query": "power" }
 ```
 
-`browser` is taken out of the request's `params` the way `panel` is, so a script or `rustgis-cli`
-can send the same shape:
+The plugin reads these as `params.browser.node` and `params.browser.query`; RustGIS leaves
+`browser` in the request's `params`. To drive `browse` from a script or `rustgis-cli`, run the
+`plugin.browse` command, whose own parameters are `id`, `node` and `query` (not the `browser`
+shape):
 
 ```sh
 rustgis-cli run --sample --cmd 'plugin.browse={"id":"my-plugin"}'
@@ -470,7 +472,7 @@ for. It is read-only, so it is no undo step. The `browse` command answers:
 {
   "nodes": [
     { "id": "scope:my", "label": "My Content", "icon": "folder", "expandable": true },
-    { "id": "item:abc123", "label": "Power Lines", "detail": "mike.hollis · 2026-10-21", "expandable": true },
+    { "id": "item:abc123", "label": "Power Lines", "detail": "owner · 2026-10-21", "expandable": true },
     { "id": "layer:abc123/0", "label": "Lines", "icon": "line", "expandable": false }
   ],
   "truncated": false,
@@ -486,7 +488,7 @@ for. It is read-only, so it is no undo step. The `browse` command answers:
 - `icon` is one of RustGIS's own icon names. A node with an icon of another name, or none, shows an
   open-folder icon if it is a branch and a table icon if it is a leaf.
 - `truncated` says the plugin listed fewer nodes than there are, and `notes` are short remarks
-  (at most 16); both show under the level.
+  (at most 16, each kept to one line of at most 200 characters); both show under the level.
 - RustGIS checks the answer like any other: unknown fields and values of the wrong type are
   ignored, a node without an id, or with one longer than 200 characters or taken already, is left
   out with its children. Labels are clipped to 200 characters and `detail` to 80, text is kept to
@@ -498,7 +500,8 @@ for. It is read-only, so it is no undo step. The `browse` command answers:
 
 A click selects a node; a double-click opens or closes a branch, or runs `open` on a leaf. The
 right-click menu of a node shows the `menu` commands, and that of the section's title **Refresh**
-and **Collapse All**. `open` and the `menu` commands run with the node's id as their parameters:
+and **Collapse All**. `open` and the `menu` commands run with the node's id, which they read as
+`params.browser.node`:
 
 ```json
 "browser": { "node": "layer:abc123/0" }
@@ -507,14 +510,14 @@ and **Collapse All**. `open` and the `menu` commands run with the node's id as t
 They run like any plugin command: their answer is shown as notices or errors, and one that
 changes the project is an undo step. `browse` is not one.
 
-**What `browse` may ask of RustGIS.** Listing never holds the map: RustGIS runs `browse` on a
-background thread, away from the project, so a slow service leaves the map usable and the section
-shows a spinner. With no project to ask, a `browse` command can call `host.info` (and `log`) and
-nothing else; any other request fails with `browse commands may only call host.info, not '<op>'`.
-That is the same on the desktop and from `rustgis-cli`. A `browse` command answers from its own
-sources (the network, files), not from the map. `open` and `menu` commands do run against the
-project, like every other command, and so on the main thread: one that adds a large layer shows
-the usual "running" state while it works.
+**What `browse` may ask of RustGIS.** The desktop pane runs `browse` on a background thread, away
+from the project, so a slow service leaves the map usable and the section shows a spinner (in the
+browser build, and for the `plugin.browse` command, it runs inline). With no project to ask, a
+`browse` command can call `host.info` (and `log`) and nothing else; any other request fails with
+`browse commands may only call host.info, not '<op>'`. That is the same on the desktop and from
+`rustgis-cli`. A `browse` command answers from its own sources (the network, files), not from the
+map. `open` and `menu` commands do run against the project, like every other command, and so on
+the main thread: one that adds a large layer shows the usual "running" state while it works.
 
 RustGIS versions before the Browser section ignore `browser`: keep the commands usable from a tab
 or the command line too, or set `minRustgisVersion`.

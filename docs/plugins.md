@@ -485,6 +485,9 @@ for. It is read-only, so it is no undo step. The `browse` command answers:
   `count` (a whole number, shown in brackets after the label) and `expandable` (a branch whose
   children are asked for when it is opened; `false` unless given). Inline `children` are allowed
   for a small fixed sub-tree; a node that is not `expandable` shows them when it is opened.
+  A node should not reappear below itself (such a node is shown but not opened), and the same id
+  in two places names one thing: the two open, close and are kept together. Levels read on
+  opening go at most 32 deep.
 - `icon` is one of RustGIS's own icon names. A node with an icon of another name, or none, shows an
   open-folder icon if it is a branch and a table icon if it is a leaf.
 - `truncated` says the plugin listed fewer nodes than there are, and `notes` are short remarks

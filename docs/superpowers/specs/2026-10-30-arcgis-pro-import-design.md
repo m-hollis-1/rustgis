@@ -75,7 +75,7 @@ the day they import; a map import pays off only once its data sources open.
 
 ## Part 1: the CIM reader (shared)
 
-A module `rustgis_map::arcgis` that turns CIM JSON into map and layout types.
+A module `rustgis_map::cim` that turns CIM JSON into map and layout types.
 
 **Documents and references.** A `.pagx` is a `CIMLayoutDocument` with `layoutDefinition`,
 `mapDefinitions` (maps the layout's frames embed), `layerDefinitions` (their layers),

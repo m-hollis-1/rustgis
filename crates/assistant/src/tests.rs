@@ -1305,7 +1305,8 @@ fn mcp_serves_the_docs() {
 
 #[test]
 fn docs_pages_and_addresses() {
-    // Every page in docs/ is built in (add new pages to `docs::PAGES`).
+    // Every page in docs/ is built in (add new pages to `docs::PAGES`), except the design
+    // documents and plans under docs/superpowers, which are for contributors, not the assistant.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
     let mut found = Vec::new();
     let mut dirs = vec![root.clone()];
@@ -1313,6 +1314,9 @@ fn docs_pages_and_addresses() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
             let p = e.path();
             if p.is_dir() {
+                if d == root && p.file_name().is_some_and(|n| n == "superpowers") {
+                    continue;
+                }
                 dirs.push(p);
             } else if p.extension().is_some_and(|x| x == "md") {
                 found.push(p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"));

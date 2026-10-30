@@ -2000,7 +2000,7 @@ fn hostile_params_never_panic() {
         json!({"source": "rustgis-s3::0::s3://bucket/key", "id": "c1", "remember": {"a": 1}}),
         json!({"source": 7, "id": ["c1"]}),
         // A plugin browser: a junk node and query.
-        json!({"id": "eng-browser", "node": 1e300, "query": {}}),
+        json!({"id": "hostile-browser", "node": 1e300, "query": {}}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);

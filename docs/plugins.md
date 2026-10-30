@@ -519,9 +519,12 @@ from the project, so a slow service leaves the map usable and the section shows 
 browser build, and for the `plugin.browse` command, it runs inline). With no project to ask, a
 `browse` command can call `host.info` (and `log`) and nothing else; any other request fails with
 `browse commands may only call host.info, not '<op>'`. That is the same on the desktop and from
-`rustgis-cli`. A `browse` command answers from its own sources (the network, files), not from the
-map. `open` and `menu` commands do run against the project, like every other command, and so on
-the main thread: one that adds a large layer shows the usual "running" state while it works.
+`rustgis-cli`. A `browse` command answers from its own sources, not from the map. A process
+plugin may use the network and files directly. A WebAssembly plugin reaches the network only
+through `host.fetch`, which `browse` may not call, so its `browse` can list only what it already
+has: a WebAssembly section lists static or bundled content. `open` and `menu` commands do run
+against the project, like every other command, and so on the main thread: one that adds a large
+layer shows the usual "running" state while it works.
 
 RustGIS versions before the Browser section ignore `browser`: keep the commands usable from a tab
 or the command line too, or set `minRustgisVersion`.

@@ -3,6 +3,7 @@
 
 pub mod antimeridian;
 pub mod camera;
+pub mod cim;
 pub mod color;
 pub mod design;
 pub mod effects;

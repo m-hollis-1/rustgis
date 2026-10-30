@@ -418,6 +418,110 @@ Any command can answer the panel's new state, beside the rest of its answer:
 - RustGIS versions before panels ignore `panel` (and refuse a tab that names it): keep the
   commands usable from the ribbon too, or set `minRustgisVersion`.
 
+### A Browser section
+
+A plugin can add a section to the **Browser** pane: a tree it fills one level at a time, such as
+the folders and items of a web service. Declare it in `plugin.json`:
+
+```json
+"browser": {
+  "label": "ArcGIS Online",
+  "icon": "cloud",
+  "browse": "browse-nodes",
+  "open": "add-node",
+  "menu": ["add-node", "refresh-node"],
+  "search": true
+}
+```
+
+- `label` (1 to 32 characters, translated through `i18n`) is the section's title in the Browser
+  pane; `icon` is one of RustGIS's own icon names, as for commands (an open-folder icon when it is
+  missing or isn't one).
+- `browse` is the command RustGIS runs to list the children of a node. `open` is the command run
+  when a leaf is double-clicked. `menu` lists commands for a node's context menu, shown with their
+  declared labels, at most 16; `open` always comes first in the menu, once, whether or not
+  `menu` lists it. Every name must be one of the plugin's own commands.
+- `search: true` puts a search box above the section's nodes. What is typed goes with every
+  `browse` request as `query`, and changing it drops the levels RustGIS has kept for the section.
+  The plugin decides what the query means.
+- A plugin may have `browser` with or without `panel` and `tab`. The section shows for enabled
+  plugins, in plugin id order, after Folder Connections.
+
+RustGIS runs `browse` when a branch is first opened, with the node's id (`null` for the roots) and
+the text of the search box:
+
+```json
+"browser": { "node": "item:abc123", "query": "power" }
+```
+
+The plugin reads these as `params.browser.node` and `params.browser.query`; RustGIS leaves
+`browser` in the request's `params`. To drive `browse` from a script or `rustgis-cli`, run the
+`plugin.browse` command, whose own parameters are `id`, `node` and `query` (not the `browser`
+shape):
+
+```sh
+rustgis-cli run --sample --cmd 'plugin.browse={"id":"my-plugin"}'
+rustgis-cli run --sample --cmd 'plugin.browse={"id":"my-plugin","node":"scope:my","query":"power"}'
+```
+
+`plugin.browse` takes the plugin's `id` and, optionally, a `node` and a `query`, and answers
+`{id, node, nodes, truncated, notes}`: the checked listing below, with the plugin and node it is
+for. It is read-only, so it is no undo step. The `browse` command answers:
+
+```json
+{
+  "nodes": [
+    { "id": "scope:my", "label": "My Content", "icon": "folder", "expandable": true },
+    { "id": "item:abc123", "label": "Power Lines", "detail": "owner · 2026-10-21", "expandable": true },
+    { "id": "layer:abc123/0", "label": "Lines", "icon": "line", "expandable": false }
+  ],
+  "truncated": false,
+  "notes": ["Showing the newest 100"]
+}
+```
+
+- A node has an `id` (what RustGIS gives back to ask for its children; unique in the answer), a
+  `label` (the id when it is missing), and optionally `detail` (grey text after the label), `icon`,
+  `count` (a whole number, shown in brackets after the label) and `expandable` (a branch whose
+  children are asked for when it is opened; `false` unless given). Inline `children` are allowed
+  for a small fixed sub-tree; a node that is not `expandable` shows them when it is opened.
+- `icon` is one of RustGIS's own icon names. A node with an icon of another name, or none, shows an
+  open-folder icon if it is a branch and a table icon if it is a leaf.
+- `truncated` says the plugin listed fewer nodes than there are, and `notes` are short remarks
+  (at most 16, each kept to one line of at most 200 characters); both show under the level.
+- RustGIS checks the answer like any other: unknown fields and values of the wrong type are
+  ignored, a node without an id, or with one longer than 200 characters or taken already, is left
+  out with its children. Labels are clipped to 200 characters and `detail` to 80, text is kept to
+  one line, and an answer holds at most 5,000 nodes, 8 levels deep. An answer that isn't an object
+  with a `nodes` list is an error.
+- RustGIS keeps each level until the section's refresh, a change to the search box, or a change in
+  the installed plugins (one installed, updated or disabled). A level that fails shows the
+  plugin's error with a **Retry** button.
+
+A click selects a node; a double-click opens or closes a branch, or runs `open` on a leaf. The
+right-click menu of a node shows the `menu` commands, and that of the section's title **Refresh**
+and **Collapse All**. `open` and the `menu` commands run with the node's id, which they read as
+`params.browser.node`:
+
+```json
+"browser": { "node": "layer:abc123/0" }
+```
+
+They run like any plugin command: their answer is shown as notices or errors, and one that
+changes the project is an undo step. `browse` is not one.
+
+**What `browse` may ask of RustGIS.** The desktop pane runs `browse` on a background thread, away
+from the project, so a slow service leaves the map usable and the section shows a spinner (in the
+browser build, and for the `plugin.browse` command, it runs inline). With no project to ask, a
+`browse` command can call `host.info` (and `log`) and nothing else; any other request fails with
+`browse commands may only call host.info, not '<op>'`. That is the same on the desktop and from
+`rustgis-cli`. A `browse` command answers from its own sources (the network, files), not from the
+map. `open` and `menu` commands do run against the project, like every other command, and so on
+the main thread: one that adds a large layer shows the usual "running" state while it works.
+
+RustGIS versions before the Browser section ignore `browser`: keep the commands usable from a tab
+or the command line too, or set `minRustgisVersion`.
+
 ### What a plugin can ask for
 
 Inside a request, `host::call(op, params)` sends one of these to RustGIS:

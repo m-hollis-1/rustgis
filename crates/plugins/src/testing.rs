@@ -20,9 +20,13 @@
 //!   Imagery plugin's would look.
 //! - `q` (echo): returns the request itself, so a test sees what the plugin was sent; its
 //!   `panel` (the panel's values) is then the answer's, and is taken in again.
+//! - `b` (browse): returns a fixed listing (see [`browse_answer`]). A request carrying
+//!   `browser` has it before `id` (byte 10 is then the `b` of `"browser"`), so that too is
+//!   answered this way.
 //!
 //! [`panel_manifest`] declares a panel over `p` and `q`. With a panel, requests carry `panel`
-//! before `params`, so `f` reads them only from plugins without one.
+//! before `params`, so `f` reads them only from plugins without one. [`browser_manifest`]
+//! declares a Browser section over `b` and `q`.
 
 use std::io::Write;
 
@@ -38,6 +42,7 @@ const WAT: &str = r#"
   (data (i32.const 128) "{\22error\22:\22nope\22}")
   (data (i32.const 192) "{\22ok\22:")
   (data (i32.const 2048) "PANEL_DATA")
+  (data (i32.const 4096) "BROWSE_DATA")
   (data (i32.const 256) "{\22ok\22:{\22layers\22:[{\22name\22:\22Made\22,\22geojson\22:{\22type\22:\22FeatureCollection\22,\22features\22:[{\22type\22:\22Feature\22,\22properties\22:{\22n\22:1},\22geometry\22:{\22type\22:\22Point\22,\22coordinates\22:[1,2]}}]}}],\22messages\22:[\22made\22]}}")
   (data (i32.const 1024) "{\22ok\22:{\22selection\22:{\22layer\22:\22Cities\22,\22rows\22:[0,2]}}}")
   (func $alloc (export "rustgis_alloc") (param $n i32) (result i32)
@@ -76,6 +81,8 @@ const WAT: &str = r#"
       (then (return (call $reply (i32.const 256) (i32.const 195)))))
     (if (i32.eq (local.get $c) (i32.const 120)) (then (return (call $reply (i32.const 1024) (i32.const 52)))))
     (if (i32.eq (local.get $c) (i32.const 112)) (then (return (call $reply (i32.const 2048) (i32.const PANEL_LEN)))))
+    (if (i32.or (i32.eq (local.get $c) (i32.const 98)) (i32.eq (i32.load8_u (i32.add (local.get $p) (i32.const 10))) (i32.const 98)))
+      (then (return (call $reply (i32.const 4096) (i32.const BROWSE_LEN)))))
     (if (i32.eq (local.get $c) (i32.const 113)) (then
       (local.set $buf (call $alloc (i32.add (local.get $n) (i32.const 7))))
       (call $copy (local.get $buf) (i32.const 192) (i32.const 6))
@@ -115,11 +122,33 @@ pub fn panel_state() -> serde_json::Value {
     }})
 }
 
+/// The listing command `b` answers: two top-level nodes, the second with a child already.
+pub fn browse_answer() -> serde_json::Value {
+    serde_json::json!({"ok": {
+        "nodes": [
+            {"id": "env", "label": "Environment", "detail": "3 datasets", "expandable": true},
+            {"id": "arts", "label": "Arts", "children": [{"id": "arts/1", "label": "Museums"}]}
+        ],
+        "notes": ["from test"]
+    }})
+}
+
+/// `answer` as the contents of a WebAssembly text string.
+fn wat_string(answer: &str) -> String {
+    answer.replace('\\', "\\5c").replace('"', "\\22")
+}
+
 /// The test module.
 pub fn wasm() -> Vec<u8> {
-    let answer = serde_json::json!({"ok": panel_state()}).to_string();
-    let data = answer.replace('\\', "\\5c").replace('"', "\\22");
-    wat::parse_str(WAT.replace("PANEL_DATA", &data).replace("PANEL_LEN", &answer.len().to_string())).unwrap_or_default()
+    let panel = serde_json::json!({"ok": panel_state()}).to_string();
+    let browse = browse_answer().to_string();
+    wat::parse_str(
+        WAT.replace("PANEL_DATA", &wat_string(&panel))
+            .replace("PANEL_LEN", &panel.len().to_string())
+            .replace("BROWSE_DATA", &wat_string(&browse))
+            .replace("BROWSE_LEN", &browse.len().to_string()),
+    )
+    .unwrap_or_default()
 }
 
 /// A manifest for the test module, with the given id and permissions.
@@ -190,6 +219,24 @@ pub fn panel_manifest(id: &str) -> String {
     m["i18n"] =
         serde_json::json!({"de": {"Hello": "Hallo", "Historical Imagery": "Historische Luftbilder", "Release timeline": "Zeitleiste"}});
     m.to_string()
+}
+
+/// A manifest for the test module with a Browser section: the listing command `b`, and the echo
+/// command `q` for opening a node, with `h` in the node menu.
+pub fn browser_manifest(id: &str) -> String {
+    let mut m: serde_json::Value = serde_json::from_str(&manifest(id, &[])).unwrap_or_default();
+    if let Some(c) = m["commands"].as_array_mut() {
+        c.push(serde_json::json!({"id": "b", "label": "Browse"}));
+        c.push(serde_json::json!({"id": "q", "label": "Echo"}));
+    }
+    m["browser"] =
+        serde_json::json!({"label": "Test Tree", "icon": "folder", "browse": "b", "open": "q", "menu": ["q", "h"], "search": true});
+    m.to_string()
+}
+
+/// A `.rgplugin` package of the test module with [`browser_manifest`].
+pub fn browser_package(id: &str) -> Vec<u8> {
+    zip_of(&[("plugin.json", browser_manifest(id).as_bytes()), ("plugin.wasm", &wasm())])
 }
 
 /// A `.rgplugin` package of the test module with [`panel_manifest`].

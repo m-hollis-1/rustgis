@@ -1999,6 +1999,8 @@ fn hostile_params_never_panic() {
         json!({"id": "c1", "remember": true, "source": "rustgis-s3:junk", "node": 5}),
         json!({"source": "rustgis-s3::0::s3://bucket/key", "id": "c1", "remember": {"a": 1}}),
         json!({"source": 7, "id": ["c1"]}),
+        // A plugin browser: a junk node and query.
+        json!({"id": "eng-browser", "node": 1e300, "query": {}}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);
@@ -6521,6 +6523,55 @@ fn plugin_edits_are_one_undo_step() {
     }
     assert!(forward(&mut s, "eng-edit", "layer.rename", json!({"layer": "Rivers", "name": "Streams"})).is_ok());
     rustgis_plugins::unload("eng-edit");
+}
+
+#[test]
+fn plugin_browse_lists_nodes_without_undo() {
+    let mut s = world();
+    let pkg = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::browser_package("eng-browser")).unwrap();
+    rustgis_plugins::load(pkg, "test").unwrap();
+    let got = s.run("plugin.browse", &json!({"id": "eng-browser"})).unwrap();
+    assert_eq!(got["id"], "eng-browser");
+    assert_eq!(got["node"], Value::Null);
+    assert_eq!(got["nodes"][0]["id"], "env");
+    assert_eq!(got["nodes"][0]["expandable"], true);
+    assert_eq!(got["nodes"][1]["children"][0]["id"], "arts/1");
+    assert_eq!(got["notes"], json!(["from test"]));
+    assert_eq!(got["truncated"], false);
+    assert!(!s.can_undo(), "browsing is no undo step");
+    let got = s.run("plugin.browse", &json!({"id": "eng-browser", "node": "env", "query": "mus"})).unwrap();
+    assert_eq!(got["node"], "env");
+    // The open command receives the node as a parameter, untouched.
+    let got = s.run("plugin:eng-browser/q", &json!({"browser": {"node": "env"}})).unwrap();
+    assert_eq!(got["params"]["browser"]["node"], "env");
+    rustgis_plugins::unload("eng-browser");
+}
+
+#[test]
+fn plugin_browse_reports_bad_answers() {
+    let mut s = world();
+    plugin("eng-nobrowser", &[]);
+    assert!(s.run("plugin.browse", &json!({"id": "eng-nobrowser"})).unwrap_err().contains("no browser"));
+    assert!(s.run("plugin.browse", &json!({"id": "missing"})).unwrap_err().contains("no plugin"));
+    assert!(s.run("plugin.browse", &json!({})).is_err());
+    // A browser whose browse command answers something that isn't a listing.
+    let mut m: Value = serde_json::from_str(&rustgis_plugins::testing::browser_manifest("eng-badbrowse")).unwrap();
+    m["browser"]["browse"] = json!("h"); // h answers {"hello": "world"}
+    let wasm = rustgis_plugins::testing::wasm();
+    let zip = rustgis_plugins::testing::zip_of(&[("plugin.json", m.to_string().as_bytes()), ("plugin.wasm", &wasm)]);
+    rustgis_plugins::load(rustgis_plugins::Package::from_zip(&zip).unwrap(), "test").unwrap();
+    assert!(s.run("plugin.browse", &json!({"id": "eng-badbrowse"})).unwrap_err().contains("nodes"));
+    // A browse command that asks the host for anything else fails: f forwards a host request
+    // and this request has no op, so it is an error either way.
+    m["id"] = json!("eng-hostbrowse");
+    m["browser"]["browse"] = json!("f");
+    let zip = rustgis_plugins::testing::zip_of(&[("plugin.json", m.to_string().as_bytes()), ("plugin.wasm", &wasm)]);
+    rustgis_plugins::load(rustgis_plugins::Package::from_zip(&zip).unwrap(), "test").unwrap();
+    assert!(s.run("plugin.browse", &json!({"id": "eng-hostbrowse"})).is_err());
+    assert!(!s.can_undo());
+    for id in ["eng-nobrowser", "eng-badbrowse", "eng-hostbrowse"] {
+        rustgis_plugins::unload(id);
+    }
 }
 
 #[test]

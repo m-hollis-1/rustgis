@@ -1355,3 +1355,31 @@ fn python_environments_are_prepared_one_at_a_time() {
     crate::unload("pyenv-lock");
     let _ = std::fs::remove_dir_all(&plugins);
 }
+
+#[test]
+fn manifest_with_browser_parses_and_validates() {
+    let m = Manifest::parse(&testing::browser_manifest("tb")).unwrap();
+    let b = m.browser.as_ref().unwrap();
+    assert_eq!((b.label.as_str(), b.browse.as_str(), b.open.as_str(), b.search), ("Test Tree", "b", "q", true));
+    let mut v: Value = serde_json::from_str(&testing::browser_manifest("tb")).unwrap();
+    v["browser"]["browse"] = json!("zz");
+    assert!(Manifest::parse(&v.to_string()).unwrap_err().contains("browser"));
+    let mut v: Value = serde_json::from_str(&testing::manifest("tb", &[])).unwrap();
+    v["browser"] = json!("not an object");
+    assert!(Manifest::parse(&v.to_string()).is_err());
+}
+
+#[test]
+fn the_test_plugin_lists_a_browser_tree() {
+    let pkg = Package::from_zip(&testing::browser_package("unit-browser")).unwrap();
+    crate::load(pkg, "test").unwrap();
+    let cmd = crate::command("plugin:unit-browser/b").unwrap();
+    let answer = crate::run_command(&cmd, &mut Recorder::default(), &json!({})).unwrap();
+    let l = crate::browser::listing(&answer).unwrap();
+    assert_eq!(l.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["env", "arts"]);
+    assert_eq!(l.nodes[0].detail.as_deref(), Some("3 datasets"));
+    assert!(l.nodes[0].expandable);
+    assert_eq!(l.nodes[1].children[0].label, "Museums");
+    assert_eq!(l.notes, ["from test"]);
+    crate::unload("unit-browser");
+}

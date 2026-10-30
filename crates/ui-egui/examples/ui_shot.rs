@@ -17,7 +17,7 @@
 //! `{"scroll": [x, y, dy]}` turns the mouse wheel by `dy` points over (x, y) (negative zooms
 //! out) and runs one frame (shots then catch the map mid-zoom),
 //! `{"plugin": path}` loads a `.rgplugin` or a plugin folder for the run (as `rustgis-cli run
-//! --plugin` does), and `{"testPlugin": "panel"}` the plugin tests use, with a panel,
+//! --plugin` does), and `{"testPlugin": "panel"}` the plugin tests use, with a panel (`"browser"`: with a Browser section),
 //! `{"sitePackage": "/abs/out.rgplugin"}` writes the test plugin's package there before the first frame
 //! (for a site file's `plugins.install`, see `RUSTGIS_SITE_FILE`),
 //! `{"titlebar": {"left_inset": 80, "height": 34}}`
@@ -259,6 +259,7 @@ fn main() {
         } else if let Some(which) = l.get("testPlugin").and_then(|v| v.as_str()) {
             let bytes = match which {
                 "panel" => rustgis_plugins::testing::panel_package("test-panel"),
+                "browser" => rustgis_plugins::testing::browser_package("shot-browser"),
                 _ => rustgis_plugins::testing::package("test-plugin", &[]),
             };
             if let Err(e) = rustgis_plugins::Package::from_zip(&bytes).and_then(|pkg| rustgis_plugins::load(pkg, "test")) {

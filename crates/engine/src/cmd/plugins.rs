@@ -34,6 +34,9 @@ pub fn commands() -> Vec<C> {
         C::new("plugin.panel", "Plugin Panel State", "Plugins", panel).view().params(
             r#"{"id": plugin id, "values"?: {widget id: true/false, a whole number, or a tree node's id (null for none)}, "refresh"?: bool (run the panel's state command)}"#,
         ),
+        C::new("plugin.browse", "Browse Plugin Content", "Plugins", super::plugin_browse::browse).view().params(
+            r#"{"id": plugin id, "node"?: "a node's id as a listing gave it (the roots when absent)", "query"?: "search text, when the plugin's browser declares search"} → {id, node, nodes: [{id, label, detail?, icon?, count?, expandable, children}], truncated, notes}"#,
+        ),
         C::new("plugin.prepare", "Prepare Plugin Environment", "Plugins › Manage", prepare)
             .view()
             .params(r#"{"id": plugin id (a process plugin that declares "python": downloads its Python and packages)}"#),

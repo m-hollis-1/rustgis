@@ -442,7 +442,8 @@ the folders and items of a web service. Declare it in `plugin.json`:
   declared labels, at most 16; `open` always comes first in the menu, once, whether or not
   `menu` lists it. Every name must be one of the plugin's own commands.
 - `search: true` puts a search box above the section's nodes. What is typed goes with every
-  `browse` request as `query`, and changing it drops the levels RustGIS has kept for the section.
+  `browse` request as `query`. Once the text has stayed the same for 300 ms, RustGIS drops the
+  levels it has kept for the section and reads them again; open branches stay open.
   The plugin decides what the query means.
 - A plugin may have `browser` with or without `panel` and `tab`. The section shows for enabled
   plugins, in plugin id order, after Folder Connections.
@@ -485,6 +486,9 @@ for. It is read-only, so it is no undo step. The `browse` command answers:
   `count` (a whole number, shown in brackets after the label) and `expandable` (a branch whose
   children are asked for when it is opened; `false` unless given). Inline `children` are allowed
   for a small fixed sub-tree; a node that is not `expandable` shows them when it is opened.
+  A node should not reappear below itself (such a node is shown but not opened), and the same id
+  in two places names one thing: the two open, close and are kept together. Levels read on
+  opening go at most 32 deep.
 - `icon` is one of RustGIS's own icon names. A node with an icon of another name, or none, shows an
   open-folder icon if it is a branch and a table icon if it is a leaf.
 - `truncated` says the plugin listed fewer nodes than there are, and `notes` are short remarks
@@ -515,9 +519,12 @@ from the project, so a slow service leaves the map usable and the section shows 
 browser build, and for the `plugin.browse` command, it runs inline). With no project to ask, a
 `browse` command can call `host.info` (and `log`) and nothing else; any other request fails with
 `browse commands may only call host.info, not '<op>'`. That is the same on the desktop and from
-`rustgis-cli`. A `browse` command answers from its own sources (the network, files), not from the
-map. `open` and `menu` commands do run against the project, like every other command, and so on
-the main thread: one that adds a large layer shows the usual "running" state while it works.
+`rustgis-cli`. A `browse` command answers from its own sources, not from the map. A process
+plugin may use the network and files directly. A WebAssembly plugin reaches the network only
+through `host.fetch`, which `browse` may not call, so its `browse` can list only what it already
+has: a WebAssembly section lists static or bundled content. `open` and `menu` commands do run
+against the project, like every other command, and so on the main thread: one that adds a large
+layer shows the usual "running" state while it works.
 
 RustGIS versions before the Browser section ignore `browser`: keep the commands usable from a tab
 or the command line too, or set `minRustgisVersion`.

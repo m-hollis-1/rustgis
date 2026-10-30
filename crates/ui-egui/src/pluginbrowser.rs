@@ -4,16 +4,19 @@
 //! A level is read on a background thread (`plugin.browse`'s `BrowseJob` runs off the frame),
 //! one at a time; the frame shows a spinner for it and [`poll`] lands the answer. In the
 //! browser (wasm) there are no threads, so the job runs inline. The answers are kept until the
-//! section is refreshed, its search text changes or the loaded plugins do.
+//! section is refreshed, its search text changes (and then stays the same for 300 ms) or the
+//! loaded plugins do. Open branches stay open through all but the last, and read again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use egui::collapsing_header::CollapsingState;
 use egui::{Label, RichText, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::cmd::plugin_browse;
 use rustgis_engine::plugins::{self, BrowserDecl, BrowserNode, Listing, Plugin};
 use serde_json::json;
+use web_time::Instant;
 
 use crate::theme::{Tokens, semibold};
 use crate::{RustGisApp, Slot, i18n, icons};
@@ -25,6 +28,8 @@ type Key = (String, String);
 const INDENT: f32 = 14.0;
 /// The size of a row's icon.
 const ICON: f32 = 16.0;
+/// How long the search text must stay the same before the section is read again with it.
+const SETTLE: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 pub struct State {
@@ -35,6 +40,8 @@ pub struct State {
     selected: Option<Key>,
     /// What each section's search box holds.
     query: HashMap<String, String>,
+    /// When each section's search text last changed, while the read with it waits to settle.
+    typed: HashMap<String, Instant>,
     /// The fetch under way (one at a time).
     running: Option<Running>,
     /// The loaded plugins ([`plugins::revision`]) the entries were read from.
@@ -72,6 +79,35 @@ pub(crate) fn visible<'a>(listing: &'a Listing, open: &HashSet<String>) -> Vec<(
     out
 }
 
+/// How many lazily read levels may sit one below another.
+const MAX_DEPTH: usize = 32;
+
+/// One row of a level as drawn under the ancestors `path` (the ids of the nodes whose listings
+/// hold it, from the section's root).
+pub(crate) struct Row<'a> {
+    /// How deep the row sits within its level.
+    pub depth: usize,
+    pub node: &'a BrowserNode,
+    /// The node's own listing is drawn below it.
+    pub descend: bool,
+    /// An expandable node that is not opened however it is clicked: it is one of its own
+    /// ancestors (it reappears below itself), or the levels are as deep as they may go.
+    pub cut: bool,
+}
+
+/// The rows of `listing` (see [`visible`]) and which of them open their own listing, so the tree
+/// is finite whatever ids the plugin answers with.
+pub(crate) fn rows<'a>(listing: &'a Listing, open: &HashSet<String>, path: &[String]) -> Vec<Row<'a>> {
+    visible(listing, open)
+        .into_iter()
+        .map(|(depth, node)| {
+            let cut = node.expandable && (path.len() >= MAX_DEPTH || path.contains(&node.id));
+            let descend = node.expandable && !cut && open.contains(&node.id);
+            Row { depth, node, descend, cut }
+        })
+        .collect()
+}
+
 /// The pure part of landing an answer for `key`: the entry stored under it is taken out and
 /// handed back for the caller to replace, unless the plugin is gone (`still_there` false), which
 /// leaves nothing behind.
@@ -84,11 +120,17 @@ fn take<T>(slot: &Slot<T>) -> Option<T> {
     slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
-/// Forgets what plugin `plugin`'s section has read, so it reads again.
+/// How long is left, at `now`, before a search changed at `changed` is read; `None` once it is due.
+pub(crate) fn settle_left(changed: Instant, now: Instant) -> Option<Duration> {
+    SETTLE.checked_sub(now.saturating_duration_since(changed)).filter(|d| !d.is_zero())
+}
+
+/// Forgets what plugin `plugin`'s section has read, so it reads again. The open branches stay
+/// open and read again too; only Collapse All closes them.
 pub fn refresh(app: &mut RustGisApp, plugin: &str) {
     let st = &mut app.ui.plugin_browser;
     st.entries.retain(|k, _| k.0 != plugin);
-    st.open.retain(|k| k.0 != plugin);
+    st.typed.remove(plugin);
     if st.selected.as_ref().is_some_and(|k| k.0 == plugin) {
         st.selected = None;
     }
@@ -113,6 +155,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     sections.sort_by(|a, b| a.0.manifest.id.cmp(&b.0.manifest.id));
     for (p, decl) in sections {
         let id = p.manifest.id.as_str();
+        // A search read again once the text has stayed the same a moment, without waiting for input.
+        if let Some(&changed) = app.ui.plugin_browser.typed.get(id) {
+            match settle_left(changed, Instant::now()) {
+                None => refresh(app, id),
+                Some(left) => ui.ctx().request_repaint_after(left),
+            }
+        }
         let title = p.manifest.translate(lang, &decl.label);
         // The section's icon, then its title: a header of our own, as the connection tree's folders have.
         let cid = ui.make_persistent_id(("pluginbrowser", id));
@@ -134,10 +183,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if decl.search {
                 let query = app.ui.plugin_browser.query.entry(id.to_string()).or_default();
                 if crate::widgets::search_field(ui, query, tl!("Search")).changed() {
-                    refresh(app, id);
+                    app.ui.plugin_browser.typed.insert(id.to_string(), Instant::now());
+                    ui.ctx().request_repaint_after(SETTLE);
                 }
             }
-            level(app, ui, t, &p, &decl, lang, "", 0);
+            level(app, ui, t, &p, &decl, lang, &[], 0);
         });
         let (mut reload, mut collapse) = (false, false);
         label.inner.context_menu(|ui| {
@@ -159,11 +209,12 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
 }
 
-/// One level of a section: waiting, its error with a way to try again, or its rows. `base` is
-/// how deep the level sits, for the indent.
+/// One level of a section: waiting, its error with a way to try again, or its rows. `path` is
+/// the ids of the nodes it lies under, from the root (empty) to the node it lists; `base` is how
+/// deep the level sits, for the indent.
 #[allow(clippy::too_many_arguments)]
-fn level(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, p: &Plugin, decl: &BrowserDecl, lang: &str, node: &str, base: usize) {
-    let key = (p.manifest.id.clone(), node.to_string());
+fn level(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, p: &Plugin, decl: &BrowserDecl, lang: &str, path: &[String], base: usize) {
+    let key = (p.manifest.id.clone(), path.last().cloned().unwrap_or_default());
     let shown = match app.ui.plugin_browser.entries.get(&key) {
         None => None,
         Some(Entry::Loading) => Some(Err(None)),
@@ -197,10 +248,12 @@ fn level(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, p: &Plugin, decl: &Brows
         }
         Some(Ok(l)) => {
             let open: HashSet<String> = app.ui.plugin_browser.open.iter().filter(|k| k.0 == key.0).map(|k| k.1.clone()).collect();
-            for (depth, n) in visible(&l, &open) {
-                row(app, ui, t, p, decl, lang, n, base + depth);
-                if n.expandable && open.contains(&n.id) {
-                    level(app, ui, t, p, decl, lang, &n.id, base + depth + 1);
+            for r in rows(&l, &open, path) {
+                row(app, ui, t, p, decl, lang, r.node, base + r.depth, r.cut);
+                if r.descend {
+                    let mut below = path.to_vec();
+                    below.push(r.node.id.clone());
+                    level(app, ui, t, p, decl, lang, &below, base + r.depth + 1);
                 }
             }
             let weak = |ui: &mut Ui, text: String| {
@@ -224,12 +277,23 @@ fn level(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, p: &Plugin, decl: &Brows
 
 /// One node: an arrow when it opens, its icon, label, detail and count. A click selects, a
 /// double click opens a branch or runs the section's `open` command on a leaf, the menu runs
-/// the section's commands.
+/// the section's commands. A `cut` node (see [`Row`]) is drawn without an arrow and does not open.
 #[allow(clippy::too_many_arguments)]
-fn row(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, p: &Plugin, decl: &BrowserDecl, lang: &str, n: &BrowserNode, depth: usize) {
+fn row(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    t: &Tokens,
+    p: &Plugin,
+    decl: &BrowserDecl,
+    lang: &str,
+    n: &BrowserNode,
+    depth: usize,
+    cut: bool,
+) {
     let key = (p.manifest.id.clone(), n.id.clone());
-    let branch = n.expandable || !n.children.is_empty();
-    let is_open = app.ui.plugin_browser.open.contains(&key);
+    let leaf = !n.expandable && n.children.is_empty();
+    let branch = !leaf && !cut;
+    let is_open = branch && app.ui.plugin_browser.open.contains(&key);
     let selected = app.ui.plugin_browser.selected.as_ref() == Some(&key);
     let (label, arrow) = ui
         .horizontal(|ui| {
@@ -264,14 +328,14 @@ fn row(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, p: &Plugin, decl: &Browser
     if toggled && !app.ui.plugin_browser.open.remove(&key) {
         app.ui.plugin_browser.open.insert(key.clone());
     }
-    if label.double_clicked() && !branch && !decl.open.is_empty() {
+    if label.double_clicked() && leaf && !decl.open.is_empty() {
         run_command(app, &key.0, &decl.open, &n.id);
     }
     let mut chosen = None;
     label.context_menu(|ui| {
         for cmd in decl.menu_commands() {
             let name = p.manifest.commands.iter().find(|c| c.id == cmd).map_or(cmd.as_str(), |c| p.manifest.translate(lang, &c.label));
-            if ui.button(name).clicked() {
+            if ui.button(name.replace('\n', " ")).clicked() {
                 chosen = Some(cmd.clone());
                 ui.close();
             }
@@ -361,6 +425,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         st.epoch += 1;
         st.revision = now;
         st.query.retain(|id, _| listed(id));
+        st.typed.retain(|id, _| listed(id));
     }
     if let Some(result) = st.running.as_ref().and_then(|r| take(&r.slot))
         && let Some(run) = st.running.take()
@@ -392,6 +457,61 @@ mod tests {
         assert_eq!(ids(&[]), ["0:a", "0:b"]);
         assert_eq!(ids(&["a"]), ["0:a", "1:a1", "0:b"]);
         assert_eq!(ids(&["b"]), ["0:a", "0:b"], "an expandable node's children come from its own listing, not inline");
+    }
+
+    /// The tree as `level` walks it: each level fetched by `listing` (keyed by the node it lists,
+    /// empty for the root), descending where [`rows`] says to. A row is `depth:id`, with `!`
+    /// when it is cut.
+    fn walk(listing: &dyn Fn(&str) -> Listing, open: &HashSet<String>, path: &mut Vec<String>, out: &mut Vec<String>) {
+        let l = listing(path.last().map_or("", String::as_str));
+        for r in rows(&l, open, path) {
+            out.push(format!("{}:{}{}", path.len() + r.depth, r.node.id, if r.cut { "!" } else { "" }));
+            if r.descend {
+                path.push(r.node.id.clone());
+                walk(listing, open, path, out);
+                path.pop();
+            }
+        }
+    }
+
+    fn tree(listing: &dyn Fn(&str) -> Listing, open: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(listing, &open.iter().map(|s| s.to_string()).collect(), &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn one(id: &str) -> Listing {
+        Listing { nodes: vec![node(id, true, vec![])], ..Default::default() }
+    }
+
+    #[test]
+    fn a_node_that_lists_itself_is_shown_but_not_opened() {
+        assert_eq!(tree(&|_| one("a"), &["a"]), ["0:a", "1:a!"]);
+    }
+
+    #[test]
+    fn a_cycle_stops_where_a_node_reappears() {
+        let listing = |n: &str| if n == "a" { one("b") } else { one("a") };
+        assert_eq!(tree(&listing, &["a", "b"]), ["0:a", "1:b", "2:a!"]);
+    }
+
+    #[test]
+    fn lazy_levels_stop_at_the_depth_cap() {
+        let listing = |n: &str| one(&format!("{}x", n));
+        let open: Vec<String> = (1..=40).map(|i| "x".repeat(i)).collect();
+        let open: Vec<&str> = open.iter().map(String::as_str).collect();
+        let out = tree(&listing, &open);
+        assert_eq!(out.len(), MAX_DEPTH + 1);
+        assert_eq!(out.last().map(String::as_str), Some(format!("{MAX_DEPTH}:{}!", "x".repeat(MAX_DEPTH + 1)).as_str()));
+    }
+
+    #[test]
+    fn a_search_is_read_once_it_settles() {
+        let t = Instant::now();
+        assert_eq!(settle_left(t, t), Some(SETTLE));
+        assert_eq!(settle_left(t, t + Duration::from_millis(100)), Some(Duration::from_millis(200)));
+        assert_eq!(settle_left(t, t + SETTLE), None);
+        assert_eq!(settle_left(t, t + Duration::from_secs(5)), None);
     }
 
     #[test]

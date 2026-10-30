@@ -53,30 +53,62 @@ fn per_cell(r: &Raster, f: impl Fn(i64, i64) -> Option<f64>) -> Vec<f32> {
     out
 }
 
+/// Draw the interior from three borrowed rows; edges and no-data keep the scalar path.
+fn terrain(r: &Raster, data: &[f32], zf: f64, f: impl Fn(f64, f64) -> f64) -> Vec<f32> {
+    let (w, h) = (r.width as usize, r.height as usize);
+    let cell = r.cell_size_m();
+    let scalar = |c, row| {
+        z(r, data, c, row)?;
+        let (x, y) = gradient(r, data, c, row, zf, cell)?;
+        Some(f(x, y))
+    };
+    let Some(len) = w.checked_mul(h) else { return per_cell(r, scalar) };
+    if w < 3 || h < 3 || data.len() != len {
+        return per_cell(r, scalar);
+    }
+    let value = |v: Option<f64>| v.filter(|v| v.is_finite()).map(|v| v as f32).unwrap_or(NODATA);
+    let mut out = Vec::with_capacity(len);
+    out.extend((0..w).map(|c| value(scalar(c as i64, 0))));
+    for (row, ((top, mid), bottom)) in data.chunks_exact(w).zip(data.chunks_exact(w).skip(1)).zip(data.chunks_exact(w).skip(2)).enumerate()
+    {
+        let row = row + 1;
+        out.push(value(scalar(0, row as i64)));
+        for (col, ((a, b), c)) in top.windows(3).zip(mid.windows(3)).zip(bottom.windows(3)).enumerate() {
+            let ([a, b, c], [d, center, f0], [g, h, i]) = (a, b, c) else { continue };
+            if !r.is_valid(*center) {
+                out.push(NODATA);
+            } else if [*a, *b, *c, *d, *f0, *g, *h, *i].iter().all(|v| r.is_valid(*v)) {
+                let [a, b, c, d, f0, g, h, i] = [*a, *b, *c, *d, *f0, *g, *h, *i].map(|v| f64::from(v) * zf);
+                let x = ((c + 2.0 * f0 + i) - (a + 2.0 * d + g)) / (8.0 * cell.0) * r.transform.pixel_width.signum();
+                let y = ((a + 2.0 * b + c) - (g + 2.0 * h + i)) / (8.0 * cell.1) * -r.transform.pixel_height.signum();
+                out.push(value(Some(f(x, y))));
+            } else {
+                out.push(value(scalar((col + 1) as i64, row as i64)));
+            }
+        }
+        out.push(value(scalar((w - 1) as i64, row as i64)));
+    }
+    out.extend((0..w).map(|c| value(scalar(c as i64, (h - 1) as i64))));
+    out
+}
+
 /// Slope in degrees.
 pub fn slope(r: &Raster, b: usize, zf: f64) -> Result<Vec<f32>, String> {
     let d = band(r, b)?;
-    let cell_size = r.cell_size_m();
-    Ok(per_cell(r, |c, row| {
-        z(r, d, c, row)?;
-        let (gx, gy) = gradient(r, d, c, row, zf, cell_size)?;
-        Some((gx.hypot(gy)).atan().to_degrees())
-    }))
+    Ok(terrain(r, d, zf, |gx, gy| gx.hypot(gy).atan().to_degrees()))
 }
 
 /// Aspect: the compass direction the slope faces, in degrees (flat cells are -1).
 pub fn aspect(r: &Raster, b: usize) -> Result<Vec<f32>, String> {
     let d = band(r, b)?;
-    let cell_size = r.cell_size_m();
-    Ok(per_cell(r, |c, row| {
-        z(r, d, c, row)?;
-        let (gx, gy) = gradient(r, d, c, row, 1.0, cell_size)?;
-        if gx.abs() < 1e-12 && gy.abs() < 1e-12 {
-            return Some(-1.0);
-        }
-        // Downhill is -gradient; its compass bearing.
-        Some((-gx).atan2(-gy).to_degrees().rem_euclid(360.0))
-    }))
+    Ok(terrain(
+        r,
+        d,
+        1.0,
+        |gx, gy| {
+            if gx.abs() < 1e-12 && gy.abs() < 1e-12 { -1.0 } else { (-gx).atan2(-gy).to_degrees().rem_euclid(360.0) }
+        },
+    ))
 }
 
 /// Hillshade (0–255) lit from `azimuth` and `altitude` degrees.
@@ -84,14 +116,11 @@ pub fn hillshade(r: &Raster, b: usize, azimuth: f64, altitude: f64, zf: f64) -> 
     let d = band(r, b)?;
     let (zen, az) = ((90.0 - altitude).to_radians(), azimuth.to_radians());
     let (cos_zen, sin_zen) = (zen.cos(), zen.sin());
-    let cell_size = r.cell_size_m();
-    Ok(per_cell(r, |c, row| {
-        z(r, d, c, row)?;
-        let (gx, gy) = gradient(r, d, c, row, zf, cell_size)?;
+    Ok(terrain(r, d, zf, |gx, gy| {
         let slope = gx.hypot(gy).atan();
         let aspect = (-gx).atan2(-gy);
         let v = cos_zen * slope.cos() + sin_zen * slope.sin() * (az - aspect).cos();
-        Some((v.max(0.0) * 255.0).round())
+        (v.max(0.0) * 255.0).round()
     }))
 }
 
@@ -1054,6 +1083,44 @@ impl Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_rows_match_scalar_edges_nodata_and_orientations() {
+        for (w, h) in [(1, 1), (1, 5), (2, 3), (3, 2), (3, 3), (9, 7)] {
+            for (pixel_width, pixel_height) in [(0.01, -0.01), (0.01, 0.01), (-0.01, -0.01), (-0.01, 0.01)] {
+                for with_holes in [false, true] {
+                    let values = (0..w * h)
+                        .map(|i| {
+                            if with_holes && i % 7 == 3 {
+                                -9999.0
+                            } else if with_holes && i % 11 == 4 {
+                                f32::NAN
+                            } else {
+                                (i * 31 % 53) as f32
+                            }
+                        })
+                        .collect();
+                    let transform = GeoTransform { origin_x: 0.0, origin_y: 45.0, pixel_width, pixel_height };
+                    let r = Raster::new("terrain", w, h, vec![values], transform, Crs::LonLat, Some(-9999.0), ColorHint::Gray, "Float32")
+                        .unwrap_or_else(|e| panic!("{e}"));
+                    let data = band(&r, 0).unwrap_or_default();
+                    for zf in [0.0, 1.0, 2.5] {
+                        let f = |x: f64, y: f64| x.hypot(y).atan().to_degrees();
+                        let expected = per_cell(&r, |col, row| {
+                            z(&r, data, col, row)?;
+                            let (x, y) = gradient(&r, data, col, row, zf, r.cell_size_m())?;
+                            Some(f(x, y))
+                        });
+                        assert_eq!(
+                            terrain(&r, data, zf, f),
+                            expected,
+                            "{w}x{h}, {pixel_width}, {pixel_height}, holes={with_holes}, zf={zf}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// A 20×20 lon/lat raster: a ramp rising 10 m per cell to the east, and a second band.
     fn ramp() -> Raster {

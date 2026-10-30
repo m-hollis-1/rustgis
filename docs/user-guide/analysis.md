@@ -33,7 +33,8 @@ deletes the selection, adds or calculates a field, and calculates geometry attri
   <figcaption>The attribute table, with a selection highlighted on the map and in the table.</figcaption>
 </figure>
 
-Select By Attributes and definition queries use SQL `WHERE` clauses:
+Select By Attributes and definition queries use SQL `WHERE` clauses, written in the
+[expression language](expressions.md):
 
 ```sql
 pop_est > 100000000 AND continent = 'Asia'
@@ -94,6 +95,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Symmetrical Difference | `symmetricalDifference` | Analysis › Overlay |
 | Update | `update` | Analysis › Overlay |
 | Spatial Join | `spatialJoin` | Analysis › Overlay |
+| Join Field | `joinField` | Data Management › Joins |
 | Dissolve | `dissolve` | Data Management › Generalization |
 | Minimum Bounding Geometry | `convexHull` | Data Management › Features |
 | Feature To Point | `featureToPoint` | Data Management › Features |
@@ -401,6 +403,37 @@ hold. For example, the total units permitted in each district:
 gp.run={"tool":"spatialJoin","params":{"target":"districts","join":"permits","merge":[{"field":"units","rule":"sum"}]}}
 ```
 
+**Join Field** (`joinField`) performs a one-off non-spatial attribute join,
+copying fields from a source table or layer (`joinTable`, specified by name or numeric table ID)
+into a `target` table or layer based on matching key values:
+
+- **Key fields:** `targetField` (aliases: `target_field`, `key`) names the key field in the target.
+  `joinField` (aliases: `join_field`) names the matching key in the source table; when omitted, empty,
+  or whitespace-only, it defaults to `targetField`. Numeric keys match across integer and floating-point
+  types when whole numbers (e.g. `10` matches `10.0`), while non-finite floats (`NaN`, infinity) and
+  nulls never match. Incompatible key data types (e.g. text vs integer) are rejected.
+- **Transferred fields:** `fields` selects specific source fields to transfer (a comma-separated list
+  or a JSON array of strings, e.g. `["tax_rate", "zone_code"]`; non-string and non-array types are rejected). Repeated
+  field names are deduplicated in order. When omitted or passed as a blank string (`""`), every source field except
+  the join key is transferred; passing an explicitly empty array (`[]`) or an array of blank strings transfers zero fields.
+  Transferred fields preserve their original source display aliases (retained without technical prefixes) and field types.
+- **Prefix and collision handling:** `prefix` prepends text to all transferred field names. When a
+  transferred field name conflicts with an existing target field, an incremental suffix is added
+  (`name_2`, `name_3`) to maintain schema uniqueness without overwriting existing data.
+- **Duplicate keys:** `duplicates` (`duplicateStrategy`) determines what happens when multiple source
+  rows share the same join key: **First** (default: uses the first matching source record), **Last**
+  (uses the last matching source record), or **Error** (fails the operation and reports the duplicate key).
+- **Selections and streamed inputs:** selections on the target layer or source table are honoured;
+  when a target selection is active, the output contains the selected target rows, while unselected
+  datasets are processed in full. Streamed layers that are only partially loaded in the view window are
+  rejected with a clear message (`the target layer is streamed; load all features first`) so incomplete
+  results are never committed as a whole layer. Rows with attribute counts exceeding the schema definition
+  are rejected with a clear error rather than silently truncated. Unmatched target records receive null values.
+
+```text
+gp.run={"tool":"joinField","params":{"target":"parcels","targetField":"owner_id","joinTable":"owners","fields":["name","phone"],"duplicates":"First"}}
+```
+
 **Summary Statistics** (`summaryStatistics`) makes a standalone table of statistics: one row for
 the whole table (none for an empty one), or one for each combination of values of the `case`
 fields (one field, or several as a list such as `["county", "year"]`). Rows are sorted by those
@@ -480,7 +513,6 @@ output is named `<input>_Pivot` unless `output` names it.
 The AI Assistant uses Pivot Table for questions such as "mean household income by county and year":
 it runs the tool with `county` as the row field, `year` as the pivot field and `MEAN`, then reads
 the table it names with `read_features`, a row per county.
-
 <figure markdown="span">
   ![Tissot's indicatrix on the Robinson projection: circles of 800 km every 30°, stretched and sheared toward the poles](https://assets.rustgis.app/images/tissot.webp)
   <figcaption>Tissot's indicatrix on Robinson: equal circles, stretched and sheared by the projection.</figcaption>

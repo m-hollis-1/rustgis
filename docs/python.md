@@ -230,7 +230,9 @@ The GeoLibre and Whitebox tools run as they do in the app, through the `geolibre
 
 `rustgis.Session(use_saved_secrets=True)` loads the desktop app's saved connection definitions
 and lets `connection.login` and project sources use their remembered database passwords and S3
-keys. Secrets are read lazily from the system keychain, only when a command needs one, under
+keys, and files on NASA's Earthdata data servers the remembered Earthdata Login token (which,
+like a token given with `earthdata.login`, then serves every session of the process).
+Secrets are read lazily from the system keychain, only when a command needs one, under
 the desktop's rules: the same connection ID, kind and address or S3 endpoint. Parameters given
 to a command, and environment credentials selected by a connection, take precedence over saved
 secrets. Changes to the connection definitions aren't saved back to the desktop preferences.

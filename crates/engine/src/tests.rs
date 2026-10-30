@@ -9326,6 +9326,84 @@ fn an_arcgis_token_in_a_service_address_reaches_its_layers() {
     assert!(kept.is_none() && arcgis_auth::authorization(wms).is_none());
 }
 
+/// A layer its service draws on request (#1162): one picture of the view when added from its
+/// service, tiles of 256, 512 or 1024 pixels when asked; a project saved before keeps its tiles;
+/// tiles cut from a tile set refuse both.
+#[test]
+fn wms_layers_draw_as_one_picture_or_tiles_of_a_size() {
+    const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><CRS>EPSG:3857</CRS><CRS>EPSG:4326</CRS><Layer><Name>roads</Name><Title>Roads</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+    let mut s = Session::new(Project::default());
+    s.run("service.add", &json!({"url": "https://maps.example.com/wms", "layer": "roads", "text": WMS})).unwrap();
+    let roads = |s: &Session| s.map().tiles.iter().find(|t| t.name == "Roads").cloned().unwrap();
+    assert!(roads(&s).single_image, "one picture of the view, from its service");
+    // Offered in another system too: drawn in Web Mercator as it comes, its other systems kept
+    // for maps in them (as most services are).
+    assert!(roads(&s).url.contains("#rustgis-warp=") && roads(&s).sized_tiles(), "{}", roads(&s).url);
+    let listed = s.run("map.tiles", &json!({})).unwrap();
+    assert_eq!((listed[0]["singleImage"].clone(), listed[0]["tileSize"].clone()), (json!(true), json!(256)));
+    // Tiles of 1024 pixels: asked for that size.
+    s.run("map.setTiles", &json!({"name": "Roads", "singleImage": false, "tileSize": 1024.0})).unwrap();
+    let t = roads(&s);
+    assert!(!t.single_image && t.tile_size == 1024);
+    assert!(t.url.contains("&WIDTH=1024&HEIGHT=1024&") && t.url.contains("#rustgis-warp="), "{}", t.url);
+    // Its pictures in another system take any size still.
+    let base = t.url.split('#').next().unwrap();
+    assert!(rustgis_data::ogc::warp::Warp::map_template(base).contains("BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}"));
+    // Kept with the project, and undone.
+    let saved: rustgis_map::TileLayer = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+    assert_eq!((saved.single_image, saved.tile_size), (false, 1024));
+    assert!(s.undo());
+    let t = roads(&s);
+    assert!(t.single_image && t.tile_size == 256 && t.url.contains("&WIDTH=256&HEIGHT=256&"));
+    // Junk refused, nothing changed.
+    for bad in
+        [json!({"name": "Roads", "tileSize": 300}), json!({"name": "Roads", "tileSize": "big"}), json!({"name": "Roads", "tileSize": 2048})]
+    {
+        assert!(s.run("map.setTiles", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(roads(&s).tile_size, 256);
+    // A project saved before: tiles, as then.
+    let mut old = serde_json::to_value(roads(&s)).unwrap();
+    old.as_object_mut().unwrap().remove("singleImage");
+    let old: rustgis_map::TileLayer = serde_json::from_value(old).unwrap();
+    assert!(!old.single_image);
+    // Tiles cut from a tile set are neither.
+    s.run("map.addTiles", &json!({"url": "https://tile.example.org/{z}/{x}/{y}.png", "name": "XYZ", "overlay": true})).unwrap();
+    let e = s.run("map.setTiles", &json!({"name": "XYZ", "singleImage": true})).unwrap_err();
+    assert!(e.contains("draws on request"), "{e}");
+    assert!(s.run("map.setTiles", &json!({"name": "XYZ", "tileSize": 1024})).is_err());
+    assert!(s.run("map.addTiles", &json!({"url": "https://tile.example.org/{z}/{x}/{y}.png", "singleImage": true})).is_err());
+    // Nor is an address by its box with no size to write (a generic template): asked for at its
+    // service's default size, it stays in its own tiles.
+    let bare = "https://maps.example.org/render?bbox={bbox-epsg-3857}&format=png";
+    assert!(!rustgis_map::tiles::drawn_on_request(bare));
+    assert!(s.run("map.addTiles", &json!({"url": bare, "name": "Bare", "overlay": true, "singleImage": true})).is_err());
+    s.run("map.addTiles", &json!({"url": bare, "name": "Bare", "overlay": true})).unwrap();
+    assert!(s.run("map.setTiles", &json!({"name": "Bare", "tileSize": 1024})).is_err());
+    assert!(rustgis_map::tiles::drawn_on_request("https://maps.example.org/wms?BBOX={nbbox}&width={nw}&HEIGHT={nh}&f=png"));
+    assert!(rustgis_map::tiles::drawn_on_request("https://maps.example.org/wms?BBOX={bbox-epsg-3857}&WIDTH={width}&HEIGHT={height}"));
+    assert!(!rustgis_map::tiles::drawn_on_request("https://maps.example.org/wms?BBOX={bbox-epsg-3857}&WIDTH={w}&HEIGHT=256"));
+    // Added by its address, a layer drawn on request is one picture too, unless tiles are asked
+    // for; a bare template, and tiles cut from a tile set, are tiles.
+    let wms = "https://m.example.org/wms?SERVICE=WMS&REQUEST=GetMap&LAYERS=a&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+    let single = |s: &Session, name: &str| s.map().tiles.iter().find(|t| t.name == name).unwrap().single_image;
+    s.run("map.addTiles", &json!({"url": wms, "name": "ByAddress", "overlay": true})).unwrap();
+    assert!(single(&s, "ByAddress"));
+    s.run("map.addTiles", &json!({"url": wms, "name": "AsTiles", "overlay": true, "singleImage": false})).unwrap();
+    assert!(!single(&s, "AsTiles"));
+    s.run("map.addTiles", &json!({"url": wms.replace("LAYERS=a", "LAYERS=b"), "name": "Sized", "overlay": true, "tileSize": 512})).unwrap();
+    assert!(!single(&s, "Sized"));
+    assert!(!single(&s, "Bare") && !single(&s, "XYZ"));
+    // A map service's export added with a tile size: its size asked for.
+    let export = "https://s.example.org/arcgis/rest/services/x/MapServer/export?bbox={bbox-epsg-3857}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&f=image";
+    s.run("map.addTiles", &json!({"url": export, "name": "Export", "overlay": true, "tileSize": 512})).unwrap();
+    let t = s.map().tiles.iter().find(|t| t.name == "Export").unwrap();
+    assert!(t.url.contains("&size=512,512&") && t.tile_size == 512 && !t.single_image, "{}", t.url);
+}
+
 /// A WMS layer added from its service takes its legends (the service's GetLegendGraphic, then
 /// its style's picture); any tile layer can be given one, or several for their scales; they and
 /// whether they show are kept with the project and undo; junk is refused.
@@ -9850,12 +9928,12 @@ fn services_list_and_add_layers() {
     assert_eq!(v["count"], 0);
     assert!(v["notes"].as_array().unwrap().iter().any(|n| n.as_str().is_some_and(|n| n.contains("won't fetch"))), "{v}");
     assert!(s.run("service.add", &json!({"url": url, "layer": "roads", "text": inward})).is_err());
-    // A service's answer with latitude first (its crs says so) is turned round, and a page of a
-    // larger collection is pointed out.
+    // A service's answer with latitude first (it misses the collection's extent, and fits it
+    // turned round) is turned round, and a page of a larger collection is pointed out.
     const LAT_FIRST: &[u8] = br#"{"type": "FeatureCollection", "numberMatched": 9, "numberReturned": 1, "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [50, 10]}}], "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::4326"}}}"#;
     let base = serve(LAT_FIRST, 1);
     let collections = format!(
-        r#"{{"collections": [{{"id": "wells", "title": "Wells", "links": [{{"rel": "items", "href": "{base}/collections/wells/items"}}]}}]}}"#
+        r#"{{"collections": [{{"id": "wells", "title": "Wells", "extent": {{"spatial": {{"bbox": [[9, 49, 11, 51]]}}}}, "links": [{{"rel": "items", "href": "{base}/collections/wells/items"}}]}}]}}"#
     );
     s.run("service.add", &json!({"url": format!("{base}/collections"), "layer": "wells", "text": collections})).unwrap();
     let e = s.map().layer_by_name("Wells").unwrap().extent();
@@ -10025,6 +10103,58 @@ fn service_features_asked_for_over_an_area() {
 fn view_lonlat(s: &Session) -> [f64; 4] {
     let e = crate::cmd::workspace::view_extent(s);
     [e.min_x, e.min_y, e.max_x, e.max_y]
+}
+
+/// #1053: a WFS answering like GeoServer (longitude first, named urn:ogc:def:crs:EPSG::4326) is
+/// read as it comes; one answering latitude first (as deegree does when asked in the URN form) is
+/// turned round, judged against the type's `WGS84BoundingBox`. The app's download
+/// (`layer.addDownload` with `service` and `bounds`) is judged the same way, and left alone
+/// without bounds.
+#[test]
+fn wfs_axes_judged_against_the_type_bounds() {
+    use ogc_server::{Route, Server};
+    let geoserver = r#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"uf.11","geometry":{"type":"Point","coordinates":[-63.3,-10.8]},"properties":{"uf":"RO"}},{"type":"Feature","id":"uf.43","geometry":{"type":"Point","coordinates":[-53.6,-29.7]},"properties":{"uf":"RS"}},{"type":"Feature","id":"uf.24","geometry":{"type":"Point","coordinates":[-36.5,-5.8]},"properties":{"uf":"RN"}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}},"bbox":[-63.3,-29.7,-36.5,-5.8]}"#;
+    let deegree = r#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"b.1","geometry":{"type":"Point","coordinates":[53.55,9.99]},"properties":{"name":"Mitte"}},{"type":"Feature","id":"b.2","geometry":{"type":"Point","coordinates":[53.46,9.98]},"properties":{"name":"Harburg"}}]}"#;
+    let ibge = Server::new(vec![Route::new("/wfs", geoserver)]);
+    let hamburg = Server::new(vec![Route::new("/wfs", deegree)]);
+    let caps = |base: &str, name: &str, crs: &str, lower: &str, upper: &str| {
+        format!(
+            r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="{base}/wfs?"/></HTTP></DCP></Operation></OperationsMetadata>
+<FeatureTypeList><FeatureType><Name>{name}</Name><Title>{name}</Title><DefaultCRS>{crs}</DefaultCRS><WGS84BoundingBox><LowerCorner>{lower}</LowerCorner><UpperCorner>{upper}</UpperCorner></WGS84BoundingBox></FeatureType></FeatureTypeList></WFS_Capabilities>"#
+        )
+    };
+    let mut s = Session::new(Project::default());
+    let text = caps(&ibge.base, "PNADC:uf", "urn:ogc:def:crs:EPSG::4674", "-71.99 -30.51", "-34.12 1.10");
+    s.run("service.add", &json!({"url": format!("{}/wfs", ibge.base), "layer": "PNADC:uf", "text": text, "name": "UF"})).unwrap();
+    let e = s.map().layer_by_name("UF").unwrap().extent();
+    assert_eq!([e.min_x, e.min_y, e.max_x, e.max_y], [-63.3, -29.7, -36.5, -5.8]);
+    // RustGIS asked for EPSG:4326, as the type doesn't list CRS84.
+    assert!(ibge.requests().iter().all(|r| r.query.iter().any(|(k, v)| k == "SRSNAME" && v == "EPSG:4326")));
+
+    let text = caps(&hamburg.base, "app:bezirke", "urn:ogc:def:crs:EPSG::25832", "8.41 53.39", "10.34 53.97");
+    s.run("service.add", &json!({"url": format!("{}/wfs", hamburg.base), "layer": "app:bezirke", "text": text, "name": "Bezirke"}))
+        .unwrap();
+    let e = s.map().layer_by_name("Bezirke").unwrap().extent();
+    assert_eq!([e.min_x, e.min_y, e.max_x, e.max_y], [9.98, 53.46, 9.99, 53.55]);
+
+    // The app's download of the same answers.
+    let download = |s: &mut Session, answer: &str, name: &str, bounds: Value| {
+        let id = s.download_started();
+        assert!(s.download_landed(id, answer.as_bytes().to_vec()));
+        let p = json!({"id": id, "url": format!("https://x.org/wfs?{name}"), "name": name, "service": true, "bounds": bounds});
+        s.run("layer.addDownload", &p).unwrap();
+        let e = s.map().layer_by_name(name).unwrap().extent();
+        [e.min_x, e.min_y, e.max_x, e.max_y]
+    };
+    assert_eq!(download(&mut s, geoserver, "UF2", json!([-71.99, -30.51, -34.12, 1.10])), [-63.3, -29.7, -36.5, -5.8]);
+    assert_eq!(download(&mut s, deegree, "B2", json!([8.41, 53.39, 10.34, 53.97])), [9.98, 53.46, 9.99, 53.55]);
+    assert_eq!(download(&mut s, deegree, "B3", Value::Null), [53.46, 9.98, 53.55, 9.99]);
+    // Bounds that aren't a box are refused, and the download is kept to be added again.
+    let id = s.download_started();
+    assert!(s.download_landed(id, deegree.as_bytes().to_vec()));
+    let bad = json!({"id": id, "url": "https://x.org/wfs", "name": "B4", "service": true, "bounds": [10.34, 53.39, 8.41, 53.97]});
+    assert!(s.run("layer.addDownload", &bad).unwrap_err().contains("bounds"));
+    s.run("layer.addDownload", &json!({"id": id, "url": "https://x.org/wfs", "name": "B4", "service": true})).unwrap();
 }
 
 /// A WCS coverage (from a local server) becomes a raster of the view, asked for in EPSG:4326 within
@@ -16670,6 +16800,133 @@ fn polygon_no_fill_refuses_other_layers() {
     assert!(Session::new(Project::default()).run("layer.noFill", &Value::Null).is_err());
 }
 
+/// Polygon styling follows the actual GeoJSON features, not just their dominant family.
+#[test]
+fn mixed_geometry_no_fill_preserves_other_symbols_classes_and_undo() {
+    use rustgis_data::GeometryType;
+
+    let state = |project: &Project| {
+        let mut value = serde_json::to_value(project).unwrap();
+        // Opening and undo/redo bump derived geometry revisions, independently of saved styles.
+        for map in value["maps"].as_array_mut().unwrap() {
+            for layer in map["layers"].as_array_mut().unwrap() {
+                layer.as_object_mut().unwrap().remove("geometry_rev");
+            }
+        }
+        value
+    };
+    let geometries = [
+        json!({"type": "Point", "coordinates": [-2, 0]}),
+        json!({"type": "LineString", "coordinates": [[1.5, -0.5], [2.5, 0.5]]}),
+        json!({"type": "Polygon", "coordinates": [[[-0.5,-0.5],[0.5,-0.5],[0.5,0.5],[-0.5,0.5],[-0.5,-0.5]]]}),
+    ];
+    for (dominant, kind) in [GeometryType::Point, GeometryType::Polyline, GeometryType::Polygon].into_iter().enumerate() {
+        for renderer in ["single", "unique", "graduated"] {
+            let features: Vec<Value> = [0, 1, 2, dominant, dominant]
+                .into_iter()
+                .enumerate()
+                .map(|(i, g)| json!({"type":"Feature", "geometry":geometries[g], "properties":{"class":i % 2, "value":i}}))
+                .collect();
+            let mut s = Session::new(Project::default());
+            s.run(
+                "layer.addDataText",
+                &json!({"fileName":"mixed.geojson", "text":json!({"type":"FeatureCollection", "features":features}).to_string()}),
+            )
+            .unwrap();
+            let id = s.active_layer.unwrap();
+            assert_eq!(s.map().layer(id).unwrap().geometry_type(), kind);
+            s.run("layer.symbology", &json!({"type":renderer, "field":if renderer == "unique" { "class" } else { "value" }, "classes":2}))
+                .unwrap();
+            // Both layer-wide and class-specific fills must stop drawing, while shared
+            // symbols (point interiors, line markers, outlines) keep their original colours.
+            s.run("layer.outline", &json!({"color":"#234567", "width":2.5})).unwrap();
+            s.run("layer.fillLayers", &json!({"fills":[{"color":"#FF0000"}]})).unwrap();
+            if renderer != "single" {
+                let mut p = json!({"fills":[{"color":"#00FF00"}]});
+                if renderer == "unique" {
+                    p["value"] = json!(0);
+                } else {
+                    p["index"] = json!(0);
+                }
+                s.run("layer.fillLayers", &p).unwrap();
+            }
+            let view = crate::render::View {
+                width: 400.0,
+                height: 150.0,
+                pixels_per_point: 1.0,
+                sky: false,
+                camera: rustgis_map::Camera { center: rustgis_geom::Coord::new(0.0, 0.0), res: 2000.0, bearing: 0.0, pitch: 0.0 },
+            };
+            s.map_mut().basemap = rustgis_map::Basemap::Blank;
+            let drawn_before =
+                (kind == GeometryType::Point && renderer == "single").then(|| crate::render::render(s.map_mut(), &view).unwrap().pixmap);
+            let before = state(&s.project);
+            let symbols: Vec<_> = (0..features.len()).map(|row| s.map().layer(id).unwrap().symbol(row)).collect();
+            s.run("layer.noFill", &json!({"layer":id})).unwrap();
+            let l = s.map().layer(id).unwrap();
+            for (row, symbol) in symbols.iter().enumerate() {
+                assert_eq!(&l.symbol(row), symbol, "{kind:?}/{renderer}: shared symbols stay intact");
+                assert!(l.fills(row).iter().all(|f| !f.draws(symbol.fill)), "{kind:?}/{renderer}: polygon fills are transparent");
+            }
+            if let Some(drawn_before) = drawn_before {
+                let drawn_after = crate::render::render(s.map_mut(), &view).unwrap().pixmap;
+                assert_ne!(drawn_before.pixel(200, 75), drawn_after.pixel(200, 75), "the polygon interior changes");
+                let middle = drawn_after.pixel(200, 75).unwrap();
+                assert_eq!((middle.red(), middle.green(), middle.blue()), (255, 255, 255), "the polygon interior reveals the basemap");
+                for y in 0..150 {
+                    for x in (0..165).chain(235..400) {
+                        assert_eq!(drawn_before.pixel(x, y), drawn_after.pixel(x, y), "points and lines stay unchanged at {x},{y}");
+                    }
+                }
+                let edge = drawn_after.pixel(172, 75).unwrap();
+                assert!(edge.red() < 250 || edge.green() < 250 || edge.blue() < 250, "the polygon outline remains visible");
+            }
+            let after = state(&s.project);
+            let reopened = Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+            assert_eq!(state(&reopened), after);
+            s.run("edit.undo", &Value::Null).unwrap();
+            assert_eq!(state(&s.project), before);
+            s.run("edit.redo", &Value::Null).unwrap();
+            assert_eq!(state(&s.project), after);
+            s.run("layer.noFill", &Value::Null).unwrap();
+            assert_eq!(state(&s.project), after, "No Fill is idempotent");
+            // Removing the polygon-only override restores fills without touching other symbols.
+            s.run("layer.fillLayers", &json!({"fills":[]})).unwrap();
+            assert!(s.map().layer(id).unwrap().fills(2).is_empty());
+            assert_eq!(s.map().layer(id).unwrap().symbol(0), symbols[0]);
+        }
+    }
+}
+
+/// Other families can be outside a streamed polygon layer's current view when No Fill runs.
+#[test]
+fn mixed_geometry_no_fill_preserves_unloaded_point_symbols() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let mut ds = Dataset::new("mixed", GeometryType::Polygon, vec![]);
+    let polygon =
+        Geometry::Polygon(vec![vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 0.0)]]]);
+    ds.push(Some(polygon.clone()), vec![]);
+    ds.push(Some(polygon), vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(100.0, 30.0))), vec![]);
+    let path = std::env::temp_dir().join(format!("rustgis-engine-{}-mixed-no-fill.geojson", std::process::id()));
+    std::fs::write(&path, rustgis_data::io::to_geojson(&ds).to_string()).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path":path.to_string_lossy(), "stream":true})).unwrap();
+    let id = s.active_layer.unwrap();
+    let l = s.map_mut().layer_mut(id).unwrap();
+    assert!(l.is_streamed());
+    l.dataset.features.clear();
+    let renderer = l.renderer.clone();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.loadAll", &Value::Null).unwrap();
+    let l = s.map().layer(id).unwrap();
+    assert_eq!(l.renderer, renderer, "the later point keeps its filled symbol");
+    assert!(l.symbol(2).fill.a() > 0);
+    assert!(!l.fills(0).is_empty());
+    assert!(l.fills(0).iter().all(|f| !f.draws(l.symbol(0).fill)));
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn buffer_point_adds_only_the_buffer() {
     let mut s = world();
@@ -18485,6 +18742,15 @@ fn legends_leave_layers_out() {
     s.run("layer.rename", &json!({"layer": "Nations", "name": "Countries"})).unwrap();
     s.run("layer.rename", &json!({"layer": "Lakes", "name": "Countries"})).unwrap();
     assert!(left_out(&s, lakes).is_empty(), "the other Countries isn't taken out");
+    // A WMS or WMTS layer is left out by name too, and the name follows it: renamed, removed.
+    let wms = json!({"url": "https://maps.example.org/wms/{bbox-epsg-3857}", "name": "Soils", "overlay": true, "legend": "https://maps.example.org/legend.png"});
+    s.run("map.addTiles", &wms).unwrap();
+    s.run("layout.update", &json!({"element": lakes, "exclude": ["soils"]})).unwrap();
+    assert_eq!(left_out(&s, lakes), ["Soils"]);
+    s.run("map.setTiles", &json!({"name": "Soils", "rename": "Soil map", "move": "bottom"})).unwrap();
+    assert_eq!(left_out(&s, lakes), ["Soil map"]);
+    s.run("map.removeTiles", &json!({"name": "Soil map"})).unwrap();
+    assert!(left_out(&s, lakes).is_empty());
 }
 
 /// A point layer of events, one a month through 2015 (two in March), with their dates as text,

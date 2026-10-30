@@ -1103,8 +1103,10 @@ impl RustGisApp {
     /// Installs the shell's platform hooks and reads what they keep: preferences, saved
     /// connections and the recovery copy an earlier run left.
     pub fn with_services(mut self, services: Services) -> Self {
-        // Both saved database passwords and S3 keys use the same store, installed before prefs.
+        // Saved database passwords, S3 keys and the remembered Earthdata Login token use the same
+        // store, installed before prefs.
         self.session.database_logins.set_store(services.secrets.clone());
+        rustgis_engine::render::rustgis_tiles::earthdata::set_secret_store(services.secrets.clone());
         self.services = services;
         shortcutui::load(&mut self);
         sourcespane::load_connections(&mut self);
@@ -2500,6 +2502,10 @@ impl RustGisApp {
                     if let Some(value) = p.get(key) {
                         q[key] = value.clone();
                     }
+                }
+                // A service layer's bounds, which its features' axes are checked against.
+                if let Some(b) = p.get("bounds").filter(|b| b.is_array()) {
+                    q["bounds"] = b.clone();
                 }
                 if let Some(origin) = &origin {
                     q[connectiontree::ORIGIN] = json!(origin);

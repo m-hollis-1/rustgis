@@ -396,13 +396,22 @@ as GeoLibre's Earthaccess panel does, through NASA's Common Metadata Repository 
 
 Searching needs no account, but NASA's data servers ask for an
 [Earthdata Login](https://urs.earthdata.nasa.gov) token to read most files. Paste one in the pane's
-**Earthdata Login** section (or run `earthdata.login`): it is kept until RustGIS closes, never in
-the project, and sent only over HTTPS to NASA's Earthdata data servers (`*.earthdatacloud.nasa.gov`
-and `*.earthdata.nasa.gov`), never to the login server itself; a redirect away from them (to the
+**Earthdata Login** section (or run `earthdata.login`). It is never put in the project, and is sent
+only over HTTPS to NASA's Earthdata data servers (`*.earthdatacloud.nasa.gov` and
+`*.earthdata.nasa.gov`), never to the login server itself; a redirect away from them (to the
 presigned address the file is served from) goes without it. A file the token doesn't open says
 so (an expired token, or a dataset whose EULA you haven't accepted on Earthdata Login).
-`earthdata.status` reports whether a token is kept and its expiry when present;
-`earthdata.logout` forgets it.
+
+The token is kept until RustGIS closes, unless you tick **Remember on this computer** (off by
+default; `earthdata.login` with `"remember": true`). The desktop app then keeps it in the system's
+credential store (macOS Keychain, Windows Credential Manager, or the Secret Service on Linux) and
+reads it back the next time it is needed: when the pane opens or a file is read from a data
+server. A token saved without the box ticked deletes the one remembered before. An expired token
+is forgotten, here and in the credential store, and the pane asks for a new one.
+`earthdata.status` reports whether a token is kept, its expiry, whether it is remembered and
+whether an expired one was forgotten; `earthdata.logout` (**Remove token**) forgets it and deletes
+the remembered one. The command line (`--use-saved-secrets`) and Python (`use_saved_secrets=True`)
+use the remembered token too; without them, and in the web app, a token lasts for the session.
 
 In the web app, searching and footprints work, but NASA's data servers don't let web pages read
 their files (they send no CORS headers), so GeoTIFFs are added in the desktop app; **Download**
@@ -412,6 +421,7 @@ still opens a file in a new tab, where Earthdata Login asks you to sign in.
 rustgis-cli run --cmd 'earthdata.collections={"keyword":"GEDI biomass","cloudHosted":true}'
 rustgis-cli run --sample --cmd 'earthdata.granules={"shortName":"HLSL30","bbox":[-90,42.5,-89,43.5],"start":"2024-06-01","end":"2024-06-30"}' --cmd 'share.exportMap={"path":"hls.png"}'
 rustgis-cli run --sample --cmd 'earthdata.login={"token":"…"}' --cmd 'layer.addUrl={"url":"https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/HLSL30.020/…/….B04.tif"}'
+rustgis-cli run --sample --use-saved-secrets --cmd 'layer.addUrl={"url":"https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/HLSL30.020/…/….B04.tif"}'
 ```
 
 ## Open-data portals

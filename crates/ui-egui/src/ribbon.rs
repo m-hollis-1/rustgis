@@ -4129,7 +4129,8 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                     }
                     ui.label(egui::RichText::new(tl!("Size")).size(11.5));
                 });
-            } else if layer.geometry_type() == GeometryType::Polygon && !layer.graphics {
+            }
+            if layer.has_geometry(GeometryType::Polygon) && !layer.graphics {
                 small(
                     ui,
                     app,

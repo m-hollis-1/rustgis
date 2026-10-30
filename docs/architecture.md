@@ -90,6 +90,15 @@ model listing.
   the requested bucket's explicit-grant status. Copy only that login and grant boolean, not
   the grant list; parse and validate addresses and prepare signatures outside the lock.
   Keychain calls and network I/O never run under the registry lock.
+- **Earthdata Login token.** `rustgis_tiles::earthdata::set_secret_store` gets `Services::secrets`
+  from `RustGisApp::with_services`, and `prefs::opt_in`'s store for the command line and Python. `earthdata.login` with
+  `remember` keeps the token at `earthdata/token`, and without it (or when the store refuses
+  it) deletes the remembered one; `earthdata.logout` always deletes it. The token is read back
+  once per store given, on the first
+  request to an Earthdata data host or when the NASA Earthaccess pane opens (on a worker), never
+  over a token typed this session. An expired token is deleted, not sent, and the pane and the
+  refusal message ask for a new one. The token and its store are process-global, like the
+  session token before them.
 - **ChatGPT sign-in.** The desktop app gives its store to `chatgpt::set_secret_store` at start.
   The keychain keeps only each registration's refresh token, `chatgpt/<client_id>/<subject>`,
   with the `rev` its entry in `chatgpt-auth.json` names (any other is out of date and never

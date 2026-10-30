@@ -145,8 +145,9 @@ _GeoLibre: docs/features.md › Attribute data and expressions; docs/arcgis-edit
 - [ ] **Write-back to sources**: GeoPackage, GeoJSON, PostGIS, SQL Server, ArcGIS FeatureService.
   Missing; edits stay in the project (_Roadmap: data at the source_ for GeoPackage and PostGIS).
 - [ ] **Expression builder and engine**: one engine shared by filters, labels, styles and Calculate
-  Field, with a function reference. Partial: Calculate Field is `field op field/number`
-  (_Roadmap: expressions and cartography_).
+  Field, with a function reference. Partial: one expression language serves queries, filters,
+  label classes, attribute rules and Calculate Field (docs: Expressions); symbols and labels by
+  expression and a builder are missing (_Roadmap: expressions and cartography_).
 - [ ] **Virtual fields and persistent attribute joins**. Missing; relationships exist (_Roadmap:
   data at the source_; a one-off join field tool under solid ground).
 - [ ] **Attribute form designer**: widgets, constraints, conditional visibility. Partial: domains,

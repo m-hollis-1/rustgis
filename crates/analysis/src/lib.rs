@@ -10,6 +10,7 @@
 //! [`tool`] and run by [`run`] like the rest.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod attribute_join;
 pub mod convert;
 pub mod density;
 pub mod dggs;
@@ -29,6 +30,7 @@ pub mod topology;
 pub mod trend;
 pub mod warp;
 
+pub use attribute_join::{DuplicateStrategy, JoinFieldOptions, JoinFieldReport, join_field};
 pub use density::{
     KernelType, MAX_DENSITY_CELLS, MAX_DENSITY_WORK, auto_cell_size, kernel_density, points_extent, resolve_grid_extent,
     silverman_bandwidth,
@@ -326,6 +328,9 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
     let mut p = params.as_object().cloned().unwrap_or_default();
     // Not an external suite's tool (a copy of a built-in spec counts as built-in).
     let built_in = source_of(spec).is_none();
+    if built_in {
+        tools::normalize_params(spec, &mut p);
+    }
     for ps in spec.params {
         if !p.contains_key(ps.name)
             && !ps.default.is_empty()

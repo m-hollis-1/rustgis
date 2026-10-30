@@ -12,6 +12,8 @@ use std::rc::Rc;
 
 #[path = "ogc_info.rs"]
 mod info;
+#[path = "ogc_warp.rs"]
+pub mod warp;
 pub use info::{
     FeatureInfo, InfoFeature, MAX_INFO_BYTES, answer_text, at_map_time, map_time, may_answer_in_another_format, read_feature_info,
     wms_layer_of,
@@ -800,7 +802,7 @@ fn wms(url: &str, root: &Node) -> Service {
     let version = if v13 { "1.3.0" } else { "1.1.1" };
     let info_request = info::request_of(root, url, version, format);
     let mut service = Service { kind: "WMS".into(), title, ..Service::default() };
-    let mut skipped = 0;
+    let (mut skipped, mut too_long) = (0, 0);
     let mut time_budget = MAX_DOCUMENT_TIME_VALUES;
     // Layers inherit their parents' coordinate systems, nearest valid geographic bounds, queryable
     // attribute and time dimension.
@@ -809,12 +811,12 @@ fn wms(url: &str, root: &Node) -> Service {
     let legend_graphic = wms_legend_graphic(root, url, &get_map, version);
     // (What a layer passes on is shared by its sublayers, not copied for each: a hostile document
     // may give one layer a great many.)
-    type Inherited<'a, 'i> = (Node<'a, 'i>, Rc<[String]>, Option<[f64; 4]>, bool, Rc<[Node<'a, 'i>]>, Option<Rc<LayerTime>>, Scales);
+    type Inherited<'a, 'i> = (Node<'a, 'i>, Rc<Systems>, Option<[f64; 4]>, bool, Rc<[Node<'a, 'i>]>, Option<Rc<LayerTime>>, Scales);
     let mut stack: Vec<Inherited<'_, '_>> = root
         .descendants()
         .filter(|n| n.is_element() && local(n) == "Capability")
         .flat_map(|c| children(&c, "Layer").collect::<Vec<_>>())
-        .map(|l| (l, Rc::from([]), None, false, Rc::from([]), None, Scales::default()))
+        .map(|l| (l, Rc::default(), None, false, Rc::from([]), None, Scales::default()))
         .collect();
     while let Some((layer, inherited_crs, inherited_bbox, inherited_queryable, inherited_styles, inherited_time, inherited_scales)) =
         stack.pop()
@@ -822,9 +824,14 @@ fn wms(url: &str, root: &Node) -> Service {
         if service.layers.len() >= MAX_LAYERS {
             break;
         }
-        let mut crs = inherited_crs.to_vec();
-        crs.extend(layer.children().filter(|c| c.is_element() && matches!(local(c), "CRS" | "SRS")).map(|c| text_of(&c)));
-        let crs: Rc<[String]> = crs.into();
+        // (A layer naming none of its own shares its parent's list, and what is worked out of it.)
+        let own: Vec<String> =
+            layer.children().filter(|c| c.is_element() && matches!(local(c), "CRS" | "SRS")).map(|c| text_of(&c)).collect();
+        let crs: Rc<Systems> = if own.is_empty() {
+            inherited_crs
+        } else {
+            Rc::new(Systems { names: inherited_crs.names.iter().cloned().chain(own).collect(), ..Systems::default() })
+        };
         let bbox = child(&layer, "EX_GeographicBoundingBox")
             .and_then(|b| {
                 let f = |k: &str| child_text(&b, k).and_then(|t| t.parse::<f64>().ok());
@@ -852,21 +859,48 @@ fn wms(url: &str, root: &Node) -> Service {
             stack.push((sub, Rc::clone(&crs), bbox, queryable, Rc::clone(&styles), time.clone(), scales));
         }
         let Some(name) = child_text(&layer, "Name") else { continue };
-        if !crs.iter().any(|c| c.split_whitespace().any(is_web_mercator)) {
+        // In Web Mercator, as the service draws it, else in a system of its own, warped (#769);
+        // with the other systems it is offered in, for a map drawn in one of them.
+        let mercator = crs.names.iter().any(|c| c.split_whitespace().any(is_web_mercator));
+        let listed = crs.candidates.get_or_init(|| wms_candidates(&crs.names));
+        let mut native = wms_native(&layer, listed, v13, bbox, mercator);
+        if !mercator && native.is_none() {
             skipped += 1;
             continue;
         }
         let crs_key = if v13 { "CRS" } else { "SRS" };
+        let (code, area) = match &native {
+            Some((_, w)) if w.epsg != 3857 => ("{ncrs}".to_string(), "BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}"),
+            _ => ("EPSG:3857".to_string(), "BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256"),
+        };
         let template = with_query(
             &get_map,
             &format!(
-                "SERVICE=WMS&VERSION={version}&REQUEST=GetMap&LAYERS={}&STYLES=&{crs_key}=EPSG:3857&BBOX={{bbox-epsg-3857}}&WIDTH=256&HEIGHT=256&FORMAT={}&TRANSPARENT=TRUE",
+                "SERVICE=WMS&VERSION={version}&REQUEST=GetMap&LAYERS={}&STYLES=&{crs_key}={code}&{area}&FORMAT={}&TRANSPARENT=TRUE",
                 encode(&name),
                 encode(format)
             ),
         );
         // At its time: the service's default, unless another is asked for when it is added.
         let template = if time.is_some() { with_query(&template, "TIME={Time}") } else { template };
+        // An address the map can fetch (4096 bytes at most): the last of the other systems go
+        // first, then, for a layer offered in Web Mercator, all of them.
+        let mut address = native.as_ref().map(|(_, w)| w.address(&template));
+        while let (Some(a), Some((_, w))) = (&address, &mut native)
+            && a.len() > MAX_ADDRESS
+            && w.systems.len() > 1
+        {
+            w.systems.pop();
+            address = Some(w.address(&template));
+        }
+        if address.as_ref().is_some_and(|a| a.len() > MAX_ADDRESS) {
+            if !mercator {
+                too_long += 1;
+                continue;
+            }
+            (native, address) = (None, None);
+        }
+        let template = address.unwrap_or(template);
         let title = child_text(&layer, "Title").unwrap_or_else(|| name.clone());
         // A service without GetFeatureInfo still gives each layer one, never asked, so Identify
         // doesn't fetch the capabilities again to find out.
@@ -874,7 +908,14 @@ fn wms(url: &str, root: &Node) -> Service {
             info_request
                 .as_ref()
                 .map_or_else(|| FeatureInfo { layer: name.clone(), ..FeatureInfo::default() }, |r| r.for_layer(&name, queryable)),
-        );
+        )
+        .map(|f| match &native {
+            // Asked in the system the layer is drawn in.
+            Some((code, warp::Warp { epsg, grid: warp::Grid::Map { lat_first }, .. })) if *epsg != 3857 => {
+                FeatureInfo { crs: code.clone(), lat_first: *lat_first, ..f }
+            }
+            _ => f,
+        });
         // Its legend: the one the service draws from the layer's styling (the SLD profile's
         // GetLegendGraphic, symbols with their names, as ArcGIS Pro and QGIS show a WMS layer's),
         // then its default style's `LegendURL` picture (WMS 1.3.0 §7.2.4.6.4, 1.1.1 §7.1.4.5.14: of
@@ -905,10 +946,129 @@ fn wms(url: &str, root: &Node) -> Service {
     }
     service.layers.reverse();
     if skipped > 0 {
-        service.notes.push(format!("{skipped} layers aren't offered in Web Mercator (EPSG:3857) and are left out"));
+        service.notes.push(format!("{skipped} layers aren't offered in a coordinate system RustGIS can draw and are left out"));
+    }
+    if too_long > 0 {
+        service.notes.push(format!(
+            "{too_long} layers in another coordinate system are left out: their addresses are longer than {MAX_ADDRESS} bytes"
+        ));
     }
     service
 }
+
+/// The coordinate systems a WMS layer is offered in, its own and those it inherits, and those of
+/// them RustGIS knows (worked out once, for the layers sharing the list).
+#[derive(Default)]
+struct Systems {
+    names: Vec<String>,
+    candidates: std::cell::OnceCell<Vec<Candidate>>,
+}
+
+/// A system of a WMS layer's list that RustGIS knows: its name there, its EPSG code, it, and its
+/// place in the list.
+type Candidate = (String, u32, crate::raster::Crs, usize);
+
+/// The systems of a WMS layer's list that RustGIS knows, one name each, in order of preference:
+/// projected ones first (the service's own, as a rule), then CRS:84, then other
+/// longitude/latitude ones, each kind as listed. (A GeoServer lists some 5,000 systems by
+/// default, each layer inheriting them: only a system's definition is looked up here, once a
+/// list; [`wms_native`] builds transformers, in this order, until `MAX_SYSTEMS` are kept.)
+fn wms_candidates(crs: &[String]) -> Vec<Candidate> {
+    let mut seen = std::collections::HashSet::new();
+    let mut listed: Vec<Candidate> = crs
+        .iter()
+        .flat_map(|c| c.split_whitespace())
+        .filter(|c| c.len() <= warp::MAX_SYSTEM_NAME && !is_web_mercator(c) && seen.insert(c.to_ascii_uppercase()))
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let code = warp::epsg_of(c)?;
+            let system = crate::raster::Crs::from_epsg(code).filter(|s| *s != crate::raster::Crs::WebMercator)?;
+            Some((c.to_string(), code, system, i))
+        })
+        .collect();
+    // One name for each system (EPSG:4326 and CRS:84 differ only in their axes: CRS:84 kept).
+    listed.sort_by_cached_key(|(name, code, _, _)| (*code, !warp::is_crs84(name)));
+    listed.dedup_by_key(|(_, code, _, _)| *code);
+    let rank = |(name, _, c, _): &Candidate| match (c.is_geographic(), warp::is_crs84(name)) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => 2,
+    };
+    // In the order the service lists them, the preferred first.
+    listed.sort_by_key(|l| (rank(l), l.3));
+    listed
+}
+
+/// The systems a WMS layer is offered in that RustGIS can draw (#769), of its `listed`
+/// candidates (see [`wms_candidates`]), and the one a Web Mercator map takes its pictures in: Web
+/// Mercator itself (`mercator`), else the first. `None` for a layer offered in Web Mercator
+/// alone (its address stays as it was) or in nothing usable. In WMS 1.3.0 a bounding box follows
+/// the system's axes as EPSG defines them ([`crate::raster::epsg_axes`]); for a system whose
+/// order RustGIS doesn't know, as the layer's own `BoundingBox` in it is written (else latitude
+/// first in a geographic system other than CRS:84).
+fn wms_native(layer: &Node, listed: &[Candidate], v13: bool, area: Option<[f64; 4]>, mercator: bool) -> Option<(String, warp::Warp)> {
+    // Its boxes by system (its own, else the nearest it inherits: WMS 1.3.0 §7.2.4.6.8), read
+    // once a layer.
+    let mut boxes: std::collections::HashMap<u32, Node> = std::collections::HashMap::new();
+    if v13 {
+        for b in layer
+            .ancestors()
+            .filter(|a| a.is_element() && local(a) == "Layer")
+            .flat_map(|a| children(&a, "BoundingBox").collect::<Vec<_>>())
+        {
+            // (By code: the box may name the system otherwise than the list, `EPSG:2056` for
+            // `urn:ogc:def:crs:EPSG::2056`; but a CRS:84 box, longitude first, isn't an
+            // EPSG:4326 one.)
+            if let Some(code) = b.attribute("CRS").or(b.attribute("SRS")).filter(|c| !warp::is_crs84(c)).and_then(warp::epsg_of) {
+                boxes.entry(code).or_insert(b);
+            }
+        }
+    }
+    let lat_first = |name: &str, system: crate::raster::Crs| {
+        v13 && !warp::is_crs84(name) && {
+            // In the order of the system's axes as EPSG defines them (WMS 1.3.0 §6.7.3.3); for a
+            // system newer than RustGIS's table, the layer's box in it, against its area there.
+            if let Some(north) = epsg_north_first(system) {
+                return north;
+            }
+            let own = warp::epsg_of(name).and_then(|code| boxes.get(&code));
+            let written = own.and_then(|b| {
+                let f = |k: &str| b.attribute(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite());
+                Some([f("minx")?, f("miny")?, f("maxx")?, f("maxy")?])
+            });
+            match written {
+                Some(b) => {
+                    let native = area.and_then(|a| warp::native_box(&*warp::transformer(u32::from(system.epsg()))?, a));
+                    warp::north_first(b, native, system.is_geographic())
+                }
+                None => system.is_geographic(),
+            }
+        }
+    };
+    let systems: Vec<warp::System> = listed
+        .iter()
+        .filter(|(_, code, _, _)| warp::usable(*code).is_some())
+        .take(warp::MAX_SYSTEMS)
+        .filter_map(|(name, code, system, _)| {
+            Some(warp::System { epsg: u16::try_from(*code).ok()?, name: name.clone(), lat_first: lat_first(name, *system) })
+        })
+        .collect();
+    let first = systems.first()?.clone();
+    let (epsg, lat_first) = if mercator { (3857, false) } else { (first.epsg, first.lat_first) };
+    Some((first.name, warp::Warp { epsg, grid: warp::Grid::Map { lat_first }, area, systems }))
+}
+
+/// Whether `system` is written north (or latitude) first as EPSG defines its axes, when
+/// RustGIS's table knows it ([`crate::raster::epsg_axes`]).
+fn epsg_north_first(system: crate::raster::Crs) -> Option<bool> {
+    match system {
+        crate::raster::Crs::Custom(_) => None,
+        s => crate::raster::epsg_axes::north_first(s.epsg()),
+    }
+}
+
+/// The longest address a layer in another system keeps (the map's own limit on an address).
+const MAX_ADDRESS: usize = 4096;
 
 /// The most styles a WMS layer's legend is looked for among, its own and those it inherits.
 const MAX_STYLES: usize = 64;
@@ -1005,13 +1165,81 @@ fn mercator_matrices(tms: &Node) -> Option<Vec<(String, u8)>> {
 /// `TileMatrixSetLimits` names when it gives them (WMTS 1.0.0 §7.2.4.6.3).
 fn wmts_zooms(layer: &Node, set: &str, sets: &[(String, Vec<(String, u8)>)]) -> Option<(u8, u8)> {
     let matrices = &sets.iter().find(|(id, _)| id == set)?.1;
-    let link = children(layer, "TileMatrixSetLink").find(|l| child_text(l, "TileMatrixSet").as_deref() == Some(set))?;
-    let limited: Vec<String> = child(&link, "TileMatrixSetLimits")
-        .map(|l| children(&l, "TileMatrixLimits").filter_map(|m| child_text(&m, "TileMatrix")).collect())
-        .unwrap_or_default();
+    children(layer, "TileMatrixSetLink").find(|l| child_text(l, "TileMatrixSet").as_deref() == Some(set))?;
+    let limited = wmts_limits(layer, set);
     let zooms = matrices.iter().filter(|(id, _)| limited.is_empty() || limited.contains(id)).map(|(_, z)| *z);
     let (lo, hi) = zooms.fold((u8::MAX, 0), |(lo, hi), z| (lo.min(z), hi.max(z)));
     (lo <= hi.min(24)).then_some((lo, hi.min(24)))
+}
+
+/// The tile matrices of `set` a WMTS layer's link limits it to (its `TileMatrixSetLimits`);
+/// none when it doesn't.
+fn wmts_limits(layer: &Node, set: &str) -> Vec<String> {
+    children(layer, "TileMatrixSetLink")
+        .find(|l| child_text(l, "TileMatrixSet").as_deref() == Some(set))
+        .and_then(|link| child(&link, "TileMatrixSetLimits"))
+        .map(|l| children(&l, "TileMatrixLimits").filter_map(|m| child_text(&m, "TileMatrix")).collect())
+        .unwrap_or_default()
+}
+
+/// A tile matrix as a WMTS document gives it, its corner in the order written.
+struct RawMatrix {
+    id: String,
+    scale: f64,
+    corner: (f64, f64),
+    tile: (u32, u32),
+    size: (u32, u32),
+}
+
+/// The most `TileMatrix` entries read of a tile matrix set in another system.
+const MAX_RAW_MATRICES: usize = 256;
+
+/// A tile matrix set in another system than Web Mercator that RustGIS can draw (#769): its EPSG
+/// code and its matrices RustGIS can draw, coarsest first.
+fn native_matrices(tms: &Node) -> Option<(u16, crate::raster::Crs, Vec<RawMatrix>)> {
+    let name = child_text(tms, "SupportedCRS")?;
+    let code = warp::epsg_of(&name)?;
+    let system = warp::usable(code)?;
+    let unit = warp::metres_per_unit(code);
+    let mut out = Vec::new();
+    // (In any order, up to `MAX_RAW_MATRICES` read: a real set has a few dozen.)
+    for m in children(tms, "TileMatrix").take(MAX_RAW_MATRICES) {
+        // One that can't be read or drawn is left out, not the set; only one RustGIS can draw
+        // counts towards `MAX_MATRICES`.
+        if let Some(raw) = raw_matrix(&m)
+            && warp::Matrix::from_scale(raw.id.clone(), raw.scale, unit, raw.corner, raw.tile, raw.size).is_some()
+        {
+            out.push(raw);
+        }
+    }
+    // Coarsest first. (Each layer keeps those its limits name, at most `MAX_MATRICES`; the
+    // corners' order is settled per layer, against its area.)
+    out.sort_by(|a, b| b.scale.total_cmp(&a.scale));
+    (!out.is_empty()).then_some((u16::try_from(code).ok()?, system, out))
+}
+
+/// A `TileMatrix` as the document gives it, if it gives all a matrix needs.
+fn raw_matrix(m: &Node) -> Option<RawMatrix> {
+    let n = |k: &str| child_text(m, k).and_then(|t| t.trim().parse::<f64>().ok()).filter(|v| v.is_finite());
+    let u = |k: &str| child_text(m, k).and_then(|t| t.trim().parse::<u32>().ok()).filter(|v| *v > 0);
+    let corner: Vec<f64> = child_text(m, "TopLeftCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    let [a, b] = corner.as_slice() else { return None };
+    Some(RawMatrix {
+        id: child_text(m, "Identifier")?,
+        scale: n("ScaleDenominator").filter(|v| *v > 0.0)?,
+        corner: (*a, *b),
+        tile: (u("TileWidth")?, u("TileHeight")?),
+        size: (u("MatrixWidth")?, u("MatrixHeight")?),
+    })
+}
+
+/// Past `MAX_MATRICES` the middle of `ms` (coarsest first) goes, the coarsest half kept for a
+/// wide view and the finest half for a close one.
+fn keep_matrices<T>(ms: &mut Vec<T>) {
+    let (coarse, len) = (warp::MAX_MATRICES / 2, ms.len());
+    if len > warp::MAX_MATRICES {
+        ms.drain(coarse..len - (warp::MAX_MATRICES - coarse));
+    }
 }
 
 fn wmts(url: &str, root: &Node) -> Service {
@@ -1021,6 +1249,15 @@ fn wmts(url: &str, root: &Node) -> Service {
     // Tile matrix sets that are Web Mercator pyramids, with a zoom per matrix identifier.
     let sets: Vec<(String, Vec<(String, u8)>)> =
         children(&contents, "TileMatrixSet").filter_map(|t| Some((child_text(&t, "Identifier")?, mercator_matrices(&t)?))).collect();
+    // Others in a system RustGIS can transform, drawn warped into the map's tiles (#769).
+    let natives: Vec<(String, u16, crate::raster::Crs, bool, Vec<RawMatrix>)> = children(&contents, "TileMatrixSet")
+        .filter_map(|t| {
+            let id = child_text(&t, "Identifier")?;
+            let crs84 = child_text(&t, "SupportedCRS").is_some_and(|c| warp::is_crs84(&c));
+            let (code, system, ms) = native_matrices(&t)?;
+            Some((id, code, system, crs84, ms))
+        })
+        .collect();
     let kvp = root
         .descendants()
         .find(|n| n.is_element() && local(n) == "GetTile")
@@ -1028,7 +1265,7 @@ fn wmts(url: &str, root: &Node) -> Service {
         .and_then(|g| href(&g))
         .filter(|h| is_web(h))
         .unwrap_or_else(|| endpoint(url));
-    let mut skipped = 0;
+    let (mut skipped, mut too_long) = (0, 0);
     for layer in children(&contents, "Layer").take(MAX_LAYERS) {
         let Some(name) = child_text(&layer, "Identifier") else { continue };
         let title = child_text(&layer, "Title").unwrap_or_else(|| name.clone());
@@ -1046,18 +1283,72 @@ fn wmts(url: &str, root: &Node) -> Service {
             .take(MAX_LEGENDS)
             .collect();
         let linked: Vec<String> = children(&layer, "TileMatrixSetLink").filter_map(|l| child_text(&l, "TileMatrixSet")).collect();
-        let Some((set, matrices)) = sets.iter().find(|(id, _)| linked.contains(id)) else {
-            skipped += 1;
-            continue;
+        let bbox = child(&layer, "WGS84BoundingBox").and_then(|b| {
+            let lo: Vec<f64> = child_text(&b, "LowerCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            let hi: Vec<f64> = child_text(&b, "UpperCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            lonlat_box(*lo.first()?, *lo.get(1)?, *hi.first()?, *hi.get(1)?)
+        });
+        // A Web Mercator set whose matrix identifiers are a fixed prefix then the zoom, drawn as
+        // it is; else a set in another system, warped.
+        let mercator = sets.iter().filter(|(id, _)| linked.contains(id)).find_map(|(set, matrices)| {
+            let prefix = matrices.iter().find_map(|(id, z)| id.strip_suffix(&z.to_string()).map(str::to_string));
+            let consistent = prefix.as_ref().is_some_and(|p| matrices.iter().all(|(id, z)| *id == format!("{p}{z}")));
+            prefix.filter(|_| consistent).map(|p| (set.clone(), p))
+        });
+        let native = match mercator {
+            Some(_) => None,
+            None => natives.iter().filter(|n| linked.contains(&n.0)).find_map(|(set, code, system, crs84, raw)| {
+                let geographic = system.is_geographic();
+                let area = bbox.and_then(|b| warp::native_box(&*warp::transformer(u32::from(*code))?, b));
+                // Only the matrices the layer's link limits it to (WMTS 1.0.0 §7.2.4.6.3), when it does.
+                let limited = wmts_limits(&layer, set);
+                let mut raw: Vec<&RawMatrix> = raw.iter().filter(|m| limited.is_empty() || limited.contains(&m.id)).collect();
+                keep_matrices(&mut raw);
+                let unit = warp::metres_per_unit(u32::from(*code));
+                let first = raw.first()?;
+                let m = warp::Matrix::from_scale(first.id.clone(), first.scale, unit, first.corner, first.tile, first.size)?;
+                let span = (m.cell * f64::from(m.tile_w) * f64::from(m.cols), m.cell * f64::from(m.tile_h) * f64::from(m.rows));
+                // In the order of the system's axes as EPSG defines them (WMTS 1.0.0 §6.1). A
+                // geographic corner is often written longitude first anyway: one whose first number
+                // can't be a latitude is so; one whose numbers could be either is read longitude
+                // first only when its matrix, read in EPSG's order, misses the layer and read the
+                // other way doesn't. For a system newer than RustGIS's table, the order whose
+                // matrix covers more of the layer, else latitude first in a geographic system.
+                let swap = !*crs84
+                    && match epsg_north_first(*system) {
+                        Some(_) if geographic && first.corner.0.abs() > 90.0 => false,
+                        // Read the other way only when EPSG's reading misses the layer altogether
+                        // and that one doesn't: a correct corner is kept, however the other covers.
+                        Some(north) if geographic => match warp::corner_coverage(first.corner, span, area) {
+                            Some((east, north_cov)) => {
+                                let (kept, other) = if north { (north_cov, east) } else { (east, north_cov) };
+                                if kept <= 0.0 && other > 0.0 { !north } else { north }
+                            }
+                            None => north,
+                        },
+                        Some(north) => north,
+                        None => warp::corner_north_first(first.corner, span, area).unwrap_or(geographic),
+                    };
+                let matrices: Vec<warp::Matrix> = raw
+                    .iter()
+                    .filter_map(|m| {
+                        let corner = if swap { (m.corner.1, m.corner.0) } else { m.corner };
+                        warp::Matrix::from_scale(m.id.clone(), m.scale, unit, corner, m.tile, m.size)
+                    })
+                    .collect();
+                (!matrices.is_empty())
+                    .then(|| (set.clone(), warp::Warp { epsg: *code, grid: warp::Grid::Tiles(matrices), area: bbox, systems: Vec::new() }))
+            }),
         };
-        // A template needs the zoom in the matrix identifier: a fixed prefix then the zoom.
-        let prefix = matrices.iter().find_map(|(id, z)| id.strip_suffix(&z.to_string()).map(str::to_string));
-        let consistent = prefix.as_ref().is_some_and(|p| matrices.iter().all(|(id, z)| *id == format!("{p}{z}")));
-        let Some(prefix) = prefix.filter(|_| consistent) else {
-            skipped += 1;
-            continue;
+        let (set, matrix, row, col) = match (&mercator, &native) {
+            (Some((set, prefix)), _) => (set.clone(), format!("{prefix}{{z}}"), "{y}", "{x}"),
+            (None, Some((set, _))) => (set.clone(), "{nm}".to_string(), "{nrow}", "{ncol}"),
+            (None, None) => {
+                skipped += 1;
+                continue;
+            }
         };
-        let matrix = format!("{prefix}{{z}}");
+        let set = &set;
         // A time dimension: the template with `{Time}` is preferred, which takes the time asked
         // for (its default otherwise); without one, a template with no `{Time}` is.
         // Its default: the one given, else the last time its values list (a range's end); with
@@ -1091,15 +1382,15 @@ fn wmts(url: &str, root: &Node) -> Service {
                 .replace("{TileMatrixSet}", set)
                 .replace("{Style}", &style)
                 .replace("{TileMatrix}", &matrix)
-                .replace("{TileRow}", "{y}")
-                .replace("{TileCol}", "{x}"),
+                .replace("{TileRow}", row)
+                .replace("{TileCol}", col),
             None => {
                 let format =
                     children(&layer, "Format").map(|f| text_of(&f)).find(|f| f.starts_with("image/")).unwrap_or_else(|| "image/png".into());
                 let get = with_query(
                     &kvp,
                     &format!(
-                        "SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER={}&STYLE={}&TILEMATRIXSET={}&TILEMATRIX={matrix}&TILEROW={{y}}&TILECOL={{x}}&FORMAT={}",
+                        "SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER={}&STYLE={}&TILEMATRIXSET={}&TILEMATRIX={matrix}&TILEROW={row}&TILECOL={col}&FORMAT={}",
                         encode(&name),
                         encode(&style),
                         encode(set),
@@ -1109,13 +1400,19 @@ fn wmts(url: &str, root: &Node) -> Service {
                 if time.is_some() { format!("{get}&TIME={{Time}}") } else { get }
             }
         };
-        let bbox = child(&layer, "WGS84BoundingBox").and_then(|b| {
-            let lo: Vec<f64> = child_text(&b, "LowerCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-            let hi: Vec<f64> = child_text(&b, "UpperCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-            lonlat_box(*lo.first()?, *lo.get(1)?, *hi.first()?, *hi.get(1)?)
-        });
+        let template = match &native {
+            Some((_, w)) => w.address(&template),
+            None => template,
+        };
+        // An address in another system no longer than a tile layer keeps (a set of a great many
+        // matrices, in its fragment).
+        if native.is_some() && template.len() > MAX_ADDRESS {
+            too_long += 1;
+            continue;
+        }
         service.layers.push(ServiceLayer {
-            zooms: wmts_zooms(&layer, set, &sets),
+            // A Web Mercator set's own zooms, else those a warped set's matrices make (#769).
+            zooms: wmts_zooms(&layer, set, &sets).or_else(|| native.as_ref().and_then(|(_, w)| w.zooms())),
             name,
             title,
             offer: Offer::Tiles { template },
@@ -1127,7 +1424,12 @@ fn wmts(url: &str, root: &Node) -> Service {
         });
     }
     if skipped > 0 {
-        service.notes.push(format!("{skipped} layers have no Web Mercator tile matrix set RustGIS can draw and are left out"));
+        service.notes.push(format!("{skipped} layers have no tile matrix set RustGIS can draw and are left out"));
+    }
+    if too_long > 0 {
+        service.notes.push(format!(
+            "{too_long} layers in another coordinate system are left out: their addresses are longer than {MAX_ADDRESS} bytes"
+        ));
     }
     service
 }
@@ -1200,9 +1502,12 @@ fn wfs(url: &str, root: &Node) -> Service {
                 let f = |k: &str| b.attribute(k).and_then(|t| t.parse::<f64>().ok());
                 lonlat_box(f("minx")?, f("miny")?, f("maxx")?, f("maxy")?)
             });
-        // CRS84 when the type offers it: longitude first by definition. Otherwise EPSG:4326, which
-        // WFS 1.0 answers longitude first; a 1.1 or 2.0 server answering latitude first says so
-        // with a `urn:…EPSG::4326` crs in its GeoJSON, which is turned round (`fix_axes`).
+        // CRS84 when the type offers it: longitude first by definition. Otherwise EPSG:4326 (MapServer
+        // refuses a CRS84 the type doesn't list), which every server tried in #1053 answered
+        // longitude first; deegree answers latitude first when asked in the URN form instead. The
+        // `crs` an answer names doesn't tell the order (GeoServer names its longitude-first GeoJSON
+        // `urn:ogc:def:crs:EPSG::4326`), so an answer is turned round only when its positions miss
+        // the type's bounds and fit them turned (`fix_axes`).
         let crs84 = ft.children().any(|c| {
             c.is_element() && matches!(local(&c), "DefaultCRS" | "OtherCRS" | "DefaultSRS" | "OtherSRS" | "SRS") && is_crs84(&text_of(&c))
         });
@@ -2034,9 +2339,18 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         let Some(id) = c.get("id").and_then(|i| i.as_str()) else { continue };
         let links = c.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
         let title = c.get("title").and_then(|t| t.as_str()).unwrap_or(id).to_string();
-        let bbox = c.pointer("/extent/spatial/bbox/0").and_then(|b| b.as_array()).and_then(|b| {
+        // Its extent in CRS84, the standard's default: a box in another system it names isn't
+        // read as longitude/latitude (its features' axes are judged against it, `fix_axes`). Four
+        // numbers, or six with heights.
+        let lonlat = c.pointer("/extent/spatial/crs").and_then(|v| v.as_str()).is_none_or(is_crs84);
+        let bbox = c.pointer("/extent/spatial/bbox/0").and_then(|b| b.as_array()).filter(|_| lonlat).and_then(|b| {
             let f = |i: usize| b.get(i).and_then(|v| v.as_f64());
-            lonlat_box(f(0)?, f(1)?, f(2)?, f(3)?)
+            let (e, n) = match b.len() {
+                4 => (2, 3),
+                6 => (3, 4),
+                _ => return None,
+            };
+            lonlat_box(f(0)?, f(1)?, f(e)?, f(n)?)
         });
         // OGC API Tiles: the collection's map and vector tiles in WebMercatorQuad. Its vector
         // tiles' layer is named after the collection, as the standard has it.
@@ -2690,11 +3004,178 @@ impl Pages {
     }
 }
 
-/// Whether a GeoJSON answer names, as its `crs`, EPSG:4326 in the URN form that puts latitude
-/// first (as GeoServer does for WFS 1.1 and 2.0).
-fn lat_first(crs: &str) -> bool {
-    let c = crs.to_ascii_lowercase();
-    c.starts_with("urn:") && (c.ends_with("epsg::4326") || c.ends_with("epsg:6.6:4326") || c.ends_with("epsg:4326"))
+/// How far past a layer's bounds an answer's positions may reach and still fit them: a tenth of
+/// the bounds' size along that axis, or half a degree when that is more.
+fn margin(lo: f64, hi: f64) -> f64 {
+    ((hi - lo) / 10.0).max(0.5)
+}
+
+/// Whether the extent `[west, south, east, north]` lies within `bounds`, give or take [`margin`].
+fn fits(extent: [f64; 4], bounds: [f64; 4]) -> bool {
+    let [w, s, e, n] = bounds;
+    let (mx, my) = (margin(w, e), margin(s, n));
+    extent[0] >= w - mx && extent[2] <= e + mx && extent[1] >= s - my && extent[3] <= n + my
+}
+
+/// The extent of the positions in a GeoJSON answer (a collection, a feature or a geometry), read
+/// without keeping them: `[min x, min y, max x, max y]`, or `None` for an answer that isn't JSON
+/// or has no position.
+fn positions_extent(bytes: &[u8]) -> Option<[f64; 4]> {
+    use serde::de::DeserializeSeed;
+    let mut extent = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    Members { extent: &mut extent, depth: 0 }.deserialize(&mut de).ok()?;
+    (extent[0] <= extent[2] && extent[1] <= extent[3]).then_some(extent)
+}
+
+/// A GeoJSON object (or an array of them) whose `features`, `geometry`, `geometries` and
+/// `coordinates` are walked for [`positions_extent`]; its other members are skipped.
+struct Members<'a> {
+    extent: &'a mut [f64; 4],
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Members<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Members<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a GeoJSON value")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "features" | "geometry" | "geometries" if self.depth < 16 => {
+                    map.next_value_seed(Members { extent: &mut *self.extent, depth: self.depth + 1 })?;
+                }
+                "coordinates" => {
+                    map.next_value_seed(Positions { extent: &mut *self.extent, depth: 0 })?;
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if self.depth >= 16 {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            return Ok(());
+        }
+        while seq.next_element_seed(Members { extent: &mut *self.extent, depth: self.depth + 1 })?.is_some() {}
+        Ok(())
+    }
+
+    // A null geometry, or a member of an unexpected kind: nothing to read.
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+/// A geometry's `coordinates`, nested arrays whose innermost hold positions: an array whose first
+/// two elements are numbers, as [`swap_positions`] takes one (and as deep as it goes). Gives the
+/// number it is, or `None` for an array or anything else.
+struct Positions<'a> {
+    extent: &'a mut [f64; 4],
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Positions<'_> {
+    type Value = Option<f64>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Option<f64>, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Positions<'_> {
+    type Value = Option<f64>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("GeoJSON coordinates")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Option<f64>, A::Error> {
+        if self.depth > 8 {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            return Ok(None);
+        }
+        let mut first = [None, None];
+        let mut i = 0;
+        while let Some(v) = seq.next_element_seed(Positions { extent: &mut *self.extent, depth: self.depth + 1 })? {
+            if let Some(slot) = first.get_mut(i) {
+                *slot = v;
+            }
+            i += 1;
+        }
+        if let [Some(x), Some(y)] = first
+            && x.is_finite()
+            && y.is_finite()
+        {
+            let e = &mut *self.extent;
+            *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
+        }
+        Ok(None)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Option<f64>, E> {
+        Ok(Some(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Option<f64>, E> {
+        Ok(Some(v as f64))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Option<f64>, E> {
+        Ok(Some(v as f64))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Option<f64>, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Option<f64>, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Option<f64>, E> {
+        Ok(None)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Option<f64>, A::Error> {
+        while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
 }
 
 fn swap_positions(v: &mut serde_json::Value, depth: usize) {
@@ -2725,20 +3206,22 @@ fn swap_geometry(g: &mut serde_json::Value, depth: usize) {
     }
 }
 
-/// A service's GeoJSON answer with latitude-first coordinates (see [`lat_first`]) turned round to
-/// longitude first, and its `crs` dropped; `None` when it is longitude first already.
-pub fn fix_axes(bytes: &[u8]) -> Option<Vec<u8>> {
-    let (head, tail) = edges(bytes);
-    let mentions =
-        |t: &str| t.to_ascii_lowercase().contains("urn:ogc:def:crs:epsg:") || t.to_ascii_lowercase().contains("urn:x-ogc:def:crs:epsg:");
-    if !(mentions(&head) || mentions(&tail)) {
+/// A service's GeoJSON answer with latitude-first coordinates turned round to longitude first, and
+/// its `crs` dropped; `None` when it is left as it came.
+///
+/// The data decide, not the `crs` name: GeoServer names longitude-first answers
+/// `urn:ogc:def:crs:EPSG::4326`, and deegree's one latitude-first answer has no `crs` at all
+/// (#1053). The positions are turned round only when their extent misses the layer's
+/// longitude/latitude `bounds` from the capabilities (west, south, east, north) and the turned
+/// extent fits them, give or take a tenth of their size or half a degree. With no bounds, or an
+/// answer that fits both ways (or neither), it can't tell, and nothing is turned.
+pub fn fix_axes(bytes: &[u8], bounds: Option<[f64; 4]>) -> Option<Vec<u8>> {
+    let bounds = bounds?;
+    let [x0, y0, x1, y1] = positions_extent(bytes)?;
+    if fits([x0, y0, x1, y1], bounds) || !fits([y0, x0, y1, x1], bounds) {
         return None;
     }
     let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let crs = v.pointer("/crs/properties/name").and_then(|n| n.as_str())?;
-    if !lat_first(crs) {
-        return None;
-    }
     if let Some(o) = v.as_object_mut() {
         o.remove("crs");
     }
@@ -2767,6 +3250,58 @@ mod fixtures;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A layer's box names its system otherwise than its list (`EPSG:3035` for the URN): found by
+    /// code, it still says the service writes LAEA Europe north first.
+    #[test]
+    fn a_box_is_found_by_its_systems_code() {
+        let xml = r#"<Layer><CRS>urn:ogc:def:crs:EPSG::3035</CRS><BoundingBox CRS="EPSG:3035" minx="2700000" miny="4000000" maxx="3600000" maxy="4700000"/></Layer>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let listed = wms_candidates(&["urn:ogc:def:crs:EPSG::3035".to_string()]);
+        let (_, w) = wms_native(&doc.root_element(), &listed, true, Some([6.0, 47.0, 15.0, 55.0]), false).unwrap();
+        assert_eq!((w.epsg, w.grid), (3035, warp::Grid::Map { lat_first: true }));
+    }
+
+    /// A WMS 1.3.0 layer is asked in the order EPSG gives its system's axes, with no box to read
+    /// it from (Gauss-Krüger zone 4, north first) and over a box written the other way (LV95,
+    /// east first); WMS 1.1.1 is always east first.
+    #[test]
+    fn a_wms_layer_follows_epsg_axis_order() {
+        let order = |xml: &str, crs: &str, v13: bool| {
+            let doc = roxmltree::Document::parse(xml).unwrap();
+            let listed = wms_candidates(&[crs.to_string()]);
+            let (_, w) = wms_native(&doc.root_element(), &listed, v13, Some([10.0, 47.5, 13.0, 50.5]), false).unwrap();
+            w.grid
+        };
+        let gk4 = "<Layer><CRS>EPSG:31468</CRS></Layer>";
+        assert_eq!(order(gk4, "EPSG:31468", true), warp::Grid::Map { lat_first: true });
+        assert_eq!(order(gk4, "EPSG:31468", false), warp::Grid::Map { lat_first: false });
+        let lv95 = r#"<Layer><CRS>EPSG:2056</CRS><BoundingBox CRS="EPSG:2056" minx="1070000" miny="2480000" maxx="1300000" maxy="2840000"/></Layer>"#;
+        assert_eq!(order(lv95, "EPSG:2056", true), warp::Grid::Map { lat_first: false });
+    }
+
+    /// A tile matrix set keeps the matrices it can read when one can't be (no identifier), and
+    /// past `MAX_MATRICES` its 20 coarsest and 20 finest.
+    #[test]
+    fn a_tile_matrix_set_keeps_what_it_can_read() {
+        let matrix = |id: &str, scale: f64| {
+            format!(
+                "<TileMatrix>{id}<ScaleDenominator>{scale}</ScaleDenominator><TopLeftCorner>2420000 1350000</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>4</MatrixWidth><MatrixHeight>3</MatrixHeight></TileMatrix>"
+            )
+        };
+        let set = |ms: &str| format!("<TileMatrixSet><SupportedCRS>EPSG:2056</SupportedCRS>{ms}</TileMatrixSet>");
+        let xml = set(&(matrix("<Identifier>a</Identifier>", 2_000_000.0) + &matrix("", 1_000_000.0)));
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let (code, _, ms) = native_matrices(&doc.root_element()).unwrap();
+        assert_eq!((code, ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>()), (2056, vec!["a"]));
+        let many: String = (0..50).map(|i| matrix(&format!("<Identifier>{i}</Identifier>"), 1e7 / f64::from(i + 1))).collect();
+        let xml = set(&many);
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let mut ms = native_matrices(&doc.root_element()).unwrap().2;
+        keep_matrices(&mut ms);
+        let ids: Vec<&str> = ms.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!((ids.len(), ids[0], ids[19], ids[20], ids[39]), (40, "0", "19", "30", "49"));
+    }
 
     /// #167: World_Street_Map's map is named "Layers" and titled "Map", and its description is
     /// HTML: the service is named from its address, never from the description.
@@ -3022,17 +3557,78 @@ mod tests {
             "{:?}",
             s.layers[0].offer
         );
-        // An answer that says latitude comes first is turned round; others are left alone.
-        let lat_lon = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[46.5,7.1],[47.0,8.2]]}},{"type":"Feature","properties":{},"geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[45,6]}]}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}}}"#;
-        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(lat_lon).unwrap()).unwrap();
-        assert_eq!(fixed.pointer("/features/0/geometry/coordinates/0").unwrap(), &serde_json::json!([7.1, 46.5]));
-        assert_eq!(fixed.pointer("/features/1/geometry/geometries/0/coordinates").unwrap(), &serde_json::json!([6, 45]));
+    }
+
+    /// #1053: an answer's axes are judged from its positions against the layer's bounds, never
+    /// from the `crs` it names.
+    #[test]
+    fn axes_judged_against_the_layer_bounds() {
+        // IBGE (GeoServer): longitude first, named urn:ogc:def:crs:EPSG::4326. Left alone.
+        let ibge = br#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"v.1","geometry":{"type":"MultiPolygon","coordinates":[[[[-61.9307472,-11.9734947],[-62.8940789,-13.1189419],[-61.886511,-11.827457],[-61.9307472,-11.9734947]]]]},"properties":{"nome":"Rondonia"}},{"type":"Feature","id":"v.2","geometry":{"type":"Point","coordinates":[-35.2,-5.8]},"properties":{}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}},"bbox":[-62.8940789,-13.1189419,-35.2,-5.8]}"#;
+        let brazil = Some([-71.99, -30.51, -34.12, 1.10]);
+        assert!(fix_axes(ibge, brazil).is_none());
+
+        // Latitude first with no crs, as deegree answers when asked in the URN form (RustGIS asks
+        // EPSG:4326). Turned round, a GeometryCollection too; a null geometry and a property
+        // holding numbers are no positions.
+        let hamburg = Some([8.41, 53.40, 10.33, 53.96]);
+        let deegree = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"at":[0,0]},"geometry":{"type":"LineString","coordinates":[[53.55,9.99],[53.6,10.1]]}},{"type":"Feature","properties":{},"geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[53.45,8.5]}]}},{"type":"Feature","properties":{},"geometry":null}]}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(deegree, hamburg).unwrap()).unwrap();
+        assert_eq!(fixed.pointer("/features/0/geometry/coordinates/0").unwrap(), &serde_json::json!([9.99, 53.55]));
+        assert_eq!(fixed.pointer("/features/1/geometry/geometries/0/coordinates").unwrap(), &serde_json::json!([8.5, 53.45]));
+        assert_eq!(fixed.pointer("/features/0/properties/at").unwrap(), &serde_json::json!([0, 0]));
+        // A crs naming the latitude-first order is dropped with the turn.
+        let named = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[53.55,9.99]}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}}}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(named, hamburg).unwrap()).unwrap();
         assert!(fixed.get("crs").is_none());
-        assert!(
-            fix_axes(br#"{"type":"FeatureCollection","features":[],"crs":{"type":"name","properties":{"name":"EPSG:4326"}}}"#).is_none()
-        );
-        assert!(fix_axes(br#"{"type":"FeatureCollection","features":[]}"#).is_none());
-        assert!(fix_axes(b"urn:ogc:def:crs:EPSG::4326 not json").is_none());
+        // A lone feature and a bare geometry.
+        let feature = br#"{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[53.55,9.99]}}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(feature, hamburg).unwrap()).unwrap();
+        assert_eq!(fixed.pointer("/geometry/coordinates").unwrap(), &serde_json::json!([9.99, 53.55]));
+        let geometry = br#"{"type":"Point","coordinates":[53.55,9.99,12.5]}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(geometry, hamburg).unwrap()).unwrap();
+        assert_eq!(fixed.pointer("/coordinates").unwrap(), &serde_json::json!([9.99, 53.55, 12.5]));
+
+        // No bounds: it can't tell, and nothing is turned.
+        assert!(fix_axes(deegree, None).is_none());
+
+        // Fits both ways (near 10°E 10°N, or a layer covering the world): left alone.
+        let both = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[9.8,10.1],[10.2,9.9]]}}]}"#;
+        assert!(fix_axes(both, Some([9.5, 9.5, 10.5, 10.5])).is_none());
+        assert!(fix_axes(deegree, Some([-180.0, -90.0, 180.0, 90.0])).is_none());
+        // Fits neither way: left alone.
+        assert!(fix_axes(deegree, brazil).is_none());
+
+        // Slightly past the bounds, within the margin (a tenth of their size, or half a degree):
+        // it fits as it comes, though only the turned point lies strictly inside.
+        let past = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[12.3,11.0]}}]}"#;
+        assert!(fix_axes(past, Some([10.0, 10.0, 12.0, 14.0])).is_none());
+
+        // Nothing to judge from: no features, not JSON.
+        assert!(fix_axes(br#"{"type":"FeatureCollection","features":[]}"#, hamburg).is_none());
+        assert!(fix_axes(b"urn:ogc:def:crs:EPSG::4326 not json", hamburg).is_none());
+        // Positions under arrays nested deeper than a GeoJSON answer goes aren't read.
+        let deep = format!("{}{{\"type\":\"Point\",\"coordinates\":[53.55,9.99]}}{}", "[".repeat(20), "]".repeat(20));
+        assert!(fix_axes(deep.as_bytes(), hamburg).is_none());
+    }
+
+    /// An OGC API collection's extent is its longitude/latitude bounds only in CRS84 (named, or
+    /// by default), with or without heights: a box in EPSG:4326's latitude-first order would turn
+    /// longitude-first features round (#1053).
+    #[test]
+    fn ogc_api_extent_read_only_in_crs84() {
+        let doc = br#"{"collections": [
+            {"id": "a", "extent": {"spatial": {"bbox": [[8.41, 53.39, 10.34, 53.97]]}}, "links": [{"rel": "items", "href": "https://x.org/collections/a/items"}]},
+            {"id": "b", "extent": {"spatial": {"bbox": [[8.41, 53.39, 10.34, 53.97]], "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}}, "links": [{"rel": "items", "href": "https://x.org/collections/b/items"}]},
+            {"id": "c", "extent": {"spatial": {"bbox": [[8.41, 53.39, -5, 10.34, 53.97, 120]], "crs": "http://www.opengis.net/def/crs/OGC/0/CRS84h"}}, "links": [{"rel": "items", "href": "https://x.org/collections/c/items"}]},
+            {"id": "d", "extent": {"spatial": {"bbox": [[53.39, 8.41, 53.97, 10.34]], "crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}}, "links": [{"rel": "items", "href": "https://x.org/collections/d/items"}]},
+            {"id": "e", "extent": {"spatial": {"bbox": [[8.41, 9.0, 53.39, 10.34, 53.97]]}}, "links": [{"rel": "items", "href": "https://x.org/collections/e/items"}]}]}"#;
+        let s = parse("https://x.org/collections", doc).unwrap();
+        let bbox = |id: &str| s.layers.iter().find(|l| l.name == id).map(|l| l.bbox);
+        let hamburg = Some(Some([8.41, 53.39, 10.34, 53.97]));
+        assert_eq!((bbox("a"), bbox("b"), bbox("c")), (hamburg, hamburg, hamburg));
+        // A box in another system, or of neither four nor six numbers: no bounds.
+        assert_eq!((bbox("d"), bbox("e")), (Some(None), Some(None)));
     }
 
     #[test]
@@ -3363,6 +3959,124 @@ mod tests {
         assert_eq!(photo(&wmts(limits)), Some((8, 17)));
     }
 
+    /// WMTS layers whose tile matrix sets are in another system (#769): swisstopo's LV95, its
+    /// corners east first, and one in longitude/latitude written latitude first (EPSG:4326): read
+    /// as matrices in the system, the layer's address asking for them by `{nm}`, `{ncol}`, `{nrow}`.
+    #[test]
+    fn wmts_layers_in_other_systems() {
+        let caps = r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>
+<Layer><ows:Title>Map</ows:Title><ows:Identifier>map</ows:Identifier>
+ <ows:WGS84BoundingBox><ows:LowerCorner>5.1 45.4</ows:LowerCorner><ows:UpperCorner>11.5 48.2</ows:UpperCorner></ows:WGS84BoundingBox>
+ <Style isDefault="true"><ows:Identifier>default</ows:Identifier></Style>
+ <TileMatrixSetLink><TileMatrixSet>lv95</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/{Style}/{TileMatrixSet}/{TileMatrix}/{TileCol}/{TileRow}.png"/></Layer>
+<Layer><ows:Title>World</ows:Title><ows:Identifier>world</ows:Identifier>
+ <TileMatrixSetLink><TileMatrixSet>geo</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/w/{TileMatrix}/{TileRow}/{TileCol}.png"/></Layer>
+<Layer><ows:Title>Elsewhere</ows:Title><ows:Identifier>odd</ows:Identifier>
+ <TileMatrixSetLink><TileMatrixSet>odd</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/o/{TileMatrix}/{TileRow}/{TileCol}.png"/></Layer>
+<TileMatrixSet><ows:Identifier>lv95</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG:2056</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>21</ows:Identifier><ScaleDenominator>17857.142857142857</ScaleDenominator><TopLeftCorner>2420000.0 1350000.0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>375</MatrixWidth><MatrixHeight>250</MatrixHeight></TileMatrix>
+ <TileMatrix><ows:Identifier>20</ows:Identifier><ScaleDenominator>35714.28571428571</ScaleDenominator><TopLeftCorner>2420000.0 1350000.0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>188</MatrixWidth><MatrixHeight>125</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+<TileMatrixSet><ows:Identifier>geo</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG::4326</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>279541132.0143589</ScaleDenominator><TopLeftCorner>90 -180</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>2</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+<TileMatrixSet><ows:Identifier>odd</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:IAU::49900</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>1000</ScaleDenominator><TopLeftCorner>0 0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>1</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+</Contents></Capabilities>"#;
+        let s = parse("https://t.example.org/WMTSCapabilities.xml", caps.as_bytes()).unwrap();
+        let names: Vec<&str> = s.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["map", "world"], "{:?}", s.notes);
+        assert!(s.notes.iter().any(|n| n.starts_with("1 layers have no tile matrix set")));
+        let read = |i: usize| {
+            let Offer::Tiles { template } = &s.layers[i].offer else { panic!() };
+            let filled = template.replace("{z}/{x}/{y}", "0/0/0");
+            let (base, _, w) = warp::Warp::parse(&filled).unwrap();
+            (base.to_string(), w)
+        };
+        let (base, w) = read(0);
+        assert_eq!(base, "https://t.example.org/default/lv95/{nm}/{ncol}/{nrow}.png");
+        assert_eq!((w.epsg, w.area), (2056, Some([5.1, 45.4, 11.5, 48.2])));
+        let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+        // Coarsest first; 10 m and 5 m pixels; east first.
+        assert_eq!(ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["20", "21"]);
+        assert!((ms[0].cell - 10.0).abs() < 1e-9 && (ms[1].cell - 5.0).abs() < 1e-9);
+        assert_eq!((ms[1].left, ms[1].top, ms[1].cols, ms[1].rows), (2_420_000.0, 1_350_000.0, 375, 250));
+        // Latitude first in the document: read as west, north; its cells in degrees.
+        let (base, w) = read(1);
+        assert_eq!(base, "https://t.example.org/w/{nm}/{nrow}/{ncol}.png");
+        let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+        assert_eq!((w.epsg, ms[0].left, ms[0].top), (4326, -180.0, 90.0));
+        assert!((ms[0].cell - 0.703_125).abs() < 1e-6, "{}", ms[0].cell);
+    }
+
+    /// A WMTS corner is read in EPSG's order even where the layer's box tips the guess the other
+    /// way (swisstopo's LV03 set: its box reaches a little west of the corner), and a
+    /// longitude/latitude corner written longitude first is read so.
+    #[test]
+    fn a_wmts_corner_follows_epsg_axis_order() {
+        let caps = r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>
+<Layer><ows:Title>Map</ows:Title><ows:Identifier>map</ows:Identifier>
+ <ows:WGS84BoundingBox><ows:LowerCorner>5.140242 45.398181</ows:LowerCorner><ows:UpperCorner>11.47757 48.230651</ows:UpperCorner></ows:WGS84BoundingBox>
+ <TileMatrixSetLink><TileMatrixSet>21781_27</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/{TileMatrix}/{TileCol}/{TileRow}.png"/></Layer>
+<Layer><ows:Title>World</ows:Title><ows:Identifier>world</ows:Identifier>
+ <TileMatrixSetLink><TileMatrixSet>geo</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/w/{TileMatrix}/{TileRow}/{TileCol}.png"/></Layer>
+<TileMatrixSet><ows:Identifier>21781_27</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG:21781</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>14285714.285714287</ScaleDenominator><TopLeftCorner>420000.0 350000.0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>1</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+<TileMatrixSet><ows:Identifier>geo</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG::4326</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>279541132.0143589</ScaleDenominator><TopLeftCorner>-180 90</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>2</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+</Contents></Capabilities>"#;
+        let s = parse("https://t.example.org/WMTSCapabilities.xml", caps.as_bytes()).unwrap();
+        let corner = |i: usize| {
+            let Offer::Tiles { template } = &s.layers[i].offer else { panic!() };
+            let (_, _, w) = warp::Warp::parse(&template.replace("{z}/{x}/{y}", "0/0/0")).unwrap();
+            let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+            (w.epsg, ms[0].left, ms[0].top)
+        };
+        assert_eq!(corner(0), (21781, 420_000.0, 350_000.0));
+        assert_eq!(corner(1), (4326, -180.0, 90.0));
+    }
+
+    /// A regional longitude/latitude WMTS corner whose numbers could be either way round: written
+    /// longitude first (`5 50`) as some services do, it misses the layer read latitude first and
+    /// is read longitude first; written latitude first (`50 5`) as the standard has it, it is kept,
+    /// both at 5° E, 50° N. A correct corner is kept even where the other reading would cover
+    /// more of the layer (`50 40` over lon 50..150, lat -60..40: 40° E, 50° N).
+    #[test]
+    fn a_regional_geographic_corner_is_read_by_its_layer() {
+        let caps = |corner: &str, lower: &str, upper: &str, scale: f64| {
+            format!(
+                r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>
+<Layer><ows:Title>Europe</ows:Title><ows:Identifier>europe</ows:Identifier>
+ <ows:WGS84BoundingBox><ows:LowerCorner>{lower}</ows:LowerCorner><ows:UpperCorner>{upper}</ows:UpperCorner></ows:WGS84BoundingBox>
+ <TileMatrixSetLink><TileMatrixSet>geo</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.png"/></Layer>
+<TileMatrixSet><ows:Identifier>geo</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG::4326</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>{scale}</ScaleDenominator><TopLeftCorner>{corner}</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>1</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+</Contents></Capabilities>"#
+            )
+        };
+        let europe = ("5 40", "15 50", 15_902_784.0);
+        let wide = ("50 -60", "150 40", 155_300_628.896_866);
+        for (written, (lower, upper, scale), at) in
+            [("5 50", europe, (5.0, 50.0)), ("50 5", europe, (5.0, 50.0)), ("50 40", wide, (40.0, 50.0))]
+        {
+            let s = parse("https://t.example.org/WMTSCapabilities.xml", caps(written, lower, upper, scale).as_bytes()).unwrap();
+            let Offer::Tiles { template } = &s.layers[0].offer else { panic!() };
+            let (_, _, w) = warp::Warp::parse(&template.replace("{z}/{x}/{y}", "0/0/0")).unwrap();
+            let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+            assert_eq!((ms[0].left, ms[0].top), at, "{written}");
+        }
+    }
+
     #[test]
     fn wms_layers_in_web_mercator() {
         let xml = r#"<?xml version="1.0"?><WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
@@ -3372,20 +4086,41 @@ mod tests {
   <Layer><Name>roads</Name><Title>Roads</Title><EX_GeographicBoundingBox><westBoundLongitude>-10</westBoundLongitude><eastBoundLongitude>20</eastBoundLongitude><southBoundLatitude>35</southBoundLatitude><northBoundLatitude>60</northBoundLatitude></EX_GeographicBoundingBox></Layer>
   <Layer><Name>water bodies</Name></Layer>
 </Layer>
-<Layer><Name>utm only</Name><CRS>EPSG:32633</CRS></Layer></Capability></WMS_Capabilities>"#;
+<Layer><Name>utm only</Name><CRS>EPSG:32633</CRS><BoundingBox CRS="EPSG:32633" minx="500000" miny="5200000" maxx="700000" maxy="5400000"/></Layer>
+<Layer><Name>automatic</Name><CRS>AUTO:42001</CRS></Layer></Capability></WMS_Capabilities>"#;
         let s = parse("https://maps.example.org/wms", xml.as_bytes()).unwrap();
         assert_eq!((s.kind.as_str(), s.title.as_str()), ("WMS", "Demo WMS"));
         let names: Vec<&str> = s.layers.iter().map(|l| l.name.as_str()).collect();
-        assert!(names.contains(&"roads") && names.contains(&"water bodies") && !names.contains(&"utm only"), "{names:?}");
+        assert!(names.contains(&"roads") && names.contains(&"water bodies") && !names.contains(&"automatic"), "{names:?}");
         let roads = s.layers.iter().find(|l| l.name == "roads").unwrap();
         assert_eq!(roads.bbox, Some([-10.0, 35.0, 20.0, 60.0]));
         let Offer::Tiles { template } = &roads.offer else { panic!() };
         assert_eq!(
             template,
-            "https://maps.example.org/wms?map=demo&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=roads&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng&TRANSPARENT=TRUE"
+            "https://maps.example.org/wms?map=demo&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=roads&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng&TRANSPARENT=TRUE\
+             #rustgis-warp={z}/{x}/{y};crs=3857;in=-10,35,20,60;sys=4326|n|EPSG:4326;map=east"
         );
+        // Drawn in Web Mercator as it comes; its other system (latitude first, WMS 1.3.0's
+        // EPSG:4326) kept for a map drawn in it.
+        let tile = |t: &str| t.replace("{z}/{x}/{y}", "0/0/0");
+        let roads_tile = tile(template);
+        let (base, _, w) = warp::Warp::parse(&roads_tile).unwrap();
+        let base = base.to_string();
+        assert!(w.epsg == 3857 && base.contains("CRS=EPSG:3857&BBOX={bbox-epsg-3857}&"));
+        assert_eq!(w.systems, [warp::System { epsg: 4326, name: "EPSG:4326".into(), lat_first: true }]);
+        assert!(warp::Warp::map_template(&base).contains("&CRS={ncrs}&BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}&"));
         let water = s.layers.iter().find(|l| l.name == "water bodies").unwrap();
         assert!(matches!(&water.offer, Offer::Tiles { template } if template.contains("LAYERS=water%20bodies")));
+        // A layer offered only in UTM: in UTM, warped (east first, as its own box says).
+        let utm = s.layers.iter().find(|l| l.name == "utm only").unwrap();
+        let Offer::Tiles { template } = &utm.offer else { panic!() };
+        let filled = tile(template);
+        let (base, _, w) = warp::Warp::parse(&filled).unwrap();
+        assert!(base.contains("&CRS={ncrs}&BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}&"), "{base}");
+        assert_eq!((w.epsg, &w.grid), (32633, &warp::Grid::Map { lat_first: false }));
+        // Its identify asks in UTM too.
+        assert_eq!(utm.feature_info.as_ref().map(|f| f.crs.as_str()), Some("EPSG:32633"));
+        // One in a system RustGIS can't draw is left out, and said so.
         assert!(s.notes.iter().any(|n| n.contains("1 layers")));
     }
 

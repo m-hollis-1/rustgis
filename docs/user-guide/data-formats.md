@@ -173,8 +173,8 @@ Scripts use `service.import {"url":"…","name":"My OGC Layer"}` and
 
 | Service | What it lists | How a layer is added |
 | --- | --- | --- |
-| WMS 1.1.1 / 1.3.0 | Named layers offered in Web Mercator | A tile layer of GetMap images (PNG when the service offers it, else JPEG) |
-| WMTS | Layers whose tile matrix set is Web Mercator's pyramid | A tile layer from the tile template (or KVP GetTile) |
+| WMS 1.1.1 / 1.3.0 | Named layers offered in Web Mercator or in a coordinate system RustGIS can transform (an EPSG code, CRS:84) | A layer of GetMap images (PNG when the service offers it, else JPEG): one picture of the view, or tiles; see [One picture of the view, or tiles](#one-picture-of-the-view-or-tiles) and [Services in other coordinate systems](#services-in-other-coordinate-systems) |
+| WMTS | Layers whose tile matrix set is Web Mercator's pyramid, or a tile matrix set in a coordinate system RustGIS can transform | A tile layer from the tile template (or KVP GetTile) |
 | WFS 1.1 / 2.0 | Feature types | Their features downloaded as GeoJSON, in the output format the service names (up to 50,000) |
 | OGC API Features | Collections | Their items downloaded as GeoJSON, following the service's `next` pages up to 100,000 features (a command such as `service.add` waits a minute at most) |
 | OGC API Tiles | Collections' map and vector tiles; a landing page's dataset map tiles | A tile layer in WebMercatorQuad, from the tile template the tileset advertises (its `item` link; `…/tiles/WebMercatorQuad/{z}/{y}/{x}`, the usual path, when that can't be read), keeping the tiles link's query (a token), map tiles in the server's image format, vector tiles drawn layer by layer in colours of their own |
@@ -199,6 +199,16 @@ A coverage is read once, for the view when it was added (its DescribeCoverage fi
 format and bounds; `service.coverage` gives the GetCoverage address alone). Moving the map doesn't
 ask for it again: add it again for another area. The server reprojects it to EPSG:4326 (WCS 2.0
 through its CRS extension); one that can't answers with an error, which is shown.
+
+A feature type is asked for in CRS84 when it offers it, else in `EPSG:4326`. Every server tried
+answered those requests longitude first, but a server may answer latitude first (deegree does
+when asked in the URN form, `urn:ogc:def:crs:EPSG::4326`). The `crs` a GeoJSON answer names
+doesn't tell the order (GeoServer names its longitude-first answers `urn:ogc:def:crs:EPSG::4326`),
+so the features' positions are turned round only when they miss the layer's longitude/latitude
+bounds from the capabilities and fit them turned (give or take a tenth of the bounds' size, or
+half a degree). An OGC API collection's extent counts as such bounds only in CRS84, the
+standard's default. A layer listed without bounds, or whose features fit both ways, is read as it
+comes.
 
 A WFS, OGC API Features or ArcGIS feature layer comes whole, as in other GIS programs. A large
 one (a country's municipalities, hundreds of megabytes) can be asked for over an area instead:
@@ -231,6 +241,87 @@ never cause a blocking capabilities fetch. Each listed layer includes `source_ur
 and the same documents to `service.add` to distinguish layers with the same name. Discovery
 follows at most four documents and rejects loops and disallowed addresses. Collection lists
 aren't paged. On the desktop, feature downloads follow their `next` pages (see the table above).
+
+### One picture of the view, or tiles
+
+A WMS layer and an ArcGIS map or image service's export draw their pictures on request, for any
+area and size. Added from **Add Service**, the Library or the National Map (its drawn maps; its
+imagery stays in tiles), such a layer is asked for **one picture of the view**: the service lays
+out its symbols and labels over the whole view, so none is cut at a tile edge, and it is asked
+once a view instead of for every tile (#1162). So is one added by its address (`map.addTiles`
+with a GetMap or export address that has its size: `WIDTH` and `HEIGHT`, or `size`), unless
+it's given `"singleImage": false` or a `"tileSize"`.
+
+- The picture reaches past the view, its middle on a grid, so small pans and zooms (most of a
+  quarter of a level) ask for nothing new; while the next picture loads, the last one stays in
+  place.
+- It is asked for in the map's logical pixels, as tiles are, so the service's symbols keep their
+  size on a high-density screen; at most 4096 pixels a side (2048 for five minutes after a larger
+  picture of the layer fails), coarser for a view larger than that. A picture the service fails
+  to draw leaves the layer drawn in tiles there.
+- Nothing is asked for zoomed out past the layer's scale range or outside its bounds, and closer
+  in than its finest zoom its picture there is stretched, as its tiles are.
+- It is drawn so on a flat map, north up or turned, in Web Mercator or in a projection with an
+  EPSG code. The picture is asked for in the map's own system when the service offers it (a
+  map service's export takes any: the service projects it); otherwise in one it does offer
+  (Web Mercator, or the WMS layer's [own system](#services-in-other-coordinate-systems)), and
+  warped into place piece by piece. On the globe, a tilted map, a projection without an EPSG
+  code (the presets), or a Web Mercator or longitude/latitude picture across or near the
+  antimeridian (a little larger than the view, it would cross it; tiles wrap), the layer is
+  drawn in tiles. Exports
+  and layouts ask for their own picture.
+
+Right-click the layer in the Layers pane, **Draw as**, to switch to **Tiles** and back to
+**Single image** (`map.setTiles` with `"singleImage"`). A layer asked for in Web Mercator takes
+tiles of 256, 512 or 1024 pixels (`"tileSize"`): larger tiles cut fewer labels and ask fewer times.
+Tiles are fetched while the map moves, and kept for panning back. A layer in a project saved
+before keeps its tiles until you switch it.
+
+### Services in other coordinate systems
+
+National and regional services often draw their maps in a coordinate system of their own
+(Switzerland's LV95, EPSG:2056; Austria's EPSG:31287) and sometimes not in Web Mercator at all. A
+WMS layer offered in any system with an EPSG code that RustGIS can transform (or in CRS:84), and a
+WMTS layer whose tile matrix set is in one, is listed and added like any other (#769):
+
+- **On a Web Mercator map**, a layer the service offers in Web Mercator is asked for in it, as
+  before. Otherwise a WMS layer drawn as [one picture of the view](#one-picture-of-the-view-or-tiles)
+  is asked for one picture in its own system, warped into place; drawn as tiles (and a WMTS
+  layer), each of the map's tiles is made from what the service gives for its area in the
+  layer's own system, warped into place on your computer: one GetMap image, or the tiles of the
+  WMTS matrix nearest the map's detail (a coarser one where that would take more than 16 tiles;
+  of a set of more than 40 matrices, its 20 coarsest and 20 finest are kept). A WMS layer is
+  asked for in the projected system it lists first, else in CRS:84, else in another
+  longitude/latitude system.
+- **On a map in another projection** (**View › Projection**, `map.projection`) that the layer is
+  offered in, a WMS layer is asked for in that system, as
+  [one picture of the view](#one-picture-of-the-view-or-tiles) or, drawn as tiles, in tiles of its
+  own 256 pixels a side, and drawn as the service draws it: nothing is warped, so its lines and labels stay sharp. A WMTS
+  layer is drawn so on a map in its tile matrix set's system. Change the map's projection and the
+  layer follows: in Web Mercator again, it is asked for in Web Mercator (or warped), and in a
+  projection the layer isn't offered in, it is drawn warped as before. A WMS layer is drawn so in
+  up to 64 of the systems it lists that RustGIS can transform (projected ones first, then
+  CRS:84, then other longitude/latitude ones, each kind in the order listed), and warped in the
+  rest. A tilted map draws every layer warped.
+- **Identify** asks a WMS layer drawn in a system of its own (GetFeatureInfo) in that system.
+- **Axis order.** A WMS 1.3.0 bounding box and a WMTS `TopLeftCorner` are in the order of the
+  system's axes as EPSG defines them, as the standards ask: latitude first in EPSG:4326 and other
+  longitude/latitude systems (not in CRS:84), north first in EPSG:3035 (LAEA Europe), the German
+  Gauss-Krüger zones, SWEREF99 TM, Poland's CS92, Austria's Lambert and the ETRS89 "UTM (N-E)"
+  codes (EPSG:3040 and its neighbours), east first in Web Mercator, the other UTM codes and LV95.
+  RustGIS carries that order for the systems it knows (from the EPSG dataset); for a system newer
+  than its table, the layer's own `BoundingBox` is read the way that holds the layer, and a WMTS
+  corner the way its matrix covers the layer. A longitude/latitude WMTS corner, which services
+  often write longitude first, is read longitude first when its first number can't be a
+  latitude, or when its matrix read in EPSG's order misses the layer and read the other way
+  doesn't; otherwise in EPSG's order.
+
+A layer offered in no system RustGIS can transform (an `AUTO:` system, a planet's) is still left
+out, and the dialog says how many were.
+
+```sh
+rustgis-cli run --cmd 'service.add={"url":"https://wmts.geo.admin.ch/EPSG/2056/1.0.0/WMTSCapabilities.xml","layer":"ch.swisstopo.pixelkarte-farbe"}' --cmd 'map.projection={"type":"EPSG:2056"}' --cmd 'map.goToXY={"lon":7.4474,"lat":46.948,"scale":20000}' --cmd 'share.exportMap={"path":"bern-lv95.png"}'
+```
 
 ### Secured ArcGIS services
 

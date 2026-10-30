@@ -67,7 +67,7 @@ Correct, robust and recoverable, with the foundations other themes stand on.
   AI provider keys and the ChatGPT sign-in's tokens are already kept there).
 - Spatial Join by distance, closest, centre in and largest overlap, with merge rules (sum, mean,
   first…) for one-to-one joins ([#851](https://github.com/opengeos/RustGIS/issues/851)).
-- Vector tools, each writing a new layer: join field (a one-off attribute join), points along lines, check and fix geometry _(open)_; summary fields
+- Vector tools, each writing a new layer: points along lines, check and fix geometry _(open)_; summary fields
   (sum, mean, first…) on Dissolve and Summarize Within _(open)_.
 - Batch runs: one tool over many layers or a folder of files.
 
@@ -219,11 +219,11 @@ Open questions rather than plans; discuss before building.
   relationships, archiving.
 - Analysis: selection by attributes and location; polygon, lasso and radius on the map; overlay
   (clip, erase, split, intersect, identity, union, symmetrical difference, update), proximity
-  (buffer, near) and summary tools, spatial join, feature vertices to points, zonal statistics,
-  A5 grids, kriging, Calculate Geometry with metric or imperial units, and Vector to PMTiles
-  export (#557); guided workflows (viewshed, line of sight, IDW, shortest path, suitability);
-  ModelBuilder on a node canvas, scripts with command, parameter and value completion, and history
-  copied as code; the GeoLibre and Whitebox suite (1,000+ tools) natively and in the browser.
+  (buffer, near) and summary tools, spatial join, join field (non-spatial attribute join), feature
+  vertices to points, zonal statistics, A5 grids, kriging, Calculate Geometry with metric or imperial
+  units, and Vector to PMTiles export (#557); guided workflows (viewshed, line of sight, IDW, shortest
+  path, suitability); ModelBuilder on a node canvas, scripts with command, parameter and value completion,
+  and history copied as code; the GeoLibre and Whitebox suite (1,000+ tools) natively and in the browser.
 - Layouts (map frames, surrounds, map series, publication sheets and figures in one command,
   format panes, guides, snapping, element locking and PDF), reports, presentations and
   notebooks; the web app embeddable in a page (`?embed`).
@@ -236,8 +236,8 @@ Open questions rather than plans; discuss before building.
   documentation built in.
 - The AI Assistant's skills, subagents and ACP clients; MCP over HTTP, an audited loopback
   relay and a file bridge, which let external AI clients drive the app. Database passwords, S3
-  keys and AI provider keys optionally remembered in the desktop OS keychain, where the ChatGPT
-  sign-in keeps its tokens.
+  keys, AI provider keys and the Earthdata Login token optionally remembered in the desktop OS
+  keychain, where the ChatGPT sign-in keeps its tokens.
 - Sandboxed WebAssembly plugins with a registry at plugins.rustgis.app; process plugins that
   run as programs (with Python environments RustGIS makes), in the background with progress and
   Cancel.

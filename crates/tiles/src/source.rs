@@ -328,7 +328,12 @@ fn fetch_json(url: &str) -> Result<Option<Value>, String> {
 /// The tile addresses for a template with `{s}` expanded over its subdomains, and TMS rows
 /// written as `{-y}`.
 fn templates(spec: &Spec) -> Vec<String> {
-    let url = if spec.tms { spec.url.replace("{y}", "{-y}") } else { spec.url.clone() };
+    // (Not in a layer's fragment naming the map tile it is for, `#rustgis-warp=`: #769.)
+    let url = match spec.url.split_once(rustgis_data::ogc::warp::MARK) {
+        Some((base, layout)) if spec.tms => format!("{}{}{layout}", base.replace("{y}", "{-y}"), rustgis_data::ogc::warp::MARK),
+        _ if spec.tms => spec.url.replace("{y}", "{-y}"),
+        _ => spec.url.clone(),
+    };
     if url.contains("{s}") {
         let subs: Vec<String> = if spec.subdomains.is_empty() { vec!["a".into(), "b".into(), "c".into()] } else { spec.subdomains.clone() };
         subs.iter().map(|s| url.replace("{s}", s)).collect()

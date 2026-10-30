@@ -94,6 +94,13 @@ the colour picker's opacity control can also make a fill visible again. By comma
 layer.noFill={"layer":"Countries"}
 ```
 
+A GeoJSON with mixed geometry keeps its points, lines and polygons in one layer, classified by its
+most common geometry family. **No Fill** and the **Fills** editor are also available when that
+layer contains polygons. No Fill leaves point and line symbols unchanged; use the Fills editor
+to change the polygon fill's colour or remove its transparent fill to restore the symbol's fill.
+For layers read in place, these controls recognise polygon features in the currently loaded view
+as well as the layer's declared geometry family.
+
 The ribbon's **Color** control changes Unique Values or Graduated Colors back to Single Symbol.
 To keep the classification, edit a class's colour in the Symbology pane instead. A polygon's
 fill and outline are independent: changing its fill leaves its outline intact.

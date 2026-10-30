@@ -1,6 +1,6 @@
 ---
 name: geoprocessing
-description: Run geoprocessing tools and chain them — buffer, clip, erase, split, dissolve, select by location or attributes, summarize within, summary statistics, simplify, export features, kernel density. Use for "within N km of", "inside", "merge by", "count per", "overlay", "density surface", or any multi-step analysis.
+description: Run geoprocessing tools and chain them — buffer, clip, erase, split, dissolve, join attributes, select by location or attributes, summarize within, summary statistics, simplify, export features, kernel density. Use for "within N km of", "inside", "merge by", "count per", "overlay", "join tables", "density surface", or any multi-step analysis.
 ---
 
 # Geoprocessing
@@ -26,6 +26,8 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
      (`input`, `where`)
    - statistics: `countPoints` (Summarize Within: `polygons`, `points`), `summaryStatistics`
      (`input`, `statistics`, `case`), `pivotTable` (`input`, `fields`, `pivot`, `value`, `statistic`)
+   - joins: `spatialJoin` (`target`, `join`, `match`), `joinField` (`target`, `targetField`,
+     `joinTable`, `joinField`, `fields`, `prefix`, `duplicates`)
    - conversion: `exportFeatures` (`input`, `where`)
    - density: `kernelDensity` (`input`, `field`, `radius`, `pixelSize`, `kernel`, `crs`)
 2. **Run it:** use `run_tool` with layers named in `params`. The output is usually one new layer,

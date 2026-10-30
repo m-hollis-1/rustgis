@@ -22,6 +22,9 @@ app. The codes it lacks (EPSG 9020–20003, `crates/data/src/raster/epsg_gap.rs`
 [terms of use](https://epsg.org/terms-of-use.html)), written as PROJ definitions by PROJ 9.8.
 The Equi7 grids' codes (EPSG 27701–27707, in the same file) are from the dataset's v13.106,
 written as PROJ definitions of its Azimuthal Equidistant method.
+The axis order of those systems (`crates/data/src/raster/epsg_axes.rs`: which are written north
+or latitude first) is from the EPSG Geodetic Parameter Dataset v11.022 (© IOGP, under its terms
+of use), read from the PROJ 9.5.1 database through pyproj 3.7.2.
 The map's ESRI codes (`crates/data/src/raster/esri.rs`) are Esri's projected coordinate systems
 from Esri's [projection-engine-db-doc](https://github.com/Esri/projection-engine-db-doc)
 (Apache-2.0), as imported into the [PROJ](https://proj.org) 9.7.1 database (MIT) and written as

@@ -222,7 +222,9 @@ tile service, **Overlay** ticked in Add Tile Layer) on top of the map's layers w
 every new layer goes. Drag one, or right-click it and choose **Move up** or **Move down**, to put it
 between the map's layers (above a layer group, never inside one). Tick
 one to show or hide it, and right-click it for **Zoom To Layer** (when its bounds are known), opacity,
-**Blend** mode, order and **Remove**.
+**Blend** mode, order and **Remove**; a WMS or map service layer also has **Draw as**: one picture
+of the view or tiles of a size (see
+[One picture of the view, or tiles](data-formats.md#one-picture-of-the-view-or-tiles)).
 A blend mode (Multiply, Screen, Overlay, Darken, Lighten, Difference) combines a tile layer with
 what is drawn beneath it (tile layers, the basemap, and map layers when it's placed over them): stack imagery over a hillshade and set it to Multiply to
 let the terrain show through. Overlays stay over the basemaps; choosing a built-in basemap

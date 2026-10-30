@@ -292,7 +292,7 @@ fn shapeburst(pm: &mut Pixmap, part: &Part, edges: &Path, b: &Burst) {
     }
     let cut = [bx.left() < lo_x, bx.top() < lo_y, bx.right() > hi_x, bx.bottom() > hi_y];
     let (l, t, r, btm) = (bx.left().max(lo_x), bx.top().max(lo_y), bx.right().min(hi_x), bx.bottom().min(hi_y));
-    if !(r > l && btm > t) || !(l.is_finite() && t.is_finite() && r.is_finite() && btm.is_finite()) {
+    if !(r > l && btm > t && l.is_finite() && t.is_finite() && r.is_finite() && btm.is_finite()) {
         return;
     }
     // A cell and a pixel beyond each uncut side: a cell's middle past the edge, at any scale.

@@ -147,8 +147,14 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   nothing there, such as an empty one, is left out, in layouts saved before this too. Tick **All
   classes** in its properties (`"allClasses": true`) to list every class of every visible layer
   instead, and **Hide other values** (`"hideOther": true`) to leave `<all other values>` out of
-  the legend in either mode (the features it stands for are still drawn). Its **Layers** section
-  has a checkbox for each layer of the frame's map: untick one to leave it out of the legend
+  the legend in either mode (the features it stands for are still drawn). A visible WMS or WMTS
+  layer with a legend is listed by its name over its service's legend picture, the one for the
+  frame's scale (as the Layers pane shows it), a pixel a point and narrowed to fit the legend's
+  width, in the order the map draws its layers (as the Layers pane lists them); one whose picture
+  can't be loaded (or is wider or taller than 2048 pixels) is left out. Exporting waits up to
+  half a minute for the pictures, as it waits for the map's tiles; in the browser the page is
+  drawn with those that have arrived, and again as the others arrive. Its **Layers** section
+  has a checkbox for each layer of the frame's map (and each WMS or WMTS layer with a legend): untick one to leave it out of the legend
   while the map still draws it (a mask, a highlight, a basemap-like layer). Scripts give the same
   with `"exclude": ["Graticule"]` on `layout.addElement` or `layout.update` (`[]` lists every
   layer again); a renamed layer stays left out.

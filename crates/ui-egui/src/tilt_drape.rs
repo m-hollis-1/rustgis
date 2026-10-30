@@ -166,10 +166,12 @@ impl TiltDrape {
         let ctx = ctx.clone();
         let work = std::panic::AssertUnwindSafe(work);
         let spawned = std::thread::Builder::new().name("rustgis-tilt-drape".into()).spawn(move || {
-            // Without an answer (a panic) `take` finds the channel closed.
+            // Without an answer (a panic) `take` finds the channel closed. It is closed before the
+            // frame is woken, so the woken frame finds the job over, not still running.
             if let Ok(done) = std::panic::catch_unwind(work) {
                 let _ = tx.send(done);
             }
+            drop(tx);
             ctx.request_repaint();
         });
         if spawned.is_ok() {
@@ -799,6 +801,34 @@ mod tests {
         assert!(d.prepare(&ctx, &mut m, key, 0, 800.0, 600.0, 1.0, 0.2));
         assert!(!d.busy());
         assert!(covers(&m.camera, 800.0, 600.0, d.drape.as_ref().map(|d| &d.bands[..]).unwrap_or_default()));
+    }
+
+    /// The frame a worker's panic wakes finds the job over (its map change marked failed): the
+    /// worker closes the channel before it wakes the frame, so no wake-up is lost. (The callback
+    /// holds the worker until the test has looked.)
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_frame_a_panic_wakes_finds_the_job_over() {
+        let ctx = egui::Context::default();
+        let (woken, wake) = std::sync::mpsc::channel::<()>();
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let (woken, gate) = (std::sync::Mutex::new(woken), std::sync::Mutex::new(gate));
+        ctx.set_request_repaint_callback(move |_| {
+            if let Ok(w) = woken.lock() {
+                let _ = w.send(());
+            }
+            if let Ok(g) = gate.lock() {
+                let _ = g.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        });
+        let key = DrapeKey { rev: 0, sources: 0 };
+        let mut m = tilted(60.0);
+        let mut d = TiltDrape::default();
+        assert!(d.start_with(&ctx, key, || panic!("the renderer failed")));
+        assert!(wake.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "never woken");
+        assert!(d.take(&mut m).is_none());
+        assert!(!d.busy() && d.failed == Some(key), "the woken frame found the job still running");
+        drop(open);
     }
 
     /// A drape that can't be drawn on the UI thread either keeps the last one: the panic doesn't

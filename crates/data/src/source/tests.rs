@@ -374,6 +374,35 @@ fn geopackage_in_memory() {
 }
 
 #[test]
+fn geopackage_in_memory_handles_mutated_headers() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("mutated.gpkg");
+    write_gpkg(&path, false);
+    let original = std::fs::read(path).unwrap();
+    let mut offsets: Vec<usize> = (0..100).collect();
+    // SQLite pages have a short header; exercise the beginning of each one.
+    for page in (4096..original.len()).step_by(4096) {
+        offsets.extend(page..(page + 12).min(original.len()));
+    }
+    // Exercise flags and envelope metadata in actual GeoPackage geometry blobs.
+    let geometries: Vec<_> =
+        original.windows(4).enumerate().filter_map(|(i, bytes)| (bytes == b"GP\x00\x03").then_some(i)).take(3).collect();
+    assert_eq!(geometries.len(), 3);
+    for i in geometries {
+        offsets.extend(i..i + 8);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    for offset in offsets {
+        let mut bytes = original.clone();
+        bytes[offset] ^= 0xff;
+        if let Ok(source) = gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(bytes)), None) {
+            let _ = source.read(&Request::all());
+        }
+    }
+}
+
+#[test]
 fn an_unknown_coordinate_system_is_reported() {
     let p = dir().join("unknown_crs.gpkg");
     write_gpkg(&p, true);

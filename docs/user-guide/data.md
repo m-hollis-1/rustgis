@@ -86,10 +86,10 @@ Open a feature layer's table with ++ctrl+t++ (++cmd+t++ on macOS), **Home › Se
 or **Attribute Table** on a feature layer's **Data** tab (`table.open`). Rows and map selections stay in sync.
 Standalone tables open from their right-click menu; their cells are read only. See [The attribute table](analysis.md#the-attribute-table) for
 sorting, filtering, selection and the SQL `WHERE` clause syntax used by **Select By Attributes**
-and **Definition Query**. These clauses filter a layer; they are not DuckDB queries.
+and **Definition Query** (the full grammar is in [Expressions](expressions.md)). These clauses filter a layer; they are not DuckDB queries.
 
 For an editable feature layer, double-click a cell to change it. The table's toolbar also adds
-fields, calculates field expressions and opens **Calculate Geometry** (`edit.calculateGeometry`).
+fields, calculates field [expressions](expressions.md) and opens **Calculate Geometry** (`edit.calculateGeometry`).
 The geometry calculator fills a new double field or an existing numeric field with area,
 perimeter, length or point X/Y, for all or selected features. Point coordinates can be WGS 84
 degrees or a supported projected EPSG system's units. See [Editing](editing.md) for field
@@ -570,7 +570,9 @@ Data Sources** also opens it) gathers the places data comes from:
   edit, test, duplicate, copy its address or remove it.
 - **Library**: well-known public sources: OpenStreetMap tiles, EOX Sentinel-2 cloudless and
   NASA GIBS (WMTS), USGS imagery, topographic and hydrography maps (ArcGIS), GEBCO bathymetry
-  (WMS), swisstopo's maps and imagery (geo.admin.ch, WMTS), Earth Search and Planetary Computer (STAC), and the Natural Earth sample layers.
+  (WMS), swisstopo's maps and imagery (geo.admin.ch) as WMTS tiles and as a WMS (most of its
+  layers answer Identify), Earth Search and Planetary Computer (STAC), and the Natural Earth
+  sample layers.
 
 A click on a file, a web address, a tile layer or a sample adds it at once. The lists are kept
 with the app's preferences, never in a project. They hold no secrets: a web address loses its

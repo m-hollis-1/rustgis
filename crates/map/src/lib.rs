@@ -8,6 +8,7 @@ pub mod design;
 pub mod effects;
 pub mod fills;
 pub mod geolibre;
+mod geometry_kinds;
 pub mod globe;
 pub mod graphics;
 pub mod layout;
@@ -223,6 +224,9 @@ pub struct Layer {
     /// Allocation identities and byte totals, shared with render snapshots without retaining rows.
     #[serde(skip)]
     view_memory: view_memory::Cache,
+    /// Geometry families in the current rows, invalidated by copy-on-write edits and window reads.
+    #[serde(skip)]
+    geometry_kinds: geometry_kinds::Cache,
     /// Bumped whenever geometry changes so caches rebuild.
     #[serde(default)]
     pub geometry_rev: u64,
@@ -386,6 +390,7 @@ impl Layer {
             projected_for: String::new(),
             geometry_rev: 0,
             view_memory: Default::default(),
+            geometry_kinds: Default::default(),
         }
     }
 
@@ -644,6 +649,13 @@ impl Layer {
 
     pub fn geometry_type(&self) -> GeometryType {
         self.dataset.geometry_type
+    }
+
+    /// The declared family or one present in the loaded features. A mixed layer's dominant
+    /// family does not describe every feature; streamed layers also expose their current window.
+    /// Derived from row allocation identity, so repeated UI checks do not rescan the layer.
+    pub fn has_geometry(&self, kind: GeometryType) -> bool {
+        kind != GeometryType::None && (self.geometry_type() == kind || self.geometry_kinds.contains(&self.dataset.features, kind))
     }
 
     /// Copies of every geometry in a map projection's coordinates (`key` names the projection),

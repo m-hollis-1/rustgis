@@ -442,7 +442,8 @@ the folders and items of a web service. Declare it in `plugin.json`:
   declared labels, at most 16; `open` always comes first in the menu, once, whether or not
   `menu` lists it. Every name must be one of the plugin's own commands.
 - `search: true` puts a search box above the section's nodes. What is typed goes with every
-  `browse` request as `query`, and changing it drops the levels RustGIS has kept for the section.
+  `browse` request as `query`. Once the text has stayed the same for 300 ms, RustGIS drops the
+  levels it has kept for the section and reads them again; open branches stay open.
   The plugin decides what the query means.
 - A plugin may have `browser` with or without `panel` and `tab`. The section shows for enabled
   plugins, in plugin id order, after Folder Connections.

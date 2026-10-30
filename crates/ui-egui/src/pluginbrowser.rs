@@ -4,16 +4,19 @@
 //! A level is read on a background thread (`plugin.browse`'s `BrowseJob` runs off the frame),
 //! one at a time; the frame shows a spinner for it and [`poll`] lands the answer. In the
 //! browser (wasm) there are no threads, so the job runs inline. The answers are kept until the
-//! section is refreshed, its search text changes or the loaded plugins do.
+//! section is refreshed, its search text changes (and then stays the same for 300 ms) or the
+//! loaded plugins do. Open branches stay open through all but the last, and read again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use egui::collapsing_header::CollapsingState;
 use egui::{Label, RichText, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::cmd::plugin_browse;
 use rustgis_engine::plugins::{self, BrowserDecl, BrowserNode, Listing, Plugin};
 use serde_json::json;
+use web_time::Instant;
 
 use crate::theme::{Tokens, semibold};
 use crate::{RustGisApp, Slot, i18n, icons};
@@ -25,6 +28,8 @@ type Key = (String, String);
 const INDENT: f32 = 14.0;
 /// The size of a row's icon.
 const ICON: f32 = 16.0;
+/// How long the search text must stay the same before the section is read again with it.
+const SETTLE: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 pub struct State {
@@ -35,6 +40,8 @@ pub struct State {
     selected: Option<Key>,
     /// What each section's search box holds.
     query: HashMap<String, String>,
+    /// When each section's search text last changed, while the read with it waits to settle.
+    typed: HashMap<String, Instant>,
     /// The fetch under way (one at a time).
     running: Option<Running>,
     /// The loaded plugins ([`plugins::revision`]) the entries were read from.
@@ -113,11 +120,17 @@ fn take<T>(slot: &Slot<T>) -> Option<T> {
     slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
-/// Forgets what plugin `plugin`'s section has read, so it reads again.
+/// How long is left, at `now`, before a search changed at `changed` is read; `None` once it is due.
+pub(crate) fn settle_left(changed: Instant, now: Instant) -> Option<Duration> {
+    SETTLE.checked_sub(now.saturating_duration_since(changed)).filter(|d| !d.is_zero())
+}
+
+/// Forgets what plugin `plugin`'s section has read, so it reads again. The open branches stay
+/// open and read again too; only Collapse All closes them.
 pub fn refresh(app: &mut RustGisApp, plugin: &str) {
     let st = &mut app.ui.plugin_browser;
     st.entries.retain(|k, _| k.0 != plugin);
-    st.open.retain(|k| k.0 != plugin);
+    st.typed.remove(plugin);
     if st.selected.as_ref().is_some_and(|k| k.0 == plugin) {
         st.selected = None;
     }
@@ -142,6 +155,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     sections.sort_by(|a, b| a.0.manifest.id.cmp(&b.0.manifest.id));
     for (p, decl) in sections {
         let id = p.manifest.id.as_str();
+        // A search read again once the text has stayed the same a moment, without waiting for input.
+        if let Some(&changed) = app.ui.plugin_browser.typed.get(id) {
+            match settle_left(changed, Instant::now()) {
+                None => refresh(app, id),
+                Some(left) => ui.ctx().request_repaint_after(left),
+            }
+        }
         let title = p.manifest.translate(lang, &decl.label);
         // The section's icon, then its title: a header of our own, as the connection tree's folders have.
         let cid = ui.make_persistent_id(("pluginbrowser", id));
@@ -163,7 +183,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if decl.search {
                 let query = app.ui.plugin_browser.query.entry(id.to_string()).or_default();
                 if crate::widgets::search_field(ui, query, tl!("Search")).changed() {
-                    refresh(app, id);
+                    app.ui.plugin_browser.typed.insert(id.to_string(), Instant::now());
+                    ui.ctx().request_repaint_after(SETTLE);
                 }
             }
             level(app, ui, t, &p, &decl, lang, &[], 0);
@@ -404,6 +425,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         st.epoch += 1;
         st.revision = now;
         st.query.retain(|id, _| listed(id));
+        st.typed.retain(|id, _| listed(id));
     }
     if let Some(result) = st.running.as_ref().and_then(|r| take(&r.slot))
         && let Some(run) = st.running.take()
@@ -481,6 +503,15 @@ mod tests {
         let out = tree(&listing, &open);
         assert_eq!(out.len(), MAX_DEPTH + 1);
         assert_eq!(out.last().map(String::as_str), Some(format!("{MAX_DEPTH}:{}!", "x".repeat(MAX_DEPTH + 1)).as_str()));
+    }
+
+    #[test]
+    fn a_search_is_read_once_it_settles() {
+        let t = Instant::now();
+        assert_eq!(settle_left(t, t), Some(SETTLE));
+        assert_eq!(settle_left(t, t + Duration::from_millis(100)), Some(Duration::from_millis(200)));
+        assert_eq!(settle_left(t, t + SETTLE), None);
+        assert_eq!(settle_left(t, t + Duration::from_secs(5)), None);
     }
 
     #[test]

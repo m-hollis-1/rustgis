@@ -20,10 +20,11 @@ use super::{Document, Report, flag, num, str_of, typed};
 use crate::color::{Ramp, Rgba};
 use crate::fills::FillLayer;
 use crate::layout::TextAlign;
-use crate::qgis::Style;
+use crate::qgis::symbol::{hidden as hidden_symbol, stacked};
+use crate::qgis::{QGIS_SCALE, Style};
 use crate::symbology::{
-    DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, LabelPlacement, Labeling, LineStroke, MAX_LABEL_CLASSES, Marker, Renderer,
-    Symbol,
+    DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, LabelPlacement, Labeling, LineStroke, MAX_LABEL_CLASSES, Marker, OTHER_VALUES,
+    Renderer, Symbol,
 };
 
 /// The most layers read from one map.
@@ -74,7 +75,7 @@ pub fn read_map(doc: &Document, uri: &str, report: &mut Report) -> Result<MapImp
         ["latestWkid", "wkid"].iter().find_map(|k| s.get(*k).and_then(Value::as_u64).and_then(|w| u32::try_from(w).ok()).filter(|w| *w > 0))
     });
     let extent = map.get("defaultExtent").and_then(|e| Some([num(e, "xmin")?, num(e, "ymin")?, num(e, "xmax")?, num(e, "ymax")?]));
-    let mut reader = Reader { doc, report, map: &name, layers: Vec::new(), visits: 0 };
+    let mut reader = Reader { doc, report, map: &name, layers: Vec::new(), visits: 0, capped: false, exhausted: false };
     reader.list(map, true, 0);
     let layers = reader.layers;
     Ok(MapImport { name, wkid, extent, layers })
@@ -88,6 +89,9 @@ struct Reader<'a> {
     map: &'a str,
     layers: Vec<LayerImport>,
     visits: usize,
+    /// Whether the notes that the layer cap and the visit budget were reached are made.
+    capped: bool,
+    exhausted: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -102,11 +106,15 @@ impl<'a> Reader<'a> {
     fn layer(&mut self, entry: &'a Value, visible: bool, depth: usize) {
         self.visits += 1;
         if self.layers.len() >= MAX_LAYERS {
-            self.report.skipped(self.map, format!("layers past the first {MAX_LAYERS}"));
+            if !std::mem::replace(&mut self.capped, true) {
+                self.report.skipped(self.map, format!("layers past the first {MAX_LAYERS}"));
+            }
             return;
         }
         if self.visits > MAX_VISITS {
-            self.report.skipped(self.map, "more layers and groups than can be followed");
+            if !std::mem::replace(&mut self.exhausted, true) {
+                self.report.skipped(self.map, "more layers and groups than can be followed");
+            }
             return;
         }
         let (def, uri) = match entry {
@@ -173,9 +181,10 @@ fn feature_layer(def: &Value, name: String, visible: bool, report: &mut Report) 
 
     let mut style = Style { transparency: num(def, "transparency").map(|t| (t as f32).clamp(0.0, 100.0)), ..Style::default() };
     // Pro's minScale is the out-beyond limit, as RustGIS's min_scale is; a missing or 0 limit
-    // clears it (as the QGIS reader does).
+    // clears it (as the QGIS reader does). Pro works its scales out at 96 dpi as QGIS does, so
+    // they take the same factor to RustGIS's 0.28 mm pixels.
     if def.get("minScale").is_some() || def.get("maxScale").is_some() {
-        let scale = |k: &str| num(def, k).filter(|s| *s > 0.0);
+        let scale = |k: &str| num(def, k).filter(|s| *s > 0.0).map(|s| s * QGIS_SCALE);
         style.min_scale = Some(scale("minScale"));
         style.max_scale = Some(scale("maxScale"));
     }
@@ -201,9 +210,15 @@ fn connection(c: &Value, what: &str, report: &mut Report) -> (Option<String>, Op
         report.skipped(what, format!("a {} connection with no folder or no dataset, nothing to open", shown(factory)));
         return (None, None, origin);
     }
+    // A dataset is a name inside the folder, never a path out of it.
+    if dataset.contains(['/', '\\']) || dataset.contains("..") {
+        report.skipped(what, format!("a dataset named {}, which isn't a plain name, nothing to open", shown(dataset)));
+        return (None, None, origin);
+    }
     if factory.eq_ignore_ascii_case("Shapefile") {
         let folder = database.trim_end_matches(['/', '\\']);
         let sep = if folder.contains('\\') { '\\' } else { '/' };
+        // (Pro writes a shapefile's dataset with its .shp; one without is the shapefile's name.)
         let file = if dataset.contains('.') { dataset.to_string() } else { format!("{dataset}.shp") };
         (Some(format!("{folder}{sep}{file}")), None, origin)
     } else if factory.eq_ignore_ascii_case("FileGDB") {
@@ -235,21 +250,15 @@ struct Look {
 
 /// Nothing drawn.
 fn hidden() -> Look {
-    Look {
-        symbol: Symbol { fill: CLEAR, stroke: CLEAR, stroke_width: 0.0, size: 0.0, marker: Marker::Circle },
-        strokes: Vec::new(),
-        fills: Vec::new(),
-    }
-}
-
-/// Whether the strokes say more than the symbol's single line does.
-fn stacked(strokes: &[LineStroke]) -> bool {
-    strokes.len() > 1 || strokes.iter().any(|s| s.offset != 0.0 || s.dash.is_some() || s.markers.is_some())
+    Look { symbol: hidden_symbol(), strokes: Vec::new(), fills: Vec::new() }
 }
 
 /// A polygon, line or point symbol (or the `CIMSymbolReference` holding one) as a [`Look`].
 fn look(v: &Value, what: &str, report: &mut Report) -> Option<Look> {
-    let s = symbol_of(v)?;
+    let Some(s) = symbol_of(v) else {
+        report.skipped(what, "symbols that can't be read, left out");
+        return None;
+    };
     match str_of(s, "type") {
         Some("CIMPolygonSymbol") => {
             let p = symbol::polygon(s, what, report);
@@ -285,21 +294,31 @@ fn look(v: &Value, what: &str, report: &mut Report) -> Option<Look> {
             report.skipped(what, format!("{} symbols, left out", shown(other)));
             None
         }
-        None => None,
+        None => {
+            report.skipped(what, "symbols with no type, left out");
+            None
+        }
     }
 }
 
 /// Sets `style`'s renderer (and the strokes and fills that go with it) from a layer's renderer.
 fn renderer(r: &Value, what: &str, style: &mut Style, report: &mut Report) {
     let done = match str_of(r, "type") {
-        Some("CIMSimpleRenderer") => match r.get("symbol").and_then(|s| look(s, what, report)) {
-            Some(l) => {
-                style.line_strokes = Some(l.strokes);
-                style.fill_layers = Some(l.fills);
-                style.renderer = Some(Renderer::Single(l.symbol));
-                true
+        Some("CIMSimpleRenderer") => match r.get("symbol") {
+            // (A symbol that can't be read is noted by `look`.)
+            Some(s) => match look(s, what, report) {
+                Some(l) => {
+                    style.line_strokes = Some(l.strokes);
+                    style.fill_layers = Some(l.fills);
+                    style.renderer = Some(Renderer::Single(l.symbol));
+                    true
+                }
+                None => false,
+            },
+            None => {
+                report.skipped(what, "simple renderers with no symbol, drawn with a default symbol");
+                false
             }
-            None => false,
         },
         Some("CIMUniqueValueRenderer") => unique(r, what, style, report),
         Some(other) => {
@@ -363,7 +382,12 @@ fn unique(r: &Value, what: &str, style: &mut Style, report: &mut Report) -> bool
     }
     // The default symbol draws the rest only where the renderer says to use it.
     let other = if flag(r, "useDefaultSymbol", false) { r.get("defaultSymbol").and_then(|s| look(s, what, report)) } else { None };
+    if classes.is_empty() && other.is_none() {
+        report.skipped(what, "unique value renderers with no class to read and no default symbol, nothing drawn");
+    }
     let other = other.unwrap_or_else(hidden);
+    // The default's legend label, unless it is the usual one.
+    let other_label = str_of(r, "defaultLabel").map(str::trim).filter(|l| !l.is_empty() && *l != OTHER_VALUES).map(str::to_string);
     style.line_strokes = Some(Vec::new());
     style.fill_layers = Some(Vec::new());
     style.renderer = Some(Renderer::Unique {
@@ -372,7 +396,7 @@ fn unique(r: &Value, what: &str, style: &mut Style, report: &mut Report) -> bool
         other: other.symbol,
         ramp: Ramp::default(),
         class_labels,
-        other_label: None,
+        other_label,
         class_strokes,
         other_strokes: other.strokes,
         class_fills,
@@ -404,7 +428,7 @@ fn labels(def: &Value, what: &str, report: &mut Report) -> Option<Labeling> {
     }
     let enabled = flag(def, "labelVisibility", false);
     // One class is the Default class; several are classes of their own, with Default (a hidden
-    // copy of the first) switched off, as the QGIS reader has it.
+    // copy of the first) switched off. (The twin of how `qgis/labels.rs::read` composes them.)
     if classes.len() == 1 {
         let mut default = classes.pop()?;
         default.name = DEFAULT_LABEL_CLASS.into();
@@ -442,7 +466,8 @@ fn label_class(c: &Value, what: &str, report: &mut Report) -> Option<LabelClass>
     let halo = halo_symbol.is_some() && halo_size.is_some();
     let halo_color = halo_symbol.filter(|_| halo).and_then(|h| symbol::polygon(h, what, report).fill);
     let halo_width = halo_size.filter(|_| halo).map(|s| f64::from(pt96(s)).clamp(*HALO_WIDTH.start(), *HALO_WIDTH.end()) as f32);
-    let scale = |k: &str| num(c, k).filter(|s| *s > 0.0);
+    // (Scales at 96 dpi, as the layer's: see `feature_layer`.)
+    let scale = |k: &str| num(c, k).filter(|s| *s > 0.0).map(|s| s * QGIS_SCALE);
     Some(LabelClass {
         name: str_of(c, "name").unwrap_or_default().to_string(),
         visible: flag(c, "visibility", true),

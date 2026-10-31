@@ -1954,7 +1954,10 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     let c = &map.layers[1];
     assert_eq!(c.path.as_deref(), Some(r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN\Counties.shp"));
     assert_eq!(c.style.transparency, None);
-    assert_eq!((c.style.min_scale, c.style.max_scale), (Some(Some(5_000_000.0)), Some(None)));
+    // Pro's scales are at 96 dpi, as QGIS's are.
+    let min = c.style.min_scale.flatten().unwrap();
+    assert!((min - 5_000_000.0 * crate::qgis::QGIS_SCALE).abs() < 1e-6, "{min}");
+    assert_eq!(c.style.max_scale, Some(None));
     assert!(c.style.labels.is_none());
     let Some(Renderer::Single(sym)) = &c.style.renderer else { panic!() };
     assert_eq!((sym.fill, sym.stroke_width), (Rgba::rgb(200, 100, 0), 0.0));
@@ -2021,7 +2024,7 @@ fn unique_value_renderers_read_their_classes() {
     let grey = polygon_symbol(vec![solid_fill(rgb(128, 128, 128))]);
     let mut hidden = unique_class("Hidden", &["H"], blue.clone());
     hidden["visible"] = json!(false);
-    let zones = feature_layer(
+    let mut zones = feature_layer(
         "Zones",
         standard_connection("FileGDB", r"DATABASE=C:\data\zones.gdb", "Zones"),
         json!({"renderer": unique_renderer(
@@ -2035,12 +2038,14 @@ fn unique_value_renderers_read_their_classes() {
             Some(grey.clone()),
         )}),
     );
+    zones["renderer"]["defaultLabel"] = json!(" Everything else ");
     // No default symbol: the rest is not drawn. Two fields: the first.
-    let two = feature_layer(
+    let mut two = feature_layer(
         "Two",
         standard_connection("FileGDB", r"DATABASE=C:\data\zones.gdb", "Two"),
         json!({"renderer": unique_renderer(&["A", "B"], vec![unique_class("x", &["1"], blue)], None)}),
     );
+    two["renderer"]["defaultLabel"] = json!("<all other values>");
     // A line's classes with stacked strokes keep them.
     let road = |w: f64, c: serde_json::Value| solid_stroke(c, w);
     let roads = feature_layer(
@@ -2058,7 +2063,8 @@ fn unique_value_renderers_read_their_classes() {
     let uris = ["CIMPATH=new_detail_map/zones.json", "CIMPATH=new_detail_map/two.json", "CIMPATH=new_detail_map/roads.json"];
     let (map, report) = read_new_detail_map(&map_document(&[zones, two, roads], &uris));
 
-    let Some(Renderer::Unique { field, classes, other, class_labels, class_strokes, class_fills, .. }) = &map.layers[0].style.renderer
+    let Some(Renderer::Unique { field, classes, other, other_label, class_labels, class_strokes, class_fills, .. }) =
+        &map.layers[0].style.renderer
     else {
         panic!("{:?}", map.layers[0].style.renderer)
     };
@@ -2070,14 +2076,16 @@ fn unique_value_renderers_read_their_classes() {
     assert_eq!(classes[1].1.fill, Rgba::rgb(0, 0, 255));
     assert_eq!(classes[4].1.fill.a(), 0, "a class switched off draws nothing");
     assert_eq!(other.fill, Rgba::rgb(128, 128, 128));
+    assert_eq!(other_label.as_deref(), Some("Everything else"));
     // A label only where it isn't the value.
     assert_eq!(class_labels.get("R").map(String::as_str), Some("Residential"));
     assert_eq!(class_labels.get("B2").map(String::as_str), Some("Business"));
     assert!(!class_labels.contains_key("C"));
     assert!(class_strokes.is_empty() && class_fills.is_empty());
 
-    let Some(Renderer::Unique { field, other, .. }) = &map.layers[1].style.renderer else { panic!() };
+    let Some(Renderer::Unique { field, other, other_label, .. }) = &map.layers[1].style.renderer else { panic!() };
     assert_eq!(field, "A");
+    assert_eq!(*other_label, None, "the usual label is not kept");
     assert_eq!(other.fill.a(), 0);
     assert_eq!(other.stroke.a(), 0);
     assert!(notes(&report).iter().any(|n| n.starts_with("Two: ") && n.contains("2 fields")), "{:?}", notes(&report));
@@ -2120,7 +2128,8 @@ fn label_classes_read_their_expressions_text_and_ranges() {
     assert_eq!(fields, ["NAME", "POP", "CODE", "ID", "FIRST"]);
     assert_eq!(labels.classes[0].name, "Names");
     assert_eq!(labels.classes[0].size, 12.0);
-    assert_eq!((labels.classes[1].min_scale, labels.classes[1].max_scale), (Some(100_000.0), Some(5000.0)));
+    let (min, max) = (labels.classes[1].min_scale.unwrap(), labels.classes[1].max_scale.unwrap());
+    assert!((min - 100_000.0 * crate::qgis::QGIS_SCALE).abs() < 1e-6 && (max - 5000.0 * crate::qgis::QGIS_SCALE).abs() < 1e-6);
     assert_eq!((labels.classes[0].min_scale, labels.classes[0].max_scale), (None, None));
     assert!(!labels.classes[2].visible);
     // Several classes: the default is a hidden copy of the first.
@@ -2306,6 +2315,8 @@ fn maps_and_groups_are_bounded() {
     let (map, report) = read_new_detail_map(&map_document(&layers, &uris));
     assert_eq!(map.layers.len(), 500);
     assert!(notes(&report).iter().any(|n| n.contains("500")), "{:?}", notes(&report));
+    let past: Vec<_> = report.notes.iter().filter(|n| n.text.contains("layers past")).collect();
+    assert_eq!(past.iter().map(|n| n.count).collect::<Vec<_>>(), [1], "noted once, not per layer");
 
     // Groups nested in groups end somewhere.
     let groups: Vec<serde_json::Value> = (0..100)
@@ -2316,4 +2327,37 @@ fn maps_and_groups_are_bounded() {
         .collect();
     let (map, _) = read_new_detail_map(&map_document(&groups, &["CIMPATH=new_detail_map/g0.json"]));
     assert!(map.layers.len() <= 500);
+}
+
+#[test]
+fn unreadable_symbols_empty_renderers_and_odd_datasets_are_noted() {
+    use crate::symbology::Renderer;
+    let shp = |dataset: &str| standard_connection("Shapefile", "DATABASE=/d", dataset);
+    let no_symbol = feature_layer("NoSymbol", shp("a.shp"), json!({"renderer": {"type": "CIMSimpleRenderer"}}));
+    let typeless = feature_layer("Typeless", shp("b.shp"), json!({"renderer": simple_renderer(json!({"symbolLayers": []}))}));
+    let empty = feature_layer("Empty", shp("c.shp"), json!({"renderer": unique_renderer(&["F"], vec![], None)}));
+    let up = feature_layer("Up", shp("../secret.shp"), json!({}));
+    let deep = feature_layer("Deep", shp(r"sub\d.shp"), json!({}));
+    let uris = ["nosymbol", "typeless", "empty", "up", "deep"].map(|n| format!("CIMPATH=new_detail_map/{n}.json"));
+    let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+    let (map, report) = read_new_detail_map(&map_document(&[no_symbol, typeless, empty, up, deep], &uris));
+    // A symbol that can't be read still leaves a layer that draws.
+    assert!(matches!(map.layers[0].style.renderer, Some(Renderer::Single(_))));
+    assert!(matches!(map.layers[1].style.renderer, Some(Renderer::Single(_))));
+    assert!(matches!(map.layers[2].style.renderer, Some(Renderer::Unique { .. })));
+    assert_eq!((map.layers[3].path.as_deref(), map.layers[4].path.as_deref()), (None, None));
+    let n = notes(&report);
+    for expected in [
+        "NoSymbol: simple renderers with no symbol, drawn with a default symbol",
+        "Typeless: symbols with no type, left out",
+        "Empty: unique value renderers with no class to read and no default symbol, nothing drawn",
+    ] {
+        assert!(
+            n.iter().any(|t| t == expected),
+            "{expected}
+{n:?}"
+        );
+    }
+    assert!(n.iter().any(|t| t.starts_with("Up: ") && t.contains("secret")), "{n:?}");
+    assert!(n.iter().any(|t| t.starts_with("Deep: ")), "{n:?}");
 }

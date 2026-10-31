@@ -50,7 +50,7 @@ fn layers(sym: &Value) -> impl Iterator<Item = &Value> {
 }
 
 /// At most 64 characters of `s`, for a note that names something a file said.
-fn shown(s: &str) -> String {
+pub(super) fn shown(s: &str) -> String {
     s.chars().take(64).collect()
 }
 

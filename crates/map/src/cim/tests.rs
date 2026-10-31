@@ -1854,3 +1854,466 @@ fn hostile_layouts_never_panic() {
         read_and_check(&doc);
     }
 }
+
+// ---- embedded maps ----
+
+const LANDGRID: &str = r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN";
+
+fn standard_connection(factory: &str, connection: &str, dataset: &str) -> serde_json::Value {
+    json!({"type": "CIMStandardDataConnection", "workspaceConnectionString": connection, "workspaceFactory": factory,
+        "dataset": dataset, "datasetType": "esriDTFeatureClass"})
+}
+
+fn feature_layer(name: &str, connection: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    let mut l = json!({"type": "CIMFeatureLayer", "name": name, "uRI": format!("CIMPATH=new_detail_map/{}.json", name.to_lowercase()),
+        "visibility": true, "featureTable": {"type": "CIMFeatureTable", "displayField": "NAME", "dataConnection": connection}});
+    if let (Some(o), Some(e)) = (l.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    l
+}
+
+fn simple_renderer(symbol: serde_json::Value) -> serde_json::Value {
+    json!({"type": "CIMSimpleRenderer", "symbol": {"type": "CIMSymbolReference", "symbol": symbol}})
+}
+
+fn symbol_ref(symbol: serde_json::Value) -> serde_json::Value {
+    json!({"type": "CIMSymbolReference", "symbol": symbol})
+}
+
+/// A document embedding `layers` and a map "NEW DETAIL MAP" that lists the ones named in `listed`.
+fn map_document(layers: &[serde_json::Value], listed: &[&str]) -> Document {
+    let doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0", "layerDefinitions": layers,
+        "mapDefinitions": [{"type": "CIMMap", "name": "NEW DETAIL MAP", "uRI": "CIMPATH=map/new_detail_map.json", "layers": listed,
+            "spatialReference": {"wkid": 4326, "latestWkid": 4326},
+            "defaultExtent": {"xmin": -125.0, "ymin": 24.0, "xmax": -66.0, "ymax": 50.0, "spatialReference": {"wkid": 4326}}}]});
+    Document::from_json(&doc.to_string()).unwrap()
+}
+
+fn read_new_detail_map(doc: &Document) -> (MapImport, Report) {
+    let mut report = Report::default();
+    let map = read_map(doc, "CIMPATH=map/new_detail_map.json", &mut report).unwrap();
+    (map, report)
+}
+
+#[test]
+fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
+    use crate::symbology::Renderer;
+    let states_symbol = polygon_symbol(vec![
+        solid_stroke(rgb(52, 52, 52), 1.0),
+        json!({"type": "CIMSolidFill", "enable": true, "color": {"type": "CIMRGBColor", "values": [130, 130, 130, 0]}}),
+    ]);
+    let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]));
+    let label_symbol = symbol_ref(text_symbol(json!({"fontFamilyName": "Yu Gothic UI", "fontStyleName": "Regular", "height": 10,
+        "haloSize": 1, "haloSymbol": halo})));
+    let states = feature_layer(
+        "TAA_US_States",
+        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "TAA_US_States.shp"),
+        json!({"transparency": 30, "renderer": simple_renderer(states_symbol), "labelVisibility": true,
+            "labelClasses": [{"type": "CIMLabelClass", "expression": "$feature.STATE_NAME", "expressionEngine": "Arcade",
+                "visibility": true, "textSymbol": label_symbol, "name": "Class 1"}]}),
+    );
+    let counties = feature_layer(
+        "Counties",
+        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "Counties.shp"),
+        json!({"visibility": false, "minScale": 5000000.0, "renderer": simple_renderer(polygon_symbol(vec![solid_fill(rgb(200, 100, 0))]))}),
+    );
+    let doc = map_document(&[states, counties], &["CIMPATH=new_detail_map/taa_us_states.json", "CIMPATH=new_detail_map/counties.json"]);
+    let (map, report) = read_new_detail_map(&doc);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    assert_eq!(map.name, "NEW DETAIL MAP");
+    assert_eq!(map.wkid, Some(4326));
+    assert_eq!(map.extent, Some([-125.0, 24.0, -66.0, 50.0]));
+    let names: Vec<&str> = map.layers.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["TAA_US_States", "Counties"]);
+    assert_eq!(map.layers.iter().map(|l| l.visible).collect::<Vec<_>>(), [true, false]);
+
+    let s = &map.layers[0];
+    assert_eq!(s.path.as_deref(), Some(r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN\TAA_US_States.shp"));
+    assert_eq!(s.table, None);
+    assert_eq!(s.origin, r"Shapefile TAA_US_States.shp in G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN");
+    let Some(Renderer::Single(sym)) = &s.style.renderer else { panic!("{:?}", s.style.renderer) };
+    assert_eq!(sym.stroke, Rgba::rgb(52, 52, 52));
+    assert!((sym.stroke_width - 1.333).abs() < 1e-3, "{}", sym.stroke_width);
+    assert_eq!(sym.fill.a(), 0);
+    assert_eq!(s.style.transparency, Some(30.0));
+    assert_eq!(s.style.fill_layers, Some(Vec::new()));
+    let labels = s.style.labels.as_ref().unwrap();
+    assert!(labels.enabled);
+    assert!(labels.classes.is_empty());
+    let c = &labels.default;
+    assert_eq!((c.field.as_str(), c.size, c.font.as_deref()), ("STATE_NAME", 10.0, Some("Yu Gothic UI")));
+    assert_eq!((c.color, c.visible, c.bold, c.italic), (Rgba::rgb(10, 20, 30), true, false, false));
+    assert!(c.halo);
+    assert_eq!(c.halo_color, Some(Rgba::rgb(255, 255, 255)));
+    assert!((c.halo_width.unwrap() - 1.333).abs() < 1e-3);
+    // Only what the file sets is set.
+    assert_eq!((s.style.min_scale, s.style.max_scale), (None, None));
+
+    let c = &map.layers[1];
+    assert_eq!(c.path.as_deref(), Some(r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN\Counties.shp"));
+    assert_eq!(c.style.transparency, None);
+    assert_eq!((c.style.min_scale, c.style.max_scale), (Some(Some(5_000_000.0)), Some(None)));
+    assert!(c.style.labels.is_none());
+    let Some(Renderer::Single(sym)) = &c.style.renderer else { panic!() };
+    assert_eq!((sym.fill, sym.stroke_width), (Rgba::rgb(200, 100, 0), 0.0));
+}
+
+#[test]
+fn file_paths_follow_the_connections_folder_and_factory() {
+    let layer = |name: &str, factory: &str, connection: &str, dataset: &str| {
+        feature_layer(name, standard_connection(factory, connection, dataset), json!({}))
+    };
+    let doc = map_document(
+        &[
+            layer("A", "Shapefile", "DATABASE=/data/shp;OTHER=1", "a.shp"),
+            layer("B", "FileGDB", "database=C:\\data\\parcels.gdb", "Parcels"),
+            layer("C", "Shapefile", "DATABASE=D:\\folder\\", "c"),
+            layer("D", "SDE", "SERVER=x;DATABASE=y", "d"),
+            layer("E", "Shapefile", "OTHER=1", "e.shp"),
+        ],
+        &[
+            "CIMPATH=new_detail_map/a.json",
+            "CIMPATH=new_detail_map/b.json",
+            "CIMPATH=new_detail_map/c.json",
+            "CIMPATH=new_detail_map/d.json",
+            "CIMPATH=new_detail_map/e.json",
+        ],
+    );
+    let (map, report) = read_new_detail_map(&doc);
+    let got: Vec<(Option<&str>, Option<&str>)> = map.layers.iter().map(|l| (l.path.as_deref(), l.table.as_deref())).collect();
+    assert_eq!(
+        got,
+        [
+            (Some("/data/shp/a.shp"), None),
+            (Some(r"C:\data\parcels.gdb"), Some("Parcels")),
+            (Some(r"D:\folder\c.shp"), None),
+            (None, None),
+            (None, None),
+        ]
+    );
+    assert_eq!(map.layers[1].origin, r"FileGDB Parcels in C:\data\parcels.gdb");
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.starts_with("D: ") && t.contains("SDE")), "{n:?}");
+    assert!(n.iter().any(|t| t.starts_with("E: ")), "{n:?}");
+}
+
+fn unique_class(label: &str, values: &[&str], symbol: serde_json::Value) -> serde_json::Value {
+    let values: Vec<_> = values.iter().map(|v| json!({"type": "CIMUniqueValue", "fieldValues": [v]})).collect();
+    json!({"type": "CIMUniqueValueClass", "label": label, "patch": "Default", "visible": true, "symbol": symbol_ref(symbol), "values": values})
+}
+
+fn unique_renderer(fields: &[&str], classes: Vec<serde_json::Value>, default: Option<serde_json::Value>) -> serde_json::Value {
+    let mut r = json!({"type": "CIMUniqueValueRenderer", "fields": fields, "useDefaultSymbol": default.is_some(),
+        "groups": [{"type": "CIMUniqueValueGroup", "heading": fields.first(), "classes": classes}]});
+    if let (Some(o), Some(d)) = (r.as_object_mut(), default) {
+        o.insert("defaultSymbol".into(), symbol_ref(d));
+    }
+    r
+}
+
+#[test]
+fn unique_value_renderers_read_their_classes() {
+    use crate::symbology::Renderer;
+    let red = polygon_symbol(vec![solid_stroke(rgb(0, 0, 0), 0.5), solid_fill(rgb(255, 0, 0))]);
+    let blue = polygon_symbol(vec![solid_fill(rgb(0, 0, 255))]);
+    let grey = polygon_symbol(vec![solid_fill(rgb(128, 128, 128))]);
+    let mut hidden = unique_class("Hidden", &["H"], blue.clone());
+    hidden["visible"] = json!(false);
+    let zones = feature_layer(
+        "Zones",
+        standard_connection("FileGDB", r"DATABASE=C:\data\zones.gdb", "Zones"),
+        json!({"renderer": unique_renderer(
+            &["ZONE"],
+            vec![
+                unique_class("Residential", &["R"], red),
+                unique_class("Business", &["B1", "B2"], blue.clone()),
+                unique_class("C", &["C"], grey.clone()),
+                hidden,
+            ],
+            Some(grey.clone()),
+        )}),
+    );
+    // No default symbol: the rest is not drawn. Two fields: the first.
+    let two = feature_layer(
+        "Two",
+        standard_connection("FileGDB", r"DATABASE=C:\data\zones.gdb", "Two"),
+        json!({"renderer": unique_renderer(&["A", "B"], vec![unique_class("x", &["1"], blue)], None)}),
+    );
+    // A line's classes with stacked strokes keep them.
+    let road = |w: f64, c: serde_json::Value| solid_stroke(c, w);
+    let roads = feature_layer(
+        "Roads",
+        standard_connection("FileGDB", r"DATABASE=C:\data\zones.gdb", "Roads"),
+        json!({"renderer": unique_renderer(
+            &["KIND"],
+            vec![
+                unique_class("Highway", &["H"], json!({"type": "CIMLineSymbol", "symbolLayers": [road(6.0, rgb(0, 0, 0)), road(4.0, rgb(255, 200, 0))]})),
+                unique_class("Street", &["S"], json!({"type": "CIMLineSymbol", "symbolLayers": [road(1.0, rgb(90, 90, 90))]})),
+            ],
+            None,
+        )}),
+    );
+    let uris = ["CIMPATH=new_detail_map/zones.json", "CIMPATH=new_detail_map/two.json", "CIMPATH=new_detail_map/roads.json"];
+    let (map, report) = read_new_detail_map(&map_document(&[zones, two, roads], &uris));
+
+    let Some(Renderer::Unique { field, classes, other, class_labels, class_strokes, class_fills, .. }) = &map.layers[0].style.renderer
+    else {
+        panic!("{:?}", map.layers[0].style.renderer)
+    };
+    assert_eq!(field, "ZONE");
+    let values: Vec<&str> = classes.iter().map(|(v, _)| v.as_str()).collect();
+    assert_eq!(values, ["R", "B1", "B2", "C", "H"]);
+    assert_eq!(classes[0].1.fill, Rgba::rgb(255, 0, 0));
+    assert_eq!(classes[0].1.stroke, Rgba::rgb(0, 0, 0));
+    assert_eq!(classes[1].1.fill, Rgba::rgb(0, 0, 255));
+    assert_eq!(classes[4].1.fill.a(), 0, "a class switched off draws nothing");
+    assert_eq!(other.fill, Rgba::rgb(128, 128, 128));
+    // A label only where it isn't the value.
+    assert_eq!(class_labels.get("R").map(String::as_str), Some("Residential"));
+    assert_eq!(class_labels.get("B2").map(String::as_str), Some("Business"));
+    assert!(!class_labels.contains_key("C"));
+    assert!(class_strokes.is_empty() && class_fills.is_empty());
+
+    let Some(Renderer::Unique { field, other, .. }) = &map.layers[1].style.renderer else { panic!() };
+    assert_eq!(field, "A");
+    assert_eq!(other.fill.a(), 0);
+    assert_eq!(other.stroke.a(), 0);
+    assert!(notes(&report).iter().any(|n| n.starts_with("Two: ") && n.contains("2 fields")), "{:?}", notes(&report));
+
+    let r = &map.layers[2].style;
+    let Some(Renderer::Unique { class_strokes, .. }) = &r.renderer else { panic!() };
+    assert_eq!(class_strokes.get("H").map(Vec::len), Some(2));
+    assert!(!class_strokes.contains_key("S"), "a plain stroke is the symbol's own");
+}
+
+#[test]
+fn label_classes_read_their_expressions_text_and_ranges() {
+    let label = |expression: serde_json::Value, extra: serde_json::Value| {
+        let mut c = json!({"type": "CIMLabelClass", "visibility": true, "textSymbol": symbol_ref(text_symbol(json!({"height": 12})))});
+        if let (Some(o), Some(e)) = (c.as_object_mut(), extra.as_object()) {
+            o.extend(e.clone());
+        }
+        if let Some(o) = c.as_object_mut() {
+            o.insert("expression".into(), expression);
+        }
+        c
+    };
+    let classes = vec![
+        label(json!("$feature[\"NAME\"]"), json!({"name": "Names"})),
+        label(json!("[POP]"), json!({"minimumScale": 100000.0, "maximumScale": 5000.0})),
+        label(json!("!CODE!"), json!({"visibility": false})),
+        label(json!("ID"), json!({})),
+        label(json!("$feature.FIRST + \" \" + $feature.SECOND"), json!({})),
+        label(json!("\"no field here\""), json!({})),
+    ];
+    let layer = feature_layer(
+        "Places",
+        standard_connection("Shapefile", "DATABASE=/d", "p.shp"),
+        json!({"labelVisibility": false, "labelClasses": classes}),
+    );
+    let (map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/places.json"]));
+    let labels = map.layers[0].style.labels.as_ref().unwrap();
+    assert!(!labels.enabled);
+    let fields: Vec<&str> = labels.classes.iter().map(|c| c.field.as_str()).collect();
+    assert_eq!(fields, ["NAME", "POP", "CODE", "ID", "FIRST"]);
+    assert_eq!(labels.classes[0].name, "Names");
+    assert_eq!(labels.classes[0].size, 12.0);
+    assert_eq!((labels.classes[1].min_scale, labels.classes[1].max_scale), (Some(100_000.0), Some(5000.0)));
+    assert_eq!((labels.classes[0].min_scale, labels.classes[0].max_scale), (None, None));
+    assert!(!labels.classes[2].visible);
+    // Several classes: the default is a hidden copy of the first.
+    assert_eq!((labels.default.name.as_str(), labels.default.visible, labels.default.field.as_str()), ("Default", false, "NAME"));
+    assert!(!labels.classes[0].halo);
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.contains("label expression $feature.FIRST") && t.contains("drawn as FIRST")), "{n:?}");
+    assert!(n.iter().any(|t| t.starts_with("Places: ") && t.contains("no field here")), "{n:?}");
+}
+
+#[test]
+fn unsupported_layers_are_noted() {
+    use crate::symbology::Renderer;
+    let child = feature_layer("Child", standard_connection("Shapefile", "DATABASE=/d", "child.shp"), json!({}));
+    let group = json!({"type": "CIMGroupLayer", "name": "Boundaries", "uRI": "CIMPATH=new_detail_map/boundaries.json", "visibility": false,
+        "layers": ["CIMPATH=new_detail_map/child.json", "CIMPATH=new_detail_map/gone.json"]});
+    let raster = json!({"type": "CIMRasterLayer", "name": "Imagery", "uRI": "CIMPATH=new_detail_map/imagery.json", "visibility": true});
+    let surface = json!({"type": "CIMElevationSurfaceLayer", "name": "Ground", "uRI": "CIMPATH=new_detail_map/ground.json"});
+    let classed = feature_layer(
+        "Classed",
+        standard_connection("Shapefile", "DATABASE=/d", "classed.shp"),
+        json!({"renderer": {"type": "CIMClassBreaksRenderer", "field": "X"}}),
+    );
+    let sql = feature_layer(
+        "Query",
+        json!({"type": "CIMSqlQueryDataConnection", "workspaceConnectionString": "DATABASE=/d", "sqlQuery": "select 1"}),
+        json!({}),
+    );
+    let doc = map_document(
+        &[group, child, raster, surface, classed, sql],
+        &[
+            "CIMPATH=new_detail_map/boundaries.json",
+            "CIMPATH=new_detail_map/imagery.json",
+            "CIMPATH=new_detail_map/ground.json",
+            "CIMPATH=new_detail_map/classed.json",
+            "CIMPATH=new_detail_map/query.json",
+            "CIMPATH=new_detail_map/missing.json",
+        ],
+    );
+    let (map, report) = read_new_detail_map(&doc);
+    let got: Vec<(&str, bool, bool)> = map.layers.iter().map(|l| (l.name.as_str(), l.visible, l.path.is_some())).collect();
+    assert_eq!(
+        got,
+        [
+            ("Child", false, true), // a group's layers are listed one by one, hidden with it
+            ("gone", false, false),
+            ("Imagery", true, false),
+            ("Ground", true, false),
+            ("Classed", true, true),
+            ("Query", true, false),
+            ("missing", true, false),
+        ]
+    );
+    assert!(matches!(map.layers[4].style.renderer, Some(Renderer::Single(_))));
+    let n = notes(&report);
+    for expected in [
+        "Boundaries: group Boundaries, its layers listed one by one",
+        "Imagery: CIMRasterLayer layers, left out",
+        "Ground: CIMElevationSurfaceLayer layers, left out",
+        "Classed: CIMClassBreaksRenderer renderers, drawn with a default symbol",
+    ] {
+        assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
+    }
+    assert!(n.iter().any(|t| t.starts_with("Query: ") && t.contains("CIMSqlQueryDataConnection")), "{n:?}");
+    assert!(n.iter().any(|t| t.contains("missing.json")), "{n:?}");
+    assert!(n.iter().any(|t| t.contains("gone.json")), "{n:?}");
+
+    // Not a map: an error, and no map at all.
+    let mut report = Report::default();
+    assert!(read_map(&doc, "CIMPATH=new_detail_map/child.json", &mut report).is_err());
+    assert!(read_map(&doc, "CIMPATH=nothing.json", &mut report).is_err());
+}
+
+#[test]
+fn point_and_line_symbols_become_symbols() {
+    use crate::symbology::{Marker, Renderer};
+    let marker = json!({"type": "CIMVectorMarker", "enable": true, "size": 9.0, "markerGraphics": [{"type": "CIMMarkerGraphic",
+        "geometry": {"curveRings": [[[0.0, 0.0]]]}, "symbol": polygon_symbol(vec![solid_fill(rgb(0, 128, 0))])}]});
+    let gif = json!({"type": "CIMPictureMarker", "enable": true, "size": 8.0, "url": "data:image/gif;base64,R0lGODlhAQABAAAAACw="});
+    let wells = feature_layer(
+        "Wells",
+        standard_connection("Shapefile", "DATABASE=/d", "wells.shp"),
+        json!({"renderer": simple_renderer(json!({"type": "CIMPointSymbol", "symbolLayers": [gif, marker]}))}),
+    );
+    let pipes = feature_layer(
+        "Pipes",
+        standard_connection("Shapefile", "DATABASE=/d", "pipes.shp"),
+        json!({"renderer": simple_renderer(json!({"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(rgb(1, 2, 3), 2.0)]}))}),
+    );
+    let (map, report) =
+        read_new_detail_map(&map_document(&[wells, pipes], &["CIMPATH=new_detail_map/wells.json", "CIMPATH=new_detail_map/pipes.json"]));
+    let Some(Renderer::Single(w)) = &map.layers[0].style.renderer else { panic!() };
+    // The first marker (the picture, a circle for now); the second is noted.
+    assert_eq!((w.marker, w.size), (Marker::Circle, 8.0 * 96.0 / 72.0));
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t == "Wells: a GIF or BMP marker, drawn as a circle"), "{n:?}");
+    assert!(n.iter().any(|t| t.starts_with("Wells: ") && t.contains("first marker")), "{n:?}");
+    let Some(Renderer::Single(p)) = &map.layers[1].style.renderer else { panic!() };
+    assert_eq!((p.stroke, p.fill, p.stroke_width, p.size), (Rgba::rgb(1, 2, 3), Rgba::rgb(1, 2, 3), 2.0 * 96.0 / 72.0, 0.0));
+    assert_eq!(map.layers[1].style.line_strokes, Some(Vec::new()), "a single plain stroke is the symbol's own");
+}
+
+fn hostile_map_base() -> serde_json::Value {
+    let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]));
+    let states = feature_layer(
+        "TAA_US_States",
+        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "TAA_US_States.shp"),
+        json!({"transparency": 30, "minScale": 1e7, "maxScale": 1e3, "labelVisibility": true,
+            "renderer": simple_renderer(polygon_symbol(vec![solid_stroke(rgb(52, 52, 52), 1.0), solid_fill(rgb(1, 2, 3))])),
+            "labelClasses": [{"type": "CIMLabelClass", "expression": "$feature.STATE_NAME", "visibility": true, "minimumScale": 5e6,
+                "textSymbol": symbol_ref(text_symbol(json!({"haloSize": 1, "haloSymbol": halo})))}]}),
+    );
+    let zones = feature_layer(
+        "Zones",
+        standard_connection("FileGDB", r"DATABASE=C:\z.gdb", "Zones"),
+        json!({"renderer": unique_renderer(
+            &["ZONE"],
+            vec![unique_class("Residential", &["R"], polygon_symbol(vec![solid_fill(rgb(255, 0, 0))]))],
+            Some(polygon_symbol(vec![solid_fill(rgb(9, 9, 9))])),
+        )}),
+    );
+    // (A group that lists itself must not loop.)
+    let group = json!({"type": "CIMGroupLayer", "name": "G", "uRI": "CIMPATH=new_detail_map/g.json",
+        "layers": ["CIMPATH=new_detail_map/zones.json", "CIMPATH=new_detail_map/g.json"]});
+    json!({"type": "CIMLayoutDocument", "version": "3.7.0", "layerDefinitions": [states, zones, group],
+        "mapDefinitions": [{"type": "CIMMap", "name": "M", "uRI": "CIMPATH=map/m.json",
+            "layers": ["CIMPATH=new_detail_map/taa_us_states.json", "CIMPATH=new_detail_map/g.json"],
+            "spatialReference": {"wkid": 4326, "latestWkid": 4326},
+            "defaultExtent": {"xmin": -125.0, "ymin": 24.0, "xmax": -66.0, "ymax": 50.0}}]})
+}
+
+/// Reads `doc`'s map; when that works, what it carries must serialise (which refuses NaN and infinities).
+fn read_map_and_check(doc: &serde_json::Value) {
+    let Ok(doc) = Document::from_json(&doc.to_string()) else { return };
+    let mut report = Report::default();
+    if let Ok(map) = read_map(&doc, "CIMPATH=map/m.json", &mut report) {
+        assert!(map.layers.len() <= 500);
+        for l in &map.layers {
+            let json = serde_json::to_string(&l.style.renderer);
+            assert!(json.is_ok(), "{:?}", json.err());
+            let json = serde_json::to_string(&l.style.labels);
+            assert!(json.is_ok(), "{:?}", json.err());
+        }
+    }
+}
+
+#[test]
+fn hostile_maps_never_panic() {
+    let base = hostile_map_base();
+    let mut report = Report::default();
+    let doc = Document::from_json(&base.to_string()).unwrap();
+    let map = read_map(&doc, "CIMPATH=map/m.json", &mut report).unwrap();
+    // The fixture reads whole: its layer, then the group's one (the group's own loop is cut).
+    assert_eq!(map.layers.first().map(|l| l.name.as_str()), Some("TAA_US_States"));
+    assert!(map.layers.iter().any(|l| l.name == "Zones"));
+    read_map_and_check(&base);
+
+    let mut paths = Vec::new();
+    json_paths(&base, &mut Vec::new(), &mut paths);
+    let mut runs = 0;
+    for path in &paths {
+        let mut probe = base.clone();
+        let Some(here) = node_at(&mut probe, path) else { continue };
+        for junk in replacements(here) {
+            let mut doc = base.clone();
+            if let Some(node) = node_at(&mut doc, path) {
+                *node = junk;
+            }
+            read_map_and_check(&doc);
+            runs += 1;
+        }
+    }
+    assert!(runs >= 200, "{runs} mutations");
+}
+
+#[test]
+fn maps_and_groups_are_bounded() {
+    // 600 layers listed: 500 read.
+    let layers: Vec<serde_json::Value> =
+        (0..600).map(|i| feature_layer(&format!("L{i}"), standard_connection("Shapefile", "DATABASE=/d", "x.shp"), json!({}))).collect();
+    let uris: Vec<String> = (0..600).map(|i| format!("CIMPATH=new_detail_map/l{i}.json")).collect();
+    let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+    let (map, report) = read_new_detail_map(&map_document(&layers, &uris));
+    assert_eq!(map.layers.len(), 500);
+    assert!(notes(&report).iter().any(|n| n.contains("500")), "{:?}", notes(&report));
+
+    // Groups nested in groups end somewhere.
+    let groups: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({"type": "CIMGroupLayer", "name": format!("G{i}"), "uRI": format!("CIMPATH=new_detail_map/g{i}.json"),
+                "layers": [format!("CIMPATH=new_detail_map/g{}.json", i + 1)]})
+        })
+        .collect();
+    let (map, _) = read_new_detail_map(&map_document(&groups, &["CIMPATH=new_detail_map/g0.json"]));
+    assert!(map.layers.len() <= 500);
+}

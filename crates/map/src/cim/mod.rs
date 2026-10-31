@@ -13,6 +13,7 @@ pub(crate) mod color;
 pub(crate) mod dyntext;
 pub(crate) mod frame;
 pub mod layout;
+pub mod map;
 pub(crate) mod surround;
 pub(crate) mod symbol;
 pub(crate) mod units;
@@ -26,6 +27,7 @@ use serde_json::Value;
 
 pub use crate::qgis::{Note, NoteKind, Report};
 pub use layout::{FrameBinding, LayoutImport, PictureSource, read_layout};
+pub use map::{LayerImport, MapImport, read_map};
 
 /// The most JSON text a document (or all of a project's entries together) is read from.
 pub const MAX_JSON: usize = 64 << 20;

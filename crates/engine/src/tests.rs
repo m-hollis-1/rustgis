@@ -2036,7 +2036,7 @@ fn hostile_params_never_panic() {
         json!({"layer": "Cities", "image": 7}),
         json!({"layer": "Cities", "imagePath": "nope.png"}),
         // A picture's file: missing, junk, of the wrong type.
-        json!({"element": 1, "path": "nope.png", "image": 7}),
+        json!({"element": 1, "path": "/nonexistent/x.png", "image": 7}),
         json!({"kind": "picture", "element": 1, "path": ["a"], "x": "NaN"}),
         Value::Null,
         json!({}),

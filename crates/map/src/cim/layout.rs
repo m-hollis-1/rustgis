@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use super::color::symbol_of;
 use super::dyntext;
+use super::frame::{self, Frames};
 use super::symbol::{self, data_url};
 use super::units::page_unit_mm;
 use super::{Document, Report, flag, num, str_of};
@@ -179,7 +180,7 @@ fn xy(p: &Value) -> Option<(f64, f64)> {
 }
 
 /// The points of a ring or path, in order, with the end of each curve segment among them.
-fn part_points(part: &Value, budget: &mut usize) -> Vec<(f64, f64)> {
+pub(crate) fn part_points(part: &Value, budget: &mut usize) -> Vec<(f64, f64)> {
     part.as_array()
         .into_iter()
         .flatten()
@@ -258,7 +259,7 @@ fn curve_points(seg: &Value, start: (f64, f64), out: &mut Vec<(f64, f64)>) {
 }
 
 /// Whether a shape is one ring of four corners along the axes: a rectangle as Pro writes one.
-fn is_four_corner_ring(v: &Value) -> bool {
+pub(crate) fn is_four_corner_ring(v: &Value) -> bool {
     let Some([ring]) = v.get("rings").and_then(Value::as_array).map(Vec::as_slice) else { return false };
     let mut budget = 6;
     let pts = part_points(ring, &mut budget);
@@ -331,11 +332,24 @@ pub fn read_layout(doc: &Document, report: &mut Report) -> Result<LayoutImport, 
             _ => {}
         }
     }
-    let mut reader = Reader { doc, report, name, layout, pictures: Vec::new(), text_frames: Vec::new(), page_h: h, unit_mm, full: false };
+    let mut reader = Reader {
+        doc,
+        report,
+        name,
+        layout,
+        pictures: Vec::new(),
+        text_frames: Vec::new(),
+        frames: Frames::default(),
+        page_h: h,
+        unit_mm,
+        full: false,
+    };
     reader.walk(def.get("elements").unwrap_or(&NULL), 0, 0);
-    let Reader { mut layout, pictures, text_frames, .. } = reader;
+    let Reader { mut layout, pictures, text_frames, frames, .. } = reader;
+    frames.resolve(&mut layout, &text_frames, report);
     layout.clamp();
-    Ok(LayoutImport { layout, frames: Vec::new(), pictures, embedded_maps: Vec::new(), text_frames })
+    frames.restore_unset_scales(&mut layout);
+    Ok(LayoutImport { layout, frames: frames.bindings, pictures, embedded_maps: frames.embedded, text_frames })
 }
 
 /// The walk over a layout's elements, and what it has built so far.
@@ -347,6 +361,7 @@ struct Reader<'a> {
     layout: Layout,
     pictures: Vec<(u32, PictureSource)>,
     text_frames: Vec<(u32, String)>,
+    frames: Frames,
     /// The page's height in its units, and how many millimetres a unit is.
     page_h: f64,
     unit_mm: f64,
@@ -367,8 +382,7 @@ impl Reader<'_> {
             match str_of(e, "type").unwrap_or_default() {
                 "CIMGroupElement" => ids.extend(self.group(e, &name, depth, walked)),
                 "CIMGraphicElement" => ids.extend(self.graphic(e, &name)),
-                // Read by the map frame reader.
-                "CIMMapFrame" => self.report.skipped(&name, "map frames aren't imported yet"),
+                "CIMMapFrame" => ids.extend(self.map_frame(e, &name)),
                 // Read by the surround readers.
                 "CIMLegend"
                 | "CIMMarkerNorthArrow"
@@ -420,6 +434,14 @@ impl Reader<'_> {
         let id = self.layout.add(name, (x, y, w, h), ElementKind::Group { children });
         self.finish(id, e, name);
         vec![id]
+    }
+
+    /// A `CIMMapFrame` (see [`frame`]); the names it holds are resolved after the walk.
+    fn map_frame(&mut self, e: &Value, name: &str) -> Option<u32> {
+        let (b, kind, pending) = frame::read(self.doc, e, name, self.report)?;
+        let id = self.add(e, b, name, kind)?;
+        self.frames.add(id, pending);
+        Some(id)
     }
 
     /// A `CIMGraphicElement`, by the kind of its `graphic`.
@@ -657,7 +679,7 @@ fn without_rounding(sym: &Value) -> (Value, Option<f64>) {
 
 /// Whether a shape is an ellipse or circle: one ring that starts at a point, runs only along
 /// arcs about one centre, and closes.
-fn is_ellipse(v: &Value) -> bool {
+pub(crate) fn is_ellipse(v: &Value) -> bool {
     if v.get("rings").is_some() {
         return false;
     }

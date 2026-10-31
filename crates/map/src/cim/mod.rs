@@ -11,6 +11,7 @@
 
 pub(crate) mod color;
 pub(crate) mod dyntext;
+pub(crate) mod frame;
 pub mod layout;
 pub(crate) mod symbol;
 pub(crate) mod units;

@@ -914,3 +914,293 @@ fn a_margin_never_shrinks_a_paragraph_below_a_millimetre_and_text_without_a_posi
     assert!(near(e.x, 25.4 + 0.77, 0.01), "{e:?}");
     assert!(notes(&report).iter().any(|s| s == "Nowhere: text with no position, left out"), "{:?}", notes(&report));
 }
+
+use crate::layout::{FrameLink, FrameShape, LinkMode};
+
+// ---- map frames ----
+
+/// An embedded map definition with `uri`, in spatial reference `wkid`.
+fn embedded_map(uri: &str, wkid: u32, extra: serde_json::Value) -> serde_json::Value {
+    let mut m = json!({"type": "CIMMap", "name": uri, "uRI": uri, "spatialReference": {"wkid": wkid, "latestWkid": wkid}});
+    if let (Some(o), Some(e)) = (m.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    m
+}
+
+/// A map frame element over the rectangle (x0, y0)-(x1, y1) inches, with `extra` keys set on it.
+fn map_frame_element(name: &str, (x0, y0, x1, y1): (f64, f64, f64, f64), extra: serde_json::Value) -> serde_json::Value {
+    let mut f = json!({"type": "CIMMapFrame", "name": name, "anchor": "BottomLeftCorner", "visible": true,
+        "frame": corner_ring(x0, y0, x1, y1)});
+    if let (Some(o), Some(e)) = (f.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    f
+}
+
+fn camera(x: f64, y: f64, scale: f64) -> serde_json::Value {
+    json!({"view": {"camera": {"type": "CIMViewCamera", "x": x, "y": y, "scale": scale, "heading": 0}}})
+}
+
+/// Reads `elements` from a layout that embeds `maps`.
+fn read_with_maps(maps: &[serde_json::Value], elements: &[serde_json::Value]) -> (LayoutImport, Report) {
+    let doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0", "mapDefinitions": maps,
+        "layoutDefinition": {"type": "CIMLayout", "name": "P",
+            "page": {"type": "CIMPage", "width": 17, "height": 11, "units": {"uwkid": 109008}, "guides": []},
+            "elements": elements}});
+    let mut report = Report::default();
+    let imported = read_layout(&Document::from_json(&doc.to_string()).unwrap(), &mut report).unwrap();
+    (imported, report)
+}
+
+/// The id and kind of the element called `name`.
+fn frame_of(imp: &LayoutImport, name: &str) -> (u32, ElementKind) {
+    let el = imp.layout.elements.iter().find(|e| e.name == name).unwrap();
+    (el.id, el.kind.clone())
+}
+
+#[test]
+fn an_embedded_frames_camera_converts_from_degrees_or_web_mercator() {
+    let maps = [embedded_map("CIMPATH=map/deg.json", 4326, json!({})), embedded_map("CIMPATH=map/web.json", 3857, json!({}))];
+    let mut a = map_frame_element("DEG", (1.0, 1.0, 9.0, 8.0), camera(-100.554, 30.333, 20_000_000.0));
+    a["uRI"] = json!("CIMPATH=map/deg.json");
+    let mut b = map_frame_element("WEB", (9.0, 1.0, 16.0, 8.0), camera(-9650117.76, 5619364.40, 25_000.0));
+    b["uRI"] = json!("CIMPATH=map/web.json");
+    let (imp, report) = read_with_maps(&maps, &[a, b]);
+    let (_, ElementKind::MapFrame { center, scale, shape, map, .. }) = frame_of(&imp, "DEG") else { panic!() };
+    assert!(near(center.x, -100.554, 1e-12) && near(center.y, 30.333, 1e-12) && scale == 20_000_000.0, "{center:?} {scale}");
+    assert_eq!((shape, map.as_str()), (FrameShape::Rectangle, "DEG"));
+    let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "WEB") else { panic!() };
+    // Web Mercator metres to degrees (the brief's "about 45.1" latitude is really 44.986).
+    assert!(near(center.x, -86.688_482_77, 1e-6) && near(center.y, 44.986_296_4, 1e-6) && scale == 25_000.0, "{center:?}");
+    assert_eq!(imp.frames.len(), 2);
+    assert_eq!(imp.frames[0].map_uri.as_deref(), Some("CIMPATH=map/deg.json"));
+    assert_eq!(imp.frames[1].saved_camera, Some((-9650117.76, 5619364.40, 25_000.0)));
+    assert_eq!(imp.embedded_maps, ["CIMPATH=map/deg.json", "CIMPATH=map/web.json"]);
+    // The box: 8 x 7 inches from the left, 3 inches down from the top.
+    let el = imp.layout.elements.first().unwrap();
+    assert!(near(el.x, 25.4, 1e-9) && near(el.y, 3.0 * 25.4, 1e-9) && near(el.w, 8.0 * 25.4, 1e-9) && near(el.h, 7.0 * 25.4, 1e-9));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn a_camera_in_another_system_falls_back_to_the_auto_extent_then_the_default_extent() {
+    let ext = |x0: f64, y0: f64, x1: f64, y1: f64, wkid: u32| json!({"type": "CIMEnvelope", "xmin": x0, "ymin": y0, "xmax": x1, "ymax": y1, "spatialReference": {"wkid": wkid}});
+    let maps = [
+        embedded_map("CIMPATH=map/sp.json", 2272, json!({"defaultExtent": ext(-80.0, 40.0, -78.0, 42.0, 4326)})),
+        embedded_map("CIMPATH=map/none.json", 2272, json!({})),
+    ];
+    let mut auto = map_frame_element("AUTO", (1.0, 1.0, 5.0, 5.0), camera(2_000_000.0, 300_000.0, 12_000.0));
+    auto["uRI"] = json!("CIMPATH=map/sp.json");
+    auto["autoCamera"] = json!({"type": "CIMAutoCamera", "source": "None", "extent": ext(-10.0, 50.0, -8.0, 52.0, 4326)});
+    let mut dflt = map_frame_element("DEFAULT", (6.0, 1.0, 9.0, 5.0), json!({}));
+    dflt["uRI"] = json!("CIMPATH=map/sp.json");
+    let mut lost = map_frame_element("LOST", (10.0, 1.0, 14.0, 5.0), camera(2_000_000.0, 300_000.0, 12_000.0));
+    lost["uRI"] = json!("CIMPATH=map/none.json");
+    let (imp, report) = read_with_maps(&maps, &[auto, dflt, lost]);
+    // The extent's centre, the camera's scale (its x and y are in the map's own system).
+    let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "AUTO") else { panic!() };
+    assert!(near(center.x, -9.0, 1e-9) && near(center.y, 51.0, 1e-9) && scale == 12_000.0, "{center:?} {scale}");
+    assert_eq!(imp.frames[0].saved_camera, Some((2_000_000.0, 300_000.0, 12_000.0)));
+    // The map's default extent; no camera scale, so none.
+    let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "DEFAULT") else { panic!() };
+    assert!(near(center.x, -79.0, 1e-9) && near(center.y, 41.0, 1e-9) && scale == 0.0, "{center:?} {scale}");
+    assert_eq!(imp.frames[1].saved_camera, None);
+    // Nothing usable: the map's view, and the system said.
+    let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "LOST") else { panic!() };
+    assert!(center.x == 0.0 && center.y == 0.0 && scale == 0.0);
+    assert_eq!(notes(&report), ["LOST: frame camera in an unsupported coordinate system (2272); the map's view is used"]);
+}
+
+#[test]
+fn absurd_camera_values_count_as_absent() {
+    let maps = [embedded_map("CIMPATH=map/deg.json", 4326, json!({}))];
+    let mk = |name: &str, x: f64, y: f64, s: f64| {
+        let mut f = map_frame_element(name, (1.0, 1.0, 5.0, 5.0), camera(x, y, s));
+        f["uRI"] = json!("CIMPATH=map/deg.json");
+        f
+    };
+    let els = [mk("LAT", 10.0, 91.0, 1000.0), mk("LON", 181.0, 10.0, 1000.0), mk("SCALE0", 10.0, 10.0, 0.0), mk("HUGE", 10.0, 10.0, 2e9)];
+    let (imp, _) = read_with_maps(&maps, &els);
+    for name in ["LAT", "LON", "SCALE0", "HUGE"] {
+        let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, name) else { panic!() };
+        assert!(center.x == 0.0 && center.y == 0.0 && scale == 0.0, "{name}: {center:?} {scale}");
+    }
+}
+
+#[test]
+fn an_unbound_frame_takes_no_camera_and_records_the_saved_one() {
+    let main = map_frame_element("MAIN MAP", (1.0, 1.0, 9.0, 8.0), camera(-12_000_000.0, 4_000_000.0, 24_000.0));
+    let mut gone = map_frame_element("GONE MAP", (10.0, 1.0, 16.0, 8.0), camera(1.0, 2.0, 3.0));
+    gone["uRI"] = json!("CIMPATH=map/missing.json");
+    let (imp, report) = read_with_maps(&[], &[main, gone]);
+    let (_, ElementKind::MapFrame { center, scale, map, .. }) = frame_of(&imp, "MAIN MAP") else { panic!() };
+    // Not clamped up to the smallest scale: zero means "take the map's view".
+    assert!(center.x == 0.0 && center.y == 0.0 && scale == 0.0, "{center:?} {scale}");
+    assert_eq!(map, "MAIN MAP");
+    let binding = &imp.frames[0];
+    assert_eq!((binding.name.as_str(), binding.map_uri.as_deref()), ("MAIN MAP", None));
+    assert_eq!(binding.saved_camera, Some((-12_000_000.0, 4_000_000.0, 24_000.0)));
+    assert_eq!(binding.element, imp.layout.elements.first().unwrap().id);
+    // A uRI that doesn't resolve is kept as given, and said.
+    assert_eq!(imp.frames[1].map_uri.as_deref(), Some("CIMPATH=map/missing.json"));
+    assert_eq!(imp.embedded_maps, ["CIMPATH=map/missing.json"]);
+    let (_, ElementKind::MapFrame { scale, .. }) = frame_of(&imp, "GONE MAP") else { panic!() };
+    assert_eq!(scale, 0.0);
+    assert_eq!(notes(&report), ["GONE MAP: the map CIMPATH=map/missing.json isn't in the document; the map's view is used"]);
+}
+
+#[test]
+fn linked_frames_and_extent_indicators_resolve_by_name() {
+    let line = |w: f64| json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(rgb(0, 0, 0), w)]}});
+    let main = map_frame_element("MAIN MAP", (1.0, 1.0, 9.0, 8.0), json!({}));
+    // Listed before the frame it follows and outlines, so the names resolve in a second pass.
+    let mut small = map_frame_element("SMALL DETAIL MAP", (10.0, 1.0, 16.0, 4.0), camera(0.0, 0.0, 5000.0));
+    small["autoCamera"] = json!({"type": "CIMAutoCamera", "source": "MapFrameLink", "mapFrameLinkName": "MAIN MAP", "autoCameraType": "Center", "syncRotation": true});
+    small["extentIndicators"] = json!([
+        {"type": "CIMExtentIndicator", "sourceMapFrame": "MAIN MAP", "symbol": line(2.0)},
+        {"type": "CIMExtentIndicator", "sourceMapFrame": "MAIN MAP", "symbol": line(3.0)},
+    ]);
+    small["view"]["camera"]["heading"] = json!(30.0);
+    small["uRI"] = json!("CIMPATH=map/detail.json");
+    let (imp, report) = read_with_maps(&[embedded_map("CIMPATH=map/detail.json", 4326, json!({}))], &[small, main]);
+    let main_id = frame_of(&imp, "MAIN MAP").0;
+    let (small_id, ElementKind::MapFrame { link, extent_of, extent_color, extent_width, bearing, pitch, .. }) =
+        frame_of(&imp, "SMALL DETAIL MAP")
+    else {
+        panic!()
+    };
+    assert_eq!(link, Some(FrameLink { frame: main_id, mode: LinkMode::Center, rotation: true }));
+    assert_eq!(extent_of, Some(main_id));
+    assert_ne!(small_id, main_id);
+    assert_eq!(extent_color, Rgba::rgb(0, 0, 0));
+    assert!(near(extent_width, 2.0 * 96.0 / 72.0, 1e-6), "{extent_width}");
+    assert!(bearing == 30.0 && pitch == 0.0);
+    assert_eq!(notes(&report), ["SMALL DETAIL MAP: 1 more extent indicators, left out"]);
+}
+
+#[test]
+fn link_modes_and_links_that_cannot_stand() {
+    let linking = |name: &str, target: &str, ty: &str| {
+        let mut f = map_frame_element(name, (1.0, 1.0, 5.0, 5.0), json!({}));
+        f["autoCamera"] = json!({"source": "MapFrameLink", "mapFrame": target, "autoCameraType": ty, "syncRotation": false});
+        f
+    };
+    let els = [
+        map_frame_element("A", (1.0, 1.0, 5.0, 5.0), json!({})),
+        linking("EXTENT", "A", "Extent"),
+        linking("SCALE", "A", "Scale"),
+        linking("ODD", "A", "Bearing"),
+        linking("SELF", "SELF", "Center"),
+        linking("MISSING", "NOPE", "Center"),
+    ];
+    let (imp, report) = read_with_maps(&[], &els);
+    let a = frame_of(&imp, "A").0;
+    let link = |n: &str| match frame_of(&imp, n).1 {
+        ElementKind::MapFrame { link, .. } => link,
+        _ => panic!(),
+    };
+    assert_eq!(link("EXTENT"), Some(FrameLink { frame: a, mode: LinkMode::Extent, rotation: false }));
+    assert_eq!(link("SCALE"), Some(FrameLink { frame: a, mode: LinkMode::Scale, rotation: false }));
+    assert_eq!(link("ODD"), Some(FrameLink { frame: a, mode: LinkMode::Center, rotation: false }));
+    assert_eq!((link("SELF"), link("MISSING")), (None, None));
+    let n = notes(&report);
+    for want in [
+        "ODD: link type Bearing, taken as centre",
+        "SELF: follows itself; the link is left out",
+        "MISSING: follows the frame NOPE, which isn't on the page; the link is left out",
+    ] {
+        assert!(n.iter().any(|s| s == want), "{want}: {n:?}");
+    }
+    assert_eq!(n.len(), 3, "{n:?}");
+}
+
+#[test]
+fn an_indicator_of_a_frame_not_on_the_page_is_dropped_and_duplicate_names_take_the_first() {
+    let ind = |target: &str| json!([{"type": "CIMExtentIndicator", "sourceMapFrame": target}]);
+    let mut gone = map_frame_element("X", (1.0, 1.0, 5.0, 5.0), json!({}));
+    gone["extentIndicators"] = ind("NOPE");
+    let mut me = map_frame_element("Y", (1.0, 1.0, 5.0, 5.0), json!({}));
+    me["extentIndicators"] = ind("Y");
+    let mut dup = map_frame_element("Y", (1.0, 1.0, 5.0, 5.0), json!({}));
+    dup["extentIndicators"] = ind("Y");
+    let mut z = map_frame_element("Z", (1.0, 1.0, 5.0, 5.0), json!({}));
+    z["extentIndicators"] = ind("Y");
+    let (imp, report) = read_with_maps(&[], &[gone, me, dup, z]);
+    let ids: Vec<u32> = imp.layout.elements.iter().map(|e| e.id).collect();
+    let of = |i: usize| match &imp.layout.elements[i].kind {
+        ElementKind::MapFrame { extent_of, extent_color, extent_width, .. } => (*extent_of, *extent_color, *extent_width),
+        _ => panic!(),
+    };
+    // No symbol: the defaults stay.
+    assert_eq!(of(0), (None, crate::layout::INDICATOR_COLOR, crate::layout::INDICATOR_WIDTH));
+    assert_eq!(of(1).0, None);
+    assert_eq!(of(2).0, Some(ids[1])); // the second Y outlines the first
+    assert_eq!(of(3).0, Some(ids[1]));
+    let n = notes(&report);
+    for want in [
+        "X: outlines the frame NOPE, which isn't on the page; the indicator is left out",
+        "Y: outlines its own extent; the indicator is left out",
+        "Y: another map frame has this name; the first is the one links and text find",
+    ] {
+        assert!(n.iter().any(|s| s == want), "{want}: {n:?}");
+    }
+}
+
+#[test]
+fn text_bound_to_a_frame_gets_its_id() {
+    let tag = |frame: &str| format!(r#"<dyn type="mapFrame" name="{frame}" property="scale" preStr="1:"/>"#);
+    let main = map_frame_element("MAIN MAP", (1.0, 1.0, 9.0, 8.0), json!({}));
+    let ok = text_element("CIMTextGraphic", "OK", json!({"x": 1.0, "y": 9.0}), &tag("MAIN MAP"), text_symbol(json!({})));
+    let lost = text_element("CIMTextGraphic", "LOST", json!({"x": 1.0, "y": 10.0}), &tag("GONE"), text_symbol(json!({})));
+    let (imp, report) = read_with_maps(&[], &[main, ok, lost]);
+    let main_id = frame_of(&imp, "MAIN MAP").0;
+    let frame_of_text = |n: &str| match frame_of(&imp, n).1 {
+        ElementKind::Text { frame, .. } => frame,
+        _ => panic!(),
+    };
+    assert_eq!(frame_of_text("OK"), Some(main_id));
+    assert_eq!(frame_of_text("LOST"), None);
+    // The names are kept for the caller.
+    let names: Vec<&str> = imp.text_frames.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(names, ["MAIN MAP", "GONE"]);
+    assert_eq!(notes(&report), ["LOST: reads frame GONE, which isn't on the page; the first frame is used"]);
+}
+
+#[test]
+fn a_frame_shape_other_than_a_rectangle_comes_across() {
+    // A triangle in a 4 x 2 inch box at (1, 1): points relative to the box, y from the top.
+    let tri = json!({"rings": [[[1.0, 1.0], [3.0, 3.0], [5.0, 1.0], [1.0, 1.0]]]});
+    let mut a = map_frame_element("TRI", (1.0, 1.0, 5.0, 3.0), json!({}));
+    a["frame"] = tri;
+    let circle = json!({"curveRings": [[[5.0, 2.0], {"a": [[5.0, 2.0], [3.0, 2.0], 0, 1]}]]});
+    let mut b = map_frame_element("OVAL", (1.0, 1.0, 5.0, 3.0), json!({}));
+    b["frame"] = circle;
+    let mut c = map_frame_element("EMPTY", (1.0, 1.0, 5.0, 3.0), json!({}));
+    c["frame"] = json!({});
+    let (imp, report) = read_with_maps(&[], &[a, b, c]);
+    let (_, ElementKind::MapFrame { shape, .. }) = frame_of(&imp, "TRI") else { panic!() };
+    assert_eq!(shape, FrameShape::Polygon(vec![(0.0, 1.0), (0.5, 0.0), (1.0, 1.0)]));
+    let (_, ElementKind::MapFrame { shape, .. }) = frame_of(&imp, "OVAL") else { panic!() };
+    assert_eq!(shape, FrameShape::Ellipse);
+    // A frame with no shape can't be placed.
+    assert_eq!(imp.layout.elements.len(), 2);
+    assert_eq!(notes(&report), ["EMPTY: a map frame with no shape, left out"]);
+}
+
+#[test]
+fn a_frames_border_comes_across_and_embedded_maps_are_distinct_in_order() {
+    let maps = [embedded_map("CIMPATH=map/a.json", 4326, json!({})), embedded_map("CIMPATH=map/b.json", 4326, json!({}))];
+    let mk = |name: &str, uri: &str| {
+        let mut f = map_frame_element(name, (1.0, 1.0, 5.0, 5.0), json!({}));
+        f["uRI"] = json!(uri);
+        f
+    };
+    let mut first = mk("F1", "CIMPATH=map/b.json");
+    first["graphicFrame"] = json!({"type": "CIMGraphicFrame", "borderSymbol": {"type": "CIMSymbolReference",
+        "symbol": {"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(rgb(0, 0, 0), 2.0)]}}});
+    let (imp, _) = read_with_maps(&maps, &[first, mk("F2", "CIMPATH=MAP/A.json"), mk("F3", "CIMPATH=MAP/B.JSON")]);
+    assert_eq!(imp.embedded_maps, ["CIMPATH=map/b.json", "CIMPATH=MAP/A.json"]);
+    let border = imp.layout.elements.first().and_then(|e| e.frame_style.as_ref()).and_then(|f| f.border);
+    assert_eq!(border, Some(Rgba::rgb(0, 0, 0)));
+}

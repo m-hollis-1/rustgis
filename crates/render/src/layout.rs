@@ -6,7 +6,7 @@ use rustgis_geom::{Coord, Extent};
 use rustgis_map::graphics::decimal;
 use rustgis_map::layout::{
     ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, Layout, LineHead, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits,
-    TextAlign, TickSide, frame_camera,
+    TextAlign, TickSide, VAlign, frame_camera,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -242,15 +242,35 @@ fn draw_page(
                     None => placeholder(&mut pm, r, "Colorbar", ppp),
                 }
             }
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name } => {
-                let first = layout.first_frame().and_then(frame);
-                let s = expand(t, layout, info, first.and_then(|f| maps.get(f.1).map(|m| (m, f.2))));
-                // An installed family by name (#762), else its generic one. The app doesn't wait
-                // for the font index while it is being built; a script or the command line builds
-                // it now (`families::find_ready`).
-                let family = font_name.as_deref().and_then(crate::families::find_ready);
-                let face = text::Face { bold: *bold, italic: *italic, serif: *font == rustgis_map::layout::FontFamily::Serif, family };
-                let style = TextStyle { face, align: *align, spacing: *letter_spacing as f32 };
+            ElementKind::Text {
+                text: t,
+                size,
+                color,
+                bold,
+                italic,
+                align,
+                letter_spacing,
+                font,
+                font_name,
+                frame: bound,
+                wrap,
+                valign,
+                line_spacing,
+                case,
+            } => {
+                // Its map tokens read the frame it is bound to, else the first one on the page.
+                let from = bound.and_then(frame).or_else(|| layout.first_frame().and_then(frame));
+                let s = expand(t, layout, info, from.and_then(|f| maps.get(f.1).map(|m| (m, f.2, f.3, f.4))));
+                let s = case.apply(s);
+                let face = text_face(*bold, *italic, *font, font_name.as_deref());
+                let style = TextStyle {
+                    face,
+                    align: *align,
+                    spacing: *letter_spacing as f32,
+                    wrap: *wrap,
+                    valign: *valign,
+                    line_spacing: *line_spacing as f32,
+                };
                 text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
             }
             ElementKind::Picture { image } => {
@@ -383,9 +403,10 @@ fn finish_frame_map(mut img: crate::Rendered, ppp: f64) -> Pixmap {
     img.pixmap
 }
 
-/// Expands layout text tokens: the page values from `info` and `layout`, the map ones from the
-/// first frame, all through the one expander (`rustgis_map::graphics::expand`).
-pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, rustgis_map::Camera)>) -> String {
+/// Expands layout text tokens: the page values from `info` and `layout`, the map ones from a
+/// frame, all through the one expander (`rustgis_map::graphics::expand`). The frame is its map,
+/// camera and size on the page in points (the size gives the extent it shows).
+pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, rustgis_map::Camera, f64, f64)>) -> String {
     let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let mut v = rustgis_map::graphics::TokenValues {
         page: info.page.max(1),
@@ -397,8 +418,11 @@ pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, ru
         now,
         ..Default::default()
     };
-    if let Some((m, cam)) = frame {
+    if let Some((m, cam, w, h)) = frame {
         v.map = m.name.clone();
+        // The degrees the frame shows, as the legend works out what a frame draws.
+        let view = View { width: w, height: h, pixels_per_point: 1.0, camera: cam, sky: false };
+        v.extent = (w > 0.0 && h > 0.0).then(|| crate::view_lonlat(m, &view));
         v.scale = m.ground_res_at(&cam) / rustgis_map::layout::PAPER_M_PER_PT;
         v.crs = m.projection.label();
         let crs = m.projection.info();
@@ -1672,6 +1696,56 @@ struct TextStyle {
     align: TextAlign,
     /// Letter spacing in points.
     spacing: f32,
+    /// Each line broken at the element's width.
+    wrap: bool,
+    /// Where the block of lines sits down the element.
+    valign: VAlign,
+    /// The line pitch as a multiple of the usual one.
+    line_spacing: f32,
+}
+
+impl Default for TextStyle {
+    /// Upright sans, left-aligned, unspaced, unwrapped from the top at the usual pitch.
+    fn default() -> TextStyle {
+        TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0, wrap: false, valign: VAlign::Top, line_spacing: 1.0 }
+    }
+}
+
+/// The face a layout text is drawn in: bold, italic and its generic family, or an installed
+/// family by name (#762). The app doesn't wait for the font index while it is being built; a
+/// script or the command line builds it now (`families::find_ready`).
+pub(crate) fn text_face(bold: bool, italic: bool, font: rustgis_map::layout::FontFamily, font_name: Option<&str>) -> text::Face {
+    let family = font_name.and_then(crate::families::find_ready);
+    text::Face { bold, italic, serif: font == rustgis_map::layout::FontFamily::Serif, family }
+}
+
+/// The most lines a text element takes from what it says, and the most it draws once they are
+/// broken to its width.
+const TEXT_LINES: usize = 200;
+const WRAPPED_LINES: usize = 500;
+
+/// The lines a text element draws: those of `s` (`\n` ends one), each broken to `wrap_w` (in
+/// pixels at 96 dpi) when it is given. A word wider than that stays whole on a line of its own.
+/// `size` is in points and `spacing` the letter spacing in points.
+pub(crate) fn text_lines(s: &str, size: f32, face: text::Face, spacing: f32, wrap_w: Option<f32>) -> Vec<String> {
+    let lines = s.lines().take(TEXT_LINES);
+    match wrap_w {
+        None => lines.map(str::to_string).collect(),
+        Some(w) => lines.flat_map(|l| text::wrap(l, size, face, spacing, w)).take(WRAPPED_LINES).collect(),
+    }
+}
+
+/// How far down a box `box_h` tall a block of `lines` lines starts for `valign`, in the units of
+/// `px` (a line's font size): the block is a line's 1.25 `px` and a pitch (`line_spacing` times
+/// that) for each line more. A block taller than the box starts at its top.
+pub(crate) fn block_shift(valign: VAlign, box_h: f64, px: f64, lines: usize, line_spacing: f64) -> f64 {
+    let block = px * 1.25 * (1.0 + lines.saturating_sub(1) as f64 * line_spacing);
+    let free = (box_h - block).max(0.0);
+    match valign {
+        VAlign::Top => 0.0,
+        VAlign::Middle => free / 2.0,
+        VAlign::Bottom => free,
+    }
 }
 
 /// The distance between two lines of text at `size` points, in mm, as [`text_block`] sets them.
@@ -1679,15 +1753,20 @@ pub fn line_pitch_mm(size: f64) -> f64 {
     size.clamp(2.0, 400.0) * 1.33 * 1.25 * 25.4 / 96.0
 }
 
-/// Text in an element: lines split at `\n` from the top, each placed by the style's alignment. A
-/// centred or right-aligned line wider than the element runs out past its left edge, as a
-/// left-aligned one runs past its right.
+/// Text in an element: lines split at `\n` (and at the element's width, when wrapped), the block
+/// from the top, middle or bottom, each line placed by the style's alignment. A centred or
+/// right-aligned line wider than the element runs out past its left edge, as a left-aligned one
+/// runs past its right.
 fn text_block(pm: &mut Pixmap, r: Rect, s: &str, size: f32, color: Rgba, style: TextStyle, ppp: f64) {
-    let px = size.clamp(2.0, 400.0) * 1.33 * ppp as f32;
+    let size = size.clamp(2.0, 400.0);
+    let px = size * 1.33 * ppp as f32;
     // Letter spacing is in points, as the size is.
     let spacing = style.spacing * 1.33 * ppp as f32;
-    let mut y = r.y() + px * 0.6;
-    for line in s.lines().take(200) {
+    let lines = text_lines(s, size, style.face, style.spacing, style.wrap.then(|| r.width() / ppp as f32));
+    let ls = if style.line_spacing.is_finite() { style.line_spacing.clamp(0.5, 3.0) } else { 1.0 };
+    let shift = block_shift(style.valign, f64::from(r.height()), f64::from(px), lines.len(), f64::from(ls)) as f32;
+    let mut y = r.y() + shift + px * 0.6;
+    for line in &lines {
         if y > r.y() + r.height() + px {
             break;
         }
@@ -1703,7 +1782,7 @@ fn text_block(pm: &mut Pixmap, r: Rect, s: &str, size: f32, color: Rgba, style: 
             }
         };
         text::styled_at(pm, line, left, y, px, color, style.face, spacing);
-        y += px * 1.25;
+        y += px * 1.25 * ls;
     }
 }
 
@@ -2165,11 +2244,141 @@ mod tests {
         rows[rows.len() - 1] - rows[0]
     }
 
+    /// The rows that hold dark ink.
+    fn ink_rows(pm: &Pixmap) -> Vec<u32> {
+        (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| rgb(pm, x, y).0 < 128)).collect()
+    }
+
+    /// `s` at 10 pt in a white box `w_mm` wide and `h` px tall, drawn with `style`.
+    fn text_in_box(s: &str, w_mm: f64, h: u32, style: TextStyle) -> Pixmap {
+        let w = ((w_mm * PT_PER_MM).round() as u32).max(1);
+        let mut pm = Pixmap::new(w, h).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let r = Rect::from_xywh(0.0, 0.0, w as f32, h as f32).unwrap();
+        text_block(&mut pm, r, s, 10.0, Rgba::rgb(0, 0, 0), style, 1.0);
+        pm
+    }
+
+    #[test]
+    fn wrapped_text_breaks_at_the_box_and_bottom_aligned_text_sits_on_the_bottom_edge() {
+        let words = "gypsy jumping quickly over typography pages while grumpy plumbers yell happily every day giving young puppies \
+                     a tough ride past jolly bakery queues";
+        let plain = TextStyle::default();
+        let span = |pm: &Pixmap| {
+            let rows = ink_rows(pm);
+            rows[rows.len() - 1] - rows[0]
+        };
+        // Unwrapped, the line is one row of letters and runs past the box; wrapped at 30 mm it
+        // breaks into several lines, none wider than the box.
+        let one = text_in_box(words, 30.0, 200, plain);
+        let wrapped = text_in_box(words, 30.0, 200, TextStyle { wrap: true, ..plain });
+        assert!(span(&one) < 17, "one line: {} rows", span(&one));
+        assert!(span(&wrapped) > 3 * 16, "several lines: {} rows", span(&wrapped));
+        let cols: Vec<u32> = (0..wrapped.width()).filter(|&x| (0..wrapped.height()).any(|y| rgb(&wrapped, x, y).0 < 128)).collect();
+        assert!(cols[cols.len() - 1] < wrapped.width() + 2 && cols[0] < 4, "inside the 30 mm: {:?}..{:?}", cols[0], cols[cols.len() - 1]);
+        // Bottom: the last line's letters (descenders included) end within 2 px of the bottom edge;
+        // middle: the block is centred; top: it starts at the top.
+        let h = wrapped.height();
+        let bottom = text_in_box(words, 30.0, 200, TextStyle { wrap: true, valign: VAlign::Bottom, ..plain });
+        let rows = ink_rows(&bottom);
+        assert!(h - 1 - rows[rows.len() - 1] <= 2, "bottom row {} of {h}", rows[rows.len() - 1]);
+        assert_eq!(span(&bottom), span(&wrapped), "the same block, moved");
+        let middle = ink_rows(&text_in_box(words, 30.0, 200, TextStyle { wrap: true, valign: VAlign::Middle, ..plain }));
+        let (above, below) = (middle[0], h - 1 - middle[middle.len() - 1]);
+        assert!(above.abs_diff(below) <= 6, "centred: {above} above, {below} below");
+        let top = ink_rows(&wrapped);
+        assert_eq!(top[0], ink_rows(&one)[0], "top starts where unwrapped text always has");
+        // Double spacing roughly doubles the distance between the first and last line.
+        let double = text_in_box(words, 30.0, 400, TextStyle { wrap: true, line_spacing: 2.0, ..plain });
+        assert!((span(&double) as f32) > 1.7 * span(&wrapped) as f32, "{} vs {} rows", span(&double), span(&wrapped));
+        // A box narrower than a word: the word overflows on its line instead of looping, and one
+        // word draws one line.
+        let narrow = text_in_box("Unbreakable", 1.0, 60, TextStyle { wrap: true, ..plain });
+        assert!(span(&narrow) < 17, "one line: {} rows", span(&narrow));
+        let narrow = text_in_box("Unbreakable words, each alone", 1.0, 200, TextStyle { wrap: true, ..plain });
+        assert!(span(&narrow) > 3 * 16, "a word to a line: {} rows", span(&narrow));
+        // Wrapped lines are bounded.
+        let face = text::Face::default();
+        assert!(text_lines(&"w ".repeat(5000), 10.0, face, 0.0, Some(1.0)).len() <= 500);
+        assert!(text_lines(&"a\n".repeat(900), 10.0, face, 0.0, None).len() <= 200);
+    }
+
+    /// Two frames of one map at 1:10,000 and 1:50,000 on a page, with `text` (bound to
+    /// `frame`) under them, drawn at 96 dpi.
+    fn two_frame_page(text: &str, frame: Option<usize>, case: rustgis_map::layout::TextCase) -> Pixmap {
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        let kind = |scale| ElementKind::MapFrame {
+            map: "m".into(),
+            center: Coord::new(0.0, 0.0),
+            scale,
+            shape: FrameShape::Rectangle,
+            grid: None,
+            extent_of: None,
+            extent_color: rustgis_map::layout::INDICATOR_COLOR,
+            extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+            bearing: 0.0,
+            pitch: 0.0,
+        };
+        let ids = [l.add("First", (5.0, 5.0, 40.0, 40.0), kind(10_000.0)), l.add("Second", (55.0, 5.0, 40.0, 40.0), kind(50_000.0))];
+        let mut t = ElementKind::text(text, 12.0, Rgba::rgb(0, 0, 0), false);
+        if let ElementKind::Text { frame: f, case: c, .. } = &mut t {
+            *f = frame.map(|i| ids[i]);
+            *c = case;
+        }
+        l.add("Text", (5.0, 60.0, 90.0, 20.0), t);
+        render(&l, &mut [Map::new("m")], 96.0, &PageInfo::default()).unwrap()
+    }
+
+    #[test]
+    fn text_tokens_read_from_the_bound_frame() {
+        use rustgis_map::layout::TextCase;
+        let none = TextCase::None;
+        // What each frame's scale prints as.
+        let layout = Layout::new("L", 100.0, 100.0);
+        let map = Map::new("m");
+        let scale = |s: f64| {
+            let cam = frame_camera(&map, Coord::new(0.0, 0.0), s, 0.0, 0.0);
+            expand("{scale}", &layout, &PageInfo::default(), Some((&map, cam, 40.0 * PT_PER_MM, 40.0 * PT_PER_MM)))
+        };
+        let (first, second) = (scale(10_000.0), scale(50_000.0));
+        assert_eq!((first.as_str(), second.as_str()), ("1:10,000", "1:50,000"));
+        // The page draws the same pixels for the token as for what it prints: bound to the second
+        // frame it reads 1:50,000, unbound the first frame's 1:10,000.
+        let same = |a: Pixmap, b: Pixmap| a.data() == b.data();
+        assert!(same(two_frame_page("{scale}", Some(1), none), two_frame_page(&second, None, none)));
+        assert!(same(two_frame_page("{scale}", None, none), two_frame_page(&first, None, none)));
+        assert!(same(two_frame_page("{scale}", Some(0), none), two_frame_page(&first, None, none)));
+        assert!(!same(two_frame_page("{scale}", Some(1), none), two_frame_page("{scale}", None, none)));
+        // Case applies after the tokens expand.
+        assert!(same(two_frame_page("map {map} {scale}", Some(1), TextCase::Upper), two_frame_page("MAP M 1:50,000", None, none)));
+        assert!(same(two_frame_page("MAP {map}", None, TextCase::Lower), two_frame_page("map m", None, none)));
+    }
+
+    /// `{extent}` is the degrees a frame shows, worked out from the frame's size on the page.
+    #[test]
+    fn the_extent_token_is_what_the_frame_shows() {
+        let map = Map::new("m");
+        let layout = Layout::new("L", 100.0, 100.0);
+        let cam = frame_camera(&map, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
+        let printed = |w_mm: f64, h_mm: f64| {
+            let s = expand("{extent}", &layout, &PageInfo::default(), Some((&map, cam, w_mm * PT_PER_MM, h_mm * PT_PER_MM)));
+            s.split(", ").map(|v| v.parse::<f64>().unwrap_or(f64::NAN)).collect::<Vec<_>>()
+        };
+        // 100 mm at 1:1,000,000 is 100 km, about 0.898 degrees at the equator, centred on 0, 0.
+        let e = printed(100.0, 50.0);
+        assert_eq!(e.len(), 4, "{e:?}");
+        assert!((e[2] - e[0] - 0.898).abs() < 0.01 && (e[3] - e[1] - 0.449).abs() < 0.01, "{e:?}");
+        assert!((e[0] + e[2]).abs() < 1e-3 && (e[1] + e[3]).abs() < 1e-3, "{e:?}");
+        // Wider frame, wider extent; no frame, nothing.
+        assert!(printed(200.0, 50.0)[2] > e[2]);
+        assert_eq!(expand("{extent}", &layout, &PageInfo::default(), None), "");
+    }
+
     /// Text elements take italic, alignment and letter spacing (#213, point c); plain, they draw
     /// as before.
     #[test]
     fn text_takes_italic_alignment_and_letter_spacing() {
-        let plain = TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let plain = TextStyle::default();
         let base = styled_line(plain);
         let (l, r, ..) = text_ink(&base);
         assert!(l < 4, "left-aligned starts at the left: {l}");
@@ -2752,7 +2961,7 @@ mod tests {
         let layout = Layout::new("L", 100.0, 100.0);
         let info = PageInfo { project: "Parcels".into(), ..Default::default() };
         assert_eq!(
-            expand("{project|Project: |\\n}{credits|Data: }", &layout, &info, Some((&map, cam))),
+            expand("{project|Project: |\\n}{credits|Data: }", &layout, &info, Some((&map, cam, 300.0, 300.0))),
             "Project: Parcels\nData: © One, © Two"
         );
         // Without a frame there are no credits.
@@ -2770,9 +2979,9 @@ mod tests {
         let cam = frame_camera(&map, Coord::new(0.0, 0.0), 6_300_000.0, 0.0, 0.0);
         let info = PageInfo { page: 1, pages: 1, ..Default::default() };
         let mut layout = Layout::new("L", 100.0, 100.0);
-        let point = expand("Scale {scale}, page {page}.", &layout, &info, Some((&map, cam)));
+        let point = expand("Scale {scale}, page {page}.", &layout, &info, Some((&map, cam, 300.0, 300.0)));
         layout.decimal_comma = true;
-        let comma = expand("Scale {scale}, page {page}.", &layout, &info, Some((&map, cam)));
+        let comma = expand("Scale {scale}, page {page}.", &layout, &info, Some((&map, cam, 300.0, 300.0)));
         // "Scale 1:6,300,000, page 1." and "Scale 1:6.300.000, page 1.": the scale's marks swap, the
         // text's comma stays.
         let scale = point.strip_prefix("Scale ").and_then(|t| t.strip_suffix(", page 1.")).unwrap_or_else(|| panic!("{point}"));
@@ -2788,7 +2997,7 @@ mod tests {
         let cam = frame_camera(&map, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
         let layout = Layout::new("L", 100.0, 100.0);
         let info = PageInfo::default();
-        let frame = Some((&map, cam));
+        let frame = Some((&map, cam, 300.0, 300.0));
         assert_eq!(
             expand("{crsName|Name: }{crsWkid|\nWKID: }", &layout, &info, frame),
             "Name: NAD83 / Texas Central (ftUS)
@@ -2801,7 +3010,7 @@ WKID: 2277"
         // The default map is Web Mercator; without a frame the tokens print nothing.
         let web = Map::new("w");
         let cam = frame_camera(&web, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
-        assert_eq!(expand("{crsName} {crsWkid}", &layout, &info, Some((&web, cam))), "WGS 84 / Pseudo-Mercator 3857");
+        assert_eq!(expand("{crsName} {crsWkid}", &layout, &info, Some((&web, cam, 300.0, 300.0))), "WGS 84 / Pseudo-Mercator 3857");
         assert_eq!(expand("{crsName}{crsWkid}", &layout, &info, None), "");
     }
 }

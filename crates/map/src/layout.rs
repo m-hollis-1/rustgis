@@ -447,6 +447,117 @@ fn is_sans(f: &FontFamily) -> bool {
     *f == FontFamily::Sans
 }
 
+/// Where a text element's block of lines sits down its box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VAlign {
+    /// From the top edge, as text always started.
+    #[default]
+    Top,
+    Middle,
+    /// The last line on the bottom edge.
+    Bottom,
+}
+
+impl VAlign {
+    pub const ALL: [VAlign; 3] = [VAlign::Top, VAlign::Middle, VAlign::Bottom];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            VAlign::Top => "top",
+            VAlign::Middle => "middle",
+            VAlign::Bottom => "bottom",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VAlign::Top => "Top",
+            VAlign::Middle => "Middle",
+            VAlign::Bottom => "Bottom",
+        }
+    }
+
+    /// `top`, `middle` or `bottom` (`center` and `centre` for the middle), in any case.
+    pub fn from_name(s: &str) -> Option<VAlign> {
+        let s = s.trim();
+        VAlign::ALL
+            .into_iter()
+            .find(|v| v.code().eq_ignore_ascii_case(s))
+            .or((s.eq_ignore_ascii_case("center") || s.eq_ignore_ascii_case("centre")).then_some(VAlign::Middle))
+    }
+}
+
+/// The case a text element's words are drawn in, whatever was typed (applied after its tokens
+/// expand).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextCase {
+    /// As typed.
+    #[default]
+    None,
+    Upper,
+    Lower,
+}
+
+impl TextCase {
+    pub const ALL: [TextCase; 3] = [TextCase::None, TextCase::Upper, TextCase::Lower];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            TextCase::None => "none",
+            TextCase::Upper => "upper",
+            TextCase::Lower => "lower",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextCase::None => "As typed",
+            TextCase::Upper => "Upper case",
+            TextCase::Lower => "Lower case",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<TextCase> {
+        let s = s.trim();
+        TextCase::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s))
+    }
+
+    /// `s` in this case.
+    pub fn apply(self, s: String) -> String {
+        match self {
+            TextCase::None => s,
+            TextCase::Upper => s.to_uppercase(),
+            TextCase::Lower => s.to_lowercase(),
+        }
+    }
+}
+
+fn is_top(v: &VAlign) -> bool {
+    *v == VAlign::Top
+}
+
+fn is_no_case(v: &TextCase) -> bool {
+    *v == TextCase::None
+}
+
+/// A text element's line spacing, a multiple of the usual pitch, until it is set.
+pub const LINE_SPACING: f64 = 1.0;
+/// The least and most a text element's line spacing may be.
+pub const MIN_LINE_SPACING: f64 = 0.5;
+pub const MAX_LINE_SPACING: f64 = 3.0;
+
+fn line_spacing() -> f64 {
+    LINE_SPACING
+}
+
+fn is_line_spacing(v: &f64) -> bool {
+    *v == LINE_SPACING
+}
+
+fn is_none_frame(v: &Option<u32>) -> bool {
+    v.is_none()
+}
+
 /// The most letter spacing a text element takes, either way (points).
 pub const MAX_LETTER_SPACING: f64 = 50.0;
 pub const MIN_LETTER_SPACING: f64 = -5.0;
@@ -951,6 +1062,23 @@ pub enum ElementKind {
         /// (trimmed, bounded, none when not a name).
         #[serde(default, deserialize_with = "crate::symbology::de_font", skip_serializing_if = "Option::is_none")]
         font_name: Option<String>,
+        /// The map frame its map tokens (`{scale}`, `{map}`, `{extent}`…) read; `None` is the
+        /// page's first frame. Unlike a surround's, it isn't removed with its frame.
+        #[serde(default, skip_serializing_if = "is_none_frame")]
+        frame: Option<u32>,
+        /// Break each line at the element's width, at spaces and after dashes; a word wider
+        /// than it stays whole on a line of its own.
+        #[serde(default, skip_serializing_if = "is_false")]
+        wrap: bool,
+        /// Where the block of lines sits down the element.
+        #[serde(default, skip_serializing_if = "is_top")]
+        valign: VAlign,
+        /// The distance between lines as a multiple of the usual one (0.5 to 3).
+        #[serde(default = "line_spacing", skip_serializing_if = "is_line_spacing")]
+        line_spacing: f64,
+        /// Upper or lower case applied once the tokens have expanded.
+        #[serde(default, skip_serializing_if = "is_no_case")]
+        case: TextCase,
     },
     Picture {
         /// Base64 PNG or JPEG.
@@ -1013,6 +1141,11 @@ impl ElementKind {
             letter_spacing: 0.0,
             font: FontFamily::Sans,
             font_name: None,
+            frame: None,
+            wrap: false,
+            valign: VAlign::Top,
+            line_spacing: LINE_SPACING,
+            case: TextCase::None,
         }
     }
 
@@ -1231,10 +1364,10 @@ impl Layout {
         let before = self.elements.len();
         self.elements.retain(|e| e.id != id && e.kind.frame() != Some(id));
         for e in &mut self.elements {
-            if let ElementKind::MapFrame { extent_of, .. } = &mut e.kind
-                && *extent_of == Some(id)
-            {
-                *extent_of = None;
+            match &mut e.kind {
+                ElementKind::MapFrame { extent_of, .. } if *extent_of == Some(id) => *extent_of = None,
+                ElementKind::Text { frame, .. } if *frame == Some(id) => *frame = None,
+                _ => {}
             }
         }
         if self.series.as_ref().is_some_and(|s| s.frame == id) {
@@ -1306,7 +1439,8 @@ impl Layout {
                     // longer match it.
                     exclude.truncate(MAX_LEGEND_EXCLUDED);
                 }
-                ElementKind::Text { text, size, letter_spacing, .. } => {
+                ElementKind::Text { text, size, letter_spacing, line_spacing, .. } => {
+                    *line_spacing = finite_or(*line_spacing, LINE_SPACING).clamp(MIN_LINE_SPACING, MAX_LINE_SPACING);
                     *size = finite_or(*size, 12.0).clamp(*crate::graphics::FONT_SIZE.start(), *crate::graphics::FONT_SIZE.end());
                     *letter_spacing = finite_or(*letter_spacing, 0.0).clamp(MIN_LETTER_SPACING, MAX_LETTER_SPACING);
                     text.truncate(text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i));
@@ -1326,10 +1460,14 @@ impl Layout {
             self.elements.iter().filter(|e| matches!(e.kind, ElementKind::MapFrame { .. })).map(|e| e.id).collect();
         self.elements.retain(|e| e.kind.frame().is_none_or(|f| frames.contains(&f)));
         for e in &mut self.elements {
-            if let ElementKind::MapFrame { extent_of, .. } = &mut e.kind
-                && extent_of.is_some_and(|o| !frames.contains(&o) || o == e.id)
-            {
-                *extent_of = None;
+            match &mut e.kind {
+                ElementKind::MapFrame { extent_of, .. } if extent_of.is_some_and(|o| !frames.contains(&o) || o == e.id) => {
+                    *extent_of = None;
+                }
+                // A text bound to something that isn't a map frame reads the first one, as an
+                // unbound one does.
+                ElementKind::Text { frame, .. } if frame.is_some_and(|f| !frames.contains(&f)) => *frame = None,
+                _ => {}
             }
         }
         if let Some(s) = &mut self.series {
@@ -1505,6 +1643,105 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_elements_saved_before_read_and_save_the_same() {
+        // `bold` has always been written; every later field is left out at its default.
+        let j = r#"{"Text":{"text":"a","size":10.0,"color":[0,0,0,255],"bold":false}}"#;
+        let k: ElementKind = serde_json::from_str(j).unwrap();
+        assert!(matches!(
+            &k,
+            ElementKind::Text { frame: None, wrap: false, valign: VAlign::Top, case: TextCase::None, line_spacing, .. } if *line_spacing == 1.0
+        ));
+        assert_eq!(serde_json::to_string(&k).unwrap(), j);
+        // Set, they are written and read back.
+        let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, .. } = k else { panic!() };
+        let set = ElementKind::Text {
+            text,
+            size,
+            color,
+            bold,
+            italic,
+            align,
+            letter_spacing,
+            font,
+            font_name,
+            frame: Some(3),
+            wrap: true,
+            valign: VAlign::Bottom,
+            line_spacing: 1.5,
+            case: TextCase::Upper,
+        };
+        let s = serde_json::to_string(&set).unwrap();
+        assert!(s.contains(r#""frame":3,"wrap":true,"valign":"Bottom","line_spacing":1.5,"case":"Upper""#), "{s}");
+        assert_eq!(serde_json::from_str::<ElementKind>(&s).unwrap(), set);
+        assert_eq!(VAlign::from_name(" MIDDLE "), Some(VAlign::Middle));
+        assert_eq!(VAlign::from_name("centre"), Some(VAlign::Middle));
+        assert_eq!(TextCase::from_name("Upper"), Some(TextCase::Upper));
+        assert_eq!(TextCase::Upper.apply("Straße 9".into()), "STRASSE 9");
+        assert_eq!(TextCase::from_name("title"), None);
+    }
+
+    #[test]
+    fn a_text_bound_to_a_frame_keeps_it_until_the_frame_goes() {
+        let mut l = Layout::new("L", 200.0, 200.0);
+        let frame = |l: &mut Layout, name: &str| {
+            l.add(
+                name,
+                (10.0, 10.0, 80.0, 80.0),
+                ElementKind::MapFrame {
+                    map: "Map".into(),
+                    center: Coord::new(0.0, 0.0),
+                    scale: 50_000.0,
+                    shape: FrameShape::Rectangle,
+                    grid: None,
+                    bearing: 0.0,
+                    pitch: 0.0,
+                    extent_of: None,
+                    extent_color: INDICATOR_COLOR,
+                    extent_width: INDICATOR_WIDTH,
+                },
+            )
+        };
+        let (a, b) = (frame(&mut l, "A"), frame(&mut l, "B"));
+        let rect = l.add(
+            "R",
+            (0.0, 0.0, 5.0, 5.0),
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 },
+        );
+        let t = l.add("T", (0.0, 100.0, 50.0, 10.0), ElementKind::text("{scale}", 10.0, Rgba::rgb(0, 0, 0), false));
+        let bind = |l: &mut Layout, f: Option<u32>| {
+            if let Some(ElementKind::Text { frame, .. }) = l.element_mut(t).map(|e| &mut e.kind) {
+                *frame = f;
+            }
+        };
+        let bound = |l: &Layout| match l.element(t).map(|e| &e.kind) {
+            Some(ElementKind::Text { frame, .. }) => *frame,
+            _ => Some(u32::MAX),
+        };
+        // A text isn't a surround: its frame doesn't carry it away, and removing a frame it
+        // isn't bound to leaves it bound.
+        assert_eq!(l.element(t).map(|e| e.kind.frame()), Some(None));
+        bind(&mut l, Some(b));
+        assert!(l.remove(a));
+        assert_eq!(bound(&l), Some(b));
+        assert!(l.remove(b));
+        assert!(l.element(t).is_some(), "the text stays");
+        assert_eq!(bound(&l), None, "and reads the first frame again");
+        // Loading drops a binding to something that isn't a map frame, and keeps line spacing in range.
+        bind(&mut l, Some(rect));
+        if let Some(ElementKind::Text { line_spacing, .. }) = l.element_mut(t).map(|e| &mut e.kind) {
+            *line_spacing = 99.0;
+        }
+        l.clamp();
+        assert_eq!(bound(&l), None);
+        assert!(matches!(l.element(t).map(|e| &e.kind), Some(ElementKind::Text { line_spacing, .. }) if *line_spacing == 3.0));
+        if let Some(ElementKind::Text { line_spacing, .. }) = l.element_mut(t).map(|e| &mut e.kind) {
+            *line_spacing = f64::NAN;
+        }
+        l.clamp();
+        assert!(matches!(l.element(t).map(|e| &e.kind), Some(ElementKind::Text { line_spacing, .. }) if *line_spacing == 1.0));
+    }
 
     #[test]
     fn elements_are_arranged_in_the_drawing_order() {

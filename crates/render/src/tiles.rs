@@ -62,7 +62,11 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
     // its own line breaks kept.
     let max_w = l.max_width * l.size;
     let text = if max_w > 0.0 {
-        lines.iter().flat_map(|line| crate::text::wrap(line, size, l.bold, spacing, max_w)).collect::<Vec<_>>().join("\n")
+        lines
+            .iter()
+            .flat_map(|line| crate::text::wrap(line, size, crate::text::Face { bold: l.bold, ..Default::default() }, spacing, max_w))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         lines.join(" ")
     };

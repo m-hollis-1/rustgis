@@ -3941,6 +3941,86 @@ fn a_frames_grid_can_be_a_measured_grid() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A layout's text is bound to a map frame, wrapped, aligned down its box, spaced and cased by
+/// `layout.addElement` and `layout.update`; a frame that isn't a map frame is refused, `null`
+/// unbinds, and the properties are text's alone.
+#[test]
+fn layout_text_takes_frame_wrap_valign_spacing_and_case() {
+    use rustgis_map::layout::{ElementKind, TextCase, VAlign};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let frame = s.project.layouts[0].first_frame().unwrap();
+    let rect =
+        s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20})).unwrap()["element"].as_u64().unwrap();
+    let props = |s: &Session, id: u64| match &s.project.layouts[0].element(id as u32).unwrap().kind {
+        ElementKind::Text { frame, wrap, valign, line_spacing, case, .. } => (*frame, *wrap, *valign, *line_spacing, *case),
+        k => panic!("{k:?}"),
+    };
+    // Added unbound, unwrapped, from the top, at the usual spacing, as typed.
+    let plain = s.run("layout.addElement", &json!({"kind": "text", "text": "Scale {scale}"})).unwrap()["element"].as_u64().unwrap();
+    assert_eq!(props(&s, plain), (None, false, VAlign::Top, 1.0, TextCase::None));
+    let all = json!({"frame": frame, "wrap": true, "valign": "Bottom", "lineSpacing": 1.5, "case": "UPPER"});
+    let mut add = all.clone();
+    add["kind"] = json!("text");
+    let added = s.run("layout.addElement", &add).unwrap()["element"].as_u64().unwrap();
+    assert_eq!(props(&s, added), (Some(frame), true, VAlign::Bottom, 1.5, TextCase::Upper));
+    // Updated one at a time or together, read back; the rest stay.
+    let mut up = all.clone();
+    up["element"] = json!(plain);
+    s.run("layout.update", &up).unwrap();
+    assert_eq!(props(&s, plain), (Some(frame), true, VAlign::Bottom, 1.5, TextCase::Upper));
+    s.run("layout.update", &json!({"element": plain, "valign": "middle", "lineSpacing": 99})).unwrap();
+    assert_eq!(props(&s, plain), (Some(frame), true, VAlign::Middle, 3.0, TextCase::Upper), "line spacing is clamped");
+    s.run("layout.update", &json!({"element": plain, "lineSpacing": 0.01, "case": "lower", "wrap": false})).unwrap();
+    assert_eq!(props(&s, plain), (Some(frame), false, VAlign::Middle, 0.5, TextCase::Lower));
+    // `null` unbinds; a second call without `frame` leaves it alone.
+    s.run("layout.update", &json!({"element": plain, "frame": null})).unwrap();
+    assert_eq!(props(&s, plain).0, None);
+    s.run("layout.update", &json!({"element": plain, "frame": frame})).unwrap();
+    s.run("layout.update", &json!({"element": plain, "size": 14})).unwrap();
+    assert_eq!(props(&s, plain).0, Some(frame));
+    // A frame that isn't a map frame, or isn't there, changes nothing at all.
+    let before = props(&s, plain);
+    for bad in [json!(rect), json!(plain), json!(9999), json!("x")] {
+        let e = s.run("layout.update", &json!({"element": plain, "frame": bad, "case": "upper", "text": "changed"})).unwrap_err();
+        assert!(e.contains("frame must be a map frame"), "{bad}: {e}");
+        let add = json!({"kind": "text", "frame": bad});
+        assert!(s.run("layout.addElement", &add).unwrap_err().contains("frame must be a map frame"), "{bad}");
+    }
+    assert_eq!(props(&s, plain), before);
+    for bad in [json!({"valign": "diagonal"}), json!({"case": "title"}), json!({"wrap": "yes please"}), json!({"lineSpacing": "tall"})] {
+        let mut p = bad.clone();
+        p["element"] = json!(plain);
+        p["text"] = json!("changed");
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+        let mut p = bad.clone();
+        p["kind"] = json!("text");
+        assert!(s.run("layout.addElement", &p).is_err(), "{bad}");
+    }
+    assert_eq!(props(&s, plain), before);
+    assert!(matches!(&s.project.layouts[0].element(plain as u32).unwrap().kind, ElementKind::Text { text, .. } if text == "Scale {scale}"));
+    // Only text takes them.
+    for k in ["wrap", "valign", "lineSpacing", "case"] {
+        let value = json!(match k {
+            "wrap" => json!(true),
+            "valign" => json!("top"),
+            "lineSpacing" => json!(2),
+            _ => json!("upper"),
+        });
+        assert!(s.run("layout.update", &json!({"element": rect, k: value})).unwrap_err().contains("only text"), "{k}");
+        assert!(s.run("layout.addElement", &json!({"kind": "rectangle", k: value})).unwrap_err().contains("only text"), "{k}");
+    }
+    // A locked text takes no binding change either.
+    s.run("layout.update", &json!({"element": plain, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": plain, "frame": null})).is_err());
+    assert_eq!(props(&s, plain).0, Some(frame));
+    s.run("layout.update", &json!({"element": plain, "locked": false})).unwrap();
+    // Removing the frame unbinds the text and leaves it on the page.
+    s.run("layout.removeElement", &json!({"element": frame})).unwrap();
+    assert_eq!(props(&s, plain).0, None);
+    assert_eq!(props(&s, added).0, None);
+}
+
 /// Grids, north arrows and scale bars take their cartographic options through commands (#327):
 /// checked before anything changes, kept when other options change, and saved with the layout.
 #[test]

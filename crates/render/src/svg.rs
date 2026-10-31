@@ -36,28 +36,59 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
         match &e.kind {
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name } => {
-                let first = layout.first_frame().and_then(|id| layout.element(id)).and_then(|f| match &f.kind {
-                    ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
-                        let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
-                        Some((m, frame_camera(m, *center, *scale, *bearing, *pitch)))
+            ElementKind::Text {
+                text: t,
+                size,
+                color,
+                bold,
+                italic,
+                align,
+                letter_spacing,
+                font,
+                font_name,
+                frame: bound,
+                wrap,
+                valign,
+                line_spacing,
+                case,
+            } => {
+                // The frame its map tokens read: the one it is bound to, else the first.
+                let resolve = |id: u32| {
+                    let f = layout.element(id)?;
+                    match &f.kind {
+                        ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
+                            let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
+                            Some((m, frame_camera(m, *center, *scale, *bearing, *pitch), f.w * PT_PER_MM, f.h * PT_PER_MM))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                });
-                let text = expand(t, layout, info, first);
-                // As the page draws it: the size in points, lines 1.25 apart, the first baseline
-                // 0.6 of the size below the top, lines past the frame left out.
+                };
+                let from = bound.and_then(resolve).or_else(|| layout.first_frame().and_then(resolve));
+                let text = case.apply(expand(t, layout, info, from));
+                // As the page draws it: the size in points, lines 1.25 (times the line spacing)
+                // apart, the first baseline 0.6 of the size below the top of the block, which
+                // sits at the top, middle or bottom of the box; the lines broken at the box's
+                // width when wrapped (by the same measure), lines past the frame left out.
                 let em = size.clamp(2.0, 400.0) * 1.33 / PT_PER_MM;
+                let spacing = if line_spacing.is_finite() { line_spacing.clamp(0.5, 3.0) } else { 1.0 };
+                let face = crate::layout::text_face(*bold, *italic, *font, font_name.as_deref());
+                let broken = crate::layout::text_lines(
+                    &text,
+                    size.clamp(2.0, 400.0) as f32,
+                    face,
+                    *letter_spacing as f32,
+                    wrap.then_some((w * PT_PER_MM) as f32),
+                );
+                let top = y + crate::layout::block_shift(*valign, h, em, broken.len(), spacing);
                 let (anchor, tx) = match align {
                     TextAlign::Left => ("start", x),
                     TextAlign::Center => ("middle", x + w / 2.0),
                     TextAlign::Right => ("end", x + w),
                 };
-                let lines: Vec<(f64, &str)> = text
-                    .lines()
-                    .take(200)
+                let lines: Vec<(f64, &str)> = broken
+                    .iter()
                     .enumerate()
-                    .map(|(i, l)| (y + em * (0.6 + 1.25 * i as f64), l))
+                    .map(|(i, l)| (top + em * (0.6 + 1.25 * spacing * i as f64), l.as_str()))
                     .take_while(|(ly, _)| *ly <= y + h + em)
                     .collect();
                 // A named family first (#762), quoted as CSS has it (its own backslashes and
@@ -71,7 +102,7 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                     s,
                     r#"<text x="{}" y="{}" font-family="{}" font-size="{}" font-weight="{}" font-style="{}" text-anchor="{anchor}" letter-spacing="{}"{} xml:space="preserve">"#,
                     num(tx),
-                    num(lines.first().map_or(y + em * 0.6, |l| l.0)),
+                    num(lines.first().map_or(top + em * 0.6, |l| l.0)),
                     esc(&family),
                     num(em),
                     if *bold { "bold" } else { "normal" },
@@ -263,6 +294,59 @@ mod tests {
             layout.add(format!("Map {i}"), (0.0, 0.0, 841.0, 1189.0), kind);
         }
         layout
+    }
+
+    /// A text in SVG is wrapped, aligned down its box, spaced and cased as the page draws it, and
+    /// reads the tokens of the frame it is bound to.
+    #[test]
+    fn text_is_wrapped_aligned_spaced_and_cased_and_reads_its_frame() {
+        use rustgis_map::layout::{TextCase, VAlign};
+        let mut layout = Layout::new("SVG", 100.0, 80.0);
+        let frame = |scale: f64| {
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": "Map", "center": {"x": 0, "y": 0}, "scale": scale}})).unwrap()
+        };
+        let _first = layout.add("First", (0.0, 0.0, 20.0, 20.0), frame(10_000.0));
+        let second = layout.add("Second", (0.0, 20.0, 20.0, 20.0), frame(50_000.0));
+        let mut kind = ElementKind::text(
+            "gypsy jumping quickly over typography pages {scale} while grumpy plumbers yell",
+            10.0,
+            rustgis_map::Rgba::rgb(0, 0, 0),
+            false,
+        );
+        if let ElementKind::Text { frame, wrap, valign, line_spacing, case, .. } = &mut kind {
+            (*frame, *wrap, *valign, *line_spacing, *case) = (Some(second), true, VAlign::Bottom, 1.5, TextCase::Upper);
+        }
+        layout.add("Text", (30.0, 10.0, 30.0, 60.0), kind.clone());
+        let svg = layout_svg(&layout, &mut [Map::new("Map")], 72.0, &PageInfo::default()).unwrap();
+        // Several lines, upper case, the token of the second frame.
+        let spans: Vec<(f64, String)> = svg
+            .split("<tspan ")
+            .skip(1)
+            .filter_map(|t| {
+                let y = t.split("y=\"").nth(1)?.split('"').next()?.parse().ok()?;
+                Some((y, t.split('>').nth(1)?.split('<').next()?.to_string()))
+            })
+            .collect();
+        assert!(spans.len() >= 3, "wrapped into lines: {spans:?}");
+        assert_eq!(
+            spans.iter().map(|s| s.1.as_str()).collect::<Vec<_>>().join(" "),
+            "GYPSY JUMPING QUICKLY OVER TYPOGRAPHY PAGES 1:50,000 WHILE GRUMPY PLUMBERS YELL"
+        );
+        // Lines 1.5 × 1.25 em apart; the last sits on the bottom (70 mm) as the page draws it.
+        let em = 10.0 * 1.33 / PT_PER_MM;
+        assert!(((spans[1].0 - spans[0].0) - em * 1.25 * 1.5).abs() < 0.01, "{spans:?}");
+        let last = spans[spans.len() - 1].0;
+        assert!((last - (70.0 - em * 1.25 + em * 0.6)).abs() < 0.01, "last baseline {last}");
+        // The same text unbound reads the first frame; top-aligned it starts at the top.
+        let unbound = {
+            let mut l = layout.clone();
+            if let Some(ElementKind::Text { frame, valign, .. }) = l.elements.last_mut().map(|e| &mut e.kind) {
+                (*frame, *valign) = (None, VAlign::Top);
+            }
+            layout_svg(&l, &mut [Map::new("Map")], 72.0, &PageInfo::default()).unwrap()
+        };
+        assert!(unbound.contains("1:10,000") && !unbound.contains("1:50,000"));
+        assert!(unbound.contains(&format!("y=\"{}\"", num(10.0 + em * 0.6))), "top: {unbound}");
     }
 
     #[test]

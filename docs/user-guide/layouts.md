@@ -213,7 +213,18 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   starts as the family's own class (a serif's is Serif).
   Scripts give the family's name: `"font": "Garamond"`, with `"fallback": "serif"` if wanted;
   `labels.fonts` lists the installed families. The project keeps the name, never a file, and no
-  font goes into a PNG or PDF export (their pages are pictures). **Picture** places a PNG or JPEG.
+  font goes into a PNG or PDF export (their pages are pictures).
+
+  A text's **Paragraph** section sets how its lines sit in the element. **Frame** picks the map
+  frame whose map the `{scale}`, `{map}`, `{crs}` and `{extent}` tokens read (the default, First
+  frame, is the first on the page, so a page with an inset and a main map can print the main
+  map's scale). **Wrap** breaks each line at the element's width, at spaces and after dashes; a
+  word wider than the element stays whole on its own line. **Vertical** puts the block of lines at
+  the top, middle or bottom of the element, **Line spacing** (0.5 to 3) scales the distance between
+  lines, and **Case** shows the text in upper or lower case after the tokens have filled in.
+  Scripts set them with `frame` (a map frame's id, or `null` for the first frame), `wrap`, `valign`
+  (`top`, `middle`, `bottom`), `lineSpacing` and `case` (`none`, `upper`, `lower`) on
+  `layout.addElement` and `layout.update`. **Picture** places a PNG or JPEG.
 - **Map Series**: one page per feature of an index layer, with the frame zoomed to each feature;
   step through pages, refresh, and export every page into one PDF.
 - Click an element to select it, drag to move, drag its handles to resize, and edit it in the

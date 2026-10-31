@@ -5129,19 +5129,19 @@ mod tests {
     fn wraps_balanced_at_spaces_and_dashes() {
         let width = |s: &str| text::measure(s, 9.0, false);
         let w = width("Times Square–42nd Street");
-        let lines = text::wrap("Times Square–42nd Street", 9.0, false, 0.0, w * 0.6);
+        let lines = text::wrap("Times Square–42nd Street", 9.0, text::Face::default(), 0.0, w * 0.6);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines.join(" ").replace("– ", "–") == "Times Square–42nd Street", "{lines:?}");
         // Balanced: neither line much longer than the other.
         let (a, b) = (width(&lines[0]), width(&lines[1]));
         assert!(a.max(b) / a.min(b) < 2.0, "{lines:?}");
         // A space after an "&" is kept.
-        let lines = text::wrap("West 42nd Street & 8th Avenue", 9.0, false, 0.0, width("West 42nd Street"));
+        let lines = text::wrap("West 42nd Street & 8th Avenue", 9.0, text::Face::default(), 0.0, width("West 42nd Street"));
         assert!(lines.iter().all(|l| !l.contains("&8")), "{lines:?}");
         // What fits, or has nowhere to break, is left alone; junk is safe.
-        assert_eq!(text::wrap("Short", 9.0, false, 0.0, 1000.0), ["Short"]);
-        assert_eq!(text::wrap("Unbreakable", 9.0, false, 0.0, 1.0), ["Unbreakable"]);
-        assert!(!text::wrap("a b c", f32::NAN, false, f32::INFINITY, -1.0).is_empty());
+        assert_eq!(text::wrap("Short", 9.0, text::Face::default(), 0.0, 1000.0), ["Short"]);
+        assert_eq!(text::wrap("Unbreakable", 9.0, text::Face::default(), 0.0, 1.0), ["Unbreakable"]);
+        assert!(!text::wrap("a b c", f32::NAN, text::Face::default(), f32::INFINITY, -1.0).is_empty());
     }
 
     #[test]

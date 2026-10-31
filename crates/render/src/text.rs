@@ -289,8 +289,8 @@ pub fn measure_in(text: &str, size: f32, face: Face) -> f32 {
 }
 
 /// How wide `text` is on one line at `size` with `spacing` points between letters, in points.
-fn spaced_width(text: &str, size: f32, bold: bool, spacing: f32) -> f32 {
-    let w = measure(text, size, bold);
+fn spaced_width(text: &str, size: f32, face: Face, spacing: f32) -> f32 {
+    let w = measure_in(text, size, face);
     if spacing == 0.0 {
         return w;
     }
@@ -301,7 +301,7 @@ fn spaced_width(text: &str, size: f32, bold: bool, spacing: f32) -> f32 {
 /// `text-max-width`: at spaces, and after a hyphen, dash, slash or the like; the lines balanced
 /// (each near the same width) rather than filled, and a word longer than that a line of its
 /// own. A line that fits, or can't be broken, is kept as it is.
-pub fn wrap(line: &str, size: f32, bold: bool, spacing: f32, max_w: f32) -> Vec<String> {
+pub fn wrap(line: &str, size: f32, face: Face, spacing: f32, max_w: f32) -> Vec<String> {
     // The pieces a line may break after: each with whether a space followed it.
     let mut pieces: Vec<(String, bool)> = Vec::new();
     let mut cur = String::new();
@@ -323,7 +323,7 @@ pub fn wrap(line: &str, size: f32, bold: bool, spacing: f32, max_w: f32) -> Vec<
     if !cur.is_empty() {
         pieces.push((cur, true));
     }
-    let width = |s: &str| spaced_width(s, size, bold, spacing);
+    let width = |s: &str| spaced_width(s, size, face, spacing);
     let total = width(line);
     if pieces.len() < 2 || !(max_w.is_finite() && max_w > 0.0) || total <= max_w {
         return vec![line.to_string()];

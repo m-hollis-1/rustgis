@@ -7,8 +7,8 @@
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
     Arrange, ArrowStyle, CoordFormat, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE,
-    MAX_GRID_WIDTH, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide,
-    frame_camera, line_angle, line_length,
+    MAX_GRID_WIDTH, MAX_LINE_SPACING, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, MIN_LINE_SPACING, Orientation, PT_PER_MM,
+    ScaleBarStyle, ScaleUnits, TextCase, TickSide, VAlign, frame_camera, line_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -1739,7 +1739,23 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         );
     });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
-    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name } = &e.kind {
+    if let ElementKind::Text {
+        text,
+        size,
+        color,
+        bold,
+        italic,
+        align,
+        letter_spacing,
+        font,
+        font_name,
+        frame: bound,
+        wrap,
+        valign,
+        line_spacing,
+        case,
+    } = &e.kind
+    {
         let key = (li, id, "text");
         let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| text.clone());
         let (mut sz, mut c, mut bb) = (*size, crate::theme::c32(*color), *bold);
@@ -1791,6 +1807,91 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             };
             update(app, font);
         }
+        // Which frame its map tokens read, and how its lines sit in the box.
+        let frames: Vec<(u32, String)> =
+            layout.elements.iter().filter(|f| matches!(f.kind, ElementKind::MapFrame { .. })).map(|f| (f.id, f.name.clone())).collect();
+        crate::textform::section(ui, "Paragraph", |ui| {
+            egui::Grid::new(("layout_text_box", id)).num_columns(2).min_col_width(crate::textform::LABEL_W).spacing(vec2(8.0, 6.0)).show(
+                ui,
+                |ui| {
+                    let input_label = ui.label(tl!("Frame"));
+                    let shown = match bound.and_then(|b| frames.iter().find(|f| f.0 == b)) {
+                        Some((_, name)) => name.clone(),
+                        None => tl!("First frame").to_string(),
+                    };
+                    egui::ComboBox::from_id_salt(("layout_text_frame", id))
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(bound.is_none(), tl!("First frame")).clicked() && bound.is_some() {
+                                update(app, json!({"frame": null}));
+                            }
+                            for (fid, name) in &frames {
+                                if ui.selectable_label(*bound == Some(*fid), name).clicked() && *bound != Some(*fid) {
+                                    update(app, json!({"frame": fid}));
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(input_label.id);
+                    ui.end_row();
+                    let input_label = ui.label(tl!("Wrap"));
+                    let mut on = *wrap;
+                    let r = ui.checkbox(&mut on, "").labelled_by(input_label.id);
+                    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, tl!("Wrap")));
+                    if r.changed() {
+                        update(app, json!({"wrap": on}));
+                    }
+                    ui.end_row();
+                    let input_label = ui.label(tl!("Vertical"));
+                    egui::ComboBox::from_id_salt(("layout_text_valign", id))
+                        .selected_text(tl!(valign.label()))
+                        .show_ui(ui, |ui| {
+                            for v in VAlign::ALL {
+                                if ui.selectable_label(*valign == v, tl!(v.label())).clicked() && *valign != v {
+                                    update(app, json!({"valign": v.code()}));
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(input_label.id);
+                    ui.end_row();
+                    let input_label = ui.label(tl!("Line spacing"));
+                    let mut ls = *line_spacing;
+                    let drag = Dragged::lend(ui, drag_key("line_spacing"), &mut ls);
+                    let r = ui
+                        .add(
+                            egui::DragValue::new(&mut ls)
+                                .range(MIN_LINE_SPACING..=MAX_LINE_SPACING)
+                                .speed(0.01)
+                                .max_decimals(2)
+                                .suffix(" ×"),
+                        )
+                        .labelled_by(input_label.id);
+                    let now = ls;
+                    r.widget_info(|| egui::WidgetInfo {
+                        label: Some(tl!("Line spacing").to_string()),
+                        ..egui::WidgetInfo::drag_value(true, now)
+                    });
+                    if drag.settled(ui, &r, &mut ls) && (ls - *line_spacing).abs() > 1e-6 {
+                        update(app, json!({"lineSpacing": ls}));
+                    }
+                    ui.end_row();
+                    let input_label = ui.label(tl!("Case"));
+                    egui::ComboBox::from_id_salt(("layout_text_case", id))
+                        .selected_text(tl!(case.label()))
+                        .show_ui(ui, |ui| {
+                            for v in TextCase::ALL {
+                                if ui.selectable_label(*case == v, tl!(v.label())).clicked() && *case != v {
+                                    update(app, json!({"case": v.code()}));
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(input_label.id);
+                    ui.end_row();
+                },
+            );
+        });
     }
     // The layers a legend lists: a checkbox for each vector layer of its frame's map and each
     // WMS or WMTS layer with a legend, ticked when listed. Names gone from the map drop out of
@@ -2531,6 +2632,69 @@ mod tests {
         assert!(app.session.project.layouts[li].element(title.id).is_some(), "Backspace kept it");
         assert_eq!(app.layout.selected, Some(title.id));
         assert!(app.session.notices.iter().any(|n| n.text.contains(super::locked_delete())), "it says why");
+    }
+
+    /// A text element's properties bind it to a map frame and set wrapping, vertical alignment,
+    /// line spacing and case.
+    #[test]
+    fn a_text_element_takes_frame_wrap_valign_spacing_and_case() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use rustgis_engine::map::layout::{ElementKind, TextCase, VAlign};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Type"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let frame = app.session.project.layouts[li].first_frame().unwrap_or_else(|| {
+            let id = app.run("layout.addFrame", json!({})).unwrap()["element"].as_u64().unwrap();
+            id as u32
+        });
+        let frame_name = app.session.project.layouts[li].element(frame).unwrap().name.clone();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.selected = Some(title);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+        let text = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(title).unwrap().kind {
+            ElementKind::Text { frame, wrap, valign, line_spacing, case, .. } => (*frame, *wrap, *valign, *line_spacing, *case),
+            k => panic!("{k:?}"),
+        };
+        assert_eq!(text(&h), (None, false, VAlign::Top, 1.0, TextCase::None));
+        h.get_by_role_and_label(Role::CheckBox, "Wrap").click();
+        h.run_steps(2);
+        assert!(text(&h).1);
+        // The combos: pick from each list.
+        for (combo, pick) in [("Vertical", "Bottom"), ("Case", "Upper case"), ("Frame", frame_name.as_str())] {
+            h.get_by_role_and_label(Role::ComboBox, combo).click();
+            h.run_steps(2);
+            h.get_by_label(pick).click();
+            h.run_steps(3);
+        }
+        assert_eq!((text(&h).0, text(&h).2, text(&h).4), (Some(frame), VAlign::Bottom, TextCase::Upper));
+        let (node, tree) = h.get_by_role_and_label(Role::SpinButton, "Line spacing").accesskit_node().locate();
+        h.event(egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::SetValue,
+            target_tree: tree,
+            target_node: node,
+            data: Some(ActionData::NumericValue(1.5)),
+        }));
+        h.run_steps(3);
+        assert_eq!(text(&h).3, 1.5);
+        // "First frame" unbinds it again.
+        h.get_by_role_and_label(Role::ComboBox, "Frame").click();
+        h.run_steps(2);
+        h.get_by_label("First frame").click();
+        h.run_steps(3);
+        assert_eq!(text(&h).0, None);
     }
 
     /// A text element's properties set italic, alignment and letter spacing (#213, point c).

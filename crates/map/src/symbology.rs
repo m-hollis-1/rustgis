@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::color::{Ramp, Rgba};
 use crate::fills::FillLayer;
 
+/// Read through [`MarkerWire`], so a picture a file holds that can't be kept reads as a circle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "MarkerWire")]
 pub enum Marker {
     #[default]
     Circle,
@@ -35,6 +37,43 @@ impl Marker {
             Marker::Star => "Star",
             Marker::Char(_) => "Character",
             Marker::Image(_) => "Image",
+        }
+    }
+}
+
+/// [`Marker`] as a file holds it. Only the picture differs: a file is not trusted, so one that is
+/// not text, not a PNG or JPEG, too large, or past the pictures kept ([`ImageRef::new`]) reads as
+/// a circle, and the rest of the file still reads.
+#[derive(Deserialize)]
+enum MarkerWire {
+    Circle,
+    Square,
+    Triangle,
+    Diamond,
+    Star,
+    Char(Glyph),
+    Image(WirePicture),
+}
+
+/// A picture marker's text in a file, `None` when it is anything else or can't be kept.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WirePicture {
+    Text(String),
+    Other(serde::de::IgnoredAny),
+}
+
+impl From<MarkerWire> for Marker {
+    fn from(w: MarkerWire) -> Marker {
+        match w {
+            MarkerWire::Circle => Marker::Circle,
+            MarkerWire::Square => Marker::Square,
+            MarkerWire::Triangle => Marker::Triangle,
+            MarkerWire::Diamond => Marker::Diamond,
+            MarkerWire::Star => Marker::Star,
+            MarkerWire::Char(g) => Marker::Char(g),
+            MarkerWire::Image(WirePicture::Text(t)) => ImageRef::new(&t).map_or(Marker::Circle, Marker::Image),
+            MarkerWire::Image(WirePicture::Other(_)) => Marker::Circle,
         }
     }
 }
@@ -120,15 +159,15 @@ impl ImageRef {
     pub const MAX_IMAGES: usize = MAX_IMAGES;
 
     /// Keeps `b64` (surrounding whitespace dropped); `None` when it is too large, is not base64,
-    /// or the table of pictures is full. Whether the bytes are an image the renderer reads is not
-    /// checked here: one it can't read draws nothing.
+    /// does not start as a PNG or JPEG does, or the table of pictures is full. Whether the whole
+    /// picture is one the renderer reads is not checked here: one it can't read draws nothing.
     pub fn new(b64: &str) -> Option<ImageRef> {
         use base64::Engine;
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         static IMAGES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
         let b64 = b64.trim();
-        if b64.is_empty() || b64.len() > Self::MAX_BYTES {
+        if b64.len() > Self::MAX_BYTES || !has_picture_signature(b64) {
             return None;
         }
         let mut images = IMAGES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
@@ -148,6 +187,14 @@ impl ImageRef {
     }
 }
 
+/// Whether base64 text starts with the bytes of a PNG or a JPEG.
+fn has_picture_signature(b64: &str) -> bool {
+    use base64::Engine;
+    // Twelve characters are nine bytes, whole base64 groups.
+    let Some(head) = b64.get(..12).and_then(|h| base64::engine::general_purpose::STANDARD.decode(h).ok()) else { return false };
+    head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) || head.starts_with(&[0xFF, 0xD8, 0xFF])
+}
+
 impl PartialEq for ImageRef {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.0, other.0)
@@ -165,14 +212,6 @@ impl std::hash::Hash for ImageRef {
 impl Serialize for ImageRef {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ImageRef {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let text = String::deserialize(d)?;
-        ImageRef::new(&text).ok_or_else(|| D::Error::custom("not a picture this build can keep"))
     }
 }
 
@@ -2504,6 +2543,7 @@ impl Labeling {
 mod tests {
     use super::*;
     use rustgis_data::{Field, Value};
+    use serde_json::json;
 
     #[test]
     fn image_markers_intern_and_round_trip() {
@@ -2521,8 +2561,36 @@ mod tests {
         let again = ImageRef::new(&copy).unwrap();
         assert!(std::ptr::eq(again.as_str(), r.as_str()));
         assert_eq!(m, Marker::Image(again));
-        // A crafted file's marker that is no base64 is an error rather than a panic.
-        assert!(serde_json::from_str::<Marker>(r#"{"Image":"***"}"#).is_err());
+        // Base64 that isn't a PNG or JPEG is not kept either.
+        assert!(ImageRef::new("AAAAAAAAAAAAAAAA").is_none());
+        assert!(ImageRef::new("/9j/4AAQSkZJRgABAQ==").is_some());
+    }
+
+    /// A picture a file holds that can't be kept reads as a circle, and the rest of the file still
+    /// reads: a crafted or damaged project must open (and must not fill the table of pictures).
+    #[test]
+    fn a_picture_marker_a_file_cannot_give_is_a_circle() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let junk = [
+            json!({"Image": "***"}),
+            json!({"Image": ""}),
+            json!({"Image": "AAAAAAAAAAAAAAAAAAAA"}),
+            json!({"Image": "A".repeat(ImageRef::MAX_BYTES + 4)}),
+            json!({"Image": 7}),
+            json!({"Image": null}),
+            json!({"Image": {"x": [1, 2]}}),
+        ];
+        for marker in junk {
+            let sym = json!({"fill": [1, 2, 3, 255], "stroke": [4, 5, 6, 255], "stroke_width": 1.5, "size": 9.0, "marker": marker});
+            let s: Symbol = serde_json::from_value(sym.clone()).unwrap_or_else(|e| panic!("{marker}: {e}"));
+            assert_eq!((s.marker, s.size, s.fill), (Marker::Circle, 9.0, Rgba::rgb(1, 2, 3)), "{marker}");
+            // In a renderer (a layer's style) and a list of markers, as files hold them.
+            let r: Renderer = serde_json::from_value(json!({"Single": sym})).unwrap_or_else(|e| panic!("{marker}: {e}"));
+            assert!(matches!(r, Renderer::Single(s) if s.marker == Marker::Circle));
+            let list: Vec<Marker> = serde_json::from_value(json!(["Star", marker, {"Image": png}, "Square"])).unwrap();
+            assert_eq!((list[0], list[1], list[3]), (Marker::Star, Marker::Circle, Marker::Square), "{marker}");
+            assert!(matches!(list[2], Marker::Image(r) if r.as_str() == png));
+        }
     }
 
     /// Labels saved before label classes (#618) read as the Default class alone, and are written

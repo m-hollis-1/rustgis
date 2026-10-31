@@ -702,7 +702,7 @@ fn a_character_of_a_font_is_a_marker_on_points_and_along_lines() {
     for (bad, says) in [
         (json!({"layer": "Cities", "char": ""}), "char is a character"),
         (json!({"layer": "Cities", "char": 7}), "char is a character"),
-        (json!({"layer": "Cities", "char": "a", "shape": "star"}), "not both"),
+        (json!({"layer": "Cities", "char": "a", "shape": "star"}), "give only one of"),
     ] {
         let err = s.run("layer.marker", &bad).unwrap_err();
         assert!(err.contains(says), "{bad}: {err}");

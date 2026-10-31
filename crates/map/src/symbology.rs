@@ -19,10 +19,12 @@ pub enum Marker {
     Star,
     /// A character of a font, as QGIS's font markers draw one: the size is the font's em.
     Char(Glyph),
+    /// A picture (a PNG), drawn at its own colours with its longer side the size.
+    Image(ImageRef),
 }
 
 impl Marker {
-    /// The shapes (every marker but [`Marker::Char`]).
+    /// The shapes (every marker but [`Marker::Char`] and [`Marker::Image`]).
     pub const ALL: [Marker; 5] = [Marker::Circle, Marker::Square, Marker::Triangle, Marker::Diamond, Marker::Star];
     pub fn label(self) -> &'static str {
         match self {
@@ -32,6 +34,7 @@ impl Marker {
             Marker::Diamond => "Diamond",
             Marker::Star => "Star",
             Marker::Char(_) => "Character",
+            Marker::Image(_) => "Image",
         }
     }
 }
@@ -98,6 +101,78 @@ impl<'de> Deserialize<'de> for FontName {
     /// Not a name (a crafted file): the label font, and the rest still reads.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(de_font(d)?.map_or_else(FontName::default, |n| FontName::new(&n)))
+    }
+}
+
+/// The most pictures kept (each is kept for the rest of the run); one past them is refused.
+const MAX_IMAGES: usize = 512;
+
+/// A picture marker's picture: base64 PNG text, kept once for the rest of the run so a symbol
+/// holding one stays `Copy` (as [`FontName`] does a font's name). Equal pictures are the same
+/// kept string, so they compare and hash by address, and render caches may key on it.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageRef(&'static str);
+
+impl ImageRef {
+    /// The most base64 text one picture may be.
+    pub const MAX_BYTES: usize = 512 << 10;
+    /// The most different pictures kept.
+    pub const MAX_IMAGES: usize = MAX_IMAGES;
+
+    /// Keeps `b64` (surrounding whitespace dropped); `None` when it is too large, is not base64,
+    /// or the table of pictures is full. Whether the bytes are an image the renderer reads is not
+    /// checked here: one it can't read draws nothing.
+    pub fn new(b64: &str) -> Option<ImageRef> {
+        use base64::Engine;
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static IMAGES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+        let b64 = b64.trim();
+        if b64.is_empty() || b64.len() > Self::MAX_BYTES {
+            return None;
+        }
+        let mut images = IMAGES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = images.get(b64) {
+            return Some(ImageRef(kept));
+        }
+        if images.len() >= MAX_IMAGES || base64::engine::general_purpose::STANDARD.decode(b64).is_err() {
+            return None;
+        }
+        let kept: &'static str = Box::leak(b64.to_owned().into_boxed_str());
+        images.insert(kept);
+        Some(ImageRef(kept))
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl PartialEq for ImageRef {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for ImageRef {}
+
+impl std::hash::Hash for ImageRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_ptr().hash(state);
+    }
+}
+
+impl Serialize for ImageRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let text = String::deserialize(d)?;
+        ImageRef::new(&text).ok_or_else(|| D::Error::custom("not a picture this build can keep"))
     }
 }
 
@@ -1505,9 +1580,10 @@ impl Renderer {
         }
     }
 
-    /// Whether any symbol is a character of a font ([`Marker::Char`]).
+    /// Whether any symbol is a character of a font or a picture ([`Marker::Char`], [`Marker::Image`]):
+    /// the markers with no shape template for the GPU.
     pub fn has_char_markers(&self) -> bool {
-        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_));
+        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_) | Marker::Image(_));
         match self {
             Renderer::Single(s) | Renderer::Proportional { base: s, .. } => char(s),
             Renderer::Unique { classes, other, .. } => char(other) || classes.iter().any(|c| char(&c.1)),
@@ -2428,6 +2504,26 @@ impl Labeling {
 mod tests {
     use super::*;
     use rustgis_data::{Field, Value};
+
+    #[test]
+    fn image_markers_intern_and_round_trip() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let r = ImageRef::new(png).unwrap();
+        let m = Marker::Image(r);
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, format!(r#"{{"Image":"{png}"}}"#));
+        assert_eq!(serde_json::from_str::<Marker>(&json).unwrap(), m);
+        assert!(ImageRef::new("***").is_none());
+        assert!(ImageRef::new(&"A".repeat(ImageRef::MAX_BYTES + 4)).is_none());
+        assert_eq!(m.label(), "Image");
+        // The same text is the same kept string, and so the same marker.
+        let copy = String::from(png);
+        let again = ImageRef::new(&copy).unwrap();
+        assert!(std::ptr::eq(again.as_str(), r.as_str()));
+        assert_eq!(m, Marker::Image(again));
+        // A crafted file's marker that is no base64 is an error rather than a panic.
+        assert!(serde_json::from_str::<Marker>(r#"{"Image":"***"}"#).is_err());
+    }
 
     /// Labels saved before label classes (#618) read as the Default class alone, and are written
     /// back the same, so older versions still read a project without classes.

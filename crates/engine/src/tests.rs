@@ -1928,10 +1928,57 @@ fn raster_masks_hide_values() {
     assert!(style(&s).mask.is_empty());
 }
 
+#[test]
+fn a_picture_is_a_marker_on_points() {
+    use rustgis_map::Marker;
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let mut s = world();
+    let symbol = |s: &Session| s.map().layer_by_name("Cities").unwrap().symbol(0);
+    s.run("layer.marker", &json!({"layer": "Cities", "image": png})).unwrap();
+    let Marker::Image(img) = symbol(&s).marker else { panic!("{:?}", symbol(&s).marker) };
+    assert_eq!(img.as_str(), png);
+    // A file is read natively, to the same picture.
+    let dir = std::env::temp_dir().join(format!("rustgis-marker-image-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("dot.png");
+    {
+        use base64::Engine;
+        std::fs::write(&file, base64::engine::general_purpose::STANDARD.decode(png).unwrap()).unwrap();
+    }
+    s.run("layer.marker", &json!({"layer": "Cities", "shape": "square"})).unwrap();
+    assert_eq!(symbol(&s).marker, Marker::Square);
+    s.run("layer.marker", &json!({"layer": "Cities", "imagePath": file.display().to_string()})).unwrap();
+    assert_eq!(symbol(&s).marker, Marker::Image(img));
+    // It draws in an export.
+    s.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 320, "height": 200})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    // What isn't a picture is refused, saying so, and changes nothing.
+    let depth = s.undo_depth();
+    for (bad, says) in [
+        (json!({"image": "***"}), "PNG or JPEG"),
+        (json!({"image": "AAAA"}), "PNG or JPEG"),
+        (json!({"imagePath": "no-such-picture.png"}), "no-such-picture.png"),
+        (json!({"image": png, "shape": "star"}), "only one"),
+        (json!({"image": png, "char": "x"}), "only one"),
+    ] {
+        let mut p = json!({"layer": "Cities"});
+        p.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        let err = s.run("layer.marker", &p).unwrap_err();
+        assert!(err.contains(says), "{bad}: {err}");
+    }
+    assert_eq!((s.undo_depth(), symbol(&s).marker), (depth, Marker::Image(img)));
+}
+
 /// Every command with junk parameters returns Ok or Err, never panics, and leaves a usable session.
 #[test]
 fn hostile_params_never_panic() {
     let junk = [
+        json!({"image": "***"}),
+        json!({"image": 7}),
+        json!({"imagePath": "nope.png"}),
+        json!({"layer": "Cities", "image": "***"}),
+        json!({"layer": "Cities", "image": 7}),
+        json!({"layer": "Cities", "imagePath": "nope.png"}),
         Value::Null,
         json!({}),
         // Shared vertex moves: valid row/destination, hostile node addresses and coordinate types.

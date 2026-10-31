@@ -1477,6 +1477,12 @@ pub(crate) fn marker_path(x: f32, y: f32, r: f32, marker: Marker) -> Option<tiny
             }
             pb.close();
         }
+        // The square the picture fills, for hit tests and a moving view's stand-in.
+        Marker::Image(_) => {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(x - r, y - r, r * 2.0, r * 2.0) {
+                pb.push_rect(rect)
+            }
+        }
         Marker::Char(g) => match glyphs::shape(g) {
             Some(s) => {
                 let em = 2.0 * r;
@@ -1508,11 +1514,35 @@ fn draw_marker(pm: &mut Pixmap, x: f32, y: f32, s: &Symbol, opacity: f32, halo: 
         let st = Stroke { width: 3.5 * ppp, line_join: LineJoin::Round, ..Stroke::default() };
         pm.stroke_path(&path, &paint(h, 1.0), &st, Transform::identity(), None);
     }
+    // A picture keeps its own colours: the symbol's fill and outline are not drawn.
+    if let Marker::Image(image) = s.marker {
+        draw_image_marker(pm, x, y, r, &image, opacity);
+        return;
+    }
     pm.fill_path(&path, &paint(s.fill, opacity), FillRule::Winding, Transform::identity(), None);
     if s.stroke_width > 0.0 && s.stroke.a() > 0 {
         let st = Stroke { width: s.stroke_width * ppp, line_join: LineJoin::Round, ..Stroke::default() };
         pm.stroke_path(&path, &paint(s.stroke, opacity), &st, Transform::identity(), None);
     }
+}
+
+/// A picture marker's picture centred at (`x`, `y`), its longer side `2 * r` pixels.
+pub(crate) fn draw_image_marker(pm: &mut Pixmap, x: f32, y: f32, r: f32, image: &rustgis_map::ImageRef, opacity: f32) {
+    let Some(img) = picture::marker_image(image) else { return };
+    let img: &Pixmap = &img;
+    let k = 2.0 * r / img.width().max(img.height()) as f32;
+    if !(k.is_finite() && x.is_finite() && y.is_finite()) || k <= 0.0 {
+        return;
+    }
+    let (dx, dy) = (x - img.width() as f32 * k / 2.0, y - img.height() as f32 * k / 2.0);
+    let paint = tiny_skia::PixmapPaint { opacity, quality: tiny_skia::FilterQuality::Bilinear, ..tiny_skia::PixmapPaint::default() };
+    pm.draw_pixmap(0, 0, img.as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, dx, dy), None);
+}
+
+/// A picture marker's pixels (premultiplied, at most 256 a side), `None` when its picture can't
+/// be read: for a swatch to show in an interface, which draws no pixmap of its own.
+pub fn marker_image(image: &rustgis_map::ImageRef) -> Option<std::sync::Arc<Pixmap>> {
+    picture::marker_image(image)
 }
 
 /// Composites premultiplied `src` over `dst` with its top left corner at (`x`, `y`).
@@ -2566,7 +2596,8 @@ impl UprightMarker {
 /// The outline of a `marker` of radius `r` centred at (`x`, `y`), as [`draw_marker`] draws it
 /// (a circle as a polygon): for drawing upright markers as meshes. Every outline is seen whole
 /// from its centre, so a fan from the centre fills it. A character, which no fan fills, as a circle
-/// of its size (while a tilted view moves; the settled view draws the character).
+/// of its size (while a tilted view moves; the settled view draws the character), and a picture as
+/// the square it fills.
 pub fn marker_outline(marker: Marker, x: f32, y: f32, r: f32) -> Vec<(f32, f32)> {
     match marker {
         Marker::Circle | Marker::Char(_) => (0..24)
@@ -2578,6 +2609,7 @@ pub fn marker_outline(marker: Marker, x: f32, y: f32, r: f32) -> Vec<(f32, f32)>
         Marker::Square => {
             vec![(x - r * 0.9, y - r * 0.9), (x + r * 0.9, y - r * 0.9), (x + r * 0.9, y + r * 0.9), (x - r * 0.9, y + r * 0.9)]
         }
+        Marker::Image(_) => vec![(x - r, y - r), (x + r, y - r), (x + r, y + r), (x - r, y + r)],
         Marker::Triangle => vec![(x, y - r * 1.1), (x + r, y + r * 0.75), (x - r, y + r * 0.75)],
         Marker::Diamond => vec![(x, y - r * 1.15), (x + r * 0.9, y), (x, y + r * 1.15), (x - r * 0.9, y)],
         Marker::Star => (0..10)
@@ -5171,6 +5203,41 @@ mod tests {
 
     use super::*;
     use rustgis_data::{Field, FieldType, Value};
+
+    /// A picture marker draws the picture's own pixels, its longer side the symbol's size, centred
+    /// at the point, over any fill: the white around it stays.
+    #[test]
+    fn an_image_marker_draws_its_pixels() {
+        use base64::Engine;
+        let mut src = Pixmap::new(2, 2).unwrap();
+        src.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(src.encode_png().unwrap());
+        let marker = Marker::Image(rustgis_map::ImageRef::new(&b64).unwrap());
+        let s = Symbol { fill: Rgba::rgb(0, 0, 255), stroke: Rgba::rgb(0, 255, 0), stroke_width: 2.0, size: 20.0, marker };
+        let drawn = |opacity: f32| {
+            let mut pm = Pixmap::new(40, 40).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            draw_marker(&mut pm, 20.0, 20.0, &s, opacity, None, 1.0);
+            pm
+        };
+        let at = |pm: &Pixmap, x, y| {
+            let p = pm.pixel(x, y).unwrap();
+            [p.red(), p.green(), p.blue(), p.alpha()]
+        };
+        let pm = drawn(1.0);
+        assert_eq!(at(&pm, 20, 20), [255, 0, 0, 255]);
+        assert_eq!(at(&pm, 11, 20), [255, 0, 0, 255]);
+        assert_eq!(at(&pm, 28, 28), [255, 0, 0, 255]);
+        // Beyond the size on any side: untouched (no fill or outline of the symbol's colours).
+        assert_eq!(at(&pm, 8, 20), [255, 255, 255, 255]);
+        assert_eq!(at(&pm, 20, 31), [255, 255, 255, 255]);
+        // The layer's opacity lets the white through.
+        let [r, g, b, _] = at(&drawn(0.5), 20, 20);
+        assert!(r == 255 && (125..=130).contains(&g) && (125..=130).contains(&b), "{r} {g} {b}");
+        // Hit tests and the moving view's meshes see a square of the size.
+        let path = marker_path(20.0, 20.0, 10.0, marker).unwrap();
+        assert_eq!((path.bounds().left(), path.bounds().right()), (10.0, 30.0));
+    }
 
     #[test]
     fn worldview_detection_and_data() {

@@ -283,7 +283,7 @@ pub(crate) fn stroke_lines(
 pub(crate) fn marker_instances(c: Coord, origin: [f64; 2], s: &Symbol, ppp: f32, halo: Option<Rgba>) -> Vec<PointInstance> {
     let r = (s.size.max(1.0) * ppp) / 2.0;
     let shape = match s.marker {
-        Marker::Circle | Marker::Char(_) => 0,
+        Marker::Circle | Marker::Char(_) | Marker::Image(_) => 0,
         Marker::Square => 1,
         Marker::Triangle => 2,
         Marker::Diamond => 3,
@@ -340,8 +340,8 @@ fn append_geometry(
 ) -> Result<(), TessError> {
     // What the layer's mesh has left: tessellation stops once a part passes it.
     let room = |v: &Vec<MeshVertex>| limit.saturating_sub(v.len());
-    // A character has no shape template: its layer draws on the CPU.
-    if matches!(s.marker, Marker::Char(_)) && matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+    // A character or a picture has no shape template: its layer draws on the CPU.
+    if matches!(s.marker, Marker::Char(_) | Marker::Image(_)) && matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
         return Err(TessError::Refused);
     }
     match g {
@@ -682,6 +682,20 @@ mod tests {
         assert_eq!(one.len(), 1, "fill only");
     }
 
+    /// A picture has no shape template, so its layer is refused to the CPU as a character's is.
+    #[test]
+    fn a_picture_marker_is_refused_to_the_cpu() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let marker = Marker::Image(rustgis_map::ImageRef::new(png).expect("base64"));
+        let s = Symbol { fill: Rgba::rgb(255, 0, 0), stroke: Rgba::rgb(0, 0, 0), stroke_width: 1.0, size: 8.0, marker };
+        let (mut v, mut i, mut pts) = (Vec::new(), Vec::new(), Vec::new());
+        let at = Geometry::Point(Coord::new(1.0, 1.0));
+        let got = append_geometry(&mut v, &mut i, &mut pts, &at, &s, [0.0, 0.0], false, 1.0, 1.0, NO_LIMIT);
+        assert!(matches!(got, Err(TessError::Refused)), "{got:?}");
+        assert!(pts.is_empty());
+        let circle = Symbol { marker: Marker::Circle, ..s };
+        assert!(append_geometry(&mut v, &mut i, &mut pts, &at, &circle, [0.0, 0.0], false, 1.0, 1.0, NO_LIMIT).is_ok());
+    }
     #[test]
     fn vertex_estimate_tracks_tessellation() {
         let s = Symbol { fill: Rgba::rgb(255, 0, 0), stroke: Rgba::rgb(0, 0, 0), stroke_width: 1.0, size: 4.0, marker: Marker::Circle };

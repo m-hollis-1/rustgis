@@ -4,11 +4,29 @@ use std::path::Path;
 
 use rustgis_data::{GeometryType, photo};
 use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES};
-use rustgis_map::{ClassMethod, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, Placements, Ramp, Renderer, Rgba};
+use rustgis_map::{
+    ClassMethod, Glyph, ImageRef, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, Placements, Ramp, Renderer, Rgba,
+};
 use serde_json::{Value, json};
 
 use super::{b, f, need_feature_layer, need_layer, ps, uint};
 use crate::{CmdResult, CommandSpec as C, Session};
+
+/// The picture marker `p` asks for: its `image` (base64) or, natively, the file `imagePath`; `None`
+/// when it asks for neither. A picture that isn't a PNG or JPEG, or is too large, is refused.
+fn image_marker(p: &Value) -> Result<Option<ImageRef>, String> {
+    let b64 = match (ps(p, "image"), ps(p, "imagePath")) {
+        (Some(b64), _) => super::graphics::picture(&json!({"image": b64}))?,
+        #[cfg(not(target_arch = "wasm32"))]
+        (None, Some(path)) => super::graphics::picture(&json!({"path": path}))?,
+        #[cfg(target_arch = "wasm32")]
+        (None, Some(_)) => return Err("imagePath reads a file, which the browser can't: give the image".into()),
+        (None, None) => return Ok(None),
+    };
+    ImageRef::new(&b64)
+        .map(Some)
+        .ok_or_else(|| "the picture is too large (at most 512 KB as base64) or the map holds too many pictures".into())
+}
 
 /// Registers layer commands shared by the UI, CLI and command search.
 pub fn commands() -> Vec<C> {
@@ -246,13 +264,17 @@ pub fn commands() -> Vec<C> {
             let shape = ps(p, "shape").map(|n| Marker::ALL.into_iter().find(|m| m.label().eq_ignore_ascii_case(n)).ok_or("unknown marker shape")).transpose()?;
             let size = f(p, "size").map(|v| v.clamp(1.0, 80.0) as f32);
             let (ch, font) = (character(p)?, ps(p, "font"));
-            if shape.is_some() && ch.is_some() {
-                return Err("give a shape or a char, not both".into());
+            let image = image_marker(p)?;
+            if [shape.is_some(), ch.is_some(), image.is_some()].into_iter().filter(|on| *on).count() > 1 {
+                return Err("give only one of a shape, a char and an image".into());
             }
             with(s, p, |l| {
                 l.renderer.map_symbols(|sym| {
                     if let Some(m) = shape {
                         sym.marker = m;
+                    }
+                    if let Some(img) = image {
+                        sym.marker = Marker::Image(img);
                     }
                     let was = match sym.marker {
                         Marker::Char(g) => Some(g),
@@ -271,7 +293,7 @@ pub fn commands() -> Vec<C> {
             })
         })
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "size"?: number}"#),
+        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "image"?: text (a base64 PNG or JPEG as the marker, drawn in its own colours with its longer side the size; at most 512 KB as base64), "imagePath"?: text (a PNG or JPEG file, read by the app, not in the browser), "size"?: number}"#),
         C::new("layer.transparency", "Transparency", "Style › Effects", |s, p| {
             let t = f(p, "value").ok_or("value (0–100) is required")?.clamp(0.0, 100.0) as f32;
             with(s, p, |l| l.transparency = t)

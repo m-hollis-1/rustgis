@@ -1474,6 +1474,11 @@ fn swatch(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, gt: GeometryType, s: 
     match gt {
         GeometryType::Point => {
             let rad = (s.size * ppp / 2.0).clamp(1.5 * ppp, h / 2.0 - 1.0);
+            // A picture keeps its own colours, its longer side the marker's size.
+            if let rustgis_map::Marker::Image(image) = s.marker {
+                crate::draw_image_marker(pm, x + w / 2.0, cy, rad, &image, 1.0);
+                return;
+            }
             if let Some(p) = PathBuilder::from_circle(x + w / 2.0, cy, rad) {
                 pm.fill_path(&p, &paint(s.fill, 1.0), FillRule::Winding, Transform::identity(), None);
                 pm.stroke_path(
@@ -1816,6 +1821,26 @@ fn chart(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, field: &str, labe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture marker's legend swatch is its picture, not a circle in the symbol's colours.
+    #[test]
+    fn a_picture_marker_is_its_own_legend_swatch() {
+        use base64::Engine;
+        let mut src = Pixmap::new(2, 2).unwrap();
+        src.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(src.encode_png().unwrap());
+        let marker = rustgis_map::Marker::Image(rustgis_map::ImageRef::new(&b64).unwrap());
+        let s = rustgis_map::Symbol { fill: Rgba::rgb(0, 0, 255), stroke: Rgba::rgb(0, 255, 0), stroke_width: 2.0, size: 12.0, marker };
+        let mut pm = Pixmap::new(40, 20).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        swatch(&mut pm, 0.0, 0.0, 40.0, 20.0, GeometryType::Point, &s, 1.0);
+        let at = |x, y| pm.pixel(x, y).map(|p| [p.red(), p.green(), p.blue()]);
+        // A square, which a circle's corner would leave white.
+        assert_eq!(at(20, 10), Some([255, 0, 0]));
+        assert_eq!(at(15, 5), Some([255, 0, 0]));
+        assert_eq!(at(24, 14), Some([255, 0, 0]));
+        assert_eq!(at(10, 10), Some([255, 255, 255]));
+    }
 
     /// Every token the Format pane offers a layout's text is one the page expands (#516).
     #[test]

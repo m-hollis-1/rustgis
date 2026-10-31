@@ -427,3 +427,289 @@ fn symbol_layers_are_bounded_and_hostile_symbols_give_nothing() {
         let _ = symbol::text(&bad, "x", &mut r);
     }
 }
+
+// ---- layouts ----
+
+/// A 17 × 11 inch layout page with a vertical guide at 16.5 in and a horizontal one at 10.25 in,
+/// holding `elements` (JSON objects, comma separated) and one embedded picture.
+fn layout_doc(elements: &str) -> Document {
+    Document::from_json(&format!(
+        r#"{{"type":"CIMLayoutDocument","version":"3.7.0",
+          "binaryReferences":[{{"type":"CIMBinaryReference","uRI":"CIMPATH=Pictures/logo.png","data":"iVBORw0KGgo="}}],
+          "layoutDefinition":{{"type":"CIMLayout","name":"11x17 LANDSCAPE",
+            "page":{{"type":"CIMPage","width":17,"height":11,"units":{{"uwkid":109008}},
+              "guides":[{{"type":"CIMGuide","position":16.5,"orientation":"Vertical"}},
+                        {{"type":"CIMGuide","position":10.25,"orientation":"Horizontal"}}]}},
+            "elements":[{elements}]}}}}"#
+    ))
+    .unwrap()
+}
+
+/// A closed four-corner ring from (x0, y0) to (x1, y1), as Pro writes a rectangle.
+fn corner_ring(x0: f64, y0: f64, x1: f64, y1: f64) -> serde_json::Value {
+    json!({"rings": [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]]})
+}
+
+/// A rectangle graphic element: a 1 pt black outline under a white fill.
+fn rectangle_element(name: &str, polygon: serde_json::Value) -> serde_json::Value {
+    json!({"type": "CIMGraphicElement", "name": name, "anchor": "BottomLeftCorner", "visible": true,
+        "graphic": {"type": "CIMPolygonGraphic", "polygon": polygon,
+            "symbol": {"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![solid_stroke(rgb(0, 0, 0), 1.0), solid_fill(rgb(255, 255, 255))])}}})
+}
+
+fn read(elements: &[serde_json::Value]) -> (LayoutImport, Report) {
+    let text: Vec<String> = elements.iter().map(|e| e.to_string()).collect();
+    let mut report = Report::default();
+    let imported = read_layout(&layout_doc(&text.join(",")), &mut report).unwrap();
+    (imported, report)
+}
+
+fn near(a: f64, b: f64, tol: f64) -> bool {
+    (a - b).abs() <= tol
+}
+
+#[test]
+fn the_page_and_guides_come_in_millimetres_from_the_top_left() {
+    let (imp, report) = read(&[]);
+    let l = &imp.layout;
+    assert_eq!(l.name, "11x17 LANDSCAPE");
+    assert!(near(l.width, 431.8, 1e-9) && near(l.height, 279.4, 1e-9), "{} × {}", l.width, l.height);
+    assert_eq!(l.guides.x.len(), 1);
+    assert!(near(l.guides.x[0], 419.1, 1e-9), "{:?}", l.guides.x);
+    assert_eq!(l.guides.y.len(), 1);
+    assert!(near(l.guides.y[0], (11.0 - 10.25) * 25.4, 1e-9), "{:?}", l.guides.y);
+    assert!(l.elements.is_empty() && imp.frames.is_empty() && imp.pictures.is_empty());
+    assert!(imp.embedded_maps.is_empty() && imp.text_frames.is_empty());
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // A unit it doesn't know is read as inches, and said.
+    let mut r = Report::default();
+    let odd = r#"{"type":"CIMLayoutDocument","layoutDefinition":{"type":"CIMLayout","name":"P",
+        "page":{"type":"CIMPage","width":10,"height":5,"units":{"uwkid":4242}},"elements":[]}}"#;
+    let imp = read_layout(&Document::from_json(odd).unwrap(), &mut r).unwrap();
+    assert!(near(imp.layout.width, 254.0, 1e-9) && near(imp.layout.height, 127.0, 1e-9));
+    assert!(notes(&r).iter().any(|n| n.contains("inches")), "{:?}", notes(&r));
+    // Not a layout at all: an error, not a panic.
+    assert!(read_layout(&Document::from_json(r#"{"type":"CIMMapDocument"}"#).unwrap(), &mut r).is_err());
+}
+
+#[test]
+fn a_rectangle_rotated_180_about_its_top_left_lands_where_pro_draws_it() {
+    // The template's LOGO RIBBON: stored below where it shows, turned about its top-left corner.
+    let mut ribbon = rectangle_element("LOGO RIBBON", corner_ring(2.314, 6.263, 4.347, 8.569));
+    ribbon["anchor"] = json!("TopLeftCorner");
+    ribbon["rotation"] = json!(180);
+    ribbon["locked"] = json!(true);
+    let (imp, report) = read(&[ribbon]);
+    let e = &imp.layout.elements[0];
+    let inch = |mm: f64| mm / 25.4;
+    assert!(near(inch(e.x), 0.281, 0.01) && near(inch(e.y), 0.125, 0.01), "{} {}", inch(e.x), inch(e.y));
+    assert!(near(inch(e.w), 2.033, 0.01) && near(inch(e.h), 2.306, 0.01), "{} {}", inch(e.w), inch(e.h));
+    assert_eq!(e.name, "LOGO RIBBON");
+    assert!(e.locked && e.visible);
+    match e.kind {
+        crate::layout::ElementKind::Rectangle { fill, outline, width, radius } => {
+            assert_eq!((fill, outline, radius), (Rgba::rgb(255, 255, 255), Rgba::rgb(0, 0, 0), 0.0));
+            assert!(near(width, 96.0 / 72.0, 1e-5), "{width}");
+        }
+        ref other => panic!("{other:?}"),
+    }
+    // A half turn leaves it upright: nothing to say.
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn a_rectangle_rotated_30_degrees_keeps_its_bounding_box_and_notes_it() {
+    let mut r = rectangle_element("Tilted", corner_ring(1.0, 1.0, 3.0, 2.0));
+    r["anchor"] = json!("CenterPoint");
+    r["rotation"] = json!(30);
+    let (imp, report) = read(&[r]);
+    let e = &imp.layout.elements[0];
+    assert!([e.x, e.y, e.w, e.h].iter().all(|v| v.is_finite()));
+    // A 2 × 1 in box turned 30° about its centre (2, 1.5) covers 2cos30 + sin30 by 2sin30 + cos30.
+    let (c, s) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
+    let (w, h) = (2.0 * c + s, 2.0 * s + c);
+    assert!(near(e.w, w * 25.4, 1e-6) && near(e.h, h * 25.4, 1e-6), "{} {}", e.w, e.h);
+    assert!(near(e.x, (2.0 - w / 2.0) * 25.4, 1e-6) && near(e.y, (11.0 - 1.5 - h / 2.0) * 25.4, 1e-6), "{} {}", e.x, e.y);
+    assert!(notes(&report).iter().any(|n| n.starts_with("Tilted: ") && n.contains("rotated")), "{:?}", notes(&report));
+}
+
+#[test]
+fn rotation_turns_anticlockwise_about_each_anchor() {
+    let b = layout::PageBox { xmin: 0.0, ymin: 0.0, xmax: 2.0, ymax: 1.0 };
+    let anchors = [
+        ("BottomLeftCorner", (0.0, 0.0)),
+        ("BottomMidPoint", (1.0, 0.0)),
+        ("BottomRightCorner", (2.0, 0.0)),
+        ("LeftMidPoint", (0.0, 0.5)),
+        ("CenterPoint", (1.0, 0.5)),
+        ("RightMidPoint", (2.0, 0.5)),
+        ("TopLeftCorner", (0.0, 1.0)),
+        ("TopMidPoint", (1.0, 1.0)),
+        ("TopRightCorner", (2.0, 1.0)),
+    ];
+    for (name, p) in anchors {
+        assert_eq!(layout::anchor_point(b, name), p, "{name}");
+    }
+    // A quarter turn about the bottom-left corner stands the box up to the left of it.
+    let r = layout::rotated(b, (0.0, 0.0), 90.0);
+    assert!(near(r.xmin, -1.0, 1e-12) && near(r.xmax, 0.0, 1e-12) && near(r.ymin, 0.0, 1e-12) && near(r.ymax, 2.0, 1e-12), "{r:?}");
+    assert!(layout::is_right_angle(-270.0) && layout::is_right_angle(360.0) && !layout::is_right_angle(45.0));
+    // Millimetres from the top-left of an 11 in page.
+    assert_eq!(layout::to_mm(b, 11.0, 25.4), (0.0, 10.0 * 25.4, 2.0 * 25.4, 25.4));
+}
+
+#[test]
+fn point_text_gets_a_box_from_its_anchor() {
+    // TITLE, 14 pt, at (2.858, 10.566) in, by its left middle.
+    let b = layout::text_box((2.858, 10.566), "LeftMidPoint", 14.0, &["TITLE"], 25.4);
+    assert!(near(b.xmin, 2.858, 1e-9), "{b:?}");
+    assert!(near((b.ymin + b.ymax) / 2.0, 10.566, 1e-9), "{b:?}");
+    // 0.55 of the size per character across, 1.25 of it per line down, in points.
+    assert!(near(b.xmax - b.xmin, 0.55 * 14.0 * 5.0 / 72.0, 1e-9), "{b:?}");
+    assert!(near(b.ymax - b.ymin, 14.0 * 1.25 / 72.0, 1e-9), "{b:?}");
+    // Two lines are twice as tall, as wide as the longer; the anchor can be any corner or middle.
+    let b = layout::text_box((10.0, 5.0), "TopRightCorner", 10.0, &["AB", "ABCD"], 25.4);
+    assert!(near(b.xmax, 10.0, 1e-9) && near(b.ymax, 5.0, 1e-9), "{b:?}");
+    assert!(near(b.xmax - b.xmin, 0.55 * 10.0 * 4.0 / 72.0, 1e-9) && near(b.ymax - b.ymin, 2.0 * 12.5 / 72.0, 1e-9));
+    let b = layout::text_box((1.0, 1.0), "CenterPoint", 10.0, &["AB"], 1.0);
+    assert!(near((b.xmin + b.xmax) / 2.0, 1.0, 1e-9) && near((b.ymin + b.ymax) / 2.0, 1.0, 1e-9));
+    assert!(near(b.xmax - b.xmin, 11.0 * 25.4 / 72.0, 1e-9), "millimetre pages: {b:?}");
+}
+
+#[test]
+fn pictures_resolve_embedded_binaries_or_remember_their_path() {
+    let picture = |name: &str, graphic: serde_json::Value| {
+        let mut g = graphic;
+        g["type"] = json!("CIMPictureGraphic");
+        g["box"] = json!({"xmin": 0.76, "ymin": 9.0, "xmax": 1.83, "ymax": 9.41});
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint", "graphic": g})
+    };
+    let (imp, report) = read(&[
+        picture("HLR LOGO", json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Holland LR Logo.png"})),
+        picture("FILE", json!({"sourceURL": r"G:\LOGOS\Other.png"})),
+        picture("INLINE", json!({"sourceURL": "data:image/png;base64,AAAA"})),
+    ]);
+    use crate::layout::ElementKind::Picture;
+    let els = &imp.layout.elements;
+    assert_eq!(els.len(), 3);
+    assert!(
+        matches!(&els[0].kind, Picture { image, source } if image == "iVBORw0KGgo=" && source.as_deref() == Some(r"G:\LOGOS\Holland LR Logo.png"))
+    );
+    assert!(matches!(&els[1].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Other.png")));
+    assert!(matches!(&els[2].kind, Picture { image, source } if image == "AAAA" && source.is_none()));
+    assert_eq!(imp.pictures, vec![(els[1].id, PictureSource::Path(r"G:\LOGOS\Other.png".into()))]);
+    let e = &els[0];
+    assert!(near(e.x, 0.76 * 25.4, 1e-9) && near(e.y, (11.0 - 9.41) * 25.4, 1e-9) && near(e.w, 1.07 * 25.4, 1e-9));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn graphic_frames_become_borders_and_backgrounds() {
+    let line_sym = |c: serde_json::Value| json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(c, 1.0)]}});
+    let mut framed = rectangle_element("Framed", corner_ring(1.0, 1.0, 2.0, 2.0));
+    framed["graphicFrame"] = json!({"type": "CIMGraphicFrame", "borderSymbol": line_sym(rgb(0, 0, 0)),
+        "backgroundSymbol": {"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![solid_fill(rgb(255, 255, 255))])},
+        "borderGapX": 5, "borderGapY": 5,
+        "shadowSymbol": {"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![solid_fill(rgb(128, 128, 128))])}});
+    let mut clear = rectangle_element("Clear", corner_ring(1.0, 1.0, 2.0, 2.0));
+    clear["graphicFrame"] = json!({"type": "CIMGraphicFrame", "borderSymbol": line_sym(json!({"type": "CIMRGBColor", "values": [0, 0, 0, 0]})),
+        "backgroundSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPolygonSymbol", "angleAlignment": "Map"}},
+        "shadowSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPolygonSymbol"}}});
+    let (imp, report) = read(&[framed, clear]);
+    let fs = imp.layout.elements[0].frame_style.clone().unwrap();
+    assert_eq!((fs.border, fs.background), (Some(Rgba::rgb(0, 0, 0)), Some(Rgba::rgb(255, 255, 255))));
+    assert!(near(fs.border_width, 96.0 / 72.0, 1e-5), "{}", fs.border_width);
+    assert!(near(fs.gap, 5.0 * 25.4 / 72.0, 1e-9), "{}", fs.gap);
+    assert_eq!(imp.layout.elements[1].frame_style, None);
+    let n = notes(&report);
+    assert!(n.iter().any(|s| s.starts_with("Framed: ") && s.contains("shadow")), "{n:?}");
+    assert!(!n.iter().any(|s| s.starts_with("Clear: ")), "{n:?}");
+}
+
+#[test]
+fn unknown_elements_are_noted_and_skipped() {
+    let (imp, report) = read(&[json!({"type": "CIMChartFrame", "name": "C"})]);
+    assert!(imp.layout.elements.is_empty());
+    let n = report.notes.iter().find(|n| n.layer == "C").unwrap();
+    assert_eq!(n.kind, NoteKind::Skipped);
+    assert!(n.text.contains("CIMChartFrame"), "{}", n.text);
+}
+
+#[test]
+fn too_many_or_too_deep_elements_are_bounded() {
+    let many: Vec<_> = (0..600).map(|i| rectangle_element(&format!("R{i}"), corner_ring(1.0, 1.0, 2.0, 2.0))).collect();
+    let (imp, report) = read(&many);
+    assert_eq!(imp.layout.elements.len(), crate::layout::MAX_ELEMENTS);
+    assert_eq!(imp.layout.elements.last().map(|e| e.name.as_str()), Some("R499"));
+    assert!(notes(&report).iter().any(|n| n.contains("500")), "{:?}", notes(&report));
+
+    // Twelve groups, one inside the other, round one rectangle: the inner four fold into the eighth.
+    let mut nested = rectangle_element("Inner", corner_ring(1.0, 1.0, 2.0, 2.0));
+    for level in (1..=12).rev() {
+        nested = json!({"type": "CIMGroupElement", "name": format!("G{level}"), "elements": [nested]});
+    }
+    let (imp, report) = read(&[nested]);
+    let l = &imp.layout;
+    let names: Vec<&str> = l.elements.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["Inner", "G8", "G7", "G6", "G5", "G4", "G3", "G2", "G1"]);
+    let id = |n: &str| l.elements.iter().find(|e| e.name == n).map(|e| e.id).unwrap();
+    assert_eq!(l.element(id("G8")).unwrap().children(), [id("Inner")]);
+    assert_eq!(l.element(id("G1")).unwrap().children(), [id("G2")]);
+    assert_eq!(l.group_depth(id("G1")), crate::layout::MAX_GROUP_DEPTH);
+    // The groups' boxes are their children's.
+    let g = l.element(id("G1")).unwrap();
+    assert!(near(g.x, 25.4, 1e-9) && near(g.w, 25.4, 1e-9) && near(g.y, 9.0 * 25.4, 1e-9), "{g:?}");
+    assert!(notes(&report).iter().any(|n| n.contains("flattened")), "{:?}", notes(&report));
+
+    // Forty groups deep (about as deep as the JSON parser goes) reads without a panic, and what
+    // is past the walk's own limit is left out and said.
+    let mut deep = rectangle_element("Deep", corner_ring(1.0, 1.0, 2.0, 2.0));
+    for _ in 0..40 {
+        deep = json!({"type": "CIMGroupElement", "name": "G", "elements": [deep]});
+    }
+    let mut r = Report::default();
+    let imp = read_layout(&layout_doc(&deep.to_string()), &mut r).unwrap();
+    assert!(imp.layout.elements.is_empty());
+    assert!(notes(&r).iter().any(|n| n.contains("left out")), "{:?}", notes(&r));
+}
+
+#[test]
+fn lines_take_their_direction_and_heads_and_curves_are_ellipses() {
+    let arrow = json!({"type": "CIMVectorMarker", "enable": true, "size": 6,
+        "markerPlacement": {"type": "CIMMarkerPlacementAtExtremities", "extremityPlacement": "JustEnd"}});
+    let line = |name: &str, path: serde_json::Value, layers: Vec<serde_json::Value>| {
+        json!({"type": "CIMGraphicElement", "name": name, "graphic": {"type": "CIMLineGraphic", "line": {"paths": [path]},
+            "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMLineSymbol", "symbolLayers": layers}}}})
+    };
+    use crate::layout::{ElementKind, LineDir, LineHead};
+    let (imp, report) = read(&[
+        // Right to left with a head at its end: the head is at the left, at the start of a horizontal line.
+        line("Level", json!([[3.0, 5.0], [1.0, 5.0]]), vec![solid_stroke(rgb(255, 0, 0), 2.0), arrow.clone()]),
+        // Up and to the right on the page.
+        line("Up", json!([[1.0, 1.0], [2.0, 3.0]]), vec![solid_stroke(rgb(0, 0, 0), 1.0)]),
+        json!({"type": "CIMGraphicElement", "name": "Oval", "graphic": {"type": "CIMPolygonGraphic",
+            "polygon": {"curveRings": [[[3.0, 2.0], {"a": [[3.0, 2.0], [2.0, 2.0], 0, 1]}]]},
+            "symbol": {"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![solid_fill(rgb(0, 0, 255))])}}}),
+        rectangle_element("Blob", json!({"rings": [[[0.0, 0.0], [1.0, 2.0], [2.0, 0.0], [1.0, -1.0], [0.0, 0.0]]]})),
+    ]);
+    let els = &imp.layout.elements;
+    match els[0].kind {
+        ElementKind::Line { color, width, dir, head } => {
+            assert_eq!((color, dir, head), (Rgba::rgb(255, 0, 0), LineDir::Horizontal, LineHead::Start));
+            assert!(near(width, 2.0 * 96.0 / 72.0, 1e-5));
+        }
+        ref other => panic!("{other:?}"),
+    }
+    assert!(near(els[0].x, 25.4, 1e-6) && near(els[0].w, 2.0 * 25.4, 1e-6), "{:?}", els[0]);
+    assert!(near(els[0].y + els[0].h / 2.0, 6.0 * 25.4, 1e-6), "{:?}", els[0]);
+    assert!(matches!(els[1].kind, ElementKind::Line { dir: LineDir::Rising, head: LineHead::None, .. }), "{:?}", els[1].kind);
+    assert!(near(els[1].x, 25.4, 1e-6) && near(els[1].y, 8.0 * 25.4, 1e-6) && near(els[1].h, 2.0 * 25.4, 1e-6), "{:?}", els[1]);
+    assert!(matches!(els[2].kind, ElementKind::Ellipse { fill, .. } if fill == Rgba::rgb(0, 0, 255)), "{:?}", els[2].kind);
+    assert!(near(els[2].x, 25.4, 1e-6) && near(els[2].w, 2.0 * 25.4, 1e-6) && near(els[2].h, 2.0 * 25.4, 1e-6), "{:?}", els[2]);
+    assert!(matches!(els[3].kind, ElementKind::Rectangle { .. }));
+    assert!(near(els[3].h, 3.0 * 25.4, 1e-6));
+    let n = notes(&report);
+    assert!(n.iter().any(|s| s.starts_with("Blob: ")), "{n:?}");
+    assert!(!n.iter().any(|s| s.starts_with("Level: ") || s.starts_with("Up: ") || s.starts_with("Oval: ")), "{n:?}");
+}

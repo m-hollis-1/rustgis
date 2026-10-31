@@ -10,6 +10,7 @@
 //! document missing what a reader looks for gives `None`, never a panic.
 
 pub(crate) mod color;
+pub mod layout;
 pub(crate) mod symbol;
 pub(crate) mod units;
 
@@ -21,6 +22,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 pub use crate::qgis::{Note, NoteKind, Report};
+pub use layout::{FrameBinding, LayoutImport, PictureSource, read_layout};
 
 /// The most JSON text a document (or all of a project's entries together) is read from.
 pub const MAX_JSON: usize = 64 << 20;

@@ -385,7 +385,7 @@ fn picture_marker(
 }
 
 /// The media type (lower case) and base64 text of a `data:<type>;base64,<text>` URL.
-fn data_url(url: &str) -> Option<(String, &str)> {
+pub(crate) fn data_url(url: &str) -> Option<(String, &str)> {
     let (head, payload) = url.get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).and_then(|_| url.get(5..))?.split_once(',')?;
     let mut parts = head.split(';');
     let media = parts.next()?.trim().to_ascii_lowercase();

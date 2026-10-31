@@ -4133,6 +4133,53 @@ fn layout_update_links_and_unlinks_frames_and_refuses_cycles() {
     assert_eq!(link_of(&s, third), None);
 }
 
+/// A map series moves its frame page by page, so a frame that follows another can't have one, and
+/// the frame of a series can't be made to follow: each is refused, and changes nothing.
+#[test]
+fn a_map_series_and_a_link_refuse_the_same_frame() {
+    use rustgis_map::layout::{FrameLink, LinkMode};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let main = s.project.layouts[0].first_frame().unwrap();
+    s.run("layout.update", &json!({"element": main, "name": "Main map"})).unwrap();
+    let inset = s.run("layout.addFrame", &json!({"x": 200, "y": 150, "w": 60, "h": 40})).unwrap()["element"].as_u64().unwrap() as u32;
+    let third = s.run("layout.addFrame", &json!({"x": 100, "y": 150, "w": 60, "h": 40})).unwrap()["element"].as_u64().unwrap() as u32;
+    let series = json!({"layer": "Lakes", "nameField": "name"});
+    let with = |frame: u32| {
+        let mut p = series.clone();
+        p["frame"] = json!(frame);
+        p
+    };
+
+    // A frame that follows has no series.
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main}})).unwrap();
+    let before = s.project.layouts[0].clone();
+    let err = s.run("layout.series", &with(inset)).unwrap_err();
+    assert_eq!(err, "the frame follows Main map: unlink it first");
+    assert_eq!(s.project.layouts[0], before);
+
+    // The frame of a series follows nothing.
+    s.run("layout.series", &with(main)).unwrap();
+    s.run("layout.seriesPage", &json!({"page": "next"})).unwrap();
+    let before = s.project.layouts[0].clone();
+    let err = s.run("layout.update", &json!({"element": main, "link": {"frame": third}})).unwrap_err();
+    assert!(err.contains("map series"), "{err}");
+    assert_eq!(s.project.layouts[0], before);
+    // A frame can still follow the series frame, and the series goes on.
+    s.run("layout.update", &json!({"element": third, "link": {"frame": main, "mode": "extent"}})).unwrap();
+    s.run("layout.seriesPage", &json!({"page": "next"})).unwrap();
+
+    // A hand-edited layout whose series frame follows: its pages are refused too.
+    if let Some(rustgis_map::layout::ElementKind::MapFrame { link, .. }) = s.project.layouts[0].element_mut(main).map(|e| &mut e.kind) {
+        *link = Some(FrameLink { frame: third, mode: LinkMode::Center, rotation: false });
+    }
+    let before = s.project.layouts[0].clone();
+    let err = s.run("layout.seriesPage", &json!({"page": "next"})).unwrap_err();
+    let name = s.project.layouts[0].element(third).unwrap().name.clone();
+    assert_eq!(err, format!("the frame follows {name}: unlink it first"));
+    assert_eq!(s.project.layouts[0], before);
+}
+
 /// A layout's text is bound to a map frame, wrapped, aligned down its box, spaced and cased by
 /// `layout.addElement` and `layout.update`; a frame that isn't a map frame is refused, `null`
 /// unbinds, and the properties are text's alone.

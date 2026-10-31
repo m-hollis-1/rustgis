@@ -963,7 +963,7 @@ pub enum LinkMode {
 impl LinkMode {
     pub const ALL: [LinkMode; 3] = [LinkMode::Center, LinkMode::Extent, LinkMode::Scale];
 
-    /// The name commands and files use.
+    /// The name `layout.update` takes (a saved layout holds the variant's own name, `Extent`).
     pub fn code(self) -> &'static str {
         match self {
             LinkMode::Center => "center",
@@ -1697,7 +1697,7 @@ impl Layout {
 }
 
 /// The most links followed in a row, and the most passes resolving them.
-const MAX_LINK_STEPS: usize = 500;
+pub const MAX_LINK_STEPS: usize = 500;
 
 /// The longitude/latitude under a camera's centre.
 fn map_center(map: &Map, cam: &Camera) -> Option<Coord> {
@@ -1782,6 +1782,11 @@ pub fn frame_camera(map: &Map, center: Coord, scale: f64, bearing: f64, pitch: f
     cam.res = scale * PAPER_M_PER_PT / per;
     cam.clamp();
     cam
+}
+
+/// The paper scale (the denominator) a frame camera shows: the inverse of [`frame_camera`].
+pub fn camera_scale(map: &Map, cam: &Camera) -> f64 {
+    map.ground_res_at(cam) / PAPER_M_PER_PT
 }
 
 /// The scale that fits a lon/lat extent into a frame `w_mm`×`h_mm` with a margin, and its centre.
@@ -2388,6 +2393,7 @@ mod tests {
         let cam = frame_camera(&map, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
         // At the equator one logical point of paper (0.2646 mm) covers 264.6 m at 1:1,000,000.
         assert!((cam.res - 264.583).abs() < 0.5, "{}", cam.res);
+        assert!((camera_scale(&map, &cam) / 1_000_000.0 - 1.0).abs() < 1e-9, "the scale back from the camera");
         let (c, s) = fit_scale(&map, &rustgis_geom::Extent::new(-10.0, -10.0, 10.0, 10.0), 200.0, 200.0).unwrap_or_default();
         assert!(c.x.abs() < 1e-6 && s > 1e7 && s < 2e7, "{c:?} {s}");
         // A finds drawing at 2:1 on the equator, where a frame's camera is closest (#902).

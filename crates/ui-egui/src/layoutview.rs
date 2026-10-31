@@ -1076,6 +1076,13 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
     }
 }
 
+/// The scale (1:n) map frame `id` of `map` is drawn at, its link applied.
+fn drawn_scale(app: &RustGisApp, layout: &Layout, id: u32, map: &str) -> Option<f64> {
+    let m = app.session.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
+    let cam = layout.resolved_cameras(&app.session.project.maps).into_iter().find(|(i, _)| *i == id)?.1;
+    Some(rustgis_engine::map::layout::camera_scale(m, &cam))
+}
+
 /// Whether map frame `id` follows another frame: its view is that frame's, so it isn't panned or
 /// zoomed.
 fn follows(layout: &Layout, id: u32) -> bool {
@@ -1662,19 +1669,22 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             .labelled_by(input_label.id);
                         ui.end_row();
                         let input_label = ui.label(tl!("Scale 1:"));
-                        let mut sc = *scale;
+                        // Taking the other frame's extent or scale, the frame is drawn at a scale
+                        // that isn't its own, and that is what the field shows, out of reach.
+                        let own_scale = link.is_none_or(|l| l.mode == LinkMode::Center);
+                        let mut sc = if own_scale { *scale } else { drawn_scale(app, layout, id, map).unwrap_or(*scale) };
                         let speed = sc * 0.01;
                         // Below 1:10, tenths: 1:0.5 is a frame at 2:1 (#902).
                         let decimals = if sc < 10.0 { 1 } else { 0 };
                         let drag = Dragged::lend(ui, drag_key("scale"), &mut sc);
-                        // Following another frame, the view is that frame's: unlink it to set the scale.
                         let r = ui
                             .add_enabled(
-                                link.is_none(),
+                                own_scale,
                                 egui::DragValue::new(&mut sc).range(MIN_FRAME_SCALE..=MAX_FRAME_SCALE).speed(speed).max_decimals(decimals),
                             )
                             .labelled_by(input_label.id);
-                        if drag.settled(ui, &r, &mut sc) && (sc / scale - 1.0).abs() > 1e-3 {
+                        let settled = drag.settled(ui, &r, &mut sc);
+                        if settled && own_scale && (sc / scale - 1.0).abs() > 1e-3 {
                             update(app, json!({"scale": sc}));
                         }
                         ui.end_row();
@@ -2537,7 +2547,18 @@ mod tests {
         h.get_by_label("Follows");
         h.get_by_label("Takes");
         h.get_by_label("Rotation");
-        assert!(h.get_by_label("Scale 1:").accesskit_node().is_disabled(), "the scale is the followed frame's");
+        assert!(!h.get_by_label("Scale 1:").accesskit_node().is_disabled(), "following the centre, the scale is its own");
+        // Taking the scale, it is the other frame's, and that is what the field shows.
+        let main_scale = match h.state().session.project.layouts[li].element(main).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { scale, .. }) => *scale,
+            _ => panic!("not a map frame"),
+        };
+        let _ = h.state_mut().run("layout.update", json!({"layout": li, "element": inset, "link": {"frame": main, "mode": "scale"}}));
+        h.run_steps(3);
+        let field = h.get_by_label("Scale 1:").accesskit_node();
+        assert!(field.is_disabled(), "the scale is the followed frame's");
+        let shown = field.numeric_value().unwrap_or_default();
+        assert!((shown / main_scale - 1.0).abs() < 0.01, "shown {shown}, drawn at {main_scale}");
         assert!(!h.get_by_label("Bearing").accesskit_node().is_disabled(), "the bearing is its own unless the rotation is followed");
         // Unlinked, it is its own again.
         let _ = h.state_mut().run("layout.update", json!({"layout": li, "element": inset, "link": null}));

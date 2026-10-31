@@ -190,10 +190,15 @@ impl Default for TokenValues {
 impl TokenValues {
     /// The values a map's dynamic text shows at `scale`, now.
     pub fn of(map: &crate::Map, scale: f64) -> Self {
+        let crs = map.projection.info();
         TokenValues {
             map: map.name.clone(),
             scale,
             crs: map.projection.label(),
+            crs_name: crs.name,
+            crs_projection: crs.method,
+            crs_units: crs.units,
+            crs_wkid: crs.wkid,
             layers: map.layers.iter().filter(|l| !l.graphics).count(),
             center: map.center_lonlat(),
             now: web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
@@ -433,5 +438,17 @@ mod tests {
             assert_eq!(scale_ratio(nothing), "1:0", "{nothing}");
         }
         assert_eq!(scale_ratio(f64::INFINITY), "1:1,000,000,000,000,000");
+    }
+
+    /// A map's own dynamic text names its coordinate system too.
+    #[test]
+    fn a_maps_text_names_its_coordinate_system() {
+        let mut map = crate::Map::new("m");
+        map.projection = crate::Projection::from_code("EPSG:2277").unwrap();
+        let v = TokenValues::of(&map, 1000.0);
+        assert_eq!(
+            expand("{crsName} / {crsProjection} / {crsUnits} / {crsWkid}", &v),
+            "NAD83 / Texas Central (ftUS) / Lambert Conformal Conic / US survey foot / 2277"
+        );
     }
 }

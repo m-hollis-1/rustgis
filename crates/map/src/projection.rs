@@ -405,6 +405,94 @@ pub fn lookup(code: &str) -> Result<(String, String), String> {
     Ok((def.to_string(), format!("EPSG:{n}")))
 }
 
+/// What a coordinate system is called, in the words a layout's dynamic text prints
+/// (`{crsName}`, `{crsProjection}`, `{crsUnits}`, `{crsWkid}`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CrsInfo {
+    /// `NAD83 / Texas Central (ftUS)`: the EPSG dataset's name, PROJ's for an ESRI code, a preset's label.
+    pub name: String,
+    /// The projection method, `Lambert Conformal Conic`.
+    pub method: String,
+    /// The linear unit, `US survey foot`; `degree` for a geographic system.
+    pub units: String,
+    /// The EPSG or ESRI code, empty for a preset or a local view.
+    pub wkid: String,
+}
+
+/// The name, method, units and code of a projection code, as [`lookup`] reads it; `None` for a code
+/// it doesn't resolve. The name is the code's, from the EPSG or ESRI tables, or the label when
+/// those lack it.
+pub fn describe(code: &str) -> Option<CrsInfo> {
+    let (proj4, label) = lookup(code).ok()?;
+    let numbered = label.strip_prefix("EPSG:").map(|n| (n, true)).or_else(|| label.strip_prefix("ESRI:").map(|n| (n, false)));
+    let (wkid, name) = match numbered.and_then(|(n, epsg)| Some((n, n.parse::<u32>().ok()?, epsg))) {
+        Some((digits, n, epsg)) => {
+            let known = if epsg { rustgis_data::raster::crs::epsg_name(n) } else { rustgis_data::raster::crs::esri_name(n) };
+            (digits.to_string(), known.map_or_else(|| label.clone(), str::to_string))
+        }
+        None => (String::new(), label),
+    };
+    Some(CrsInfo { name, method: method_name(&proj4), units: units_name(&proj4), wkid })
+}
+
+/// The value of a `+key=value` parameter of a PROJ string.
+fn proj_param<'a>(def: &'a str, key: &str) -> Option<&'a str> {
+    def.split_whitespace().find_map(|t| t.strip_prefix('+')?.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// The projection method of a PROJ string, by its `+proj=`: the EPSG name for the methods the map
+/// draws, the PROJ name for any other.
+fn method_name(def: &str) -> String {
+    let Some(proj) = proj_param(def, "proj") else { return String::new() };
+    let name = match proj {
+        "tmerc" | "utm" => "Transverse Mercator",
+        "lcc" => "Lambert Conformal Conic",
+        // Web Mercator's sphere: the same radius for both axes.
+        "merc" if proj_param(def, "a").is_some() && proj_param(def, "a") == proj_param(def, "b") => "Mercator (Auxiliary Sphere)",
+        "merc" => "Mercator",
+        "webmerc" => "Mercator (Auxiliary Sphere)",
+        "aea" => "Albers Equal Area",
+        "laea" => "Lambert Azimuthal Equal Area",
+        "stere" => "Stereographic",
+        "sterea" => "Oblique Stereographic",
+        "omerc" => "Hotine Oblique Mercator",
+        "somerc" => "Swiss Oblique Mercator",
+        "cass" => "Cassini-Soldner",
+        "eqc" => "Equidistant Cylindrical",
+        "cea" => "Cylindrical Equal Area",
+        "aeqd" => "Azimuthal Equidistant",
+        "poly" => "American Polyconic",
+        "krovak" => "Krovak",
+        "mill" => "Miller Cylindrical",
+        "moll" => "Mollweide",
+        "robin" => "Robinson",
+        "eqearth" => "Equal Earth",
+        "natearth" => "Natural Earth",
+        "wintri" => "Winkel Tripel",
+        "eck4" => "Eckert IV",
+        "sinu" => "Sinusoidal",
+        "longlat" => "Geographic",
+        other => other,
+    };
+    name.to_string()
+}
+
+/// The linear unit of a PROJ string (`+units=`, or `+to_meter=`; metres when it has neither).
+fn units_name(def: &str) -> String {
+    if proj_param(def, "proj") == Some("longlat") {
+        return "degree".into();
+    }
+    match (proj_param(def, "units"), proj_param(def, "to_meter")) {
+        (Some("m"), _) | (None, None) => "metre".into(),
+        (Some("us-ft"), _) => "US survey foot".into(),
+        (Some("ft"), _) => "foot".into(),
+        (Some("km"), _) => "kilometre".into(),
+        (Some("link"), _) => "link".into(),
+        (Some(other), _) => other.into(),
+        (None, Some(metres)) => format!("{metres} metre"),
+    }
+}
+
 /// Where a projection is meant to be used. Points outside are not drawn: far from it most
 /// projections distort wildly, fold back or run off to infinity.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1577,5 +1665,49 @@ mod tests {
             let back = p.inverse(m).unwrap();
             assert!((back.x - c.x).abs() < 1e-6 && (back.y - c.y).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn describe_gives_name_method_units_and_wkid() {
+        let i = describe("EPSG:2277").unwrap();
+        assert_eq!(i.name, "NAD83 / Texas Central (ftUS)");
+        assert_eq!(i.method, "Lambert Conformal Conic");
+        assert_eq!(i.units, "US survey foot");
+        assert_eq!(i.wkid, "2277");
+        // A bare number reads as EPSG; UTM is a transverse Mercator; ESRI codes have names too.
+        let utm = describe("32614").unwrap();
+        assert_eq!((utm.name.as_str(), utm.method.as_str(), utm.units.as_str()), ("WGS 84 / UTM zone 14N", "Transverse Mercator", "metre"));
+        let esri = describe("ESRI:102740").unwrap();
+        assert_eq!(
+            (esri.method.as_str(), esri.units.as_str(), esri.wkid.as_str()),
+            ("Lambert Conformal Conic", "US survey foot", "102740")
+        );
+        // A preset has its label and method, and no code; nonsense has nothing.
+        let robinson = describe("robinson").unwrap();
+        assert_eq!(
+            (robinson.name.as_str(), robinson.method.as_str(), robinson.units.as_str(), robinson.wkid.as_str()),
+            ("Robinson", "Robinson", "metre", "")
+        );
+        assert!(describe("no such thing").is_none());
+        assert!(describe("local:10,20").is_some_and(|l| l.method == "Azimuthal Equidistant" && l.wkid.is_empty()));
+    }
+
+    #[test]
+    fn a_projections_info_names_the_default_maps() {
+        use crate::globe::Projection;
+        let web = Projection::WebMercator.info();
+        assert_eq!(
+            (web.name.as_str(), web.method.as_str(), web.units.as_str(), web.wkid.as_str()),
+            ("WGS 84 / Pseudo-Mercator", "Mercator (Auxiliary Sphere)", "metre", "3857")
+        );
+        let globe = Projection::Globe.info();
+        assert_eq!(
+            (globe.name.as_str(), globe.method.as_str(), globe.units.as_str(), globe.wkid.as_str()),
+            ("WGS 84", "Geographic", "degree", "4326")
+        );
+        let tx = Projection::from_code("EPSG:2277").unwrap().info();
+        assert_eq!((tx.name.as_str(), tx.wkid.as_str()), ("NAD83 / Texas Central (ftUS)", "2277"));
+        // A code nothing resolves keeps its text as the name.
+        assert_eq!(Projection::Custom("odd".into()).info().name, "odd");
     }
 }

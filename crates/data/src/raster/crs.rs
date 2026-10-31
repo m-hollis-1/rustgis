@@ -46,6 +46,23 @@ pub fn esri_proj4(code: u32) -> Option<&'static str> {
     super::esri::proj4(code)
 }
 
+/// The name of an EPSG code as the dataset spells it (`NAD83 / Texas Central (ftUS)` for 2277), for
+/// the codes of the PROJ tables here and the rest of the dataset's projected, geographic, geocentric
+/// and compound systems. `None` for a code it lacks.
+pub fn epsg_name(code: u32) -> Option<&'static str> {
+    name_of(super::epsg_names::EPSG_NAMES, code)
+}
+
+/// The name of an ESRI code as PROJ's database holds it (`NAD_1983_StatePlane_Texas_Central_FIPS_4203_Feet`),
+/// not the spelling ArcGIS Pro shows. `None` for a code it lacks.
+pub fn esri_name(code: u32) -> Option<&'static str> {
+    name_of(super::epsg_names::ESRI_NAMES, code)
+}
+
+fn name_of(table: &'static [(u32, &'static str)], code: u32) -> Option<&'static str> {
+    table.binary_search_by_key(&code, |&(c, _)| c).ok().and_then(|i| table.get(i)).map(|&(_, n)| n)
+}
+
 /// Every ESRI code [`esri_proj4`] knows, in order.
 pub fn esri_codes() -> impl Iterator<Item = u32> {
     super::esri::DEFS.iter().map(|&(c, _)| c)
@@ -755,6 +772,33 @@ mod tests {
             let crs = Crs::from_epsg(u32::from(code)).unwrap_or_else(|| panic!("EPSG:{code}"));
             assert_eq!(crs.is_geographic(), def.contains("+proj=longlat"), "EPSG:{code}");
             crs.transformer().unwrap_or_else(|e| panic!("EPSG:{code}: {e}"));
+        }
+    }
+
+    /// EPSG and ESRI codes have names, as the dataset spells them.
+    #[test]
+    fn epsg_names_are_found_by_code() {
+        assert_eq!(epsg_name(2277), Some("NAD83 / Texas Central (ftUS)"));
+        assert_eq!(epsg_name(4326), Some("WGS 84"));
+        assert_eq!(epsg_name(1), None);
+        assert_eq!(esri_name(102740), Some("NAD_1983_StatePlane_Texas_South_Central_FIPS_4204_Feet"));
+        assert_eq!(esri_name(1), None);
+    }
+
+    /// The name tables are sorted (they are binary searched) and name every code the PROJ tables define.
+    #[test]
+    fn every_known_code_has_a_name() {
+        for table in [super::super::epsg_names::EPSG_NAMES, super::super::epsg_names::ESRI_NAMES] {
+            assert!(table.windows(2).all(|w| w[0].0 < w[1].0), "unsorted or repeated codes");
+            assert!(table.iter().all(|&(_, n)| !n.is_empty()));
+        }
+        for code in 0..=u16::MAX {
+            if epsg_proj4(code).is_some() {
+                assert!(epsg_name(code.into()).is_some(), "EPSG:{code} has no name");
+            }
+        }
+        for code in esri_codes() {
+            assert!(esri_name(code).is_some(), "ESRI:{code} has no name");
         }
     }
 }

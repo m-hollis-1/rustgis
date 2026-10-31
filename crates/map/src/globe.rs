@@ -14,6 +14,7 @@ use rustgis_geom::{Coord, Extent, MERCATOR_R};
 use serde::{Deserialize, Serialize};
 
 use crate::Camera;
+use crate::projection::CrsInfo;
 
 /// Camera distance from the Earth's centre, in Earth radii.
 pub const GLOBE_DISTANCE: f64 = 6.0;
@@ -46,6 +47,23 @@ impl Projection {
             Projection::WebMercator => "Web Mercator".into(),
             Projection::Globe => "Globe".into(),
             Projection::Custom(c) => crate::projection::lookup(c).map(|(_, l)| l).unwrap_or_else(|_| c.clone()),
+        }
+    }
+
+    /// The coordinate system's name, projection method, units and code, for dynamic text. The flat
+    /// default is Web Mercator (EPSG:3857) and the globe WGS 84 (EPSG:4326); another projection is
+    /// described by [`crate::projection::describe`], or by its label alone when that has nothing.
+    pub fn info(&self) -> CrsInfo {
+        let text = |name: &str, method: &str, units: &str, wkid: &str| CrsInfo {
+            name: name.into(),
+            method: method.into(),
+            units: units.into(),
+            wkid: wkid.into(),
+        };
+        match self {
+            Projection::WebMercator => text("WGS 84 / Pseudo-Mercator", "Mercator (Auxiliary Sphere)", "metre", "3857"),
+            Projection::Globe => text("WGS 84", "Geographic", "degree", "4326"),
+            Projection::Custom(c) => crate::projection::describe(c).unwrap_or_else(|| CrsInfo { name: self.label(), ..Default::default() }),
         }
     }
 

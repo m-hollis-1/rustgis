@@ -401,6 +401,8 @@ pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, ru
         v.map = m.name.clone();
         v.scale = m.ground_res_at(&cam) / rustgis_map::layout::PAPER_M_PER_PT;
         v.crs = m.projection.label();
+        let crs = m.projection.info();
+        (v.crs_name, v.crs_projection, v.crs_units, v.crs_wkid) = (crs.name, crs.method, crs.units, crs.wkid);
         v.layers = m.layers.iter().filter(|l| !l.graphics).count();
         v.center = m.to_lonlat(cam.center).unwrap_or_default();
         v.credits = credits(m);
@@ -2776,5 +2778,30 @@ mod tests {
         let scale = point.strip_prefix("Scale ").and_then(|t| t.strip_suffix(", page 1.")).unwrap_or_else(|| panic!("{point}"));
         assert!(scale.starts_with("1:") && scale.contains(','), "{point}");
         assert_eq!(comma, format!("Scale {}, page 1.", scale.replace(',', ".")));
+    }
+
+    /// The coordinate system tokens read the first frame's map projection.
+    #[test]
+    fn crs_tokens_read_the_frame_maps_projection() {
+        let mut map = Map::new("m");
+        map.projection = rustgis_map::Projection::from_code("EPSG:2277").unwrap();
+        let cam = frame_camera(&map, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
+        let layout = Layout::new("L", 100.0, 100.0);
+        let info = PageInfo::default();
+        let frame = Some((&map, cam));
+        assert_eq!(
+            expand("{crsName|Name: }{crsWkid|\nWKID: }", &layout, &info, frame),
+            "Name: NAD83 / Texas Central (ftUS)
+WKID: 2277"
+        );
+        assert_eq!(
+            expand("{crsProjection}, {crsUnits}, {crs}", &layout, &info, frame),
+            "Lambert Conformal Conic, US survey foot, EPSG:2277"
+        );
+        // The default map is Web Mercator; without a frame the tokens print nothing.
+        let web = Map::new("w");
+        let cam = frame_camera(&web, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
+        assert_eq!(expand("{crsName} {crsWkid}", &layout, &info, Some((&web, cam))), "WGS 84 / Pseudo-Mercator 3857");
+        assert_eq!(expand("{crsName}{crsWkid}", &layout, &info, None), "");
     }
 }

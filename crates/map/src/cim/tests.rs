@@ -560,6 +560,43 @@ fn rotation_turns_anticlockwise_about_each_anchor() {
 }
 
 #[test]
+fn a_quarter_turn_about_a_corner_goes_anticlockwise() {
+    // A 2 × 1 in box turned 90° anticlockwise about its bottom-left (1, 1) stands up to its left:
+    // x 0..1, y 1..3 (clockwise it would hang below: x 1..2, y -1..1).
+    let mut r = rectangle_element("Quarter", corner_ring(1.0, 1.0, 3.0, 2.0));
+    r["rotation"] = json!(90);
+    let (imp, report) = read(&[r]);
+    let e = &imp.layout.elements[0];
+    assert!(near(e.x, 0.0, 1e-9) && near(e.w, 25.4, 1e-9), "{e:?}");
+    assert!(near(e.y, 8.0 * 25.4, 1e-9) && near(e.h, 2.0 * 25.4, 1e-9), "{e:?}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn rounded_corners_become_a_radius() {
+    let (w, h) = (20.0 / 25.4, 10.0 / 25.4);
+    let mut stroke = solid_stroke(rgb(0, 0, 0), 1.0);
+    stroke["effects"] = json!([{"type": "CIMGeometricEffectRounding", "rounding": 100}]);
+    let mut effect = rectangle_element("Effect", corner_ring(1.0, 1.0, 1.0 + w, 1.0 + h));
+    effect["graphic"]["symbol"]["symbol"]["symbolLayers"] = json!([stroke, solid_fill(rgb(255, 255, 255))]);
+    let mut attr = rectangle_element("Attr", corner_ring(1.0, 1.0, 1.0 + w, 1.0 + h));
+    attr["graphic"]["attributes"] = json!({"type": "PropertySet", "propertySetItems": ["Rounding", 50]});
+    let mut square = rectangle_element("Square", corner_ring(1.0, 1.0, 2.0, 2.0));
+    square["graphic"]["attributes"] = json!({"type": "PropertySet", "propertySetItems": ["Rounding", 0]});
+    let (imp, report) = read(&[effect, attr, square]);
+    let radius = |i: usize| match imp.layout.elements[i].kind {
+        crate::layout::ElementKind::Rectangle { radius, .. } => radius,
+        ref other => panic!("{other:?}"),
+    };
+    assert!(near(radius(0), 5.0, 1e-9) && near(radius(1), 2.5, 1e-9) && radius(2) == 0.0, "{} {}", radius(0), radius(1));
+    let n = notes(&report);
+    assert!(n.iter().any(|s| s == "Effect: rounded corners, approximated"), "{n:?}");
+    assert!(!n.iter().any(|s| s.contains("line effects") || s.starts_with("Square: ")), "{n:?}");
+    assert_eq!(layout::corner_radius(100.0, 400.0, 300.0), 50.0);
+    assert_eq!(layout::corner_radius(f64::NAN, 20.0, 10.0), 0.0);
+}
+
+#[test]
 fn point_text_gets_a_box_from_its_anchor() {
     // TITLE, 14 pt, at (2.858, 10.566) in, by its left middle.
     let b = layout::text_box((2.858, 10.566), "LeftMidPoint", 14.0, &["TITLE"], 25.4);
@@ -590,6 +627,11 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
         picture("FILE", json!({"sourceURL": r"G:\LOGOS\Other.png"})),
         picture("INLINE", json!({"sourceURL": "data:image/png;base64,AAAA"})),
     ]);
+    // A data: URL that isn't base64 is neither a picture nor a file.
+    let (bad, bad_report) = read(&[picture("BAD", json!({"sourceURL": "DATA:image/png,abc"}))]);
+    assert!(matches!(&bad.layout.elements[0].kind, Picture { image, source } if image.is_empty() && source.is_none()));
+    assert!(bad.pictures.is_empty());
+    assert!(notes(&bad_report).iter().any(|n| n.starts_with("BAD: ") && n.contains("data:")), "{:?}", notes(&bad_report));
     use crate::layout::ElementKind::Picture;
     let els = &imp.layout.elements;
     assert_eq!(els.len(), 3);
@@ -622,6 +664,15 @@ fn graphic_frames_become_borders_and_backgrounds() {
     assert!(near(fs.border_width, 96.0 / 72.0, 1e-5), "{}", fs.border_width);
     assert!(near(fs.gap, 5.0 * 25.4 / 72.0, 1e-9), "{}", fs.gap);
     assert_eq!(imp.layout.elements[1].frame_style, None);
+    // A picture keeps its frame in its graphic, and a polygon may give its geometry as `shape`.
+    let pic = json!({"type": "CIMGraphicElement", "name": "Pic", "graphic": {"type": "CIMPictureGraphic", "sourceURL": "a.png",
+        "box": {"xmin": 1, "ymin": 1, "xmax": 2, "ymax": 2}, "frame": {"type": "CIMGraphicFrame", "borderSymbol": line_sym(rgb(255, 0, 0))}}});
+    let mut shaped = rectangle_element("Shaped", json!(null));
+    shaped["graphic"]["shape"] = corner_ring(1.0, 1.0, 2.0, 2.0);
+    let (imp2, r2) = read(&[pic, shaped]);
+    assert_eq!(imp2.layout.elements[0].frame_style.as_ref().and_then(|f| f.border), Some(Rgba::rgb(255, 0, 0)));
+    assert!(near(imp2.layout.elements[1].w, 25.4, 1e-9), "{:?}", imp2.layout.elements[1]);
+    assert!(r2.notes.is_empty(), "{:?}", notes(&r2));
     let n = notes(&report);
     assert!(n.iter().any(|s| s.starts_with("Framed: ") && s.contains("shadow")), "{n:?}");
     assert!(!n.iter().any(|s| s.starts_with("Clear: ")), "{n:?}");
@@ -629,8 +680,11 @@ fn graphic_frames_become_borders_and_backgrounds() {
 
 #[test]
 fn unknown_elements_are_noted_and_skipped() {
-    let (imp, report) = read(&[json!({"type": "CIMChartFrame", "name": "C"})]);
+    let (imp, report) = read(&[json!({"type": "CIMChartFrame", "name": "C"}), json!({"name": "T"}), json!(7)]);
     assert!(imp.layout.elements.is_empty());
+    let n = notes(&report);
+    assert!(n.iter().any(|s| s == "T: an element with no type, left out"), "{n:?}");
+    assert!(n.iter().any(|s| s == "Element: an element with no type, left out"), "{n:?}");
     let n = report.notes.iter().find(|n| n.layer == "C").unwrap();
     assert_eq!(n.kind, NoteKind::Skipped);
     assert!(n.text.contains("CIMChartFrame"), "{}", n.text);
@@ -671,7 +725,7 @@ fn too_many_or_too_deep_elements_are_bounded() {
     let mut r = Report::default();
     let imp = read_layout(&layout_doc(&deep.to_string()), &mut r).unwrap();
     assert!(imp.layout.elements.is_empty());
-    assert!(notes(&r).iter().any(|n| n.contains("left out")), "{:?}", notes(&r));
+    assert!(notes(&r).iter().any(|n| n.contains("nested past 32")), "{:?}", notes(&r));
 }
 
 #[test]
@@ -692,6 +746,22 @@ fn lines_take_their_direction_and_heads_and_curves_are_ellipses() {
             "polygon": {"curveRings": [[[3.0, 2.0], {"a": [[3.0, 2.0], [2.0, 2.0], 0, 1]}]]},
             "symbol": {"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![solid_fill(rgb(0, 0, 255))])}}}),
         rectangle_element("Blob", json!({"rings": [[[0.0, 0.0], [1.0, 2.0], [2.0, 0.0], [1.0, -1.0], [0.0, 0.0]]]})),
+        // Three straight sides and one arced: curved, but not an ellipse.
+        rectangle_element(
+            "Half",
+            json!({"curveRings": [[[0.0, 0.0], [2.0, 0.0], {"a": [[2.0, 2.0], [2.0, 1.0], 0, 0]}, [0.0, 2.0], [0.0, 0.0]]]}),
+        ),
+        line("Down", json!([[1.0, 1.0], [1.0, 3.0]]), vec![solid_stroke(rgb(0, 0, 0), 1.0)]),
+        line("Fall", json!([[1.0, 3.0], [2.0, 1.0]]), vec![solid_stroke(rgb(0, 0, 0), 1.0)]),
+        line(
+            "Begin",
+            json!([[1.0, 1.0], [2.0, 1.0]]),
+            vec![
+                solid_stroke(rgb(0, 0, 0), 1.0),
+                json!({"type": "CIMVectorMarker", "markerPlacement": {"type": "CIMMarkerPlacementOnLine", "relativeTo": "LineBeginning"}}),
+                json!({"type": "CIMVectorMarker", "markerPlacement": {"type": "CIMMarkerPlacementOnLine", "relativeTo": "LineMiddle"}}),
+            ],
+        ),
     ]);
     let els = &imp.layout.elements;
     match els[0].kind {
@@ -709,7 +779,13 @@ fn lines_take_their_direction_and_heads_and_curves_are_ellipses() {
     assert!(near(els[2].x, 25.4, 1e-6) && near(els[2].w, 2.0 * 25.4, 1e-6) && near(els[2].h, 2.0 * 25.4, 1e-6), "{:?}", els[2]);
     assert!(matches!(els[3].kind, ElementKind::Rectangle { .. }));
     assert!(near(els[3].h, 3.0 * 25.4, 1e-6));
+    assert!(matches!(els[4].kind, ElementKind::Rectangle { .. }), "{:?}", els[4].kind);
+    assert!(matches!(els[5].kind, ElementKind::Line { dir: LineDir::Vertical, .. }), "{:?}", els[5].kind);
+    assert!(matches!(els[6].kind, ElementKind::Line { dir: LineDir::Falling, .. }), "{:?}", els[6].kind);
+    assert!(matches!(els[7].kind, ElementKind::Line { dir: LineDir::Horizontal, head: LineHead::Start, .. }), "{:?}", els[7].kind);
     let n = notes(&report);
     assert!(n.iter().any(|s| s.starts_with("Blob: ")), "{n:?}");
+    assert!(n.iter().any(|s| s == "Half: a polygon other than a rectangle, drawn as the rectangle round it"), "{n:?}");
+    assert!(n.iter().any(|s| s == "Begin: markers along a line, left out"), "{n:?}");
     assert!(!n.iter().any(|s| s.starts_with("Level: ") || s.starts_with("Up: ") || s.starts_with("Oval: ")), "{n:?}");
 }

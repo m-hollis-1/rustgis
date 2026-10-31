@@ -370,6 +370,7 @@ impl Reader<'_> {
                 | "CIMSteppedLineScaleBar"
                 | "CIMHollowScaleBar"
                 | "CIMAlternatingScaleBar" => self.report.skipped(&name, "legends, scale bars and north arrows aren't imported yet"),
+                "" => self.report.skipped(&name, "an element with no type, left out"),
                 other => self.report.skipped(&name, format!("a {} element, left out", shown(other))),
             }
         }
@@ -468,29 +469,38 @@ impl Reader<'_> {
         }
     }
 
-    /// A `CIMPolygonGraphic`: a rectangle (four corners), an ellipse (curves), or the rectangle
-    /// round any other shape.
+    /// A `CIMPolygonGraphic`: a rectangle (four corners, rounded or not), an ellipse (one ring of
+    /// arcs about one centre), or the rectangle round any other shape.
     fn polygon(&mut self, e: &Value, g: &Value, name: &str) -> Option<u32> {
         let shape = shape_of(g);
         let Some(b) = geometry_box(shape) else {
             self.report.skipped(name, "a shape with no points, left out");
             return None;
         };
-        let paint = symbol::polygon(g.get("symbol").unwrap_or(&NULL), name, self.report);
+        let (sym, effect_rounding) = without_rounding(g.get("symbol").unwrap_or(&NULL));
+        let rounding = effect_rounding.or_else(|| attribute(g, "Rounding")).filter(|r| *r > 0.0);
+        let paint = symbol::polygon(&sym, name, self.report);
         if !paint.fills.is_empty() {
             self.report.approximated(name, "fills other than one solid colour, drawn in the top solid one");
         }
         let fill = paint.fill.unwrap_or(Rgba::TRANSPARENT);
         let (outline, width) = paint.stroke.map_or((Rgba::TRANSPARENT, 0.0), |(c, w)| (c, f64::from(w)));
-        let kind = if shape.get("curveRings").is_some() {
+        let rect = self.place(e, b, name);
+        let kind = if is_ellipse(shape) {
             ElementKind::Ellipse { fill, outline, width }
         } else {
             if !is_four_corner_ring(shape) {
                 self.report.approximated(name, "a polygon other than a rectangle, drawn as the rectangle round it");
             }
-            ElementKind::Rectangle { fill, outline, width, radius: 0.0 }
+            let radius = rounding.map_or(0.0, |pct| {
+                self.report.approximated(name, "rounded corners, approximated");
+                corner_radius(pct, rect.2, rect.3)
+            });
+            ElementKind::Rectangle { fill, outline, width, radius }
         };
-        self.add(e, b, name, kind)
+        let id = self.layout.add(name, rect, kind);
+        self.finish(id, e, name);
+        Some(id)
     }
 
     /// A `CIMLineGraphic`: a straight line from its first point to its last, with arrowheads
@@ -543,8 +553,12 @@ impl Reader<'_> {
             return None;
         };
         let url = str_of(g, "sourceURL").map(str::trim).filter(|u| !u.is_empty());
+        let is_data = url.is_some_and(|u| u.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")));
         let inline = url.and_then(data_url).map(|(_, payload)| payload);
-        let path = url.filter(|_| inline.is_none());
+        if is_data && inline.is_none() {
+            self.report.skipped(name, "a data: URL that isn't base64, left out");
+        }
+        let path = url.filter(|_| !is_data);
         let embedded = str_of(g, "referenceURI").and_then(|u| self.doc.binary(u)).map(|d| data_url(d).map_or(d, |(_, payload)| payload));
         let image = embedded.or(inline).unwrap_or_default().to_string();
         if image.is_empty() && path.is_none() {
@@ -556,6 +570,70 @@ impl Reader<'_> {
         }
         Some(id)
     }
+}
+
+/// The largest corner radius a rectangle takes (mm).
+const MAX_CORNER_RADIUS: f64 = 50.0;
+
+/// The corner radius (mm) of a `w` × `h` mm rectangle rounded by `percent`: a percentage of half
+/// its shorter side, as Pro's rounding is.
+pub(crate) fn corner_radius(percent: f64, w: f64, h: f64) -> f64 {
+    let r = percent.clamp(0.0, 100.0) / 100.0 * w.min(h).max(0.0) / 2.0;
+    if r.is_finite() { r.clamp(0.0, MAX_CORNER_RADIUS) } else { 0.0 }
+}
+
+/// The number a graphic's `attributes` property set gives `key` (`["Rounding", 0, …]`).
+fn attribute(g: &Value, key: &str) -> Option<f64> {
+    let items = g.get("attributes")?.get("propertySetItems")?.as_array()?;
+    let i = items.iter().take(MAX_POINTS).step_by(2).position(|k| k.as_str() == Some(key))?;
+    items.get(i * 2 + 1)?.as_f64().filter(|v| v.is_finite())
+}
+
+/// A polygon symbol without its rounded-corner effects (`CIMGeometricEffectRounding`, which the
+/// rectangle's radius stands for), and the largest `rounding` they gave.
+fn without_rounding(sym: &Value) -> (Value, Option<f64>) {
+    let Some(mut s) = symbol_of(sym).cloned() else { return (NULL, None) };
+    let mut rounding: Option<f64> = None;
+    for layer in s.get_mut("symbolLayers").and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(effects) = layer.get_mut("effects").and_then(Value::as_array_mut) {
+            effects.retain(|fx| {
+                if str_of(fx, "type") != Some("CIMGeometricEffectRounding") {
+                    return true;
+                }
+                if let Some(r) = num(fx, "rounding") {
+                    rounding = Some(rounding.map_or(r, |m| m.max(r)));
+                }
+                false
+            });
+        }
+    }
+    (s, rounding)
+}
+
+/// Whether a shape is an ellipse or circle: one ring that starts at a point, runs only along
+/// arcs about one centre, and closes.
+fn is_ellipse(v: &Value) -> bool {
+    if v.get("rings").is_some() {
+        return false;
+    }
+    let Some([ring]) = v.get("curveRings").and_then(Value::as_array).map(Vec::as_slice) else { return false };
+    let Some((Some(start), segs)) = ring.as_array().and_then(|r| r.split_first()).map(|(s, rest)| (xy(s), rest)) else {
+        return false;
+    };
+    let arcs: Option<Vec<((f64, f64), (f64, f64))>> = segs
+        .iter()
+        .take(MAX_POINTS)
+        .map(|seg| {
+            let a = seg.get("a")?.as_array()?;
+            Some((a.first().and_then(xy)?, a.get(1).and_then(xy)?))
+        })
+        .collect();
+    let Some(arcs) = arcs.filter(|a| !a.is_empty()) else { return false };
+    let Some(&(end, centre)) = arcs.last() else { return false };
+    let size = arcs.iter().map(|(p, c)| (p.0 - c.0).hypot(p.1 - c.1)).fold(1.0, f64::max);
+    let tol = 1e-9 * size;
+    let same = |p: (f64, f64), q: (f64, f64)| (p.0 - q.0).abs() <= tol && (p.1 - q.1).abs() <= tol;
+    same(end, start) && arcs.iter().all(|(_, c)| same(*c, centre))
 }
 
 /// A graphic's geometry: `shape`, or what its kind calls it (`polygon`, `line`, `box`).

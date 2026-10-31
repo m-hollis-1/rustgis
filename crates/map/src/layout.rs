@@ -962,6 +962,146 @@ impl ScaleBarStyle {
     }
 }
 
+/// Where a scale bar's division labels sit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BarLabels {
+    /// Over the bar (where scale bars have always put them).
+    #[default]
+    Above,
+    /// Under the bar.
+    Below,
+}
+
+impl BarLabels {
+    pub const ALL: [BarLabels; 2] = [BarLabels::Above, BarLabels::Below];
+
+    /// The name `layout.update` takes (a saved layout holds the variant's own name).
+    pub fn code(self) -> &'static str {
+        match self {
+            BarLabels::Above => "above",
+            BarLabels::Below => "below",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BarLabels::Above => "Above the bar",
+            BarLabels::Below => "Below the bar",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<BarLabels> {
+        BarLabels::ALL.into_iter().find(|v| v.code() == s)
+    }
+}
+
+/// Where a scale bar's unit label (the unit's abbreviation, or the text given) sits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitLabel {
+    /// To the right of the bar, level with it.
+    AfterBar,
+    /// After the last division label, on the labels' line.
+    #[default]
+    AfterLabels,
+    /// Centred over the bar, on a line of its own.
+    Above,
+    /// Centred under the bar, on a line of its own.
+    Below,
+}
+
+impl UnitLabel {
+    pub const ALL: [UnitLabel; 4] = [UnitLabel::AfterBar, UnitLabel::AfterLabels, UnitLabel::Above, UnitLabel::Below];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            UnitLabel::AfterBar => "afterBar",
+            UnitLabel::AfterLabels => "afterLabels",
+            UnitLabel::Above => "above",
+            UnitLabel::Below => "below",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UnitLabel::AfterBar => "After the bar",
+            UnitLabel::AfterLabels => "After the labels",
+            UnitLabel::Above => "Above the bar",
+            UnitLabel::Below => "Below the bar",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<UnitLabel> {
+        UnitLabel::ALL.into_iter().find(|v| v.code() == s)
+    }
+}
+
+/// What a scale bar does when its divisions don't come out round across its box (ArcGIS Pro's
+/// fitting strategy).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScaleFit {
+    /// Stretch the divisions to the box's width: their value may not be a round number.
+    #[default]
+    AdjustDivisionValue,
+    /// Keep the division value round and add or drop divisions to fill the width.
+    AdjustDivision,
+    /// Keep the divisions and their round value and draw the bar as wide as they need: not the
+    /// box's width.
+    AdjustWidth,
+}
+
+impl ScaleFit {
+    pub const ALL: [ScaleFit; 3] = [ScaleFit::AdjustDivisionValue, ScaleFit::AdjustDivision, ScaleFit::AdjustWidth];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            ScaleFit::AdjustDivisionValue => "adjustDivisionValue",
+            ScaleFit::AdjustDivision => "adjustDivision",
+            ScaleFit::AdjustWidth => "adjustWidth",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleFit::AdjustDivisionValue => "Adjust division value",
+            ScaleFit::AdjustDivision => "Adjust divisions",
+            ScaleFit::AdjustWidth => "Adjust width",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<ScaleFit> {
+        ScaleFit::ALL.into_iter().find(|v| v.code() == s)
+    }
+}
+
+/// The most parts a scale bar's first division is split into.
+pub const MAX_SCALE_SUBDIVISIONS: usize = 10;
+/// The most divisions a scale bar has left of zero.
+pub const MAX_SCALE_BEFORE_ZERO: usize = 2;
+/// The most decimals a scale bar's labels have.
+pub const MAX_SCALE_DECIMALS: usize = 3;
+/// A scale bar's label size, in points.
+pub const SCALE_LABEL_SIZE: std::ops::RangeInclusive<f64> = 4.0..=24.0;
+/// The longest unit label text, in characters.
+pub const MAX_UNIT_LABEL_CHARS: usize = 100;
+/// The label size scale bars have unless set (points).
+pub const DEFAULT_SCALE_LABEL_SIZE: f64 = 8.0;
+
+fn scale_label_size() -> f64 {
+    DEFAULT_SCALE_LABEL_SIZE
+}
+
+fn is_scale_label_size(v: &f64) -> bool {
+    *v == DEFAULT_SCALE_LABEL_SIZE
+}
+
+fn is_zero_count(v: &usize) -> bool {
+    *v == 0
+}
+
+fn is_default_value<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
 /// The most divisions a scale bar has.
 pub const MAX_SCALE_DIVISIONS: usize = 10;
 
@@ -1114,6 +1254,31 @@ pub enum ElementKind {
         divisions: usize,
         #[serde(default)]
         style: ScaleBarStyle,
+        /// Parts the first division (the one after zero) is split into, 0 to
+        /// [`MAX_SCALE_SUBDIVISIONS`]; 0 and 1 leave it whole. They are not labelled.
+        #[serde(default, skip_serializing_if = "is_zero_count")]
+        subdivisions: usize,
+        /// Whole divisions left of zero, 0 to [`MAX_SCALE_BEFORE_ZERO`], labelled with negatives.
+        #[serde(default, skip_serializing_if = "is_zero_count")]
+        divisions_before_zero: usize,
+        /// Where the division labels sit.
+        #[serde(default, skip_serializing_if = "is_default_value")]
+        label_position: BarLabels,
+        /// The text of the unit label; `None` is the unit's abbreviation and an empty text prints
+        /// nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit_label: Option<String>,
+        #[serde(default, skip_serializing_if = "is_default_value")]
+        unit_label_position: UnitLabel,
+        /// Decimals of every division label, 0 to [`MAX_SCALE_DECIMALS`]; 0 gives each label
+        /// the decimals its division needs.
+        #[serde(default, skip_serializing_if = "is_zero_count")]
+        decimals: usize,
+        /// The labels' size in points, within [`SCALE_LABEL_SIZE`].
+        #[serde(default = "scale_label_size", skip_serializing_if = "is_scale_label_size")]
+        label_size: f64,
+        #[serde(default, skip_serializing_if = "is_default_value")]
+        fit: ScaleFit,
     },
     Legend {
         frame: u32,
@@ -1300,7 +1465,20 @@ impl ElementKind {
 
     /// A scale bar for `frame`, in the default style.
     pub fn scale_bar(frame: u32) -> ElementKind {
-        ElementKind::ScaleBar { frame, units: ScaleUnits::default(), divisions: divisions(), style: ScaleBarStyle::default() }
+        ElementKind::ScaleBar {
+            frame,
+            units: ScaleUnits::default(),
+            divisions: divisions(),
+            style: ScaleBarStyle::default(),
+            subdivisions: 0,
+            divisions_before_zero: 0,
+            label_position: BarLabels::default(),
+            unit_label: None,
+            unit_label_position: UnitLabel::default(),
+            decimals: 0,
+            label_size: DEFAULT_SCALE_LABEL_SIZE,
+            fit: ScaleFit::default(),
+        }
     }
 
     pub fn code(&self) -> &'static str {
@@ -1865,7 +2043,17 @@ impl Layout {
                     text.truncate(text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i));
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
-                ElementKind::ScaleBar { divisions, .. } => *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS),
+                ElementKind::ScaleBar { divisions, subdivisions, divisions_before_zero, unit_label, decimals, label_size, .. } => {
+                    *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS);
+                    *subdivisions = (*subdivisions).min(MAX_SCALE_SUBDIVISIONS);
+                    *divisions_before_zero = (*divisions_before_zero).min(MAX_SCALE_BEFORE_ZERO);
+                    *decimals = (*decimals).min(MAX_SCALE_DECIMALS);
+                    *label_size =
+                        finite_or(*label_size, DEFAULT_SCALE_LABEL_SIZE).clamp(*SCALE_LABEL_SIZE.start(), *SCALE_LABEL_SIZE.end());
+                    if let Some(t) = unit_label {
+                        t.truncate(t.char_indices().nth(MAX_UNIT_LABEL_CHARS).map_or(t.len(), |(i, _)| i));
+                    }
+                }
                 ElementKind::Rectangle { width, .. } | ElementKind::Ellipse { width, .. } => {
                     *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
                 }
@@ -2342,6 +2530,79 @@ mod tests {
         assert_eq!((cols(2), cols(3)), (1, MAX_LEGEND_COLUMNS));
         for f in LegendFit::ALL {
             assert_eq!(LegendFit::from_name(f.code()), Some(f));
+        }
+    }
+
+    #[test]
+    fn scale_bars_without_details_save_as_before() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"ScaleBar":{"frame":2,"units":"Auto","divisions":4,"style":"Alternating"}}}"#;
+        let mut e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        let ElementKind::ScaleBar {
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            label_size,
+            fit,
+            ..
+        } = &mut e.kind
+        else {
+            panic!("not a scale bar")
+        };
+        assert_eq!((*subdivisions, *divisions_before_zero, *decimals, *label_size), (0, 0, 0, 8.0));
+        assert_eq!(
+            (*label_position, *unit_label_position, *fit),
+            (BarLabels::Above, UnitLabel::AfterLabels, ScaleFit::AdjustDivisionValue)
+        );
+        assert_eq!(*unit_label, None);
+        *subdivisions = 2;
+        *divisions_before_zero = 1;
+        *label_position = BarLabels::Below;
+        *unit_label = Some("Feet".into());
+        *unit_label_position = UnitLabel::AfterBar;
+        *decimals = 2;
+        *label_size = 10.0;
+        *fit = ScaleFit::AdjustWidth;
+        let s = serde_json::to_string(&e).unwrap();
+        for part in [
+            r#""subdivisions":2"#,
+            r#""divisions_before_zero":1"#,
+            r#""label_position":"Below""#,
+            r#""unit_label":"Feet""#,
+            r#""unit_label_position":"AfterBar""#,
+            r#""decimals":2"#,
+            r#""label_size":10.0"#,
+            r#""fit":"AdjustWidth""#,
+        ] {
+            assert!(s.contains(part), "{part} in {s}");
+        }
+        assert_eq!(serde_json::from_str::<Element>(&s).unwrap(), e);
+        // A loaded layout's details are limited.
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"MapFrame":{"map":"m","center":{"x":0,"y":0},"scale":1000}}},
+            {"id":2,"name":"b","x":0,"y":0,"w":10,"h":10,"kind":{"ScaleBar":{"frame":1,"subdivisions":99,"divisions_before_zero":9,"decimals":9,"label_size":1e9}}},
+            {"id":3,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"ScaleBar":{"frame":1,"label_size":-4}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        let get = |id| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::ScaleBar { subdivisions, divisions_before_zero, decimals, label_size, .. }) => {
+                (*subdivisions, *divisions_before_zero, *decimals, *label_size)
+            }
+            _ => (0, 0, 0, 0.0),
+        };
+        assert_eq!(get(2), (MAX_SCALE_SUBDIVISIONS, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS, 24.0));
+        assert_eq!(get(3).3, 4.0);
+        for v in BarLabels::ALL {
+            assert_eq!(BarLabels::from_name(v.code()), Some(v));
+        }
+        for v in UnitLabel::ALL {
+            assert_eq!(UnitLabel::from_name(v.code()), Some(v));
+        }
+        for v in ScaleFit::ALL {
+            assert_eq!(ScaleFit::from_name(v.code()), Some(v));
         }
     }
 

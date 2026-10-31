@@ -2002,6 +2002,12 @@ fn hostile_params_never_panic() {
         json!({"kind": "legend", "element": 1, "columns": 1e308, "fit": "", "showLayerNames": null}),
         json!({"kind": "legend", "element": 1, "columns": -1e308, "fit": "adjustSize"}),
         json!({"kind": "text", "element": 1, "font": {"family": "serif"}, "italic": [], "align": 7}),
+        // A scale bar's details: of the wrong type, out of range, on elements that have none.
+        json!({"kind": "scaleBar", "element": 1, "subdivisions": [null], "divisionsBeforeZero": {}, "labelPosition": 7, "unitLabel": 7}),
+        json!({"kind": "scaleBar", "element": 1, "unitLabelPosition": "", "decimals": "x", "labelSize": "NaN", "fit": {"x": 1}}),
+        json!({"kind": "scaleBar", "element": 1, "subdivisions": 1e308, "divisionsBeforeZero": -1e308, "decimals": f64::MAX, "labelSize": -1e308, "unitLabel": null}),
+        json!({"kind": "scaleBar", "element": 1, "unitLabel": "x".repeat(5000), "fit": "adjustWidth", "labelPosition": "below", "unitLabelPosition": "afterBar"}),
+        json!({"kind": "legend", "element": 1, "decimals": 2, "labelSize": 9, "fit": "adjustDivision", "unitLabel": "m"}),
         // A QGIS project and style whose web layer and scale range are junk.
         json!({"text": "<qgis><projectlayers><maplayer type=\"raster\" hasScaleBasedVisibilityFlag=\"1\" minScale=\"NaN\" maxScale=\"-1e308\"><datasource>type=xyz&amp;url=&amp;zmax=999</datasource><layername></layername><provider>wms</provider><pipe><rasterrenderer opacity=\"inf\"/></pipe></maplayer></projectlayers></qgis>"}),
         // A label class placed along lines, with junk the placement and style read after it.
@@ -4419,6 +4425,140 @@ fn layout_surrounds_take_cartographic_options() {
     ));
     // The page draws with them all, and they survive a save.
     let out = std::env::temp_dir().join(format!("rustgis-surrounds-{}.png", std::process::id()));
+    s.run("layout.export", &json!({"path": out.to_string_lossy()})).unwrap();
+    let _ = std::fs::remove_file(&out);
+    let text = serde_json::to_string(&s.project.layouts[0]).unwrap();
+    let back: rustgis_map::layout::Layout = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, s.project.layouts[0]);
+}
+
+/// A scale bar's subdivisions, divisions before zero, labels, unit label, decimals and fitting
+/// take commands (#327): numbers are limited, names and types checked before anything changes, the
+/// details refused for other elements, and all saved with the layout.
+#[test]
+fn layout_scale_bars_take_their_details() {
+    use rustgis_map::layout::{BarLabels, ElementKind, ScaleFit, UnitLabel};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let find = |s: &Session, code: &str| s.project.layouts[0].elements.iter().find(|e| e.kind.code() == code).unwrap().clone();
+    let bar = find(&s, "scaleBar").id;
+    let details = |s: &Session, id: u32| match &s.project.layouts[0].element(id).unwrap().kind {
+        ElementKind::ScaleBar {
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            label_size,
+            fit,
+            ..
+        } => {
+            (*subdivisions, *divisions_before_zero, *label_position, unit_label.clone(), *unit_label_position, *decimals, *label_size, *fit)
+        }
+        k => panic!("{k:?}"),
+    };
+    assert_eq!(details(&s, bar), (0, 0, BarLabels::Above, None, UnitLabel::AfterLabels, 0, 8.0, ScaleFit::AdjustDivisionValue));
+    s.run(
+        "layout.update",
+        &json!({"element": bar, "subdivisions": 3, "divisionsBeforeZero": 1, "labelPosition": "below", "unitLabel": "Feet",
+                "unitLabelPosition": "afterBar", "decimals": 2, "labelSize": 10.5, "fit": "adjustDivision"}),
+    )
+    .unwrap();
+    let all = (3, 1, BarLabels::Below, Some("Feet".to_string()), UnitLabel::AfterBar, 2, 10.5, ScaleFit::AdjustDivision);
+    assert_eq!(details(&s, bar), all);
+    // Changing one keeps the others, units and divisions among them.
+    s.run("layout.update", &json!({"element": bar, "units": "feet", "labelSize": "12", "fit": "adjustWidth"})).unwrap();
+    assert_eq!(details(&s, bar), (3, 1, BarLabels::Below, Some("Feet".to_string()), UnitLabel::AfterBar, 2, 12.0, ScaleFit::AdjustWidth));
+    // Null is not set, except that a null unit label is the unit's abbreviation again; an empty
+    // one prints nothing.
+    s.run("layout.update", &json!({"element": bar, "decimals": null, "labelPosition": null, "fit": null, "unitLabel": ""})).unwrap();
+    assert_eq!(details(&s, bar), (3, 1, BarLabels::Below, Some(String::new()), UnitLabel::AfterBar, 2, 12.0, ScaleFit::AdjustWidth));
+    s.run("layout.update", &json!({"element": bar, "unitLabel": null})).unwrap();
+    assert_eq!(details(&s, bar).3, None);
+    // Numbers are limited.
+    s.run("layout.update", &json!({"element": bar, "subdivisions": 99, "divisionsBeforeZero": 9, "decimals": -4, "labelSize": 1e9}))
+        .unwrap();
+    let d = details(&s, bar);
+    assert_eq!((d.0, d.1, d.5, d.6), (10, 2, 0, 24.0));
+    s.run("layout.update", &json!({"element": bar, "decimals": 99, "labelSize": -5})).unwrap();
+    let d = details(&s, bar);
+    assert_eq!((d.5, d.6), (3, 4.0));
+    // A bad value changes nothing, not even the good ones given with it.
+    let before = details(&s, bar);
+    for bad in [
+        json!({"subdivisions": "many"}),
+        json!({"divisionsBeforeZero": []}),
+        json!({"labelPosition": "left"}),
+        json!({"labelPosition": 7}),
+        json!({"unitLabel": 7}),
+        json!({"unitLabel": ["ft"]}),
+        json!({"unitLabelPosition": "beside"}),
+        json!({"unitLabelPosition": "above "}),
+        json!({"decimals": {}}),
+        json!({"labelSize": "big"}),
+        json!({"fit": "manual"}),
+        json!({"fit": 3}),
+        json!({"fit": "AdjustWidth"}),
+    ] {
+        let mut p = bad.clone();
+        p["element"] = json!(bar);
+        p["divisions"] = json!(3);
+        p["style"] = json!("line");
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+        assert_eq!(details(&s, bar), before, "{bad}");
+        assert!(matches!(find(&s, "scaleBar").kind, ElementKind::ScaleBar { style: rustgis_map::layout::ScaleBarStyle::Alternating, .. }));
+    }
+    // Added with them.
+    let added = s
+        .run(
+            "layout.addElement",
+            &json!({"kind": "scaleBar", "subdivisions": 2, "divisionsBeforeZero": 2, "labelPosition": "below", "unitLabel": "Kilometers",
+                    "unitLabelPosition": "above", "decimals": 1, "labelSize": 9, "fit": "adjustWidth"}),
+        )
+        .unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    assert_eq!(
+        details(&s, added),
+        (2, 2, BarLabels::Below, Some("Kilometers".to_string()), UnitLabel::Above, 1, 9.0, ScaleFit::AdjustWidth)
+    );
+    let count = s.project.layouts[0].elements.len();
+    for bad in [
+        json!({"kind": "scaleBar", "labelPosition": "middle"}),
+        json!({"kind": "scaleBar", "fit": "adjustSize"}),
+        json!({"kind": "scaleBar", "columns": 2}),
+        json!({"kind": "northArrow", "decimals": 2}),
+        json!({"kind": "northArrow", "labelSize": 9}),
+        json!({"kind": "legend", "unitLabel": "m"}),
+        json!({"kind": "legend", "fit": "adjustWidth"}),
+        json!({"kind": "text", "subdivisions": 2}),
+        json!({"kind": "colorbar", "fit": "adjustWidth"}),
+    ] {
+        assert!(s.run("layout.addElement", &bad).is_err(), "{bad}");
+        assert_eq!(s.project.layouts[0].elements.len(), count, "{bad}");
+    }
+    // The other elements refuse them too; a legend still takes its own fit.
+    let arrow = find(&s, "northArrow").id;
+    for bad in [json!({"decimals": 2}), json!({"unitLabelPosition": "below"}), json!({"fit": "adjustWidth"})] {
+        let mut p = bad.clone();
+        p["element"] = json!(arrow);
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+    }
+    let legend = s.run("layout.addElement", &json!({"kind": "legend"})).unwrap()["element"].as_u64().unwrap() as u32;
+    s.run("layout.update", &json!({"element": legend, "fit": "adjustSize"})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": legend, "labelSize": 9})).is_err());
+    assert!(s.run("layout.update", &json!({"element": bar, "columns": 2})).is_err(), "a scale bar has no columns");
+    // A locked bar takes no change, a null unit label included.
+    s.run("layout.update", &json!({"element": bar, "locked": true})).unwrap();
+    for p in [json!({"decimals": 1}), json!({"unitLabel": null}), json!({"unitLabel": "m"})] {
+        let mut p = p.clone();
+        p["element"] = json!(bar);
+        assert!(s.run("layout.update", &p).is_err(), "{p}");
+    }
+    s.run("layout.update", &json!({"element": bar, "locked": false})).unwrap();
+    // The page draws with them, and they survive a save.
+    let out = std::env::temp_dir().join(format!("rustgis-bar-details-{}.png", std::process::id()));
     s.run("layout.export", &json!({"path": out.to_string_lossy()})).unwrap();
     let _ = std::fs::remove_file(&out);
     let text = serde_json::to_string(&s.project.layouts[0]).unwrap();

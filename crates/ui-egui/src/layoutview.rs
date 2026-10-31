@@ -6,10 +6,10 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, CoordFormat, ElementKind, FrameLink, Grid, GridKind, GridStyle, Layout, LegendFit, LineHead, LinkMode,
-    MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_LINE_SPACING, MAX_SCALE_DIVISIONS, MAX_TICK_MM,
-    MIN_FRAME_SCALE, MIN_LINE_SPACING, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TextCase, TickSide, VAlign, frame_camera,
-    line_angle, line_length,
+    Arrange, ArrowStyle, BarLabels, CoordFormat, ElementKind, FrameLink, Grid, GridKind, GridStyle, Layout, LegendFit, LineHead, LinkMode,
+    MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_LINE_SPACING, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS,
+    MAX_SCALE_DIVISIONS, MAX_SCALE_SUBDIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, MIN_LINE_SPACING, Orientation, PT_PER_MM, SCALE_LABEL_SIZE,
+    ScaleBarStyle, ScaleFit, ScaleUnits, TextCase, TickSide, UnitLabel, VAlign, frame_camera, line_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -1840,7 +1840,20 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             ui.end_row();
                         }
                     }
-                    ElementKind::ScaleBar { units, divisions, style, .. } => {
+                    ElementKind::ScaleBar {
+                        units,
+                        divisions,
+                        style,
+                        subdivisions,
+                        divisions_before_zero,
+                        label_position,
+                        unit_label,
+                        unit_label_position,
+                        decimals,
+                        label_size,
+                        fit,
+                        ..
+                    } => {
                         let input_label = ui.label(tl!("Style"));
                         egui::ComboBox::from_id_salt(("scale_style", id))
                             .selected_text(tl!(style.label()))
@@ -1874,6 +1887,80 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         if drag.settled(ui, &r, &mut n) && n as usize != *divisions {
                             update(app, json!({"divisions": n}));
                         }
+                        ui.end_row();
+                        // Parts the first division is cut into, and whole divisions left of zero.
+                        for (label, key, current, most) in [
+                            ("Subdivisions", "subdivisions", *subdivisions, MAX_SCALE_SUBDIVISIONS),
+                            ("Divisions before zero", "divisionsBeforeZero", *divisions_before_zero, MAX_SCALE_BEFORE_ZERO),
+                            ("Decimals", "decimals", *decimals, MAX_SCALE_DECIMALS),
+                        ] {
+                            let input_label = ui.label(tl!(label));
+                            let mut n = current as u64;
+                            let drag = Dragged::lend(ui, drag_key(key), &mut n);
+                            let r = ui.add(egui::DragValue::new(&mut n).range(0..=most as u64)).labelled_by(input_label.id);
+                            if drag.settled(ui, &r, &mut n) && n as usize != current {
+                                update(app, json!({key: n}));
+                            }
+                            ui.end_row();
+                        }
+                        let input_label = ui.label(tl!("Label size"));
+                        let mut size = *label_size;
+                        let drag = Dragged::lend(ui, drag_key("labelSize"), &mut size);
+                        let r = ui
+                            .add(egui::DragValue::new(&mut size).range(SCALE_LABEL_SIZE).speed(0.25).max_decimals(1).suffix(" pt"))
+                            .labelled_by(input_label.id);
+                        if drag.settled(ui, &r, &mut size) && (size - *label_size).abs() > 1e-6 {
+                            update(app, json!({"labelSize": size}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Label position"));
+                        egui::ComboBox::from_id_salt(("scale_labels", id))
+                            .selected_text(tl!(label_position.label()))
+                            .show_ui(ui, |ui| {
+                                for v in BarLabels::ALL {
+                                    if ui.selectable_label(*label_position == v, tl!(v.label())).clicked() && *label_position != v {
+                                        update(app, json!({"labelPosition": v.code()}));
+                                    }
+                                }
+                            })
+                            .response
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                        // Empty, the unit's own abbreviation prints.
+                        let input_label = ui.label(tl!("Unit label"));
+                        if let Some(t) =
+                            text_field(app, ui, (li, id, "unitLabel"), unit_label.as_deref().unwrap_or(""), false, input_label.id)
+                        {
+                            update(app, json!({"unitLabel": (!t.is_empty()).then_some(t)}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Unit label position"));
+                        egui::ComboBox::from_id_salt(("scale_unit_label", id))
+                            .selected_text(tl!(unit_label_position.label()))
+                            .show_ui(ui, |ui| {
+                                for v in UnitLabel::ALL {
+                                    if ui.selectable_label(*unit_label_position == v, tl!(v.label())).clicked() && *unit_label_position != v
+                                    {
+                                        update(app, json!({"unitLabelPosition": v.code()}));
+                                    }
+                                }
+                            })
+                            .response
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                        // How the divisions fill the element's width.
+                        let input_label = ui.label(tl!("Fit"));
+                        egui::ComboBox::from_id_salt(("scale_fit", id))
+                            .selected_text(tl!(fit.label()))
+                            .show_ui(ui, |ui| {
+                                for v in ScaleFit::ALL {
+                                    if ui.selectable_label(*fit == v, tl!(v.label())).clicked() && *fit != v {
+                                        update(app, json!({"fit": v.code()}));
+                                    }
+                                }
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
                     }
                     ElementKind::Table { rows, .. } => {
@@ -3478,6 +3565,70 @@ mod tests {
         assert_eq!(set(&h), (1, LegendFit::AdjustColumns, false));
         // The columns are a number field of the pane.
         assert!(h.query_by_label("Columns").is_some());
+    }
+
+    /// A scale bar's properties set its subdivisions, labels, unit label and fitting through
+    /// `layout.update`.
+    #[test]
+    fn a_scale_bar_takes_its_details_in_the_format_pane() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::{BarLabels, ElementKind, ScaleFit, UnitLabel};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Bar", "template": "map"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let bar = app.session.project.layouts[li].elements.iter().find(|e| matches!(e.kind, ElementKind::ScaleBar { .. })).unwrap().id;
+        app.layout.selected = Some(bar);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let set = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(bar).unwrap().kind {
+            ElementKind::ScaleBar { label_position, unit_label, unit_label_position, fit, .. } => {
+                (*label_position, unit_label.clone(), *unit_label_position, *fit)
+            }
+            _ => panic!("a scale bar"),
+        };
+        assert_eq!(set(&h), (BarLabels::Above, None, UnitLabel::AfterLabels, ScaleFit::AdjustDivisionValue));
+        // The number fields and the choices are there, found by their labels.
+        for label in [
+            "Subdivisions",
+            "Divisions before zero",
+            "Decimals",
+            "Label size",
+            "Label position",
+            "Unit label",
+            "Unit label position",
+            "Fit",
+        ] {
+            assert!(h.query_by_label(label).is_some(), "{label}");
+        }
+        h.get_by_label("Label position").click();
+        h.run_steps(2);
+        h.get_by_label("Below the bar").click();
+        h.run_steps(2);
+        assert_eq!(set(&h).0, BarLabels::Below);
+        h.get_by_label("Fit").click();
+        h.run_steps(2);
+        h.get_by_label("Adjust width").click();
+        h.run_steps(2);
+        assert_eq!(set(&h).3, ScaleFit::AdjustWidth);
+        // The unit label is typed, set once left.
+        h.get_by_label("Unit label").focus();
+        h.run_steps(2);
+        h.get_by_label("Unit label").type_text("Feet");
+        h.run_steps(2);
+        h.get_by_label("Subdivisions").focus();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some("Feet"));
     }
 
     /// The layout view with the Format pane beside it, as the app draws them: after following

@@ -1131,8 +1131,8 @@ pub enum ElementKind {
         /// highlight, a basemap-like layer. Empty, it lists every layer it would otherwise.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<String>,
-        /// Columns the rows run down and across, 1 to [`MAX_LEGEND_COLUMNS`]: the first column
-        /// fills, then the second.
+        /// Columns the rows run down and across, 1 to [`MAX_LEGEND_COLUMNS`], shared out so the
+        /// columns are about equally tall.
         #[serde(default = "one_column", skip_serializing_if = "is_one_column")]
         columns: usize,
         /// What the legend does when its rows don't fit the box.

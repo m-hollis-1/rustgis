@@ -165,7 +165,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   while the map still draws it (a mask, a highlight, a basemap-like layer). Scripts give the same
   with `"exclude": ["Graticule"]` on `layout.addElement` or `layout.update` (`[]` lists every
   layer again); a renamed layer stays left out. **Columns** (`"columns": 1` to `6`) runs the rows
-  down the box and on into the next column, the first column filling before the second; a layer's
+  down the box and on into the next column, shared out so the columns are about as tall as each
+  other (a box taller than they need does not leave the later columns empty); a layer's
   name is never left at the foot of a column without its first class. **Fit** says what the legend
   does when its rows don't fit the box (`"fit"`): `manual` (the default) draws the rows that fit
   and cuts the rest, `adjustSize` shrinks the text together, down to 6 pt, until they fit,

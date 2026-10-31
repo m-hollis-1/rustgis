@@ -588,6 +588,51 @@ mod tests {
         assert!(difference <= 2, "composited SVG pictures match the page within antialias rounding: {difference}");
     }
 
+    /// A legend that fits its frame runs over its box, in the SVG as on the page.
+    #[test]
+    fn an_adjust_frame_legend_is_not_cut_at_its_box() {
+        use rustgis_map::layout::LegendFit;
+        let (mut layout, mut maps, frame) = page();
+        for i in 0..9 {
+            maps[0].add_dataset(rustgis_data::Dataset::new(format!("Layer {i}"), rustgis_data::GeometryType::Point, vec![]));
+        }
+        let legend = layout.add(
+            "Legend",
+            (10.0, 10.0, 40.0, 20.0),
+            ElementKind::Legend {
+                frame,
+                title: String::new(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                fit: LegendFit::Manual,
+                show_layer_names: true,
+            },
+        );
+        let info = PageInfo::default();
+        let drawn = |layout: &Layout, maps: &mut Vec<Map>| {
+            let (pm, [_, y, _, h]) = render_element(layout, legend, maps, 96.0, &info, false).unwrap().unwrap();
+            let k = PT_PER_MM;
+            let ink = (0..pm.height()).filter(|&row| (0..pm.width()).any(|x| pm.pixel(x, row).is_some_and(|p| p.alpha() > 0))).max();
+            (y, h, ink.map(|row| (f64::from(row) + 1.0) / k + y))
+        };
+        // Manual stops at the box: 20 mm from 10 mm.
+        let (_, h, bottom) = drawn(&layout, &mut maps);
+        assert!((h - 20.0).abs() < 0.5 && bottom.is_some_and(|b| b <= 30.5), "{h} {bottom:?}");
+        // Nine rows are 135 points, 35.7 mm: the pixels reach that far and the SVG picture does.
+        if let Some(ElementKind::Legend { fit, .. }) = layout.element_mut(legend).map(|e| &mut e.kind) {
+            *fit = LegendFit::AdjustFrame;
+        }
+        let (y, h, bottom) = drawn(&layout, &mut maps);
+        assert!(h > 35.0, "{h}");
+        assert!(bottom.is_some_and(|b| b > 40.0 && b <= y + h + 0.1), "{bottom:?}");
+        let svg = layout_svg(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        let image = svg.split(&format!("<g id=\"element-{legend}\"")).nth(1).unwrap();
+        let height: f64 = image.split(r#"height=""#).nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+        assert!(height > 35.0, "{height}");
+    }
+
     #[test]
     fn cropped_images_use_their_actual_pixel_bounds() {
         let (mut layout, mut maps, _) = page();

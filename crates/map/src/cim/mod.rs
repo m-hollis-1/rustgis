@@ -10,6 +10,7 @@
 //! document missing what a reader looks for gives `None`, never a panic.
 
 pub(crate) mod color;
+pub(crate) mod dyntext;
 pub mod layout;
 pub(crate) mod symbol;
 pub(crate) mod units;

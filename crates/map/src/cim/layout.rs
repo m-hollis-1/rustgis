@@ -14,11 +14,12 @@
 use serde_json::Value;
 
 use super::color::symbol_of;
+use super::dyntext;
 use super::symbol::{self, data_url};
 use super::units::page_unit_mm;
 use super::{Document, Report, flag, num, str_of};
 use crate::Rgba;
-use crate::layout::{ElementKind, FrameStyle, Layout, LineHead, MAX_ELEMENTS, MAX_GROUP_DEPTH, line_at_angle};
+use crate::layout::{ElementKind, FontFamily, FrameStyle, Layout, LineHead, MAX_ELEMENTS, MAX_GROUP_DEPTH, line_at_angle};
 
 /// Millimetres in an inch, and in a point (1/72 inch).
 const INCH_MM: f64 = 25.4;
@@ -142,6 +143,13 @@ pub(crate) fn to_mm(b: PageBox, page_h: f64, unit_mm: f64) -> (f64, f64, f64, f6
     (b.xmin * unit_mm, (page_h - b.ymax) * unit_mm, (b.xmax - b.xmin) * unit_mm, (b.ymax - b.ymin) * unit_mm)
 }
 
+/// Box `b` shrunk by `margin` on every side, but never to less than `min` across or up.
+fn inset(b: PageBox, margin: f64, min: f64) -> PageBox {
+    let m = |lo: f64, hi: f64| if margin.is_finite() { margin.min(((hi - lo) - min).max(0.0) / 2.0) } else { 0.0 };
+    let (mx, my) = (m(b.xmin, b.xmax), m(b.ymin, b.ymax));
+    PageBox { xmin: b.xmin + mx, ymin: b.ymin + my, xmax: b.xmax - mx, ymax: b.ymax - my }
+}
+
 /// A page point in millimetres from the top-left.
 fn point_mm(p: (f64, f64), page_h: f64, unit_mm: f64) -> (f64, f64) {
     (p.0 * unit_mm, (page_h - p.1) * unit_mm)
@@ -152,7 +160,6 @@ fn point_mm(p: (f64, f64), page_h: f64, unit_mm: f64) -> (f64, f64) {
 /// character of the longest line, and its height is [`LINE_HEIGHT`] of the size per line: the
 /// renderer draws the text at its real width inside, aligned, so an estimate a little out moves
 /// the box's far edge, not the ink.
-#[allow(dead_code)] // the text reader (point text) is built on it
 pub(crate) fn text_box(point: (f64, f64), anchor: &str, size_pt: f64, lines: &[&str], unit_mm: f64) -> PageBox {
     let unit = if unit_mm.is_finite() && unit_mm > 0.0 { unit_mm } else { INCH_MM };
     let size = if size_pt.is_finite() { size_pt.max(0.0) } else { 0.0 };
@@ -294,7 +301,7 @@ pub(crate) fn frame_style(frame: &Value, what: &str, report: &mut Report) -> Opt
 }
 
 /// At most 64 characters of `s`, for a note that names something a file said.
-fn shown(s: &str) -> String {
+pub(crate) fn shown(s: &str) -> String {
     s.chars().take(64).collect()
 }
 
@@ -324,11 +331,11 @@ pub fn read_layout(doc: &Document, report: &mut Report) -> Result<LayoutImport, 
             _ => {}
         }
     }
-    let mut reader = Reader { doc, report, name, layout, pictures: Vec::new(), page_h: h, unit_mm, full: false };
+    let mut reader = Reader { doc, report, name, layout, pictures: Vec::new(), text_frames: Vec::new(), page_h: h, unit_mm, full: false };
     reader.walk(def.get("elements").unwrap_or(&NULL), 0, 0);
-    let Reader { mut layout, pictures, .. } = reader;
+    let Reader { mut layout, pictures, text_frames, .. } = reader;
     layout.clamp();
-    Ok(LayoutImport { layout, frames: Vec::new(), pictures, embedded_maps: Vec::new(), text_frames: Vec::new() })
+    Ok(LayoutImport { layout, frames: Vec::new(), pictures, embedded_maps: Vec::new(), text_frames })
 }
 
 /// The walk over a layout's elements, and what it has built so far.
@@ -339,6 +346,7 @@ struct Reader<'a> {
     name: String,
     layout: Layout,
     pictures: Vec<(u32, PictureSource)>,
+    text_frames: Vec<(u32, String)>,
     /// The page's height in its units, and how many millimetres a unit is.
     page_h: f64,
     unit_mm: f64,
@@ -421,11 +429,7 @@ impl Reader<'_> {
             "CIMPolygonGraphic" => self.polygon(e, g, name),
             "CIMLineGraphic" => self.line(e, g, name),
             "CIMPictureGraphic" => self.picture(e, g, name),
-            // Read by the text reader.
-            "CIMTextGraphic" | "CIMParagraphTextGraphic" => {
-                self.report.skipped(name, "text isn't imported yet");
-                None
-            }
+            "CIMTextGraphic" | "CIMParagraphTextGraphic" => self.text(e, g, name),
             other => {
                 self.report.skipped(name, format!("a {} graphic, left out", shown(other)));
                 None
@@ -542,6 +546,47 @@ impl Reader<'_> {
         let (rect, dir, head) = line_at_angle(centre, (b.0 - a.0).hypot(b.1 - a.1), angle, head);
         let id = self.layout.add(name, rect, ElementKind::Line { color, width, dir, head });
         self.finish(id, e, name);
+        Some(id)
+    }
+
+    /// A `CIMTextGraphic` (point text, one line or more, no wrapping, its box the text's own) or
+    /// a `CIMParagraphTextGraphic` (wrapped in its shape, less its `margin`). Pro's markup is
+    /// translated to tokens; the name of the frame the tokens read is kept in `text_frames`.
+    fn text(&mut self, e: &Value, g: &Value, name: &str) -> Option<u32> {
+        let Some(b) = geometry_box(shape_of(g)) else {
+            self.report.skipped(name, "text with no position, left out");
+            return None;
+        };
+        let style = symbol::text(g.get("symbol").unwrap_or(&NULL), name, self.report);
+        let (text, frame) = dyntext::translate(str_of(g, "text").unwrap_or_default(), self.report, name);
+        let paragraph = str_of(g, "type") == Some("CIMParagraphTextGraphic");
+        let b = if paragraph {
+            let margin = num(g, "margin").or_else(|| num(e, "margin")).unwrap_or(0.0).max(0.0) * PT_MM / self.unit_mm;
+            inset(b, margin, 1.0 / self.unit_mm)
+        } else {
+            let lines: Vec<&str> = text.split('\n').collect();
+            text_box((b.xmin, b.ymin), str_of(e, "anchor").unwrap_or(DEFAULT_ANCHOR), style.size, &lines, self.unit_mm)
+        };
+        let kind = ElementKind::Text {
+            text,
+            size: style.size,
+            color: style.color,
+            bold: style.bold,
+            italic: style.italic,
+            align: style.align,
+            letter_spacing: style.letter_spacing,
+            font: FontFamily::Sans,
+            font_name: style.font,
+            frame: None,
+            wrap: paragraph,
+            valign: style.valign,
+            line_spacing: style.line_spacing,
+            case: style.case,
+        };
+        let id = self.add(e, b, name, kind)?;
+        if let Some(f) = frame {
+            self.text_frames.push((id, f));
+        }
         Some(id)
     }
 

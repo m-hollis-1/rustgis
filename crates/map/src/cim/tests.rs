@@ -789,3 +789,128 @@ fn lines_take_their_direction_and_heads_and_curves_are_ellipses() {
     assert!(n.iter().any(|s| s == "Begin: markers along a line, left out"), "{n:?}");
     assert!(!n.iter().any(|s| s.starts_with("Level: ") || s.starts_with("Up: ") || s.starts_with("Oval: ")), "{n:?}");
 }
+
+// ---- text ----
+
+use crate::layout::ElementKind;
+
+/// A text graphic element (`kind` is `CIMTextGraphic` or `CIMParagraphTextGraphic`) with `text` at `shape`.
+fn text_element(kind: &str, name: &str, shape: serde_json::Value, text: &str, symbol: serde_json::Value) -> serde_json::Value {
+    json!({"type": "CIMGraphicElement", "name": name, "anchor": "TopLeftCorner", "visible": true,
+        "graphic": {"type": kind, "shape": shape, "text": text, "margin": 5,
+            "symbol": {"type": "CIMSymbolReference", "symbol": symbol}}})
+}
+
+fn text_symbol(extra: serde_json::Value) -> serde_json::Value {
+    let mut s = json!({"type": "CIMTextSymbol", "fontFamilyName": "Arial", "fontStyleName": "Bold", "height": 24,
+        "symbol": polygon_symbol(vec![solid_fill(rgb(10, 20, 30))])});
+    if let (Some(o), Some(e)) = (s.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    s
+}
+
+#[test]
+fn dyn_tags_become_tokens_with_prefix_suffix_and_newline() {
+    let (t, frame) = dyntext::translate(
+        r#"Spatial Reference<dyn type="mapFrame" name="MAIN MAP" property="sr" srProperty="name" preStr="Name: " newLine="true" emptyStr=""/><dyn type="mapFrame" name="MAIN MAP" property="scale" preStr="1:"/>"#,
+        &mut Report::default(),
+        "T",
+    );
+    assert_eq!(t, "Spatial Reference{crsName|Name: |\\n}{scale}");
+    assert_eq!(frame.as_deref(), Some("MAIN MAP"));
+}
+
+#[test]
+fn layout_and_project_and_date_tags_translate() {
+    let mut report = Report::default();
+    let (t, frame) = dyntext::translate(r#"Map Name: <dyn type="project" property="name"/>"#, &mut report, "T");
+    assert_eq!((t.as_str(), frame), ("Map Name: {project}", None));
+    let (t, _) = dyntext::translate(r#"<dyn type="layout" name="8x11 LANDSCAPE" property="serviceLayerCredits"/>"#, &mut report, "T");
+    assert_eq!(t, "{credits}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    let (t, _) = dyntext::translate(r#"<dyn type="date" format="short"/>"#, &mut report, "T");
+    assert_eq!(t, "{date}");
+    assert_eq!(notes(&report), ["T: date format short, drawn as RustGIS's"]);
+}
+
+#[test]
+fn unknown_tags_and_formatting_are_stripped_with_notes() {
+    let mut report = Report::default();
+    let (t, _) = dyntext::translate(r#"<BOL>Title</BOL> <dyn type="user" property="name"/>"#, &mut report, "T");
+    assert_eq!(t, "Title ");
+    assert_eq!(notes(&report), ["T: formatting tags, left out", "T: dynamic text user/name, left out"]);
+}
+
+#[test]
+fn a_frame_name_that_isnt_on_the_page_is_kept_and_the_text_still_imports() {
+    let text = r#"<dyn type="mapFrame" name="GONE" property="scale" preStr="Scale 1:"/>"#;
+    let (imp, _) = read(&[text_element("CIMTextGraphic", "Scale", json!({"x": 1.0, "y": 5.0}), text, text_symbol(json!({})))]);
+    assert_eq!(imp.layout.elements.len(), 1);
+    let el = &imp.layout.elements[0];
+    assert_eq!(imp.text_frames, vec![(el.id, "GONE".to_string())]);
+    assert!(matches!(&el.kind, ElementKind::Text { text, frame: None, .. } if text == "{scale|Scale }"), "{:?}", el.kind);
+}
+
+#[test]
+fn paragraph_text_wraps_and_point_text_doesnt() {
+    use crate::layout::{FontFamily, TextAlign, TextCase, VAlign};
+    let disclaimer = text_element(
+        "CIMParagraphTextGraphic",
+        "DISCLAIMER",
+        json!({"xmin": 1.0, "ymin": 1.0, "xmax": 5.0, "ymax": 3.0}),
+        "Not for <ITA>construction</ITA> &amp; so on.",
+        text_symbol(
+            json!({"fontStyleName": "Regular", "height": 8, "verticalAlignment": "Center", "textCase": "Allcaps", "horizontalAlignment": "Center"}),
+        ),
+    );
+    let title = text_element("CIMTextGraphic", "TITLE", json!({"x": 1.0, "y": 10.0}), "Title", text_symbol(json!({})));
+    let (imp, report) = read(&[disclaimer, title]);
+    let els = &imp.layout.elements;
+    let m = 5.0 * 25.4 / 72.0;
+    match &els[0].kind {
+        ElementKind::Text { text, size, wrap, valign, case, align, bold, font, font_name, color, .. } => {
+            assert_eq!(text, "Not for construction & so on.");
+            assert_eq!(
+                (*size, *wrap, *valign, *case, *align, *bold),
+                (8.0, true, VAlign::Middle, TextCase::Upper, TextAlign::Center, false)
+            );
+            assert_eq!((*font, font_name.as_deref(), *color), (FontFamily::Sans, Some("Arial"), Rgba::rgb(10, 20, 30)));
+        }
+        other => panic!("{other:?}"),
+    }
+    let e = &els[0];
+    assert!(near(e.x, 25.4 + m, 1e-9) && near(e.w, 4.0 * 25.4 - 2.0 * m, 1e-9), "{e:?}");
+    assert!(near(e.y, 8.0 * 25.4 + m, 1e-9) && near(e.h, 2.0 * 25.4 - 2.0 * m, 1e-9), "{e:?}");
+    match &els[1].kind {
+        ElementKind::Text { text, size, wrap, bold, valign, .. } => {
+            assert_eq!((text.as_str(), *size, *wrap, *bold, *valign), ("Title", 24.0, false, true, VAlign::Top));
+        }
+        other => panic!("{other:?}"),
+    }
+    // Point text: the box is the text's own, its top left at the point.
+    let t = &els[1];
+    assert!(near(t.x, 25.4, 1e-9) && near(t.y, 25.4, 1e-9), "{t:?}");
+    assert!(near(t.w, 0.55 * 24.0 * 5.0 / 72.0 * 25.4, 1e-9) && near(t.h, 24.0 * 1.25 / 72.0 * 25.4, 1e-9), "{t:?}");
+    assert_eq!(imp.text_frames, vec![]);
+    let n = notes(&report);
+    assert!(n.iter().all(|s| !s.starts_with("TITLE: ")) && n.iter().any(|s| s == "DISCLAIMER: formatting tags, left out"), "{n:?}");
+}
+
+#[test]
+fn a_margin_never_shrinks_a_paragraph_below_a_millimetre_and_text_without_a_position_is_skipped() {
+    let tiny = text_element(
+        "CIMParagraphTextGraphic",
+        "Tiny",
+        json!({"xmin": 1.0, "ymin": 1.0, "xmax": 1.1, "ymax": 1.1}),
+        "x",
+        text_symbol(json!({})),
+    );
+    let nowhere = text_element("CIMTextGraphic", "Nowhere", json!({}), "x", text_symbol(json!({})));
+    let (imp, report) = read(&[tiny, nowhere]);
+    assert_eq!(imp.layout.elements.len(), 1);
+    let e = &imp.layout.elements[0];
+    assert!(near(e.w, 1.0, 1e-9) && near(e.h, 1.0, 1e-9), "{e:?}");
+    assert!(near(e.x, 25.4 + 0.77, 0.01), "{e:?}");
+    assert!(notes(&report).iter().any(|s| s == "Nowhere: text with no position, left out"), "{:?}", notes(&report));
+}

@@ -6,10 +6,10 @@ use std::path::Path;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::Rgba;
 use rustgis_map::layout::{
-    Arrange, ArrowStyle, CoordFormat, ElementKind, FontFamily, FrameShape, FrameStyle, Grid, GridEdges, GridKind, GridStyle, Guides,
-    Layout, LineDir, LineHead, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries,
-    Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TextCase, TickSide, VAlign, fit_scale, line_angle, line_at_angle,
-    line_length,
+    Arrange, ArrowStyle, CoordFormat, ElementKind, FontFamily, FrameLink, FrameShape, FrameStyle, Grid, GridEdges, GridKind, GridStyle,
+    Guides, Layout, LineDir, LineHead, LinkMode, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES, MAX_SCALE_DIVISIONS, MAX_TICK_MM,
+    MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TextCase, TickSide, VAlign, fit_scale, line_angle,
+    line_at_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -89,7 +89,7 @@ pub fn commands() -> Vec<C> {
             r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame; for text and dynamicText, the map frame whose map its tokens ({scale}, {map}, {extent}…) read, default none: the first frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "wrap"?: bool (text, dynamicText: break each line at the element's width; a word wider than it stays whole), "valign"?: "top"|"middle"|"bottom" (text, dynamicText: where the block of lines sits down the element, default top), "lineSpacing"?: 0.5 to 3 (text, dynamicText: the distance between lines as a multiple of the usual, default 1), "case"?: "none"|"upper"|"lower" (text, dynamicText: applied once the tokens have expanded; wrap, valign, lineSpacing and case are refused for other kinds), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "x"?, "y"?, "w"?, "h"?: mm; "border"?: "#RRGGBB"|"#RRGGBBAA" (a line round the element, whatever it is; not for a grid or extentIndicator), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA" (a fill behind it), "gap"?: mm, 0 to 50 (between the element and its border and background)}"##,
         ),
         C::new("layout.update", "Element Properties", "Publish › Element", update).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"?, "frame"?: map frame id | null (text: the frame its tokens read; null: the first frame), "wrap"?: bool, "valign"?: "top"|"middle"|"bottom", "lineSpacing"?: 0.5 to 3, "case"?: "none"|"upper"|"lower" (text only: refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?, "border"?: "#RRGGBB"|"#RRGGBBAA"|null (a line round the element, whatever it is; null for none), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA"|null (a fill behind it; null for none), "gap"?: mm, 0 to 50 (between the element and its border and background; the frame style the four make is kept for any element kind, and not given keeps what it has)}"##,
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"?, "frame"?: map frame id | null (text: the frame its tokens read; null: the first frame), "wrap"?: bool, "valign"?: "top"|"middle"|"bottom", "lineSpacing"?: 0.5 to 3, "case"?: "none"|"upper"|"lower" (text only: refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?, "border"?: "#RRGGBB"|"#RRGGBBAA"|null (a line round the element, whatever it is; null for none), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA"|null (a fill behind it; null for none), "gap"?: mm, 0 to 50 (between the element and its border and background; the frame style the four make is kept for any element kind, and not given keeps what it has), "link"?: {"frame": map frame id, "mode"?: "center"|"extent"|"scale", "rotation"?: bool} | null (map frame: follow another frame, taking its centre (the default; the frame keeps its scale), the scale that fits what it shows, or its scale (the frame keeps its centre), and with rotation its bearing too; a frame's own view returns when it's unlinked; null unlinks; a loop, the frame itself or an element that isn't a map frame is refused)}"##,
         ),
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
@@ -111,7 +111,7 @@ pub fn commands() -> Vec<C> {
         })
         .params(r#"{"layout"?, "element": id}"#),
         C::new("layout.frameZoom", "Zoom Frame", "Publish › Map Frame", frame_zoom).params(
-            r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?}"#,
+            r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?; refused for a frame that follows another: unlink it first with layout.update}"#,
         ),
         C::new("layout.series", "Map Series", "Publish › Map Frames", series).params(
             r#"{"layout"?, "layer": index layer, "nameField"?: string, "frame"?: id, "margin"?: 0..1, "off"?: bool}"#,
@@ -280,6 +280,7 @@ fn frame_kind(s: &Session, map: &str, w: f64, shape: FrameShape) -> ElementKind 
         extent_width: rustgis_map::layout::INDICATOR_WIDTH,
         bearing,
         pitch,
+        link: None,
     }
 }
 
@@ -1392,6 +1393,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
+            link: None,
         },
     );
     // Over the map, clear of the graticule's labels (drawn inside the frame along its labelled
@@ -1708,6 +1710,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
     }
@@ -2778,6 +2781,49 @@ fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String>
     }
 }
 
+/// The `link` of `layout.update` on element `id`: absent is `None` (keep), `null` unlinks, an
+/// object links to the map frame `"frame"` (`"mode"` and `"rotation"` as `layout.update` says).
+/// What `Layout::clamp` would drop, or isn't a link, is refused.
+fn read_link(l: &Layout, id: u32, p: &Value) -> Result<Option<Option<FrameLink>>, String> {
+    const USAGE: &str = r#"link is {"frame": map frame id, "mode"?: "center"|"extent"|"scale", "rotation"?: bool}, or null"#;
+    let Some(v) = p.get("link") else { return Ok(None) };
+    if !matches!(l.element(id).map(|e| &e.kind), Some(ElementKind::MapFrame { .. })) {
+        return Err("only map frames follow another frame".into());
+    }
+    let o = match v {
+        Value::Null => return Ok(Some(None)),
+        Value::Object(o) => o,
+        _ => return Err(USAGE.into()),
+    };
+    let frame = o.get("frame").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()).ok_or(USAGE)?;
+    let mode = match o.get("mode") {
+        None => LinkMode::default(),
+        Some(m) => m.as_str().and_then(LinkMode::from_name).ok_or("mode is \"center\", \"extent\" or \"scale\"")?,
+    };
+    let rotation = match o.get("rotation") {
+        None => false,
+        Some(r) => r.as_bool().ok_or("rotation is true or false")?,
+    };
+    if frame == id {
+        return Err("a frame can't follow itself".into());
+    }
+    if !matches!(l.element(frame).map(|e| &e.kind), Some(ElementKind::MapFrame { .. })) {
+        return Err(format!("no map frame {frame}"));
+    }
+    // The frames this one would follow, in turn: back at this one, they would go in a circle.
+    let mut at = frame;
+    for _ in 0..=l.elements.len() {
+        match l.element(at).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { link: Some(next), .. }) if next.frame == id => {
+                return Err(format!("frame {frame} already follows this frame, directly or through others"));
+            }
+            Some(ElementKind::MapFrame { link: Some(next), .. }) => at = next.frame,
+            _ => break,
+        }
+    }
+    Ok(Some(Some(FrameLink { frame, mode, rotation })))
+}
+
 fn update(s: &mut Session, p: &Value) -> CmdResult {
     let id = element_id(p)?;
     // Checked before anything changes, so a bad value leaves the element as it was.
@@ -2805,12 +2851,14 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     let changes = unbinds
         || p.as_object().is_some_and(|o| {
             o.iter().any(|(k, v)| {
-                (!v.is_null() || matches!(k.as_str(), "border" | "background")) && !matches!(k.as_str(), "layout" | "element" | "locked")
+                (!v.is_null() || matches!(k.as_str(), "border" | "background" | "link"))
+                    && !matches!(k.as_str(), "layout" | "element" | "locked")
             })
         });
     if changes && b(p, "locked") != Some(false) {
         unlocked(s.project.layouts.get(li).ok_or("no layout")?, id)?;
     }
+    let new_link = read_link(s.project.layouts.get(li).ok_or("no layout")?, id, p)?;
     // A new layer (tables and charts) or field (charts) must exist in the frame's map.
     let checked = {
         let l = s.project.layouts.get(li).ok_or("no layout")?;
@@ -3101,7 +3149,10 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *reverse = v;
             }
         }
-        ElementKind::MapFrame { map, center, scale, grid, bearing, pitch, extent_of, extent_color, extent_width, .. } => {
+        ElementKind::MapFrame { map, center, scale, grid, bearing, pitch, extent_of, extent_color, extent_width, link, .. } => {
+            if let Some(l) = new_link {
+                *link = l;
+            }
             match new_indicator {
                 Some(None) => *extent_of = None,
                 Some(Some((c, w))) => (*extent_color, *extent_width) = (c, w),
@@ -3176,6 +3227,11 @@ fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
     };
     unlocked(l, frame)?;
     let map = match l.element(frame).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { link: Some(link), .. }) => {
+            // Its view is its source's: zooming would change what it keeps for when it is unlinked.
+            let name = l.element(link.frame).map(|e| e.name.trim()).filter(|n| !n.is_empty());
+            return Err(format!("the frame follows {}: unlink it first", name.map_or_else(|| format!("#{}", link.frame), String::from)));
+        }
         Some(ElementKind::MapFrame { map, .. }) => map.clone(),
         _ => return Err("no such frame".into()),
     };

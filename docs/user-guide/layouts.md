@@ -105,6 +105,13 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   muted page, and **Remove Extent Indicator** takes it away. Scripts set the same with `color`
   and `width` on `layout.addElement` (`kind` `extentIndicator`), or `layout.update` with
   `"extentIndicator": {"color": "#555555", "width": 1}` (`false` removes it).
+- **Linked frames**: **Follows** in a map frame's properties makes it follow another frame, as an
+  inset follows the main map. **Takes** picks what it follows: the **centre** (the frame keeps its
+  own scale), the **extent** (the scale that fits what the other frame shows) or the **scale** (the
+  frame keeps its own centre); **Rotation** also takes the other frame's bearing. A frame that
+  follows is not panned or zoomed (`layout.frameZoom` refuses it): choose **Nothing** to get its
+  own view back. Scripts use `layout.update` with `"link": {"frame": 1, "mode": "extent",
+  "rotation": true}` (`null` unlinks); a frame can't follow itself, or follow in a circle.
 - **Grids**: the **Grid** section of a frame's properties turns the grid on and sets its
   **Interval** in degrees (**Auto** picks one from the frame's extent), its **Style** (full lines
   across the frame, ticks along its neatline only, or both, with the **Tick length**), its colour

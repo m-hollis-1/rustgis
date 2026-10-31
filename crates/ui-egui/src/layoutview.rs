@@ -6,9 +6,9 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, CoordFormat, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE,
-    MAX_GRID_WIDTH, MAX_LINE_SPACING, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, MIN_LINE_SPACING, Orientation, PT_PER_MM,
-    ScaleBarStyle, ScaleUnits, TextCase, TickSide, VAlign, frame_camera, line_angle, line_length,
+    Arrange, ArrowStyle, CoordFormat, ElementKind, FrameLink, Grid, GridKind, GridStyle, Layout, LineHead, LinkMode, MAX_COLORBAR_TICKS,
+    MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LINE_SPACING, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, MIN_LINE_SPACING, Orientation,
+    PT_PER_MM, ScaleBarStyle, ScaleUnits, TextCase, TickSide, VAlign, frame_camera, line_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -824,7 +824,9 @@ pub fn page_info(app: &mut RustGisApp, li: usize) -> rustgis_engine::render::lay
 fn nav_frame(app: &RustGisApp, layout: &Layout, page: Rect, s: f32, p: Pos2) -> Option<u32> {
     let (x, y) = to_mm(page, s, p);
     layout.hit(x, y).filter(|id| {
-        app.layout.navigate && layout.element(*id).is_some_and(|e| !e.locked && matches!(e.kind, ElementKind::MapFrame { .. }))
+        app.layout.navigate
+            && !follows(layout, *id)
+            && layout.element(*id).is_some_and(|e| !e.locked && matches!(e.kind, ElementKind::MapFrame { .. }))
     })
 }
 
@@ -1011,8 +1013,9 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
                 (Some(vertical), ..) => Some(Drag::NewGuide(vertical)),
                 (None, Some((id, h)), ..) => Some(Drag::Resize(id, h, p)),
                 (None, None, Some((vertical, i)), _) => Some(Drag::Guide(vertical, i)),
-                // A locked element is selected and stays put, its map too.
-                (None, None, None, Some(id)) if locked(layout, id) => {
+                // A locked element is selected and stays put, its map too; so does the map of a
+                // frame that follows another.
+                (None, None, None, Some(id)) if locked(layout, id) || (shift && follows(layout, id)) => {
                     app.layout.selected = Some(id);
                     None
                 }
@@ -1073,8 +1076,92 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
     }
 }
 
+/// Whether map frame `id` follows another frame: its view is that frame's, so it isn't panned or
+/// zoomed.
+fn follows(layout: &Layout, id: u32) -> bool {
+    matches!(layout.element(id).map(|e| &e.kind), Some(ElementKind::MapFrame { link: Some(_), .. }))
+}
+
+/// Whether frame `target` follows frame `id`, directly or through others: `id` following it
+/// would go in a circle.
+fn follows_through(layout: &Layout, target: u32, id: u32) -> bool {
+    let mut at = target;
+    for _ in 0..=layout.elements.len() {
+        match layout.element(at).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { link: Some(l), .. }) if l.frame == id => return true,
+            Some(ElementKind::MapFrame { link: Some(l), .. }) => at = l.frame,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A map frame's "Follows" rows: the frame it follows, what it takes from it, and its rotation.
+fn frame_link_controls(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    layout: &Layout,
+    id: u32,
+    link: Option<FrameLink>,
+    update: &impl Fn(&mut RustGisApp, Value),
+) {
+    let input_label = ui.label(tl!("Follows"));
+    // The other frames that don't follow this one.
+    let others: Vec<(u32, String)> = layout
+        .elements
+        .iter()
+        .filter(|e| e.id != id && matches!(e.kind, ElementKind::MapFrame { .. }) && !follows_through(layout, e.id, id))
+        .map(|e| (e.id, e.name.clone()))
+        .collect();
+    let shown = match link {
+        Some(l) => layout.element(l.frame).map_or_else(|| format!("#{}", l.frame), |e| e.name.clone()),
+        None => tl!("Nothing").to_string(),
+    };
+    let (mode, rotation) = link.map_or((LinkMode::default(), false), |l| (l.mode, l.rotation));
+    egui::ComboBox::from_id_salt(("frame_follows", id))
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(link.is_none(), tl!("Nothing")).clicked() && link.is_some() {
+                update(app, json!({"link": null}));
+            }
+            for (other, name) in others {
+                if ui.selectable_label(link.is_some_and(|l| l.frame == other), name.as_str()).clicked()
+                    && link.is_none_or(|l| l.frame != other)
+                {
+                    update(app, json!({"link": {"frame": other, "mode": mode.code(), "rotation": rotation}}));
+                }
+            }
+        })
+        .response
+        .labelled_by(input_label.id);
+    ui.end_row();
+    let Some(l) = link else { return };
+    let input_label = ui.label(tl!("Takes"));
+    egui::ComboBox::from_id_salt(("frame_follows_mode", id))
+        .selected_text(tl!(mode.label()))
+        .show_ui(ui, |ui| {
+            for m in LinkMode::ALL {
+                if ui.selectable_label(mode == m, tl!(m.label())).clicked() && mode != m {
+                    update(app, json!({"link": {"frame": l.frame, "mode": m.code(), "rotation": rotation}}));
+                }
+            }
+        })
+        .response
+        .labelled_by(input_label.id);
+    ui.end_row();
+    let input_label = ui.label(tl!("Rotation"));
+    let mut turn = rotation;
+    if ui.checkbox(&mut turn, "").labelled_by(input_label.id).changed() {
+        update(app, json!({"link": {"frame": l.frame, "mode": mode.code(), "rotation": turn}}));
+    }
+    ui.end_row();
+}
+
 /// Moves a map frame's map by a page offset (mm).
 fn pan_frame(app: &mut RustGisApp, layout: &Layout, li: usize, id: u32, dx: f64, dy: f64) {
+    if follows(layout, id) {
+        return;
+    }
     let Some(e) = layout.element(id) else { return };
     let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &e.kind else { return };
     let Some(m) = app.session.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { return };
@@ -1090,6 +1177,9 @@ fn pan_frame(app: &mut RustGisApp, layout: &Layout, li: usize, id: u32, dx: f64,
 /// Zooms a map frame's map by `k` on its scale (below 1 zooms in), keeping the map under the
 /// page point `anchor` (mm) where it is.
 fn zoom_frame(app: &mut RustGisApp, layout: &Layout, li: usize, id: u32, k: f64, (ax, ay): (f64, f64)) {
+    if follows(layout, id) {
+        return;
+    }
     let Some(e) = layout.element(id) else { return };
     let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &e.kind else { return };
     let Some(m) = app.session.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { return };
@@ -1556,7 +1646,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                         ui.end_row();
                     }
-                    ElementKind::MapFrame { map, scale, bearing, pitch, .. } => {
+                    ElementKind::MapFrame { map, scale, bearing, pitch, link, .. } => {
                         let input_label = ui.label(tl!("Map"));
                         let maps: Vec<String> = app.session.project.maps.iter().map(|m| m.name.clone()).collect();
                         egui::ComboBox::from_id_salt(("frame_map", id))
@@ -1577,8 +1667,12 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         // Below 1:10, tenths: 1:0.5 is a frame at 2:1 (#902).
                         let decimals = if sc < 10.0 { 1 } else { 0 };
                         let drag = Dragged::lend(ui, drag_key("scale"), &mut sc);
+                        // Following another frame, the view is that frame's: unlink it to set the scale.
                         let r = ui
-                            .add(egui::DragValue::new(&mut sc).range(MIN_FRAME_SCALE..=MAX_FRAME_SCALE).speed(speed).max_decimals(decimals))
+                            .add_enabled(
+                                link.is_none(),
+                                egui::DragValue::new(&mut sc).range(MIN_FRAME_SCALE..=MAX_FRAME_SCALE).speed(speed).max_decimals(decimals),
+                            )
                             .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut sc) && (sc / scale - 1.0).abs() > 1e-3 {
                             update(app, json!({"scale": sc}));
@@ -1591,14 +1685,17 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             let input_label = ui.label(tl!(label));
                             let mut v = current;
                             let drag = Dragged::lend(ui, drag_key(key), &mut v);
+                            // The bearing is the source's when the link takes its rotation too.
+                            let own = key != "bearing" || !link.is_some_and(|l| l.rotation);
                             let r = ui
-                                .add(egui::DragValue::new(&mut v).range(range).speed(0.5).max_decimals(1).suffix("°"))
+                                .add_enabled(own, egui::DragValue::new(&mut v).range(range).speed(0.5).max_decimals(1).suffix("°"))
                                 .labelled_by(input_label.id);
                             if drag.settled(ui, &r, &mut v) && (v - current).abs() > 1e-6 {
                                 update(app, json!({key: v}));
                             }
                             ui.end_row();
                         }
+                        frame_link_controls(app, ui, layout, id, *link, &update);
                     }
                     ElementKind::NorthArrow { style, fill, outline, .. } => {
                         let input_label = ui.label(tl!("Style"));
@@ -2385,6 +2482,68 @@ mod tests {
         assert_eq!((*i, *rev), (li, app.session.revision));
         assert_eq!(drawn.element(title.id).map(|e| e.y), Some(moved.y));
         assert_eq!(app.layout.key.map(|k| k.0), Some(app.session.revision));
+    }
+
+    /// A frame that follows another is neither panned nor zoomed, and its Format pane says whom it
+    /// follows and takes its scale and bearing out of reach; picking "Nothing" frees it.
+    #[test]
+    fn a_frame_that_follows_another_is_not_panned_or_zoomed() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Linked"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let main = app.session.project.layouts[li].first_frame().unwrap();
+        let inset = app.run("layout.addFrame", json!({"x": 150, "y": 100, "w": 50, "h": 40})).unwrap()["element"].as_u64().unwrap() as u32;
+        let view = |app: &RustGisApp| match app.session.project.layouts[li].element(inset).map(|e| e.kind.clone()) {
+            Some(ElementKind::MapFrame { center, scale, link, .. }) => (center, scale, link),
+            _ => panic!("not a map frame"),
+        };
+        app.run("layout.update", json!({"layout": li, "element": inset, "link": {"frame": main}})).unwrap();
+        let before = view(&app);
+        assert!(before.2.is_some());
+        let layout = app.session.project.layouts[li].clone();
+        super::pan_frame(&mut app, &layout, li, inset, 10.0, 5.0);
+        super::zoom_frame(&mut app, &layout, li, inset, 0.5, (160.0, 110.0));
+        assert_eq!(view(&app), before, "the view is the followed frame's");
+        // The frame followed is panned as ever.
+        super::pan_frame(&mut app, &layout, li, main, 10.0, 5.0);
+        let moved = match app.session.project.layouts[li].element(main).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { center, .. }) => *center,
+            _ => panic!("not a map frame"),
+        };
+        assert_ne!(
+            moved,
+            match layout.element(main).map(|e| &e.kind) {
+                Some(ElementKind::MapFrame { center, .. }) => *center,
+                _ => panic!("not a map frame"),
+            }
+        );
+
+        app.layout.selected = Some(inset);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label("Follows");
+        h.get_by_label("Takes");
+        h.get_by_label("Rotation");
+        assert!(h.get_by_label("Scale 1:").accesskit_node().is_disabled(), "the scale is the followed frame's");
+        assert!(!h.get_by_label("Bearing").accesskit_node().is_disabled(), "the bearing is its own unless the rotation is followed");
+        // Unlinked, it is its own again.
+        let _ = h.state_mut().run("layout.update", json!({"layout": li, "element": inset, "link": null}));
+        h.run_steps(3);
+        assert!(h.query_by_label("Takes").is_none());
+        assert!(!h.get_by_label("Scale 1:").accesskit_node().is_disabled());
     }
 
     /// Dragging the map in a turned frame moves it the way the pointer goes, as in the map view.

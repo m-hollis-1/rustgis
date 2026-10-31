@@ -1580,33 +1580,7 @@ fn blend_over(dst: &mut Pixmap, src: &Pixmap, x: i64, y: i64) {
 /// The longitude/latitude extent a view shows (the whole world on the globe, or when the
 /// projection can't say).
 pub fn view_lonlat(map: &Map, view: &View) -> Extent {
-    if map.projection.is_globe() {
-        return Extent::WORLD_LONLAT;
-    }
-    let flat = map.flat();
-    let e = view.camera.extent(view.width, view.height);
-    let mut out = Extent::EMPTY;
-    const N: usize = 8;
-    for i in 0..=N {
-        let t = i as f64 / N as f64;
-        let (x, y) = (e.min_x + t * e.width(), e.min_y + t * e.height());
-        for c in [Coord::new(x, e.min_y), Coord::new(x, e.max_y), Coord::new(e.min_x, y), Coord::new(e.max_x, y)] {
-            match flat.inverse(c) {
-                Some(p) if p.is_finite() => out.expand(p),
-                _ => return Extent::WORLD_LONLAT,
-            }
-        }
-    }
-    // A pole inside the view lies beyond every edge sample (a polar projection): reach it.
-    for pole in [Coord::new(0.0, 90.0), Coord::new(0.0, -90.0)] {
-        if let Some(p) = flat.forward(pole)
-            && p.is_finite()
-            && e.contains(p)
-        {
-            out = Extent::new(-180.0, out.min_y.min(pole.y), 180.0, out.max_y.max(pole.y));
-        }
-    }
-    if out.is_empty() { Extent::WORLD_LONLAT } else { out }
+    rustgis_map::layout::camera_lonlat(map, &view.camera, view.width, view.height)
 }
 
 /// Draws the map for the screen. Layers are drawn bottom-up (the last layer in the list first).

@@ -324,6 +324,7 @@ pub fn page_layout(s: &Session, pres: &Presentation, page: &Page) -> Layout {
                     extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                     bearing: 0.0,
                     pitch: 0.0,
+                    link: None,
                 },
             );
         }

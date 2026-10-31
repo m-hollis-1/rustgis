@@ -113,14 +113,16 @@ fn draw_page(
     }
     let visible = |e: &&Element| e.visible && element.is_none_or(|id| e.id == id);
     // Frame cameras first: surrounds and extent indicators read them.
+    // Linked frames take their view from the frame they follow.
+    let cameras = layout.resolved_cameras(maps);
     let frames: Vec<(u32, usize, rustgis_map::Camera, f64, f64)> = layout
         .elements
         .iter()
         .filter_map(|e| match &e.kind {
-            ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
+            ElementKind::MapFrame { map, .. } => {
                 let mi = maps.iter().position(|m| m.name.eq_ignore_ascii_case(map))?;
-                let m = maps.get(mi)?;
-                Some((e.id, mi, frame_camera(m, *center, *scale, *bearing, *pitch), e.w * PT_PER_MM, e.h * PT_PER_MM))
+                let cam = cameras.iter().find(|(id, _)| *id == e.id)?.1;
+                Some((e.id, mi, cam, e.w * PT_PER_MM, e.h * PT_PER_MM))
             }
             _ => None,
         })
@@ -1266,13 +1268,14 @@ pub fn tile_legends_pending(map: &Map, scale: f64, exclude: &[String]) -> bool {
 /// on its way, at its frame's scale: in the browser, which doesn't wait for them, the page is
 /// drawn again once it lands.
 pub fn legends_pending(layout: &Layout, maps: &[Map]) -> bool {
+    let cameras = layout.resolved_cameras(maps);
     layout.elements.iter().filter(|e| e.visible).any(|e| {
         let ElementKind::Legend { frame, exclude, .. } = &e.kind else { return false };
-        let Some(ElementKind::MapFrame { map, center, scale, bearing, pitch, .. }) = layout.element(*frame).map(|f| &f.kind) else {
+        let Some(ElementKind::MapFrame { map, .. }) = layout.element(*frame).map(|f| &f.kind) else {
             return false;
         };
         let Some(m) = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { return false };
-        let cam = frame_camera(m, *center, *scale, *bearing, *pitch);
+        let Some(&(_, cam)) = cameras.iter().find(|(id, _)| id == frame) else { return false };
         tile_legends_pending(m, m.ground_res_at(&cam) / rustgis_geom::PIXEL_M, exclude)
     })
 }
@@ -2322,6 +2325,7 @@ mod tests {
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
         let rect = if orientation == Orientation::Vertical { (10.0, 10.0, 20.0, 80.0) } else { (10.0, 10.0, 80.0, 20.0) };
@@ -2359,11 +2363,54 @@ mod tests {
             extent_width: width,
             bearing: 0.0,
             pitch: 0.0,
+            link: None,
         };
         let mut l = Layout::new("Layout", 100.0, 100.0);
         let main = l.add("Main", (60.0, 60.0, 30.0, 30.0), frame(Coord::new(20.0, 10.0), 5e7, None));
         l.add("Inset", (5.0, 5.0, 50.0, 50.0), frame(Coord::new(0.0, 0.0), 2e8, Some(main)));
         render(&l, &mut [map], 96.0, &PageInfo::default()).unwrap()
+    }
+
+    #[test]
+    fn a_linked_frame_renders_at_its_sources_centre() {
+        use rustgis_map::layout::{FrameLink, LinkMode};
+        use rustgis_map::raster::{RasterRenderer, Stretch};
+        // The inset (55-95 mm), as pixels, with the raster strip at 0°-1° east, 1° north.
+        let inset = |source_at: Coord, own_at: Coord, link: Option<LinkMode>| -> Vec<(u8, u8, u8)> {
+            let map = ramp_map(RasterRenderer::Stretch { band: 0, ramp: rustgis_map::Ramp::Thermal, invert: false }, Stretch::MinMax);
+            let frame = |center, link| ElementKind::MapFrame {
+                map: "m".into(),
+                center,
+                scale: 1e6,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: rustgis_map::layout::INDICATOR_COLOR,
+                extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+                link,
+            };
+            let mut l = Layout::new("Layout", 100.0, 50.0);
+            let main = l.add("Main", (5.0, 5.0, 40.0, 40.0), frame(source_at, None));
+            let follow = link.map(|mode| FrameLink { frame: main, mode, rotation: false });
+            l.add("Inset", (55.0, 5.0, 40.0, 40.0), frame(own_at, follow));
+            let pm = render(&l, &mut [map], 96.0, &PageInfo::default()).unwrap();
+            let k = PT_PER_MM;
+            ((5.0 * k) as u32..(45.0 * k) as u32)
+                .flat_map(|y| ((57.0 * k) as u32..(93.0 * k) as u32).map(move |x| (x, y)))
+                .map(|(x, y)| rgb(&pm, x, y))
+                .collect()
+        };
+        let (here, far) = (Coord::new(0.5, 0.995), Coord::new(100.0, -50.0));
+        let alone = inset(far, far, None);
+        let followed = inset(here, far, Some(LinkMode::Center));
+        assert_ne!(followed, alone, "the linked inset shows what the source shows");
+        assert_eq!(followed, inset(far, here, None), "as an inset centred there does");
+        let panned = inset(Coord::new(0.5, 0.5), far, Some(LinkMode::Center));
+        assert_ne!(panned, followed, "panning the source pans the inset");
+        // Taking only the scale leaves the inset where it was.
+        assert_eq!(inset(here, far, Some(LinkMode::Scale)), alone);
     }
 
     /// Pixels inside the inset (5–55 mm) close to `c`.
@@ -2476,6 +2523,7 @@ mod tests {
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
+            link: None,
         };
         let ids = [l.add("First", (5.0, 5.0, 40.0, 40.0), kind(10_000.0)), l.add("Second", (55.0, 5.0, 40.0, 40.0), kind(50_000.0))];
         let mut t = ElementKind::text(text, 12.0, Rgba::rgb(0, 0, 0), false);
@@ -2664,6 +2712,7 @@ mod tests {
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
         let kind = ElementKind::Colorbar {
@@ -2787,6 +2836,7 @@ mod tests {
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
         render(&l, &mut maps, 96.0, &PageInfo::default()).unwrap()
@@ -2826,6 +2876,7 @@ mod tests {
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
         render(&l, &mut maps, 96.0, &PageInfo::default()).unwrap()

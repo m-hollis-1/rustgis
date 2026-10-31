@@ -2009,6 +2009,13 @@ fn hostile_params_never_panic() {
         // A frame style's border, background, width and gap: of the wrong type, out of range.
         json!({"kind": "text", "element": 1, "border": 7, "background": [], "borderWidth": "x", "gap": 1e308}),
         json!({"kind": "rectangle", "element": 1, "border": "#12", "background": {}, "borderWidth": -1e308, "gap": f64::MAX}),
+        // A map frame's link to another: the wrong types, a loop, itself, out of range.
+        json!({"element": 1, "link": {"frame": "x", "mode": 7, "rotation": []}}),
+        json!({"element": 1, "link": {"frame": 1, "mode": "zoom"}}),
+        json!({"element": 1, "link": {"frame": 1}}),
+        json!({"element": 1, "link": {"frame": 1e300, "rotation": "yes"}}),
+        json!({"element": 1, "link": [7], "x": 1e308}),
+        json!({"element": 1, "link": 7}),
         json!({"style": "", "accent": [], "kind": "rectangle", "element": 1, "radius": -1e308}),
         json!({"profile": "a3", "style": "poster", "accent": "#ZZZZZZ", "kind": "rectangle", "radius": 1e308}),
         // A STAC trend's source: a valid band and period so the junk after them is reached, and an
@@ -4023,6 +4030,107 @@ fn layout_update_sets_and_clears_border_and_background() {
     assert_eq!(frame_style(&s, rect).unwrap().border, Some(red));
     s.run("layout.update", &json!({"element": rect, "locked": false, "border": null})).unwrap();
     assert_eq!(frame_style(&s, rect), None);
+}
+
+/// `layout.update` makes a map frame follow another (`link`), unlinks it with `null`, keeps it when
+/// absent, and refuses what would be dropped on load (itself, a non-frame, a loop) or isn't a
+/// link, changing nothing; a frame that follows takes no zoom, and a locked one no link.
+#[test]
+fn layout_update_links_and_unlinks_frames_and_refuses_cycles() {
+    use rustgis_map::layout::{ElementKind, FrameLink, LinkMode};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let main = s.project.layouts[0].first_frame().unwrap();
+    s.run("layout.update", &json!({"element": main, "name": "Main map"})).unwrap();
+    let frame = |s: &mut Session, x: u32| {
+        s.run("layout.addFrame", &json!({"x": x, "y": 150, "w": 60, "h": 40})).unwrap()["element"].as_u64().unwrap() as u32
+    };
+    let (inset, third) = (frame(&mut s, 200), frame(&mut s, 100));
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    let link_of = |s: &Session, id: u32| match s.project.layouts[0].element(id).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { link, .. }) => *link,
+        _ => panic!("not a map frame"),
+    };
+    let view_of = |s: &Session, id: u32| match s.project.layouts[0].element(id).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { center, scale, bearing, .. }) => (*center, *scale, *bearing),
+        _ => panic!("not a map frame"),
+    };
+    assert_eq!(link_of(&s, inset), None, "frames follow nothing until told to");
+    let own = view_of(&s, inset);
+
+    // Centre, without turning, unless told otherwise; the frame's own view is kept for later.
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main}})).unwrap();
+    assert_eq!(link_of(&s, inset), Some(FrameLink { frame: main, mode: LinkMode::Center, rotation: false }));
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main, "mode": "extent", "rotation": true}})).unwrap();
+    let extent = FrameLink { frame: main, mode: LinkMode::Extent, rotation: true };
+    assert_eq!(link_of(&s, inset), Some(extent));
+    assert_eq!(view_of(&s, inset), own);
+    // Absent keeps the link, whatever else changes.
+    s.run("layout.update", &json!({"element": inset, "name": "Inset", "x": 190})).unwrap();
+    assert_eq!(link_of(&s, inset), Some(extent));
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main, "mode": "scale"}})).unwrap();
+    assert_eq!(link_of(&s, inset), Some(FrameLink { frame: main, mode: LinkMode::Scale, rotation: false }));
+    s.run("layout.update", &json!({"element": third, "link": {"frame": inset}})).unwrap();
+    assert_eq!(link_of(&s, third).map(|l| l.frame), Some(inset), "a chain is fine");
+
+    // Refused, and nothing in the call is applied.
+    let before = s.project.layouts[0].clone();
+    for (bad, why) in [
+        (json!({"element": inset, "link": {"frame": inset}}), "itself"),
+        (json!({"element": inset, "link": {"frame": rect}}), "a rectangle"),
+        (json!({"element": inset, "link": {"frame": 9999}}), "no such frame"),
+        (json!({"element": main, "link": {"frame": inset}}), "a loop of two"),
+        (json!({"element": main, "link": {"frame": third}}), "a loop of three"),
+        (json!({"element": rect, "link": {"frame": main}}), "a rectangle follows nothing"),
+        (json!({"element": rect, "link": null}), "a rectangle follows nothing"),
+        (json!({"element": inset, "link": 5}), "a number"),
+        (json!({"element": inset, "link": "Main map"}), "a name"),
+        (json!({"element": inset, "link": []}), "an array"),
+        (json!({"element": inset, "link": {}}), "no frame"),
+        (json!({"element": inset, "link": {"frame": "Main map"}}), "a frame by name"),
+        (json!({"element": inset, "link": {"frame": -1}}), "a negative frame"),
+        (json!({"element": inset, "link": {"frame": 1.5}}), "a fractional frame"),
+        (json!({"element": inset, "link": {"frame": 4294967297u64}}), "a frame past u32"),
+        (json!({"element": inset, "link": {"frame": main, "mode": "zoom"}}), "an unknown mode"),
+        (json!({"element": inset, "link": {"frame": main, "mode": "Center"}}), "modes are lowercase"),
+        (json!({"element": inset, "link": {"frame": main, "mode": 7}}), "a mode that isn't text"),
+        (json!({"element": inset, "link": {"frame": main, "mode": null}}), "a null mode"),
+        (json!({"element": inset, "link": {"frame": main, "rotation": "yes"}}), "a rotation that isn't a bool"),
+        (json!({"element": inset, "x": 99, "link": {"frame": main, "mode": "zoom"}}), "other changes in the call"),
+    ] {
+        assert!(s.run("layout.update", &bad).is_err(), "{why}: {bad}");
+        assert_eq!(s.project.layouts[0], before, "{why}: {bad}");
+    }
+
+    // A frame that follows another takes no zoom, naming the frame it follows.
+    let err = s.run("layout.frameZoom", &json!({"element": inset, "to": "full"})).unwrap_err();
+    assert_eq!(err, "the frame follows Main map: unlink it first");
+    assert_eq!(s.project.layouts[0], before);
+    if let Some(e) = s.project.layouts[0].element_mut(main) {
+        e.name.clear();
+    }
+    let err = s.run("layout.frameZoom", &json!({"element": inset})).unwrap_err();
+    assert_eq!(err, format!("the frame follows #{main}: unlink it first"));
+    // The frame followed zooms freely.
+    s.run("layout.frameZoom", &json!({"element": main, "to": "full"})).unwrap();
+
+    // Locked, a frame keeps its link: no change, not even an unlink.
+    s.run("layout.update", &json!({"element": inset, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": inset, "link": null})).is_err());
+    assert!(s.run("layout.update", &json!({"element": inset, "link": {"frame": third}})).is_err());
+    assert_eq!(link_of(&s, inset).map(|l| l.frame), Some(main));
+    // null unlinks (with the unlock in the same call), and the frame is its own again.
+    s.run("layout.update", &json!({"element": inset, "locked": false, "link": null})).unwrap();
+    assert_eq!(link_of(&s, inset), None);
+    assert_eq!(view_of(&s, inset), own);
+    s.run("layout.frameZoom", &json!({"element": inset, "to": "full"})).unwrap();
+    // The links survive a save, and removing the frame followed clears the links to it.
+    let saved: rustgis_map::layout::Layout = serde_json::from_str(&serde_json::to_string(&s.project.layouts[0]).unwrap()).unwrap();
+    assert_eq!(saved, s.project.layouts[0]);
+    s.run("layout.removeElement", &json!({"element": inset})).unwrap();
+    assert_eq!(link_of(&s, third), None);
 }
 
 /// A layout's text is bound to a map frame, wrapped, aligned down its box, spaced and cased by

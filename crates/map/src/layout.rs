@@ -948,6 +948,55 @@ fn ticks() -> usize {
     5
 }
 
+/// What a linked map frame takes from the frame it follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkMode {
+    /// The source's centre; the frame keeps its own scale.
+    #[default]
+    Center,
+    /// The scale that fits what the source shows into this frame.
+    Extent,
+    /// The source's scale; the frame keeps its own centre.
+    Scale,
+}
+
+impl LinkMode {
+    pub const ALL: [LinkMode; 3] = [LinkMode::Center, LinkMode::Extent, LinkMode::Scale];
+
+    /// The name commands and files use.
+    pub fn code(self) -> &'static str {
+        match self {
+            LinkMode::Center => "center",
+            LinkMode::Extent => "extent",
+            LinkMode::Scale => "scale",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LinkMode::Center => "Same centre",
+            LinkMode::Extent => "Same extent",
+            LinkMode::Scale => "Same scale",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<LinkMode> {
+        LinkMode::ALL.into_iter().find(|m| m.code() == s)
+    }
+}
+
+/// A map frame that follows another frame's view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameLink {
+    /// The map frame followed.
+    pub frame: u32,
+    #[serde(default)]
+    pub mode: LinkMode,
+    /// Also take the source's bearing.
+    #[serde(default)]
+    pub rotation: bool,
+}
+
 /// What an element is.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ElementKind {
@@ -975,6 +1024,10 @@ pub enum ElementKind {
         bearing: f64,
         #[serde(default, skip_serializing_if = "is_zero")]
         pitch: f64,
+        /// Another frame this one follows: it takes that frame's centre, extent or scale (see
+        /// [`Layout::resolved_cameras`]), and its own are kept for when the link is removed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<FrameLink>,
     },
     NorthArrow {
         frame: u32,
@@ -1419,7 +1472,14 @@ impl Layout {
         self.elements.retain(|e| e.id != id && e.kind.frame() != Some(id));
         for e in &mut self.elements {
             match &mut e.kind {
-                ElementKind::MapFrame { extent_of, .. } if *extent_of == Some(id) => *extent_of = None,
+                ElementKind::MapFrame { extent_of, link, .. } => {
+                    if *extent_of == Some(id) {
+                        *extent_of = None;
+                    }
+                    if link.is_some_and(|l| l.frame == id) {
+                        *link = None;
+                    }
+                }
                 ElementKind::Text { frame, .. } if *frame == Some(id) => *frame = None,
                 _ => {}
             }
@@ -1527,6 +1587,7 @@ impl Layout {
                 _ => {}
             }
         }
+        self.clamp_links(&frames);
         if let Some(s) = &mut self.series {
             if !frames.contains(&s.frame) {
                 self.series = None;
@@ -1535,6 +1596,145 @@ impl Layout {
             }
         }
     }
+}
+
+impl Layout {
+    /// Drops the links that point at something that isn't a map frame, at the frame itself, or
+    /// that close a loop. Frames are taken in element order and a link stays unless it would
+    /// close a loop with those kept before it, so of a pair that follow each other the first
+    /// keeps its link.
+    fn clamp_links(&mut self, frames: &std::collections::HashSet<u32>) {
+        let mut kept: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for e in &mut self.elements {
+            let ElementKind::MapFrame { link, .. } = &mut e.kind else { continue };
+            let Some(target) = link.map(|l| l.frame) else { continue };
+            // Walk the kept links from the target: back at this frame, the link would close a loop.
+            let mut at = target;
+            let mut steps = 0;
+            let closes = loop {
+                if at == e.id {
+                    break true;
+                }
+                steps += 1;
+                match kept.get(&at) {
+                    Some(&next) if steps <= MAX_LINK_STEPS => at = next,
+                    Some(_) => break true,
+                    None => break false,
+                }
+            };
+            if !frames.contains(&target) || closes {
+                *link = None;
+            } else {
+                kept.insert(e.id, target);
+            }
+        }
+    }
+
+    /// Every map frame's camera, with the links between frames applied (frames whose map is
+    /// missing from `maps` are left out). A linked frame follows its source's resolved camera,
+    /// so a chain of links works; a frame whose source can't be resolved (a missing map, or a
+    /// loop `clamp` would have cut) keeps its own saved camera.
+    pub fn resolved_cameras(&self, maps: &[Map]) -> Vec<(u32, Camera)> {
+        /// What a frame shows, before it is turned into a camera.
+        #[derive(Clone, Copy)]
+        struct Shown {
+            center: Coord,
+            scale: f64,
+            bearing: f64,
+            pitch: f64,
+        }
+        struct Frame<'a> {
+            id: u32,
+            map: &'a Map,
+            w: f64,
+            h: f64,
+            own: Shown,
+            link: Option<FrameLink>,
+        }
+        let mut frames: Vec<Frame> = Vec::new();
+        for e in &self.elements {
+            let ElementKind::MapFrame { map, center, scale, bearing, pitch, link, .. } = &e.kind else { continue };
+            let Some(m) = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { continue };
+            let own = Shown { center: *center, scale: *scale, bearing: *bearing, pitch: *pitch };
+            frames.push(Frame { id: e.id, map: m, w: e.w, h: e.h, own, link: *link });
+        }
+        // A repeated id means its first element, as references to it do.
+        let index: std::collections::HashMap<u32, usize> = frames.iter().enumerate().rev().map(|(i, f)| (f.id, i)).collect();
+        let camera = |f: &Frame, v: Shown| frame_camera(f.map, v.center, v.scale, v.bearing, v.pitch);
+        let mut done: Vec<Option<Shown>> = frames.iter().map(|f| f.link.is_none().then_some(f.own)).collect();
+        for _ in 0..MAX_LINK_STEPS {
+            let mut progress = false;
+            for (i, f) in frames.iter().enumerate() {
+                let Some(link) = f.link else { continue };
+                if done.get(i).copied().flatten().is_some() {
+                    continue;
+                }
+                let Some(&si) = index.get(&link.frame) else { continue };
+                let (Some(src), Some(Some(sv))) = (frames.get(si), done.get(si).copied()) else { continue };
+                let bearing = if link.rotation { sv.bearing } else { f.own.bearing };
+                let v = match link.mode {
+                    LinkMode::Center => Shown { center: map_center(src.map, &camera(src, sv)).unwrap_or(f.own.center), bearing, ..f.own },
+                    LinkMode::Scale => Shown { scale: sv.scale, bearing, ..f.own },
+                    LinkMode::Extent => {
+                        let seen = camera_lonlat(src.map, &camera(src, sv), src.w * PT_PER_MM, src.h * PT_PER_MM);
+                        match fit_scale(f.map, &seen, f.w, f.h) {
+                            Some((center, scale)) => Shown { center, scale, bearing, ..f.own },
+                            None => Shown { bearing, ..f.own },
+                        }
+                    }
+                };
+                if let Some(slot) = done.get_mut(i) {
+                    *slot = Some(v);
+                }
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        frames.iter().zip(&done).map(|(f, v)| (f.id, camera(f, v.unwrap_or(f.own)))).collect()
+    }
+}
+
+/// The most links followed in a row, and the most passes resolving them.
+const MAX_LINK_STEPS: usize = 500;
+
+/// The longitude/latitude under a camera's centre.
+fn map_center(map: &Map, cam: &Camera) -> Option<Coord> {
+    map.to_lonlat(cam.center).filter(|c| c.is_finite())
+}
+
+/// The longitude/latitude extent a camera shows in a `w`×`h` view (the whole world on the
+/// globe, or when the projection can't say).
+pub fn camera_lonlat(map: &Map, cam: &Camera, w: f64, h: f64) -> rustgis_geom::Extent {
+    use rustgis_geom::Extent;
+    if map.projection.is_globe() {
+        return Extent::WORLD_LONLAT;
+    }
+    let flat = map.flat();
+    let e = cam.extent(w, h);
+    let mut out = Extent::EMPTY;
+    const N: usize = 8;
+    for i in 0..=N {
+        let t = i as f64 / N as f64;
+        let (x, y) = (e.min_x + t * e.width(), e.min_y + t * e.height());
+        for c in [Coord::new(x, e.min_y), Coord::new(x, e.max_y), Coord::new(e.min_x, y), Coord::new(e.max_x, y)] {
+            match flat.inverse(c) {
+                Some(p) if p.is_finite() => out.expand(p),
+                _ => return Extent::WORLD_LONLAT,
+            }
+        }
+    }
+    // A pole inside the view lies beyond every edge sample (a polar projection): reach it.
+    for pole in [Coord::new(0.0, 90.0), Coord::new(0.0, -90.0)] {
+        if let Some(p) = flat.forward(pole)
+            && p.is_finite()
+            && e.contains(p)
+        {
+            out = Extent::new(-180.0, out.min_y.min(pole.y), 180.0, out.max_y.max(pole.y));
+        }
+    }
+    if out.is_empty() { Extent::WORLD_LONLAT } else { out }
 }
 
 fn finite_or(v: f64, d: f64) -> f64 {
@@ -1797,6 +1997,7 @@ mod tests {
                     grid: None,
                     bearing: 0.0,
                     pitch: 0.0,
+                    link: None,
                     extent_of: None,
                     extent_color: INDICATOR_COLOR,
                     extent_width: INDICATOR_WIDTH,
@@ -1895,6 +2096,206 @@ mod tests {
         assert!(r.2.is_finite() && r.3.is_finite() && r.2 > 0.0);
     }
 
+    /// A map frame at `at` (lon/lat) and 1:`scale`, 100×80 mm, linked as `link`.
+    fn linked_frame(l: &mut Layout, name: &str, at: (f64, f64), scale: f64, link: Option<FrameLink>) -> u32 {
+        l.add(
+            name,
+            (0.0, 0.0, 100.0, 80.0),
+            ElementKind::MapFrame {
+                map: "Map".into(),
+                center: Coord::new(at.0, at.1),
+                scale,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: INDICATOR_COLOR,
+                extent_width: INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+                link,
+            },
+        )
+    }
+
+    fn set_link(l: &mut Layout, id: u32, new: Option<FrameLink>) {
+        if let Some(ElementKind::MapFrame { link, .. }) = l.element_mut(id).map(|e| &mut e.kind) {
+            *link = new;
+        }
+    }
+
+    fn link_of(l: &Layout, id: u32) -> Option<FrameLink> {
+        match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { link, .. }) => *link,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_linked_frame_follows_its_sources_centre_scale_or_extent() {
+        let maps = [Map::new("Map")];
+        let map = &maps[0];
+        let camera = |l: &Layout, id: u32| l.resolved_cameras(&maps).into_iter().find(|(i, _)| *i == id).map(|(_, c)| c).unwrap();
+        let centre_of = |c: &Camera| map.to_lonlat(c.center).unwrap();
+        let go = |mode, rotation, turn: f64| {
+            let mut l = Layout::new("L", 297.0, 210.0);
+            let src = linked_frame(&mut l, "Main", (10.0, 20.0), 1_000_000.0, None);
+            let own = linked_frame(&mut l, "Inset", (-30.0, 5.0), 5_000_000.0, Some(FrameLink { frame: src, mode, rotation }));
+            if let Some(ElementKind::MapFrame { bearing, .. }) = l.element_mut(src).map(|e| &mut e.kind) {
+                *bearing = turn;
+            }
+            (camera(&l, src), camera(&l, own))
+        };
+        let near = |a: Coord, b: (f64, f64)| (a.x - b.0).abs() < 1e-6 && (a.y - b.1).abs() < 1e-6;
+        let res = |at: (f64, f64), scale| frame_camera(map, Coord::new(at.0, at.1), scale, 0.0, 0.0).res;
+
+        // Centre: the source's centre at the frame's own scale, its own bearing.
+        let (src, cam) = go(LinkMode::Center, false, 30.0);
+        assert!(near(centre_of(&cam), (10.0, 20.0)), "{:?}", centre_of(&cam));
+        assert!((cam.res / res((10.0, 20.0), 5_000_000.0) - 1.0).abs() < 1e-9);
+        assert_eq!((src.bearing, cam.bearing), (30.0, 0.0));
+        // Scale: the source's scale around the frame's own centre.
+        let (_, cam) = go(LinkMode::Scale, false, 0.0);
+        assert!(near(centre_of(&cam), (-30.0, 5.0)), "{:?}", centre_of(&cam));
+        assert!((cam.res / res((-30.0, 5.0), 1_000_000.0) - 1.0).abs() < 1e-9);
+        // Extent: the frame's box holds what the source shows, a margin around it.
+        let (src, cam) = go(LinkMode::Extent, false, 0.0);
+        assert!(near(centre_of(&cam), (10.0, 20.0)), "{:?}", centre_of(&cam));
+        let wider = cam.res / src.res;
+        assert!(wider > 1.05 && wider < 1.2, "{wider}");
+        assert_eq!(cam.bearing, 0.0);
+        let (_, cam) = go(LinkMode::Extent, true, 30.0);
+        assert_eq!(cam.bearing, 30.0, "rotation takes the bearing, whatever the mode");
+
+        // A chain follows the resolved camera of the frame before it.
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 9_000_000.0, None);
+        let b = linked_frame(&mut l, "B", (1.0, 1.0), 2_000_000.0, None);
+        let c = linked_frame(&mut l, "C", (2.0, 2.0), 3_000_000.0, None);
+        set_link(&mut l, c, Some(FrameLink { frame: b, mode: LinkMode::Center, rotation: false }));
+        set_link(&mut l, b, Some(FrameLink { frame: a, mode: LinkMode::Scale, rotation: false }));
+        let (cb, cc) = (camera(&l, b), camera(&l, c));
+        assert!((cb.res / res((1.0, 1.0), 9_000_000.0) - 1.0).abs() < 1e-9);
+        assert!(near(centre_of(&cc), (1.0, 1.0)), "{:?}", centre_of(&cc));
+        assert!((cc.res / res((1.0, 1.0), 3_000_000.0) - 1.0).abs() < 1e-9, "C keeps its own scale");
+
+        // Without its source (a loop, a dangling id, a source of a missing map) a frame keeps its own view.
+        set_link(&mut l, a, Some(FrameLink { frame: c, mode: LinkMode::Center, rotation: true }));
+        assert!((camera(&l, a).res / res((0.0, 0.0), 9_000_000.0) - 1.0).abs() < 1e-9);
+        assert!((camera(&l, c).res / res((2.0, 2.0), 3_000_000.0) - 1.0).abs() < 1e-9);
+        set_link(&mut l, a, Some(FrameLink { frame: 999, mode: LinkMode::Center, rotation: false }));
+        assert!(near(centre_of(&camera(&l, a)), (0.0, 0.0)));
+        assert!(l.resolved_cameras(&[]).is_empty(), "frames of a missing map have no camera");
+    }
+
+    #[test]
+    fn link_cycles_and_self_links_are_dropped_by_clamp() {
+        let to = |frame| Some(FrameLink { frame, mode: LinkMode::Extent, rotation: true });
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        set_link(&mut l, a, to(b));
+        set_link(&mut l, b, to(a));
+        l.clamp();
+        assert_eq!((link_of(&l, a), link_of(&l, b)), (to(b), None), "the first frame keeps its link");
+
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        set_link(&mut l, a, to(a));
+        l.clamp();
+        assert_eq!(link_of(&l, a), None);
+
+        // A longer loop loses its last link; a link to a rectangle or to nothing goes.
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        let c = linked_frame(&mut l, "C", (0.0, 0.0), 1e6, None);
+        let d = linked_frame(&mut l, "D", (0.0, 0.0), 1e6, None);
+        let e = linked_frame(&mut l, "E", (0.0, 0.0), 1e6, None);
+        let r = l.add(
+            "R",
+            (0.0, 0.0, 5.0, 5.0),
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 },
+        );
+        for (from, target) in [(a, b), (b, c), (c, a), (d, r), (e, 999)] {
+            set_link(&mut l, from, to(target));
+        }
+        l.clamp();
+        assert_eq!([a, b, c, d, e].map(|f| link_of(&l, f)), [to(b), to(c), None, None, None]);
+        // Clamping again changes nothing.
+        let before = l.clone();
+        l.clamp();
+        assert_eq!(l, before);
+    }
+
+    #[test]
+    fn a_long_chain_of_links_resolves() {
+        let maps = [Map::new("Map")];
+        let mut l = Layout::new("L", 297.0, 210.0);
+        // 300 frames, each following the one after it, the last one the source.
+        let ids: Vec<u32> = (0..300).map(|i| linked_frame(&mut l, "F", (f64::from(i % 50), 0.0), 1e6, None)).collect();
+        for w in ids.windows(2) {
+            set_link(&mut l, w[0], Some(FrameLink { frame: w[1], mode: LinkMode::Center, rotation: false }));
+        }
+        l.clamp();
+        let cams = l.resolved_cameras(&maps);
+        assert_eq!(cams.len(), 300);
+        let lonlat = |c: Option<&(u32, Camera)>| maps[0].to_lonlat(c.map(|(_, c)| c.center).unwrap()).unwrap();
+        let (first, last) = (lonlat(cams.first()), lonlat(cams.last()));
+        assert!((first.x - last.x).abs() < 1e-6 && (first.x - 49.0).abs() < 1e-6, "{first:?} {last:?}");
+    }
+
+    #[test]
+    fn removing_a_frame_clears_links_to_it() {
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        let c = linked_frame(&mut l, "C", (0.0, 0.0), 1e6, None);
+        let to = |frame| Some(FrameLink { frame, mode: LinkMode::Scale, rotation: false });
+        set_link(&mut l, a, to(b));
+        set_link(&mut l, c, to(a));
+        assert!(l.remove(b));
+        assert_eq!((link_of(&l, a), link_of(&l, c)), (None, to(a)), "only links to the frame removed go");
+    }
+
+    #[test]
+    fn frames_without_a_link_save_as_before() {
+        let j = r#"{"MapFrame":{"map":"Map","center":{"x":1.0,"y":2.0},"scale":50000.0,"shape":"Rectangle","grid":null,"extent_of":null}}"#;
+        let kind: ElementKind = serde_json::from_str(j).unwrap();
+        assert!(matches!(&kind, ElementKind::MapFrame { link: None, .. }));
+        let ElementKind::MapFrame { map, center, scale, shape, grid, extent_of, extent_color, extent_width, bearing, pitch, .. } = kind
+        else {
+            panic!()
+        };
+        let link = Some(FrameLink { frame: 7, mode: LinkMode::Extent, rotation: true });
+        let none = ElementKind::MapFrame {
+            map: map.clone(),
+            center,
+            scale,
+            shape: shape.clone(),
+            grid: grid.clone(),
+            extent_of,
+            extent_color,
+            extent_width,
+            bearing,
+            pitch,
+            link: None,
+        };
+        let plain = serde_json::to_string(&none).unwrap();
+        assert!(!plain.contains("link"), "{plain}");
+        assert_eq!(serde_json::from_str::<ElementKind>(&plain).unwrap(), none);
+        let set = ElementKind::MapFrame { map, center, scale, shape, grid, extent_of, extent_color, extent_width, bearing, pitch, link };
+        let s = serde_json::to_string(&set).unwrap();
+        assert!(s.ends_with(r#""link":{"frame":7,"mode":"Extent","rotation":true}}}"#), "{s}");
+        assert_eq!(serde_json::from_str::<ElementKind>(&s).unwrap(), set);
+        // A link names only its frame: it follows the centre, without turning.
+        assert_eq!(
+            serde_json::from_str::<FrameLink>(r#"{"frame":3}"#).unwrap(),
+            FrameLink { frame: 3, mode: LinkMode::Center, rotation: false }
+        );
+        assert_eq!(LinkMode::from_name("scale"), Some(LinkMode::Scale));
+        assert_eq!(LinkMode::from_name("Scale"), None);
+    }
+
     #[test]
     fn elements_add_hit_and_remove_with_surrounds() {
         let mut l = Layout::new("Layout", 297.0, 210.0);
@@ -1912,6 +2313,7 @@ mod tests {
                 extent_width: INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
         let n = l.add("North Arrow", (215.0, 10.0, 15.0, 20.0), ElementKind::north_arrow(f));

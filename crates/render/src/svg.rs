@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use base64::Engine;
 use rustgis_map::Map;
-use rustgis_map::layout::{ElementKind, FontFamily, Layout, LineHead, PT_PER_MM, TextAlign, frame_camera};
+use rustgis_map::layout::{ElementKind, FontFamily, Layout, LineHead, PT_PER_MM, TextAlign};
 
 use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, render_element};
 
@@ -32,6 +32,8 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
         w = num(pw),
         h = num(ph)
     );
+    // Linked frames take their view from the frame they follow.
+    let cameras = layout.resolved_cameras(maps);
     for e in layout.elements.iter().filter(|e| e.visible) {
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
@@ -71,9 +73,10 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                 let resolve = |id: u32| {
                     let f = layout.element(id)?;
                     match &f.kind {
-                        ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
+                        ElementKind::MapFrame { map, .. } => {
                             let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
-                            Some((m, frame_camera(m, *center, *scale, *bearing, *pitch), f.w * PT_PER_MM, f.h * PT_PER_MM))
+                            let cam = cameras.iter().find(|(i, _)| *i == id)?.1;
+                            Some((m, cam, f.w * PT_PER_MM, f.h * PT_PER_MM))
                         }
                         _ => None,
                     }

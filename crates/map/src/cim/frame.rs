@@ -1,7 +1,8 @@
 //! A layout's map frames (`CIMMapFrame`): the box and outline, the map each shows and where its
 //! camera is, the frame it follows, the frame whose extent it outlines. The walk in
 //! [`layout`](super::layout) calls [`read`] per frame and hands what only a second pass can settle
-//! to [`Frames`]: a link, an extent indicator and a text's frame are all a frame's *name* in the
+//! to [`Frames`]: a link, an extent indicator, a text's frame, a surround's frame (see
+//! [`surround`](super::surround)) and the map series' frame are all a frame's *name* in the
 //! file, and the frame it names may come later in the list, so [`Frames::resolve`] turns the
 //! names into ids once the whole page has been read. That is the one place names become ids.
 //!
@@ -18,9 +19,10 @@ use rustgis_geom::{Coord, merc_to_lonlat};
 use serde_json::Value;
 
 use super::layout::{FrameBinding, PageBox, geometry_box, is_ellipse, is_four_corner_ring, part_points, shown};
+use super::surround::{PendingSeries, UNBOUND};
 use super::{Document, Report, num, path_key, str_of, symbol};
 use crate::Rgba;
-use crate::layout::{ElementKind, FrameLink, FrameShape, INDICATOR_COLOR, INDICATOR_WIDTH, Layout, LinkMode};
+use crate::layout::{ElementKind, FrameLink, FrameShape, INDICATOR_COLOR, INDICATOR_WIDTH, Layout, LinkMode, MapSeries};
 
 /// The most points a polygon frame outline keeps.
 const MAX_OUTLINE_POINTS: usize = 500;
@@ -53,6 +55,9 @@ pub(crate) struct Frames {
     seen: HashSet<String>,
     links: Vec<(u32, String, LinkMode, bool)>,
     indicators: Vec<(u32, String)>,
+    /// Surrounds (legends, scale bars, north arrows, tables) and the frame name each reads.
+    surrounds: Vec<(u32, String)>,
+    series: Option<PendingSeries>,
     unset: Vec<u32>,
 }
 
@@ -77,9 +82,22 @@ impl Frames {
         self.bindings.push(FrameBinding { element: id, name: p.name, map_uri: p.map_uri, saved_camera: p.saved_camera });
     }
 
-    /// Turns the frame names the page used into ids: the links, the extent indicators, and the
-    /// frame each text reads (`text_frames`). A name no frame has leaves the field unset, and
-    /// says so; of two frames with one name the first is found.
+    /// Keeps surround element `id`, which reads the frame called `frame`.
+    pub fn add_surround(&mut self, id: u32, frame: String) {
+        self.surrounds.push((id, frame));
+    }
+
+    /// Keeps the layout's map series.
+    pub fn set_series(&mut self, series: Option<PendingSeries>) {
+        self.series = series;
+    }
+
+    /// Turns the frame names the page used into ids: the links, the extent indicators, the frame
+    /// each text reads (`text_frames`), the frame each surround reads and the map series'. A name
+    /// no frame has leaves the field unset, and says so; of two frames with one name the first
+    /// is found. A surround that reads a frame the page lacks reads the first frame instead, and
+    /// is removed when the page has none (a surround must have a frame). A map series without
+    /// its frame is left out.
     pub fn resolve(&self, layout: &mut Layout, text_frames: &[(u32, String)], report: &mut Report) {
         let mut ids: HashMap<&str, u32> = HashMap::new();
         for b in &self.bindings {
@@ -133,6 +151,51 @@ impl Frames {
             }
             if let ElementKind::Text { frame, .. } = &mut el.kind {
                 *frame = target;
+            }
+        }
+        let first = self.bindings.iter().min_by_key(|b| b.element);
+        for (id, name) in &self.surrounds {
+            let what = layout.element(*id).map(|e| e.name.clone()).unwrap_or_default();
+            let unnamed = name.trim().is_empty();
+            let target = match (find(name), first) {
+                (Some(t), _) => Some(t),
+                (None, Some(f)) => {
+                    let reads = if unnamed {
+                        "names no map frame".to_string()
+                    } else {
+                        format!("reads frame {}, which isn't on the page", shown(name))
+                    };
+                    report.approximated(&what, format!("{reads}; {} is used", shown(&f.name)));
+                    Some(f.element)
+                }
+                (None, None) => {
+                    let reads = if unnamed { "names no map frame".to_string() } else { format!("reads frame {}", shown(name)) };
+                    report.skipped(&what, format!("{reads}, and the page has no map frame; left out"));
+                    None
+                }
+            };
+            match target {
+                // A surround has one frame, which still holds `UNBOUND`.
+                Some(frame) => {
+                    if let Some(el) = layout.element_mut(*id) {
+                        el.kind.remap(|old| (old == UNBOUND).then_some(frame));
+                    }
+                }
+                None => {
+                    layout.remove(*id);
+                }
+            }
+        }
+        if let Some(s) = &self.series {
+            match find(&s.frame) {
+                Some(frame) => {
+                    layout.series =
+                        Some(MapSeries { frame, layer: s.layer.clone(), name_field: s.name_field.clone(), margin: 0.1, page: 0 });
+                }
+                None if s.frame.is_empty() => report.skipped(&s.what, "the map series names no frame; left out"),
+                None => {
+                    report.skipped(&s.what, format!("the map series reads frame {}, which isn't on the page; left out", shown(&s.frame)))
+                }
             }
         }
     }

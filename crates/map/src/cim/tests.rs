@@ -1204,3 +1204,338 @@ fn a_frames_border_comes_across_and_embedded_maps_are_distinct_in_order() {
     let border = imp.layout.elements.first().and_then(|e| e.frame_style.as_ref()).and_then(|f| f.border);
     assert_eq!(border, Some(Rgba::rgb(0, 0, 0)));
 }
+
+// ---- surrounds, tables and map series ----
+
+fn layer_def(name: &str, uri: &str) -> serde_json::Value {
+    json!({"type": "CIMFeatureLayer", "name": name, "uRI": uri})
+}
+
+/// A surround element of type `ty` reading frame `frame`, over a box at the right of the page,
+/// with `extra` keys set on it.
+fn surround_element(ty: &str, name: &str, frame: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut e = json!({"type": ty, "name": name, "anchor": "BottomLeftCorner", "visible": true, "mapFrame": frame,
+        "frame": corner_ring(10.0, 1.0, 16.0, 5.0)});
+    if let (Some(o), Some(x)) = (e.as_object_mut(), extra.as_object()) {
+        o.extend(x.clone());
+    }
+    e
+}
+
+/// Reads `elements` from a layout holding `layers` as layer definitions and, unless null, `series`
+/// as its map series.
+fn read_surrounds(layers: &[serde_json::Value], series: serde_json::Value, elements: &[serde_json::Value]) -> (LayoutImport, Report) {
+    let mut def = json!({"type": "CIMLayout", "name": "P",
+        "page": {"type": "CIMPage", "width": 17, "height": 11, "units": {"uwkid": 109008}, "guides": []},
+        "elements": elements});
+    if !series.is_null() {
+        def["mapSeries"] = series;
+    }
+    let doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0", "layerDefinitions": layers, "layoutDefinition": def});
+    let mut report = Report::default();
+    let imported = read_layout(&Document::from_json(&doc.to_string()).unwrap(), &mut report).unwrap();
+    (imported, report)
+}
+
+fn main_frame() -> serde_json::Value {
+    map_frame_element("MAIN MAP", (1.0, 1.0, 9.0, 8.0), json!({}))
+}
+
+#[test]
+fn legends_read_their_title_columns_fit_and_layer_names() {
+    use crate::layout::LegendFit;
+    let layers = [layer_def("Roads", "CIMPATH=map/roads.json"), layer_def("Mask", "CIMPATH=map/mask.json")];
+    // The template's legend: no title, one column, the fit that adds columns and shrinks text.
+    let template = surround_element(
+        "CIMLegend",
+        "LEGEND",
+        "MAIN MAP",
+        json!({"title": "Legend", "showTitle": false, "columns": 1, "fittingStrategy": "AdjustColumnsAndSize",
+            "defaultLegendItem": {"type": "CIMLegendItem", "showLayerName": true, "showHeading": true},
+            "excludedLayers": ["CIMPATH=map/mask.json", "CIMPATH=map/elsewhere.json"]}),
+    );
+    // Titled, too many columns, a font-size fit, layer names off, and items of their own.
+    let item = |uri: &str, heading: bool| json!({"type": "CIMLegendItem", "layerURI": uri, "showLayerName": false, "showHeading": heading});
+    let titled = surround_element(
+        "CIMLegend",
+        "KEY",
+        "MAIN MAP",
+        json!({"title": "Key", "showTitle": true, "columns": 9, "fittingStrategy": "AdjustFontSize",
+            "defaultLegendItem": {"type": "CIMLegendItem", "showLayerName": false, "showHeading": true},
+            "items": [item("CIMPATH=map/roads.json", true), item("CIMPATH=map/mask.json", false), item("CIMPATH=map/mask.json", false)]}),
+    );
+    let odd = surround_element("CIMLegend", "ODD", "MAIN MAP", json!({"columns": "many", "fittingStrategy": "Spiral"}));
+    let manual = surround_element("CIMLegend", "MANUAL", "MAIN MAP", json!({"fittingStrategy": "ManualColumns", "columns": 0}));
+    let (imp, report) = read_surrounds(&layers, json!(null), &[template, titled, odd, manual, main_frame()]);
+    let main = frame_of(&imp, "MAIN MAP").0;
+    let legend = |title: &str, exclude: &[&str], columns: usize, fit: LegendFit, show_layer_names: bool| ElementKind::Legend {
+        frame: main,
+        title: title.to_string(),
+        all_classes: false,
+        hide_other: false,
+        exclude: exclude.iter().map(|s| s.to_string()).collect(),
+        columns,
+        fit,
+        show_layer_names,
+    };
+    assert_eq!(frame_of(&imp, "LEGEND").1, legend("", &["Mask"], 1, LegendFit::AdjustColumnsAndSize, true));
+    assert_eq!(frame_of(&imp, "KEY").1, legend("Key", &[], 6, LegendFit::AdjustSize, false));
+    assert_eq!(frame_of(&imp, "ODD").1, legend("Legend", &[], 1, LegendFit::Manual, true));
+    assert_eq!(frame_of(&imp, "MANUAL").1, legend("Legend", &[], 1, LegendFit::Manual, true));
+    assert_eq!(
+        notes(&report),
+        ["KEY: per-layer legend item settings, drawn with the defaults", "ODD: fitting strategy Spiral, drawn as manual"]
+    );
+    // Its box is the frame's, in millimetres from the top-left of an 11 inch page.
+    let el = imp.layout.elements.iter().find(|e| e.name == "LEGEND").unwrap();
+    assert!(near(el.x, 254.0, 1e-6) && near(el.y, 6.0 * 25.4, 1e-6) && near(el.w, 152.4, 1e-6) && near(el.h, 101.6, 1e-6));
+}
+
+#[test]
+fn scale_bars_read_units_divisions_subdivisions_labels_and_format() {
+    use crate::layout::{BarLabels, ScaleBarStyle, ScaleFit, ScaleUnits, UnitLabel};
+    let label = json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 9.0, "fontStyleName": "Regular"}});
+    // The template's bar: feet, four divisions, the first cut in two, labels below.
+    let template = surround_element(
+        "CIMDoubleFillScaleBar",
+        "SCALE BAR",
+        "MAIN MAP",
+        json!({"units": {"uwkid": 9002}, "divisions": 4, "subdivisions": 2, "divisionsBeforeZero": 0, "labelPosition": "Below",
+            "unitLabel": "Feet", "unitLabelPosition": "AfterBar",
+            "numberFormat": {"type": "CIMNumericFormat", "roundingOption": "esriRoundNumberOfDecimals", "roundingValue": 0},
+            "labelSymbol": label, "fittingStrategy": "AdjustDivision"}),
+    );
+    let line = surround_element(
+        "CIMLineScaleBar",
+        "LINE",
+        "MAIN MAP",
+        json!({"units": {"uwkid": 9093}, "divisions": 99, "subdivisions": -3, "divisionsBeforeZero": 7, "labelPosition": "Above",
+            "unitLabelPosition": "Sideways", "unitLabel": "",
+            "numberFormat": {"roundingOption": "esriRoundNumberOfDecimals", "roundingValue": 9},
+            "labelSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 100.0}},
+            "fittingStrategy": "AdjustWidth", "divisionValue": 2.5, "markFrequency": "DivisionsAndSubdivisions", "markHeight": 5.0}),
+    );
+    let stepped = surround_element(
+        "CIMSteppedLineScaleBar",
+        "STEPPED",
+        "MAIN MAP",
+        json!({"units": {"uwkid": 9001}, "fittingStrategy": "AdjustFrame"}),
+    );
+    let hollow = surround_element(
+        "CIMHollowScaleBar",
+        "HOLLOW",
+        "MAIN MAP",
+        json!({"units": {"uwkid": 9036}, "fittingStrategy": "AdjustDivisionValue"}),
+    );
+    let odd =
+        surround_element("CIMAlternatingScaleBar", "ODD", "MAIN MAP", json!({"units": {"uwkid": 4326}, "fittingStrategy": "Sideways"}));
+    let (imp, report) = read_surrounds(&[], json!(null), &[template, line, stepped, hollow, odd, main_frame()]);
+    let main = frame_of(&imp, "MAIN MAP").0;
+    let ElementKind::ScaleBar {
+        frame,
+        units,
+        divisions,
+        style,
+        subdivisions,
+        divisions_before_zero,
+        label_position,
+        unit_label,
+        unit_label_position,
+        decimals,
+        label_size,
+        fit,
+    } = frame_of(&imp, "SCALE BAR").1
+    else {
+        panic!("not a scale bar")
+    };
+    assert_eq!(frame, main);
+    assert_eq!((units, divisions, subdivisions, divisions_before_zero), (ScaleUnits::Feet, 4, 2, 0));
+    assert_eq!((label_position, unit_label.as_deref(), unit_label_position), (BarLabels::Below, Some("Feet"), UnitLabel::AfterBar));
+    assert_eq!((decimals, fit, style, label_size), (0, ScaleFit::AdjustDivision, ScaleBarStyle::Alternating, 9.0));
+    // Everything out of range is clamped; what RustGIS has no word for takes the default.
+    let ElementKind::ScaleBar {
+        units,
+        divisions,
+        style,
+        subdivisions,
+        divisions_before_zero,
+        label_position,
+        unit_label,
+        unit_label_position,
+        decimals,
+        label_size,
+        fit,
+        ..
+    } = frame_of(&imp, "LINE").1
+    else {
+        panic!("not a scale bar")
+    };
+    assert_eq!((units, divisions, subdivisions, divisions_before_zero), (ScaleUnits::Miles, 10, 0, 2));
+    assert_eq!((label_position, unit_label.as_deref(), unit_label_position), (BarLabels::Above, Some(""), UnitLabel::AfterLabels));
+    assert_eq!((decimals, fit, style, label_size), (3, ScaleFit::AdjustWidth, ScaleBarStyle::Line, 24.0));
+    let get = |n: &str| match frame_of(&imp, n).1 {
+        ElementKind::ScaleBar { units, style, fit, label_size, unit_label, decimals, .. } => {
+            (units, style, fit, label_size, unit_label, decimals)
+        }
+        _ => panic!("not a scale bar"),
+    };
+    assert_eq!(get("STEPPED"), (ScaleUnits::Meters, ScaleBarStyle::Stepped, ScaleFit::AdjustWidth, 8.0, None, 0));
+    assert_eq!(get("HOLLOW"), (ScaleUnits::Kilometers, ScaleBarStyle::Alternating, ScaleFit::AdjustDivisionValue, 8.0, None, 0));
+    assert_eq!(get("ODD"), (ScaleUnits::Auto, ScaleBarStyle::Alternating, ScaleFit::AdjustDivisionValue, 8.0, None, 0));
+    assert_eq!(
+        notes(&report),
+        [
+            "LINE: unit label position Sideways, drawn after the labels",
+            "LINE: division value 2.5, drawn as RustGIS fits it",
+            "LINE: mark heights and frequency, drawn as RustGIS's",
+            "HOLLOW: a hollow bar, drawn as an alternating bar",
+            "ODD: units 4326, drawn in automatic units",
+            "ODD: fitting strategy Sideways, drawn as adjust division value",
+        ]
+    );
+}
+
+#[test]
+fn north_arrows_carry_their_point_symbol() {
+    use crate::symbology::Marker;
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let gif = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+    let picture = |url: &str| json!({"type": "CIMPictureMarker", "enable": true, "size": 36.0, "url": url});
+    let character = |c: u8| {
+        json!({"type": "CIMCharacterMarker", "enable": true, "size": 24.0, "characterIndex": 178, "fontFamilyName": "ESRI North",
+            "fontStyleName": "Regular", "symbol": polygon_symbol(vec![solid_fill(rgb(c, 0, 0))])})
+    };
+    let reference = |layers: Vec<serde_json::Value>| json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMPointSymbol", "symbolLayers": layers}});
+    let template = surround_element(
+        "CIMMarkerNorthArrow",
+        "NORTH ARROW",
+        "MAIN MAP",
+        json!({"pointSymbol": reference(vec![picture(png), character(10)]), "northType": "TrueNorth"}),
+    );
+    let mixed = surround_element(
+        "CIMMarkerNorthArrow",
+        "GIF ARROW",
+        "MAIN MAP",
+        json!({"pointSymbol": reference(vec![character(20), picture(gif)]), "northType": "MagneticNorth", "calibrationAngle": 12.5}),
+    );
+    let many = surround_element(
+        "CIMMarkerNorthArrow",
+        "MANY",
+        "MAIN MAP",
+        json!({"pointSymbol": reference((0..10).map(|_| character(30)).collect())}),
+    );
+    let bare = surround_element("CIMMarkerNorthArrow", "BARE", "MAIN MAP", json!({}));
+    let (imp, report) = read_surrounds(&[], json!(null), &[template, mixed, many, bare, main_frame()]);
+    let main = frame_of(&imp, "MAIN MAP").0;
+    let ElementKind::NorthArrow { frame, style, fill, outline, symbol } = frame_of(&imp, "NORTH ARROW").1 else {
+        panic!("not a north arrow")
+    };
+    assert_eq!((frame, style), (main, crate::layout::ArrowStyle::Classic));
+    assert_eq!(symbol.len(), 2);
+    assert!(matches!(symbol[0].marker, Marker::Image(_)));
+    assert!(matches!(symbol[1].marker, Marker::Char(_)));
+    // The top character marker's fill is the arrow's colour.
+    assert_eq!((fill, outline), (Rgba::rgb(10, 0, 0), Rgba::rgb(10, 0, 0)));
+    // The GIF is a circle until the engine converts it; the arrow's colour is the character's.
+    let (gif_id, ElementKind::NorthArrow { symbol, fill, .. }) = frame_of(&imp, "GIF ARROW") else { panic!("not a north arrow") };
+    assert_eq!((symbol.len(), fill), (2, Rgba::rgb(20, 0, 0)));
+    assert_eq!(imp.pending_pictures, vec![(gif_id, 1, gif.to_string())]);
+    // More than eight marker layers keep the first eight; no symbol is the style's own arrow.
+    let ElementKind::NorthArrow { symbol, .. } = frame_of(&imp, "MANY").1 else { panic!("not a north arrow") };
+    assert_eq!(symbol.len(), 8);
+    let ElementKind::NorthArrow { symbol, fill, outline, .. } = frame_of(&imp, "BARE").1 else { panic!("not a north arrow") };
+    assert_eq!((symbol.len(), fill, outline), (0, Rgba::rgb(0, 0, 0), Rgba::rgb(0, 0, 0)));
+    assert_eq!(
+        notes(&report),
+        [
+            "GIF ARROW: Magnetic north, drawn as true north",
+            "GIF ARROW: a calibration angle of 12.5 degrees, left out",
+            "MANY: 10 marker layers, the first 8 kept",
+        ]
+    );
+}
+
+#[test]
+fn tables_and_series_resolve_their_layers() {
+    use crate::layout::MapSeries;
+    let layers = [layer_def("Parcels", "CIMPATH=map/parcels.json"), layer_def("Index", "CIMPATH=map/index.json")];
+    let table = surround_element("CIMTableFrame", "TABLE", "MAIN MAP", json!({"tableFrameURI": "CIMPATH=map/parcels.json"}));
+    let by_layer = surround_element("CIMTableFrame", "BY LAYER", "MAIN MAP", json!({"layerURI": "CIMPATH=map/index.json"}));
+    let lost = surround_element("CIMTableFrame", "LOST", "MAIN MAP", json!({"tableFrameURI": "CIMPATH=map/gone.json"}));
+    let series = json!({"type": "CIMSpatialMapSeries", "indexLayerURI": "CIMPATH=map/index.json", "mapFrameName": "MAIN MAP",
+        "nameField": "SHEET", "sortField": "SHEET", "extentOptions": "BestFit"});
+    let (imp, report) = read_surrounds(&layers, series, &[table, by_layer, lost, main_frame()]);
+    let main = frame_of(&imp, "MAIN MAP").0;
+    assert_eq!(frame_of(&imp, "TABLE").1, ElementKind::Table { frame: main, layer: "Parcels".into(), rows: 12 });
+    assert_eq!(frame_of(&imp, "BY LAYER").1, ElementKind::Table { frame: main, layer: "Index".into(), rows: 12 });
+    assert!(imp.layout.elements.iter().all(|e| e.name != "LOST"));
+    assert_eq!(imp.layout.series, Some(MapSeries { frame: main, layer: "Index".into(), name_field: "SHEET".into(), margin: 0.1, page: 0 }));
+    assert_eq!(
+        notes(&report),
+        [
+            "TABLE: table settings, drawn as RustGIS's",
+            "BY LAYER: table settings, drawn as RustGIS's",
+            "LOST: its layer isn't in the document, left out",
+            "P: map series options, drawn as RustGIS's",
+        ]
+    );
+    // A series whose layer or frame can't be found is left out, and says so.
+    for (series, want) in [
+        (
+            json!({"indexLayerURI": "CIMPATH=map/gone.json", "mapFrameName": "MAIN MAP"}),
+            "P: the map series' index layer isn't in the document, left out",
+        ),
+        (
+            json!({"indexLayerURI": "CIMPATH=map/index.json", "mapFrameName": "NOPE"}),
+            "P: the map series reads frame NOPE, which isn't on the page; left out",
+        ),
+    ] {
+        let (imp, report) = read_surrounds(&layers, series, &[main_frame()]);
+        assert_eq!(imp.layout.series, None);
+        assert_eq!(notes(&report), [want]);
+    }
+}
+
+#[test]
+fn surrounds_of_a_frame_not_on_the_page_bind_to_the_first_frame_or_go() {
+    let named = |n: &str| surround_element("CIMMarkerNorthArrow", n, "NOPE", json!({}));
+    // Listed before the frames: the second pass finds the lowest id among them.
+    let els = [
+        named("ARROW"),
+        surround_element("CIMLegend", "LEGEND", "SECOND", json!({})),
+        main_frame(),
+        map_frame_element("SECOND", (10.0, 6.0, 16.0, 9.0), json!({})),
+    ];
+    let (imp, report) = read_surrounds(&[], json!(null), &els);
+    let main = frame_of(&imp, "MAIN MAP").0;
+    let second = frame_of(&imp, "SECOND").0;
+    assert_eq!(frame_of(&imp, "ARROW").1.frame(), Some(main));
+    assert_eq!(frame_of(&imp, "LEGEND").1.frame(), Some(second));
+    assert_eq!(notes(&report), ["ARROW: reads frame NOPE, which isn't on the page; MAIN MAP is used"]);
+    // No map frame at all: the surrounds are removed, each with a note.
+    let (imp, report) = read_surrounds(&[], json!(null), &[named("ARROW"), surround_element("CIMLegend", "LEGEND", "", json!({}))]);
+    assert!(imp.layout.elements.is_empty());
+    assert_eq!(
+        notes(&report),
+        [
+            "ARROW: reads frame NOPE, and the page has no map frame; left out",
+            "LEGEND: names no map frame, and the page has no map frame; left out",
+        ]
+    );
+}
+
+#[test]
+fn hostile_surrounds_never_crash() {
+    let junk = json!({"units": "feet", "divisions": "four", "subdivisions": null, "labelSymbol": 5, "numberFormat": [], "fittingStrategy": 3,
+        "columns": 1e300, "defaultLegendItem": 7, "items": {"a": 1}, "excludedLayers": [1, null, "CIMPATH=x"], "pointSymbol": "x",
+        "tableFrameURI": 4, "mapFrame": 9});
+    let kinds = ["CIMLegend", "CIMDoubleFillScaleBar", "CIMLineScaleBar", "CIMMarkerNorthArrow", "CIMTableFrame"];
+    let mut els: Vec<serde_json::Value> = kinds.iter().map(|k| surround_element(k, k, "MAIN MAP", junk.clone())).collect();
+    // No shape: left out.
+    els.push(json!({"type": "CIMLegend", "name": "SHAPELESS", "mapFrame": "MAIN MAP"}));
+    els.push(main_frame());
+    let (imp, report) = read_surrounds(&[], json!({"indexLayerURI": 3, "mapFrameName": []}), &els);
+    assert!(imp.layout.elements.iter().any(|e| e.name == "CIMLegend"));
+    assert!(imp.layout.elements.iter().all(|e| e.name != "SHAPELESS" && e.name != "CIMTableFrame"));
+    assert!(notes(&report).iter().any(|n| n == "SHAPELESS: no shape, left out"), "{:?}", notes(&report));
+}

@@ -16,6 +16,7 @@ use serde_json::Value;
 use super::color::symbol_of;
 use super::dyntext;
 use super::frame::{self, Frames};
+use super::surround;
 use super::symbol::{self, data_url};
 use super::units::page_unit_mm;
 use super::{Document, Report, flag, num, str_of};
@@ -54,6 +55,10 @@ pub struct LayoutImport {
     pub embedded_maps: Vec<String>,
     /// Text elements and the name of the frame their tokens read from.
     pub text_frames: Vec<(u32, String)>,
+    /// Marker pictures of a north arrow's symbol that RustGIS can't keep as they are (GIF, BMP):
+    /// the element, the marker's index in its `symbol`, and the picture's `data:` URL, for the
+    /// engine to convert to PNG. Empty for every other element.
+    pub pending_pictures: Vec<(u32, usize, String)>,
 }
 
 /// A map frame element and the map it shows.
@@ -339,17 +344,21 @@ pub fn read_layout(doc: &Document, report: &mut Report) -> Result<LayoutImport, 
         layout,
         pictures: Vec::new(),
         text_frames: Vec::new(),
+        pending_pictures: Vec::new(),
         frames: Frames::default(),
         page_h: h,
         unit_mm,
         full: false,
     };
     reader.walk(def.get("elements").unwrap_or(&NULL), 0, 0);
-    let Reader { mut layout, pictures, text_frames, frames, .. } = reader;
+    let Reader { mut layout, pictures, text_frames, mut frames, mut pending_pictures, name, .. } = reader;
+    frames.set_series(surround::series(doc, def, &name, report));
     frames.resolve(&mut layout, &text_frames, report);
     layout.clamp();
     frames.restore_unset_scales(&mut layout);
-    Ok(LayoutImport { layout, frames: frames.bindings, pictures, embedded_maps: frames.embedded, text_frames })
+    // A north arrow dropped for want of a frame takes its pictures with it.
+    pending_pictures.retain(|(id, _, _)| layout.element(*id).is_some());
+    Ok(LayoutImport { layout, frames: frames.bindings, pictures, embedded_maps: frames.embedded, text_frames, pending_pictures })
 }
 
 /// The walk over a layout's elements, and what it has built so far.
@@ -361,6 +370,7 @@ struct Reader<'a> {
     layout: Layout,
     pictures: Vec<(u32, PictureSource)>,
     text_frames: Vec<(u32, String)>,
+    pending_pictures: Vec<(u32, usize, String)>,
     frames: Frames,
     /// The page's height in its units, and how many millimetres a unit is.
     page_h: f64,
@@ -383,15 +393,15 @@ impl Reader<'_> {
                 "CIMGroupElement" => ids.extend(self.group(e, &name, depth, walked)),
                 "CIMGraphicElement" => ids.extend(self.graphic(e, &name)),
                 "CIMMapFrame" => ids.extend(self.map_frame(e, &name)),
-                // Read by the surround readers.
-                "CIMLegend"
+                ty @ ("CIMLegend"
                 | "CIMMarkerNorthArrow"
+                | "CIMTableFrame"
                 | "CIMDoubleFillScaleBar"
                 | "CIMSingleFillScaleBar"
                 | "CIMLineScaleBar"
                 | "CIMSteppedLineScaleBar"
                 | "CIMHollowScaleBar"
-                | "CIMAlternatingScaleBar" => self.report.skipped(&name, "legends, scale bars and north arrows aren't imported yet"),
+                | "CIMAlternatingScaleBar") => ids.extend(self.surround(e, ty, &name)),
                 "" => self.report.skipped(&name, "an element with no type, left out"),
                 other => self.report.skipped(&name, format!("a {} element, left out", shown(other))),
             }
@@ -441,6 +451,16 @@ impl Reader<'_> {
         let (b, kind, pending) = frame::read(self.doc, e, name, self.report)?;
         let id = self.add(e, b, name, kind)?;
         self.frames.add(id, pending);
+        Some(id)
+    }
+
+    /// A legend, scale bar, north arrow or table frame (see [`surround`]); the frame it reads is
+    /// resolved after the walk.
+    fn surround(&mut self, e: &Value, ty: &str, name: &str) -> Option<u32> {
+        let (b, kind, pending) = surround::read(self.doc, e, ty, name, self.report)?;
+        let id = self.add(e, b, name, kind)?;
+        self.frames.add_surround(id, pending.frame);
+        self.pending_pictures.extend(pending.pictures.into_iter().map(|(i, url)| (id, i, url)));
         Some(id)
     }
 

@@ -1252,7 +1252,7 @@ fn legends_read_their_title_columns_fit_and_layer_names() {
         "MAIN MAP",
         json!({"title": "Legend", "showTitle": false, "columns": 1, "fittingStrategy": "AdjustColumnsAndSize",
             "defaultLegendItem": {"type": "CIMLegendItem", "showLayerName": true, "showHeading": true},
-            "excludedLayers": ["CIMPATH=map/mask.json", "CIMPATH=map/elsewhere.json"]}),
+            "excludedLayers": ["CIMPATH=map/mask.json", "CIMPATH=map/elsewhere.json", "CIMPATH=MAP/Mask.json"]}),
     );
     // Titled, too many columns, a font-size fit, layer names off, and items of their own.
     let item = |uri: &str, heading: bool| json!({"type": "CIMLegendItem", "layerURI": uri, "showLayerName": false, "showHeading": heading});
@@ -1300,7 +1300,7 @@ fn scale_bars_read_units_divisions_subdivisions_labels_and_format() {
         "CIMDoubleFillScaleBar",
         "SCALE BAR",
         "MAIN MAP",
-        json!({"units": {"uwkid": 9002}, "divisions": 4, "subdivisions": 2, "divisionsBeforeZero": 0, "labelPosition": "Below",
+        json!({"units": {"uwkid": 9002}, "divisions": 4, "subdivisions": 2, "divisionsBeforeZero": 0, "labelPosition": "Bottom",
             "unitLabel": "Feet", "unitLabelPosition": "AfterBar",
             "numberFormat": {"type": "CIMNumericFormat", "roundingOption": "esriRoundNumberOfDecimals", "roundingValue": 0},
             "labelSymbol": label, "fittingStrategy": "AdjustDivision"}),
@@ -1313,7 +1313,7 @@ fn scale_bars_read_units_divisions_subdivisions_labels_and_format() {
             "unitLabelPosition": "Sideways", "unitLabel": "",
             "numberFormat": {"roundingOption": "esriRoundNumberOfDecimals", "roundingValue": 9},
             "labelSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 100.0}},
-            "fittingStrategy": "AdjustWidth", "divisionValue": 2.5, "markFrequency": "DivisionsAndSubdivisions", "markHeight": 5.0}),
+            "fittingStrategy": "AdjustWidth", "division": 2.5, "markFrequency": "DivisionsAndSubdivisions", "markHeight": 5.0}),
     );
     let stepped = surround_element(
         "CIMSteppedLineScaleBar",
@@ -1391,6 +1391,41 @@ fn scale_bars_read_units_divisions_subdivisions_labels_and_format() {
             "HOLLOW: a hollow bar, drawn as an alternating bar",
             "ODD: units 4326, drawn in automatic units",
             "ODD: fitting strategy Sideways, drawn as adjust division value",
+        ]
+    );
+}
+
+#[test]
+fn scale_bars_use_pros_words_for_sides_and_the_division_value() {
+    use crate::layout::{BarLabels, UnitLabel};
+    let bar = |name: &str, extra: serde_json::Value| surround_element("CIMLineScaleBar", name, "MAIN MAP", extra);
+    let els = [
+        // Pro writes Top and Bottom for the sides of the bar.
+        bar("TOP", json!({"labelPosition": "Top", "unitLabelPosition": "Bottom", "fittingStrategy": "AdjustDivision", "division": 500})),
+        bar("BELOW", json!({"labelPosition": " below ", "unitLabelPosition": "Top", "fittingStrategy": "AdjustWidth", "divisionValue": 7})),
+        bar(
+            "AFTER",
+            json!({"labelPosition": "Above", "unitLabelPosition": "AfterLabels", "fittingStrategy": "AdjustDivisionValue", "division": 9}),
+        ),
+        bar("ODD", json!({"labelPosition": "Middle", "unitLabelPosition": "Left"})),
+        main_frame(),
+    ];
+    let (imp, report) = read_surrounds(&[], json!(null), &els);
+    let get = |n: &str| match frame_of(&imp, n).1 {
+        ElementKind::ScaleBar { label_position, unit_label_position, .. } => (label_position, unit_label_position),
+        _ => panic!("not a scale bar"),
+    };
+    assert_eq!(get("TOP"), (BarLabels::Above, UnitLabel::Below));
+    assert_eq!(get("BELOW"), (BarLabels::Below, UnitLabel::Above));
+    assert_eq!(get("AFTER"), (BarLabels::Above, UnitLabel::AfterLabels));
+    assert_eq!(get("ODD"), (BarLabels::Above, UnitLabel::AfterLabels));
+    assert_eq!(
+        notes(&report),
+        [
+            "TOP: division value 500, drawn as RustGIS fits it",
+            "BELOW: division value 7, drawn as RustGIS fits it",
+            "ODD: label position Middle, drawn above the bar",
+            "ODD: unit label position Left, drawn after the labels",
         ]
     );
 }
@@ -1533,8 +1568,22 @@ fn hostile_surrounds_never_crash() {
     let mut els: Vec<serde_json::Value> = kinds.iter().map(|k| surround_element(k, k, "MAIN MAP", junk.clone())).collect();
     // No shape: left out.
     els.push(json!({"type": "CIMLegend", "name": "SHAPELESS", "mapFrame": "MAIN MAP"}));
+    // An object for the excluded layers, 10 000 items, a text for the number format.
+    let items: Vec<serde_json::Value> = (0..10_000).map(|i| json!({"type": "CIMLegendItem", "showHeading": i % 2 == 0})).collect();
+    els.push(surround_element("CIMLegend", "BIG", "MAIN MAP", json!({"excludedLayers": {"a": 1}, "items": items, "columns": 99})));
+    els.push(surround_element("CIMAlternatingScaleBar", "TEXT FORMAT", "MAIN MAP", json!({"numberFormat": "x", "labelPosition": 4})));
     els.push(main_frame());
     let (imp, report) = read_surrounds(&[], json!({"indexLayerURI": 3, "mapFrameName": []}), &els);
+    let main = frame_of(&imp, "MAIN MAP").0;
+    // The junk legend's columns clamp; the junk scale bar keeps the defaults (and its style).
+    assert!(matches!(frame_of(&imp, "CIMLegend").1, ElementKind::Legend { columns: 6, .. }));
+    assert!(matches!(frame_of(&imp, "BIG").1, ElementKind::Legend { columns: 6, ref exclude, .. } if exclude.is_empty()));
+    let mut line = ElementKind::scale_bar(main);
+    if let ElementKind::ScaleBar { style, .. } = &mut line {
+        *style = crate::layout::ScaleBarStyle::Line;
+    }
+    assert_eq!(frame_of(&imp, "CIMLineScaleBar").1, line);
+    assert_eq!(frame_of(&imp, "TEXT FORMAT").1, ElementKind::scale_bar(main));
     assert!(imp.layout.elements.iter().any(|e| e.name == "CIMLegend"));
     assert!(imp.layout.elements.iter().all(|e| e.name != "SHAPELESS" && e.name != "CIMTableFrame"));
     assert!(notes(&report).iter().any(|n| n == "SHAPELESS: no shape, left out"), "{:?}", notes(&report));

@@ -189,8 +189,7 @@ impl Frames {
         if let Some(s) = &self.series {
             match find(&s.frame) {
                 Some(frame) => {
-                    layout.series =
-                        Some(MapSeries { frame, layer: s.layer.clone(), name_field: s.name_field.clone(), margin: 0.1, page: 0 });
+                    layout.series = Some(MapSeries::new(frame, s.layer.clone(), s.name_field.clone()));
                 }
                 None if s.frame.is_empty() => report.skipped(&s.what, "the map series names no frame; left out"),
                 None => {

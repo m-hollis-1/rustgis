@@ -1682,6 +1682,13 @@ fn margin() -> f64 {
     0.1
 }
 
+impl MapSeries {
+    /// A series over `layer` in `frame`, on its first page, with the usual margin.
+    pub fn new(frame: u32, layer: impl Into<String>, name_field: impl Into<String>) -> MapSeries {
+        MapSeries { frame, layer: layer.into(), name_field: name_field.into(), margin: margin(), page: 0 }
+    }
+}
+
 /// Longest path a picture remembers as its source (characters).
 pub const MAX_PICTURE_SOURCE: usize = 1000;
 

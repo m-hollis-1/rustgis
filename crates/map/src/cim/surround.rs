@@ -75,6 +75,16 @@ fn layer_name(doc: &Document, uri: &str) -> Option<String> {
     str_of(def, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string)
 }
 
+/// Whether a side Pro names is above (`Top`, `Above`) or below (`Bottom`, `Below`) the bar; the
+/// words are the file's, not RustGIS's.
+fn side(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "top" | "above" => Some(true),
+        "bottom" | "below" => Some(false),
+        _ => None,
+    }
+}
+
 /// The whole number at `key`, within `lo..=hi`.
 fn count(v: &Value, key: &str, lo: usize, hi: usize) -> Option<usize> {
     num(v, key).map(|n| n.round().clamp(lo as f64, hi as f64) as usize)
@@ -101,15 +111,13 @@ fn legend(doc: &Document, e: &Value, name: &str, report: &mut Report) -> Element
         }
     };
     // Layers of other maps don't resolve here, and belong to those maps.
-    let exclude = e
-        .get("excludedLayers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(MAX_LEGEND_EXCLUDED)
-        .filter_map(Value::as_str)
-        .filter_map(|uri| layer_name(doc, uri))
-        .collect();
+    let mut exclude: Vec<String> = Vec::new();
+    let listed = e.get("excludedLayers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    for n in listed.iter().take(MAX_LEGEND_EXCLUDED).filter_map(Value::as_str).filter_map(|uri| layer_name(doc, uri)) {
+        if !exclude.contains(&n) {
+            exclude.push(n);
+        }
+    }
     let default_item = e.get("defaultLegendItem").filter(|d| d.is_object());
     let items = e.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     if items.iter().take(MAX_ITEMS).any(|i| item_differs(i, default_item)) {
@@ -176,17 +184,22 @@ fn scale_bar(ty: &str, e: &Value, name: &str, report: &mut Report) -> ElementKin
         Some(other) => report.approximated(name, format!("units {other}, drawn in automatic units")),
     }
     *divisions = count(e, "divisions", 1, MAX_SCALE_DIVISIONS).unwrap_or(*divisions);
-    *subdivisions = count(e, "subdivisions", 0, MAX_SCALE_SUBDIVISIONS).unwrap_or(0);
-    *divisions_before_zero = count(e, "divisionsBeforeZero", 0, MAX_SCALE_BEFORE_ZERO).unwrap_or(0);
+    *subdivisions = count(e, "subdivisions", 0, MAX_SCALE_SUBDIVISIONS).unwrap_or(*subdivisions);
+    *divisions_before_zero = count(e, "divisionsBeforeZero", 0, MAX_SCALE_BEFORE_ZERO).unwrap_or(*divisions_before_zero);
     if let Some(s) = str_of(e, "labelPosition") {
-        match BarLabels::from_name(s) {
-            Some(p) => *label_position = p,
+        match side(s) {
+            Some(above) => *label_position = if above { BarLabels::Above } else { BarLabels::Below },
             None => report.approximated(name, format!("label position {}, drawn {}", shown(s), label_position.label().to_lowercase())),
         }
     }
     *unit_label = str_of(e, "unitLabel").map(str::to_string);
     if let Some(s) = str_of(e, "unitLabelPosition") {
-        match UnitLabel::from_name(s) {
+        let parsed = match side(s) {
+            Some(true) => Some(UnitLabel::Above),
+            Some(false) => Some(UnitLabel::Below),
+            None => UnitLabel::from_name(s),
+        };
+        match parsed {
             Some(p) => *unit_label_position = p,
             None => {
                 report.approximated(name, format!("unit label position {}, drawn {}", shown(s), unit_label_position.label().to_lowercase()))
@@ -209,7 +222,9 @@ fn scale_bar(ty: &str, e: &Value, name: &str, report: &mut Report) -> ElementKin
             other => report.approximated(name, format!("fitting strategy {}, drawn as {}", shown(other), fit.label().to_lowercase())),
         }
     }
-    if let (ScaleFit::AdjustWidth | ScaleFit::AdjustDivision, Some(v)) = (*fit, num(e, "divisionValue")) {
+    // Pro writes the division value as `division`.
+    let division = num(e, "division").or_else(|| num(e, "divisionValue"));
+    if let (ScaleFit::AdjustWidth | ScaleFit::AdjustDivision, Some(v)) = (*fit, division) {
         report.approximated(name, format!("division value {v}, drawn as RustGIS fits it"));
     }
     if ["markFrequency", "markHeight", "subdivisionMarkHeight"].iter().any(|k| present(e, k)) {

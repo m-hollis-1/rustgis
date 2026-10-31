@@ -154,3 +154,276 @@ fn page_units_come_from_esris_linear_unit_table() {
     assert_eq!(units::text_pt(f64::NAN), 2.0);
     assert_eq!(units::text_pt(12.0), 12.0);
 }
+
+// ---- symbols ----
+
+fn rgb(r: u8, g: u8, b: u8) -> serde_json::Value {
+    json!({"type": "CIMRGBColor", "values": [r, g, b, 100]})
+}
+
+fn solid_fill(c: serde_json::Value) -> serde_json::Value {
+    json!({"type": "CIMSolidFill", "enable": true, "color": c})
+}
+
+fn solid_stroke(c: serde_json::Value, width: f64) -> serde_json::Value {
+    json!({"type": "CIMSolidStroke", "enable": true, "capStyle": "Round", "joinStyle": "Round", "miterLimit": 10, "width": width, "color": c})
+}
+
+fn polygon_symbol(layers: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({"type": "CIMPolygonSymbol", "symbolLayers": layers})
+}
+
+fn notes(report: &Report) -> Vec<String> {
+    report.notes.iter().map(|n| format!("{}: {}", n.layer, n.text)).collect()
+}
+
+#[test]
+fn polygon_symbols_take_their_top_fill_and_stroke_in_96ths() {
+    // Bottom to top, as Pro writes them: a 1 pt black line under two fills.
+    let sym = json!({"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![
+        solid_stroke(rgb(0, 0, 0), 1.0),
+        solid_fill(rgb(255, 255, 255)),
+        solid_fill(rgb(255, 0, 0)),
+    ])});
+    let mut report = Report::default();
+    let p = symbol::polygon(&sym, "Frame", &mut report);
+    assert_eq!(p.fill, Some(Rgba::rgb(255, 0, 0)));
+    let (c, w) = p.stroke.unwrap();
+    assert_eq!(c, Rgba::rgb(0, 0, 0));
+    assert!((w - 96.0 / 72.0).abs() < 1e-5, "{w}");
+    assert_eq!(p.strokes.len(), 1);
+    assert_eq!(p.strokes[0].color, Some(Rgba::rgb(0, 0, 0)));
+    // Two solid fills are two stacked fills; a lone one is the symbol's own fill.
+    assert_eq!(p.fills.len(), 2);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    let one = symbol::polygon(&polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]), "R", &mut report);
+    assert_eq!((one.fill, one.stroke, one.fills.len()), (Some(Rgba::rgb(255, 255, 255)), None, 0));
+}
+
+#[test]
+fn transparent_strokes_count_as_no_stroke() {
+    let clear = json!({"type": "CIMRGBColor", "values": [0, 0, 0, 0]});
+    let sym = polygon_symbol(vec![
+        solid_fill(json!({"type": "CIMRGBColor", "values": [10, 20, 30, 0]})),
+        solid_stroke(clear.clone(), 2.0),
+        json!({"type": "CIMSolidStroke", "enable": false, "width": 4, "color": rgb(1, 2, 3)}),
+    ]);
+    let mut report = Report::default();
+    let p = symbol::polygon(&sym, "R", &mut report);
+    assert_eq!((p.fill, p.stroke), (None, None));
+    assert!(p.strokes.is_empty() && p.fills.is_empty());
+    let l = symbol::line(&json!({"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(clear, 1.0)]}), "L", &mut report);
+    assert!(l.strokes.is_empty() && l.stroke.is_none());
+}
+
+#[test]
+fn line_strokes_carry_caps_joins_dashes_and_offsets_bottom_first() {
+    use crate::symbology::{LineCap, LineJoin};
+    let mut casing = solid_stroke(rgb(0, 0, 0), 4.0);
+    casing["capStyle"] = json!("Butt");
+    casing["joinStyle"] = json!("Miter");
+    let mut core = solid_stroke(rgb(255, 255, 0), 2.0);
+    core["capStyle"] = json!("Square");
+    core["joinStyle"] = json!("Bevel");
+    core["effects"] = json!([
+        {"type": "CIMGeometricEffectDashes", "dashTemplate": [4.0, 3.0], "lineDashEnding": "HalfPattern", "offsetAlongLine": 0},
+        {"type": "CIMGeometricEffectOffset", "method": "Square", "offset": 3.0, "option": "Fast"},
+    ]);
+    let mut wavy = solid_stroke(rgb(9, 9, 9), 1.0);
+    wavy["effects"] = json!([{"type": "CIMGeometricEffectWave", "amplitude": 1}]);
+    let sym = json!({"type": "CIMLineSymbol", "symbolLayers": [casing, core, wavy]});
+    let mut report = Report::default();
+    let l = symbol::line(&sym, "Road", &mut report);
+    assert_eq!(l.strokes.len(), 3);
+    assert_eq!((l.strokes[0].cap, l.strokes[0].join), (LineCap::Butt, LineJoin::Miter));
+    let top = &l.strokes[1];
+    assert_eq!((top.cap, top.join), (LineCap::Square, LineJoin::Bevel));
+    assert_eq!(top.dash.unwrap().steps(), &[4.0 * 96.0 / 72.0, 3.0 * 96.0 / 72.0]);
+    assert!((top.offset - 4.0).abs() < 1e-5, "{}", top.offset);
+    assert!((top.width.unwrap() - 2.0 * 96.0 / 72.0).abs() < 1e-5);
+    assert_eq!(l.stroke, Some((Rgba::rgb(9, 9, 9), 96.0 / 72.0)));
+    // The effect it can't draw is noted, and the stroke still comes through.
+    assert_eq!(notes(&report), vec!["Road: line effects of type CIMGeometricEffectWave, left out".to_string()]);
+    // A negative offset keeps its side.
+    let left = json!({"type": "CIMLineSymbol", "symbolLayers": [{"type": "CIMSolidStroke", "width": 1, "color": rgb(0, 0, 0),
+        "effects": [{"type": "CIMGeometricEffectOffset", "offset": -3.0}]}]});
+    assert!((symbol::line(&left, "L", &mut report).strokes[0].offset + 4.0).abs() < 1e-5);
+    // A dash pattern of more steps than a stroke holds is drawn solid, and noted.
+    let long = json!({"type": "CIMLineSymbol", "symbolLayers": [{"type": "CIMSolidStroke", "width": 1, "color": rgb(0, 0, 0),
+        "effects": [{"type": "CIMGeometricEffectDashes", "dashTemplate": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]}]}]});
+    let mut r2 = Report::default();
+    assert!(symbol::line(&long, "L", &mut r2).strokes[0].dash.is_none());
+    assert_eq!(r2.notes.len(), 1);
+}
+
+#[test]
+fn hatch_and_gradient_fills_become_fill_patterns() {
+    use crate::fills::{FillPattern, GradientShape};
+    let hatch = json!({"type": "CIMHatchFill", "enable": true, "rotation": 45.0, "separation": 6.0,
+        "lineSymbol": {"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(rgb(0, 0, 255), 0.75)]}});
+    let ramp = json!({"type": "CIMMultipartColorRamp", "colorRamps": [
+        {"type": "CIMLinearContinuousColorRamp", "fromColor": rgb(255, 0, 0), "toColor": rgb(0, 255, 0)},
+        {"type": "CIMLinearContinuousColorRamp", "fromColor": rgb(0, 255, 0), "toColor": rgb(0, 0, 255)}]});
+    let gradient = json!({"type": "CIMGradientFill", "enable": true, "gradientType": "Linear", "angle": 90.0, "colorRamp": ramp});
+    let picture = json!({"type": "CIMPictureFill", "enable": true, "url": "data:image/png;base64,AAAA"});
+    let mut report = Report::default();
+    let p = symbol::polygon(&polygon_symbol(vec![hatch, gradient, picture]), "Area", &mut report);
+    assert_eq!(p.fills.len(), 2);
+    assert_eq!(p.fills[0].color, Some(Rgba::rgb(0, 0, 255)));
+    match p.fills[0].pattern {
+        FillPattern::Hatch { angle, spacing, width, .. } => {
+            assert_eq!(angle, 45.0);
+            assert!((spacing - 8.0).abs() < 1e-5 && (width - 1.0).abs() < 1e-5, "{spacing} {width}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(p.fills[1].color, Some(Rgba::rgb(255, 0, 0)));
+    match p.fills[1].pattern {
+        FillPattern::Gradient { shape, color2, stops, angle, .. } => {
+            assert_eq!((shape, color2, angle), (GradientShape::Linear, Rgba::rgb(0, 0, 255), 90.0));
+            assert_eq!(stops.as_slice().len(), 1);
+            assert_eq!((stops.as_slice()[0].at, stops.as_slice()[0].color), (0.5, Rgba::rgb(0, 255, 0)));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(notes(&report), vec!["Area: picture fills, left out".to_string()]);
+}
+
+#[test]
+fn text_symbols_read_font_style_size_colour_alignment_and_case() {
+    use crate::layout::{TextAlign, TextCase, VAlign};
+    let sym = json!({"type": "CIMTextSymbol", "fontFamilyName": "Roboto Condensed", "fontStyleName": "Bold",
+        "height": 14.0, "horizontalAlignment": "Center", "verticalAlignment": "Center", "textCase": "Allcaps",
+        "letterSpacing": 10, "lineSpacing": 1.2, "haloSize": 1,
+        "symbol": polygon_symbol(vec![solid_fill(rgb(10, 20, 30))])});
+    let mut report = Report::default();
+    let t = symbol::text(&sym, "Title", &mut report);
+    assert_eq!(t.font.as_deref(), Some("Roboto Condensed"));
+    assert!(t.bold && !t.italic);
+    assert_eq!(t.size, 14.0);
+    assert_eq!(t.color, Rgba::rgb(10, 20, 30));
+    assert_eq!((t.align, t.valign, t.case), (TextAlign::Center, VAlign::Middle, TextCase::Upper));
+    assert!((t.letter_spacing - 1.4).abs() < 1e-9 && (t.line_spacing - 1.2).abs() < 1e-9);
+    assert!(report.notes.is_empty(), "no haloSymbol, no halo: {:?}", notes(&report));
+    // A symbol reference holds it too; italics, lower case, a baseline, a halo, justification and small caps.
+    let other = json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "fontFamilyName": "Tahoma",
+        "fontStyleName": "Bold Italic", "height": 9, "horizontalAlignment": "Justify", "verticalAlignment": "Baseline",
+        "textCase": "Lowercase", "haloSize": 2,
+        "haloSymbol": polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]),
+        "symbol": polygon_symbol(vec![solid_fill(rgb(0, 0, 0))])}});
+    let t = symbol::text(&other, "Note", &mut report);
+    assert!(t.bold && t.italic);
+    assert_eq!((t.align, t.valign, t.case), (TextAlign::Left, VAlign::Bottom, TextCase::Lower));
+    let n = notes(&report);
+    assert!(n.iter().any(|s| s == "Note: a text halo, left out"), "{n:?}");
+    assert!(n.iter().any(|s| s.starts_with("Note: justified text")), "{n:?}");
+    // Small caps with Normal case is upper case, noted.
+    let small = json!({"type": "CIMTextSymbol", "fontStyleName": "Regular", "height": 8, "textCase": "Normal", "smallCaps": true});
+    let t = symbol::text(&small, "S", &mut report);
+    assert_eq!((t.case, t.font, t.bold, t.color), (TextCase::Upper, None, false, Rgba::rgb(0, 0, 0)));
+    assert!(notes(&report).iter().any(|s| s.starts_with("S: small caps")));
+}
+
+#[test]
+fn point_symbols_stack_picture_and_character_markers_bottom_first() {
+    use crate::symbology::Marker;
+    // The smallest valid PNG is enough to be kept as a picture.
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [
+        {"type": "CIMPictureMarker", "enable": true, "size": 36.0, "url": png, "anchorPoint": {"x": 0, "y": 0}},
+        {"type": "CIMCharacterMarker", "enable": true, "size": 24.0, "characterIndex": 178, "fontFamilyName": "ESRI North",
+         "fontStyleName": "Regular", "symbol": polygon_symbol(vec![solid_fill(rgb(0, 0, 0))])},
+        {"type": "CIMPictureMarker", "enable": false, "size": 5.0, "url": png},
+    ]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "North arrow", &mut report);
+    assert_eq!(p.symbols.len(), 2);
+    assert!(p.pending_pictures.is_empty());
+    assert!(matches!(p.symbols[0].marker, Marker::Image(_)));
+    assert!((p.symbols[0].size - 48.0).abs() < 1e-5);
+    match p.symbols[1].marker {
+        Marker::Char(g) => assert_eq!((g.ch, g.font.as_str()), ('\u{b2}', "ESRI North")),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(p.symbols[1].fill, Rgba::rgb(0, 0, 0));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn gif_and_bmp_pictures_are_handed_back_to_be_converted() {
+    use crate::symbology::Marker;
+    let gif = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+    let bmp = "data:image/bmp;base64,Qk0=";
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [
+        {"type": "CIMPictureMarker", "size": 36.0, "url": gif},
+        {"type": "CIMPictureMarker", "size": 10.0, "url": bmp},
+        {"type": "CIMPictureMarker", "size": 10.0, "url": "https://example.com/x.png"},
+        {"type": "CIMPictureMarker", "size": 10.0, "url": "data:image/png;base64,not a png"},
+    ]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "Arrow", &mut report);
+    // The link is left out; the unreadable PNG is a circle.
+    assert_eq!(p.symbols.len(), 3);
+    assert_eq!(p.pending_pictures, vec![(0, gif.to_string()), (1, bmp.to_string())]);
+    assert!(p.symbols.iter().all(|s| s.marker == Marker::Circle));
+    assert_eq!(report.notes.len(), 2, "{:?}", notes(&report));
+}
+
+#[test]
+fn vector_markers_are_recognised_by_shape() {
+    use crate::symbology::Marker;
+    let ring = |pts: &[[f64; 2]]| json!({"rings": [pts]});
+    let graphic = |geometry: serde_json::Value| {
+        json!({"type": "CIMVectorMarker", "enable": true, "size": 6.0, "frame": {"xmin": -5, "ymin": -5, "xmax": 5, "ymax": 5},
+            "markerGraphics": [{"type": "CIMMarkerGraphic", "geometry": geometry,
+                "symbol": polygon_symbol(vec![solid_stroke(rgb(0, 0, 0), 0.5), solid_fill(rgb(200, 0, 0))])}]})
+    };
+    let circle = graphic(json!({"curveRings": [[[5.0, 0.0], {"a": [[5.0, 0.0], [0.0, 0.0], 0, 1]}]]}));
+    let square = graphic(ring(&[[-5.0, -5.0], [-5.0, 5.0], [5.0, 5.0], [5.0, -5.0], [-5.0, -5.0]]));
+    let diamond = graphic(ring(&[[0.0, -5.0], [-5.0, 0.0], [0.0, 5.0], [5.0, 0.0], [0.0, -5.0]]));
+    let triangle = graphic(ring(&[[-5.0, -5.0], [0.0, 5.0], [5.0, -5.0], [-5.0, -5.0]]));
+    let star_pts: Vec<[f64; 2]> = (0..10)
+        .map(|i| {
+            let (r, a) = (if i % 2 == 0 { 5.0 } else { 2.0 }, std::f64::consts::FRAC_PI_2 + i as f64 * std::f64::consts::PI / 5.0);
+            [r * a.cos(), r * a.sin()]
+        })
+        .chain([[0.0, 5.0]])
+        .collect();
+    let star = graphic(ring(&star_pts));
+    let seven = graphic(ring(&[[0.0, 0.0], [1.0, 0.0], [2.0, 1.0], [2.0, 2.0], [1.0, 3.0], [0.0, 2.0], [0.0, 0.0]]));
+    let tilted = graphic(ring(&[[-5.0, 0.0], [0.0, 5.0], [5.0, 1.0], [0.0, -5.0], [-5.0, 0.0]]));
+    assert_eq!(symbol::vector_shape(&circle), Some(Marker::Circle));
+    assert_eq!(symbol::vector_shape(&square), Some(Marker::Square));
+    assert_eq!(symbol::vector_shape(&diamond), Some(Marker::Diamond));
+    assert_eq!(symbol::vector_shape(&triangle), Some(Marker::Triangle));
+    assert_eq!(symbol::vector_shape(&star), Some(Marker::Star));
+    assert_eq!(symbol::vector_shape(&seven), None);
+    assert_eq!(symbol::vector_shape(&tilted), None);
+    assert_eq!(symbol::vector_shape(&json!({"type": "CIMVectorMarker"})), None);
+
+    // point() takes the graphic's fill and stroke, and the size in 96ths; a shape it can't tell is a noted circle.
+    let mut report = Report::default();
+    let p = symbol::point(&json!({"type": "CIMPointSymbol", "symbolLayers": [square, seven]}), "Pin", &mut report);
+    assert_eq!(p.symbols.len(), 2);
+    let s = p.symbols[0];
+    assert_eq!((s.marker, s.fill, s.stroke), (Marker::Square, Rgba::rgb(200, 0, 0), Rgba::rgb(0, 0, 0)));
+    assert!((s.size - 8.0).abs() < 1e-5 && (s.stroke_width - 0.5 * 96.0 / 72.0).abs() < 1e-5);
+    assert_eq!(p.symbols[1].marker, Marker::Circle);
+    assert_eq!(notes(&report), vec!["Pin: a drawn marker shape, shown as a circle".to_string()]);
+}
+
+#[test]
+fn symbol_layers_are_bounded_and_hostile_symbols_give_nothing() {
+    let many: Vec<_> = (0..200).map(|i| solid_stroke(rgb(i as u8, 0, 0), 1.0)).collect();
+    let mut report = Report::default();
+    let l = symbol::line(&json!({"type": "CIMLineSymbol", "symbolLayers": many}), "L", &mut report);
+    assert_eq!(l.strokes.len(), crate::symbology::MAX_STROKES);
+    assert!(!report.notes.is_empty());
+    for bad in [json!(null), json!({}), json!({"symbolLayers": 3}), json!({"symbolLayers": [1, "x", null, {"type": 5}]})] {
+        let mut r = Report::default();
+        let p = symbol::polygon(&bad, "x", &mut r);
+        assert!(p.fill.is_none() && p.stroke.is_none() && p.strokes.is_empty());
+        assert!(symbol::point(&bad, "x", &mut r).symbols.is_empty());
+        let _ = symbol::text(&bad, "x", &mut r);
+    }
+}

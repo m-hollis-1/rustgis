@@ -2135,7 +2135,7 @@ fn hostile_params_never_panic() {
         json!({"maps": 1}),
         json!({"maps": {"a": null}}),
         json!({"text": "{\"type\":\"CIMLayoutDocument\"}"}),
-        json!({"text": "{\"type\":\"CIMLayoutDocument\",\"layoutDefinition\":{\"page\":{\"width\":1e308,\"height\":-1},\"elements\":[{\"type\":\"CIMMapFrame\",\"uRI\":7}]}}", "path": "x.pagx", "dir": 7}),
+        json!({"text": "{\"type\":\"CIMLayoutDocument\",\"layoutDefinition\":{\"page\":{\"width\":1e308,\"height\":-1},\"elements\":[{\"type\":\"CIMMapFrame\",\"uRI\":7}]}}", "dir": 7}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);

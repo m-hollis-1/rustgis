@@ -6,9 +6,10 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, CoordFormat, ElementKind, FrameLink, Grid, GridKind, GridStyle, Layout, LineHead, LinkMode, MAX_COLORBAR_TICKS,
-    MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LINE_SPACING, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, MIN_LINE_SPACING, Orientation,
-    PT_PER_MM, ScaleBarStyle, ScaleUnits, TextCase, TickSide, VAlign, frame_camera, line_angle, line_length,
+    Arrange, ArrowStyle, CoordFormat, ElementKind, FrameLink, Grid, GridKind, GridStyle, Layout, LegendFit, LineHead, LinkMode,
+    MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_LINE_SPACING, MAX_SCALE_DIVISIONS, MAX_TICK_MM,
+    MIN_FRAME_SCALE, MIN_LINE_SPACING, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TextCase, TickSide, VAlign, frame_camera,
+    line_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -1643,7 +1644,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                 match &e.kind {
                     // Its text, size, colour and boldness: the shared form, below the grid.
                     ElementKind::Text { .. } => {}
-                    ElementKind::Legend { title, all_classes, hide_other, .. } => {
+                    ElementKind::Legend { title, all_classes, hide_other, columns, fit, show_layer_names, .. } => {
                         let input_label = ui.label(tl!("Title"));
                         if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false, input_label.id) {
                             update(app, json!({"title": tt}));
@@ -1661,6 +1662,34 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         if ui.checkbox(&mut hide, "").labelled_by(input_label.id).changed() {
                             update(app, json!({"hideOther": hide}));
                         }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Layer names"));
+                        let mut names = *show_layer_names;
+                        if ui.checkbox(&mut names, "").labelled_by(input_label.id).changed() {
+                            update(app, json!({"showLayerNames": names}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Columns"));
+                        let mut n = *columns as u64;
+                        let drag = Dragged::lend(ui, drag_key("columns"), &mut n);
+                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=MAX_LEGEND_COLUMNS as u64)).labelled_by(input_label.id);
+                        if drag.settled(ui, &r, &mut n) && n as usize != *columns {
+                            update(app, json!({"columns": n}));
+                        }
+                        ui.end_row();
+                        // What the legend does when its rows don't fit its box.
+                        let input_label = ui.label(tl!("Fit"));
+                        egui::ComboBox::from_id_salt(("legend_fit", id))
+                            .selected_text(tl!(fit.label()))
+                            .show_ui(ui, |ui| {
+                                for v in LegendFit::ALL {
+                                    if ui.selectable_label(*fit == v, tl!(v.label())).clicked() && *fit != v {
+                                        update(app, json!({"fit": v.code()}));
+                                    }
+                                }
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
                     }
                     ElementKind::Colorbar { frame, layer, title, orientation, ticks, tick_side, reverse } => {
@@ -3408,6 +3437,47 @@ mod tests {
         h.get_by_role_and_label(Role::CheckBox, "Rivers").click();
         h.run_steps(2);
         assert_eq!(left_out(&h), ["Cities"]);
+    }
+
+    /// A legend's properties set its layer names, columns and fitting through `layout.update`.
+    #[test]
+    fn a_legend_takes_layer_names_columns_and_a_fit() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::{ElementKind, LegendFit};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Legend"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let legend = app.session.project.layouts[li].elements.iter().find(|e| matches!(e.kind, ElementKind::Legend { .. })).unwrap().id;
+        app.layout.selected = Some(legend);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let set = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(legend).unwrap().kind {
+            ElementKind::Legend { columns, fit, show_layer_names, .. } => (*columns, *fit, *show_layer_names),
+            _ => panic!("a legend"),
+        };
+        assert_eq!(set(&h), (1, LegendFit::Manual, true));
+        h.get_by_role_and_label(Role::CheckBox, "Layer names").click();
+        h.run_steps(2);
+        assert_eq!(set(&h), (1, LegendFit::Manual, false));
+        h.get_by_label("Fit").click();
+        h.run_steps(2);
+        h.get_by_label("Adjust columns").click();
+        h.run_steps(2);
+        assert_eq!(set(&h), (1, LegendFit::AdjustColumns, false));
+        // The columns are a number field of the pane.
+        assert!(h.query_by_label("Columns").is_some());
     }
 
     /// The layout view with the Format pane beside it, as the app draws them: after following

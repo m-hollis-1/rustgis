@@ -573,6 +573,71 @@ fn is_left(a: &TextAlign) -> bool {
 /// The most layers a legend leaves out.
 pub const MAX_LEGEND_EXCLUDED: usize = 1000;
 
+/// The most columns a legend has.
+pub const MAX_LEGEND_COLUMNS: usize = 6;
+
+fn one_column() -> usize {
+    1
+}
+
+fn is_one_column(v: &usize) -> bool {
+    *v == 1
+}
+
+fn is_manual_fit(v: &LegendFit) -> bool {
+    *v == LegendFit::Manual
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+/// What a legend does when its rows don't fit its box (ArcGIS Pro's fitting strategy).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegendFit {
+    /// Draw as many rows as fit; the rest are cut off.
+    #[default]
+    Manual,
+    /// Shrink the text together, down to 6 pt, until the rows fit.
+    AdjustSize,
+    /// Add columns, up to [`MAX_LEGEND_COLUMNS`], until the rows fit.
+    AdjustColumns,
+    /// Add columns first, then shrink the text if six are not enough.
+    AdjustColumnsAndSize,
+    /// Draw at the natural size, over the box's edges.
+    AdjustFrame,
+}
+
+impl LegendFit {
+    pub const ALL: [LegendFit; 5] =
+        [LegendFit::Manual, LegendFit::AdjustSize, LegendFit::AdjustColumns, LegendFit::AdjustColumnsAndSize, LegendFit::AdjustFrame];
+
+    /// The name `layout.update` takes (a saved layout holds the variant's own name).
+    pub fn code(self) -> &'static str {
+        match self {
+            LegendFit::Manual => "manual",
+            LegendFit::AdjustSize => "adjustSize",
+            LegendFit::AdjustColumns => "adjustColumns",
+            LegendFit::AdjustColumnsAndSize => "adjustColumnsAndSize",
+            LegendFit::AdjustFrame => "adjustFrame",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LegendFit::Manual => "Manual",
+            LegendFit::AdjustSize => "Adjust size",
+            LegendFit::AdjustColumns => "Adjust columns",
+            LegendFit::AdjustColumnsAndSize => "Adjust columns and size",
+            LegendFit::AdjustFrame => "Adjust frame",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<LegendFit> {
+        LegendFit::ALL.into_iter().find(|f| f.code() == s)
+    }
+}
+
 /// Which way a line element runs across its box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineDir {
@@ -1066,6 +1131,17 @@ pub enum ElementKind {
         /// highlight, a basemap-like layer. Empty, it lists every layer it would otherwise.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<String>,
+        /// Columns the rows run down and across, 1 to [`MAX_LEGEND_COLUMNS`]: the first column
+        /// fills, then the second.
+        #[serde(default = "one_column", skip_serializing_if = "is_one_column")]
+        columns: usize,
+        /// What the legend does when its rows don't fit the box.
+        #[serde(default, skip_serializing_if = "is_manual_fit")]
+        fit: LegendFit,
+        /// List each layer's name. Off, a layer with classes keeps its classes and loses its head;
+        /// a layer drawn in one symbol keeps its name, which labels the swatch.
+        #[serde(default = "yes", skip_serializing_if = "is_true")]
+        show_layer_names: bool,
     },
     /// The colour scale of a raster layer in a frame's map: a gradient bar for a stretch, steps
     /// for classes, a block per value for unique values and colour tables (#326).
@@ -1776,7 +1852,8 @@ impl Layout {
                         g.width = finite_or(g.width, grid_width()).clamp(0.0, MAX_GRID_WIDTH);
                     }
                 }
-                ElementKind::Legend { exclude, .. } => {
+                ElementKind::Legend { exclude, columns, .. } => {
+                    *columns = (*columns).clamp(1, MAX_LEGEND_COLUMNS);
                     // Names stay whole: a layer's own name isn't cut, and a cut one would no
                     // longer match it.
                     exclude.truncate(MAX_LEGEND_EXCLUDED);
@@ -2236,6 +2313,36 @@ mod tests {
         assert_eq!(serde_json::from_str::<FrameStyle>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
         assert_eq!(serde_json::from_str::<FrameStyle>("{}").unwrap(), FrameStyle::default());
         assert_eq!(FrameStyle::default().border_width, 1.0);
+    }
+
+    #[test]
+    fn legends_without_columns_or_fit_save_as_before() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Legend":{"frame":2,"title":"L","all_classes":false,"hide_other":false}}}"#;
+        let mut e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        let ElementKind::Legend { columns, fit, show_layer_names, .. } = &mut e.kind else { panic!("not a legend") };
+        assert_eq!((*columns, *fit, *show_layer_names), (1, LegendFit::Manual, true));
+        *columns = 3;
+        *fit = LegendFit::AdjustColumnsAndSize;
+        *show_layer_names = false;
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""columns":3,"fit":"AdjustColumnsAndSize","show_layer_names":false"#), "{s}");
+        assert_eq!(serde_json::from_str::<Element>(&s).unwrap(), e);
+        // A loaded layout's columns are limited.
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"MapFrame":{"map":"m","center":{"x":0,"y":0},"scale":1000}}},
+            {"id":2,"name":"b","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":1,"title":"","columns":0}}},
+            {"id":3,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":1,"title":"","columns":99}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        let cols = |id| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Legend { columns, .. }) => *columns,
+            _ => 0,
+        };
+        assert_eq!((cols(2), cols(3)), (1, MAX_LEGEND_COLUMNS));
+        for f in LegendFit::ALL {
+            assert_eq!(LegendFit::from_name(f.code()), Some(f));
+        }
     }
 
     #[test]

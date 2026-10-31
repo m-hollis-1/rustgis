@@ -1998,6 +1998,9 @@ fn hostile_params_never_panic() {
         json!({"kind": "colorbar", "ticks": -1e308, "tickSide": 7, "orientation": "x", "layer": "", "reverse": "maybe"}),
         json!({"type": "albers", "lon_0": f64::MAX, "lat_1": "x", "lat_2": -1e308}),
         json!({"kind": "legend", "element": 1, "exclude": [null, 7, "", {"x": 1}]}),
+        json!({"kind": "legend", "element": 1, "columns": [null], "fit": {"x": 1}, "showLayerNames": 7}),
+        json!({"kind": "legend", "element": 1, "columns": 1e308, "fit": "", "showLayerNames": null}),
+        json!({"kind": "legend", "element": 1, "columns": -1e308, "fit": "adjustSize"}),
         json!({"kind": "text", "element": 1, "font": {"family": "serif"}, "italic": [], "align": 7}),
         // A QGIS project and style whose web layer and scale range are junk.
         json!({"text": "<qgis><projectlayers><maplayer type=\"raster\" hasScaleBasedVisibilityFlag=\"1\" minScale=\"NaN\" maxScale=\"-1e308\"><datasource>type=xyz&amp;url=&amp;zmax=999</datasource><layername></layername><provider>wms</provider><pipe><rasterrenderer opacity=\"inf\"/></pipe></maplayer></projectlayers></qgis>"}),
@@ -4037,6 +4040,78 @@ fn layout_update_sets_and_clears_border_and_background() {
 /// `layout.update` makes a map frame follow another (`link`), unlinks it with `null`, keeps it when
 /// absent, and refuses what would be dropped on load (itself, a non-frame, a loop) or isn't a
 /// link, changing nothing; a frame that follows takes no zoom, and a locked one no link.
+#[test]
+fn layout_update_sets_legend_columns_fit_and_layer_names() {
+    use rustgis_map::layout::{ElementKind, LegendFit};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let legend_of = |s: &Session, id: u32| match s.project.layouts[0].element(id).map(|e| &e.kind) {
+        Some(ElementKind::Legend { columns, fit, show_layer_names, .. }) => (*columns, *fit, *show_layer_names),
+        _ => panic!("not a legend"),
+    };
+    let legend = s.project.layouts[0].elements.iter().find(|e| matches!(e.kind, ElementKind::Legend { .. })).unwrap().id;
+    assert_eq!(legend_of(&s, legend), (1, LegendFit::Manual, true), "the defaults");
+    s.run("layout.update", &json!({"element": legend, "columns": 3, "fit": "adjustColumnsAndSize", "showLayerNames": false})).unwrap();
+    assert_eq!(legend_of(&s, legend), (3, LegendFit::AdjustColumnsAndSize, false));
+    // Absent keeps them; a number is limited to 1..6, as a colorbar's ticks are.
+    s.run("layout.update", &json!({"element": legend, "title": "Key"})).unwrap();
+    assert_eq!(legend_of(&s, legend), (3, LegendFit::AdjustColumnsAndSize, false));
+    s.run("layout.update", &json!({"element": legend, "columns": 99})).unwrap();
+    assert_eq!(legend_of(&s, legend).0, 6);
+    s.run("layout.update", &json!({"element": legend, "columns": 0})).unwrap();
+    assert_eq!(legend_of(&s, legend).0, 1);
+    for (code, fit) in [
+        ("manual", LegendFit::Manual),
+        ("adjustSize", LegendFit::AdjustSize),
+        ("adjustColumns", LegendFit::AdjustColumns),
+        ("adjustColumnsAndSize", LegendFit::AdjustColumnsAndSize),
+        ("adjustFrame", LegendFit::AdjustFrame),
+    ] {
+        s.run("layout.update", &json!({"element": legend, "fit": code})).unwrap();
+        assert_eq!(legend_of(&s, legend).1, fit, "{code}");
+    }
+    // Refused, and nothing in the call is applied.
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    let before = s.project.layouts[0].clone();
+    for (bad, why) in [
+        (json!({"element": legend, "columns": "many"}), "columns that isn't a number"),
+        (json!({"element": legend, "columns": [2]}), "columns as an array"),
+        (json!({"element": legend, "columns": true}), "columns as a bool"),
+        (json!({"element": legend, "fit": "shrink"}), "an unknown fit"),
+        (json!({"element": legend, "fit": "AdjustSize"}), "fits are lowerCamel"),
+        (json!({"element": legend, "fit": 2}), "a fit that isn't text"),
+        (json!({"element": legend, "showLayerNames": "no"}), "layer names that isn't a bool"),
+        (json!({"element": legend, "title": "x", "columns": 2, "fit": "zoom"}), "other changes in the call"),
+        (json!({"element": rect, "columns": 2}), "a rectangle has no columns"),
+        (json!({"element": rect, "fit": "adjustSize"}), "a rectangle has no fit"),
+        (json!({"element": rect, "showLayerNames": false}), "a rectangle has no layer names"),
+    ] {
+        assert!(s.run("layout.update", &bad).is_err(), "{why}: {bad}");
+        assert_eq!(s.project.layouts[0], before, "{why}: {bad}");
+    }
+    // Locked, a legend keeps them.
+    s.run("layout.update", &json!({"element": legend, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": legend, "columns": 4})).is_err());
+    assert_eq!(legend_of(&s, legend).0, 1);
+    s.run("layout.update", &json!({"element": legend, "locked": false, "columns": 4})).unwrap();
+    assert_eq!(legend_of(&s, legend).0, 4);
+    // A new legend takes them, and only a legend does.
+    let added = s.run("layout.addElement", &json!({"kind": "legend", "columns": 2, "fit": "adjustFrame", "showLayerNames": false})).unwrap()
+        ["element"]
+        .as_u64()
+        .unwrap() as u32;
+    assert_eq!(legend_of(&s, added), (2, LegendFit::AdjustFrame, false));
+    let plain = s.run("layout.addElement", &json!({"kind": "legend"})).unwrap()["element"].as_u64().unwrap() as u32;
+    assert_eq!(legend_of(&s, plain), (1, LegendFit::Manual, true));
+    for bad in [json!({"kind": "legend", "fit": "x"}), json!({"kind": "legend", "columns": "x"}), json!({"kind": "scaleBar", "columns": 2})]
+    {
+        assert!(s.run("layout.addElement", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.project.layouts[0].elements.len(), before.elements.len() + 2, "no element added by a refused call");
+}
+
 #[test]
 fn layout_update_links_and_unlinks_frames_and_refuses_cycles() {
     use rustgis_map::layout::{ElementKind, FrameLink, LinkMode};

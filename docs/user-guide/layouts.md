@@ -164,7 +164,16 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   has a checkbox for each layer of the frame's map (and each WMS or WMTS layer with a legend): untick one to leave it out of the legend
   while the map still draws it (a mask, a highlight, a basemap-like layer). Scripts give the same
   with `"exclude": ["Graticule"]` on `layout.addElement` or `layout.update` (`[]` lists every
-  layer again); a renamed layer stays left out.
+  layer again); a renamed layer stays left out. **Columns** (`"columns": 1` to `6`) runs the rows
+  down the box and on into the next column, the first column filling before the second; a layer's
+  name is never left at the foot of a column without its first class. **Fit** says what the legend
+  does when its rows don't fit the box (`"fit"`): `manual` (the default) draws the rows that fit
+  and cuts the rest, `adjustSize` shrinks the text together, down to 6 pt, until they fit,
+  `adjustColumns` adds columns up to six, `adjustColumnsAndSize` adds columns and then shrinks the
+  text if six are not enough, and `adjustFrame` draws at the natural size over the edges of the
+  box (the box is not resized). A legend that still doesn't fit at the smallest size or six
+  columns is cut as `manual` cuts it. Untick **Layer names** (`"showLayerNames": false`) to list
+  only the classes: a layer drawn in a single symbol keeps its name, which labels its swatch.
 - **Colorbar**: the colour scale of a raster layer in the frame's map, as the map draws it (its
   stretch, colour ramp and enhancement): a gradient bar for a stretch or a tinted hillshade,
   steps labelled at their breaks for Classify, and a block per value for Unique Values and colour

@@ -466,7 +466,16 @@ mod tests {
         layout.add(
             "Legend",
             (10.0, 10.0, 40.0, 30.0),
-            ElementKind::Legend { frame, title: "Map legend".into(), all_classes: true, hide_other: false, exclude: vec![] },
+            ElementKind::Legend {
+                frame,
+                title: "Map legend".into(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                fit: Default::default(),
+                show_layer_names: true,
+            },
         );
         assert_eq!(picture_dpi(&layout, 600.0), 600.0);
         // A frame and an inset filling an A0 page that is already drawn at its pixel limit.
@@ -540,7 +549,16 @@ mod tests {
         let legend = layout.add(
             "Legend",
             (10.0, 10.0, 40.0, 30.0),
-            ElementKind::Legend { frame, title: "Map legend".into(), all_classes: true, hide_other: false, exclude: vec![] },
+            ElementKind::Legend {
+                frame,
+                title: "Map legend".into(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                fit: Default::default(),
+                show_layer_names: true,
+            },
         );
         let info = PageInfo::default();
         let svg = layout_svg(&layout, &mut maps, 72.0, &info).unwrap();

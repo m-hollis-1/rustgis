@@ -1261,6 +1261,31 @@ impl ElementKind {
             ElementKind::Group { .. } => "Group",
         }
     }
+    /// Points each reference to another element (a surround's or a text's frame, an extent
+    /// indicator, a link, a group's children) at `to(id)`, where that gives one.
+    pub fn remap(&mut self, to: impl Fn(u32) -> Option<u32>) {
+        let swap = |id: &mut u32| {
+            if let Some(n) = to(*id) {
+                *id = n;
+            }
+        };
+        match self {
+            ElementKind::NorthArrow { frame, .. }
+            | ElementKind::ScaleBar { frame, .. }
+            | ElementKind::Legend { frame, .. }
+            | ElementKind::Colorbar { frame, .. }
+            | ElementKind::Table { frame, .. }
+            | ElementKind::Chart { frame, .. } => swap(frame),
+            ElementKind::Text { frame, .. } => frame.iter_mut().for_each(swap),
+            ElementKind::MapFrame { extent_of, link, .. } => {
+                extent_of.iter_mut().for_each(swap);
+                link.iter_mut().for_each(|l| swap(&mut l.frame));
+            }
+            ElementKind::Group { children } => children.iter_mut().for_each(swap),
+            _ => {}
+        }
+    }
+
     /// The map frame this element belongs to.
     pub fn frame(&self) -> Option<u32> {
         match self {
@@ -1519,7 +1544,9 @@ impl Layout {
     /// the surrounds that belong to it.
     pub fn locked_in_removal(&self, id: u32) -> Option<&Element> {
         let gone = self.removal(id);
-        self.elements.iter().find(|e| e.locked && gone.contains(&e.id))
+        // The groups they're in change too (and may go, emptied).
+        let around: std::collections::HashSet<u32> = gone.iter().flat_map(|g| self.groups_of(*g)).collect();
+        self.elements.iter().find(|e| e.locked && (gone.contains(&e.id) || around.contains(&e.id)))
     }
 
     /// What removing `id` removes: the element, everything in it when it's a group, and the
@@ -2941,6 +2968,15 @@ mod tests {
         l.element_mut(b).unwrap().locked = false;
         assert!(l.remove(outer));
         assert_eq!(l.elements.iter().map(|e| e.id).collect::<Vec<_>>(), vec![other]);
+        // A locked group keeps what it holds: removing one of them would change it.
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let (a, b) = (rect(&mut l, (0.0, 0.0, 5.0, 5.0)), rect(&mut l, (10.0, 0.0, 5.0, 5.0)));
+        let g = group(&mut l, vec![a, b]);
+        let top = group(&mut l, vec![g]);
+        l.element_mut(top).unwrap().locked = true;
+        assert_eq!(l.locked_in_removal(a).map(|e| e.id), Some(top), "a locked group round it");
+        l.element_mut(top).unwrap().locked = false;
+        assert_eq!(l.locked_in_removal(a).map(|e| e.id), None);
         // Removing a child takes it out of its group; the group that loses its last one goes too.
         let mut l = Layout::new("x", 200.0, 100.0);
         let (a, b) = (rect(&mut l, (0.0, 0.0, 5.0, 5.0)), rect(&mut l, (10.0, 0.0, 5.0, 5.0)));

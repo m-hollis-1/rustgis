@@ -15627,6 +15627,38 @@ fn layout_elements_are_brought_to_the_front_and_sent_to_the_back() {
     assert_eq!(s.undo_depth(), depth, "no empty undo step");
 }
 
+/// A group holding a map frame and its surrounds copies into one whose surrounds are on the
+/// copied frame: removing the original frame leaves the copy whole.
+#[test]
+fn a_copied_group_keeps_its_surrounds_on_its_own_frame() {
+    use rustgis_map::layout::ElementKind;
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Inset", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let id = |v: Value| v["element"].as_u64().unwrap() as u32;
+    let frame = id(s.run("layout.addFrame", &json!({"x": 10, "y": 10, "w": 60, "h": 40})).unwrap());
+    let other = id(s.run("layout.addFrame", &json!({"x": 100, "y": 10, "w": 60, "h": 40})).unwrap());
+    let bar = id(s.run("layout.addElement", &json!({"kind": "scaleBar", "frame": frame, "x": 10, "y": 55, "w": 40, "h": 8})).unwrap());
+    // A note bound to a frame outside the group stays bound to it.
+    let note = id(s.run("layout.addElement", &json!({"kind": "text", "text": "{scale}", "frame": other, "x": 10, "y": 65})).unwrap());
+    let g = id(s.run("layout.group", &json!({"elements": [frame, bar, note]})).unwrap());
+    let copy = id(s.run("layout.duplicateElement", &json!({"element": g})).unwrap());
+    let l = &s.project.layouts[li];
+    let kids = l.element(copy).unwrap().children().to_vec();
+    let of = |k: &ElementKind| std::mem::discriminant(k);
+    let find = |kind: &ElementKind| kids.iter().copied().find(|c| l.element(*c).is_some_and(|e| of(&e.kind) == of(kind))).unwrap();
+    let (new_frame, new_bar, new_note) =
+        (find(&l.element(frame).unwrap().kind), find(&l.element(bar).unwrap().kind), find(&l.element(note).unwrap().kind));
+    assert!(![frame, bar, note].contains(&new_frame) && new_bar != bar && new_note != note);
+    assert_eq!(l.element(new_bar).unwrap().kind.frame(), Some(new_frame), "the copy's bar measures the copy's frame");
+    assert!(matches!(l.element(new_note).unwrap().kind, ElementKind::Text { frame: Some(f), .. } if f == other));
+    s.run("layout.removeElement", &json!({"element": frame})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(bar).is_none(), "the original bar goes with its frame");
+    assert!(l.element(new_frame).is_some() && l.element(new_bar).is_some() && l.element(new_note).is_some());
+    assert_eq!(l.descendants(copy).len(), 3);
+}
+
 /// Grouped elements move, copy, reorder and delete together; a group's box is its children's.
 #[test]
 fn layout_group_and_ungroup_move_and_delete_together() {
@@ -15679,11 +15711,19 @@ fn layout_group_and_ungroup_move_and_delete_together() {
     let l = &s.project.layouts[li];
     assert!(l.element(outer).is_none());
     assert_eq!((l.group_of(g), l.group_of(c), l.group_of(a)), (None, None, Some(g)));
-    // Copied, the group's copy holds copies of its children, in new places.
+    // Copied, the group's copy holds copies of its children, in new places, framed as they are,
+    // stacked as they are.
+    s.run("layout.update", &json!({"element": g, "border": "#ff0000"})).unwrap();
+    s.run("layout.update", &json!({"element": b, "background": "#00ff00"})).unwrap();
     let n = s.project.layouts[li].elements.len();
     let copy = id(s.run("layout.duplicateElement", &json!({"element": g})).unwrap());
     let l = &s.project.layouts[li];
     assert_eq!(l.elements.len(), n + 3);
+    let style = |id: u32| l.element(id).and_then(|e| e.frame_style.clone());
+    assert_eq!(style(copy), style(g));
+    let copied: Vec<u32> = l.elements.iter().skip(n).map(|e| e.id).collect();
+    assert_eq!(copied.get(2), Some(&copy), "the group after its elements, as the original is");
+    assert_eq!(copied.get(1).copied().and_then(style), style(b), "b's copy, drawn over a's");
     let kids = l.descendants(copy);
     assert_eq!(kids.len(), 2);
     assert!(kids.iter().all(|k| ![a, b, g].contains(k)), "fresh ids");
@@ -15713,6 +15753,13 @@ fn layout_group_and_ungroup_move_and_delete_together() {
     assert!(l.element(a).is_none() && l.element(b).is_none() && l.element(g).is_none() && l.element(c).is_some());
     s.run("edit.undo", &Value::Null).unwrap();
     assert!(s.project.layouts[li].element(a).is_some(), "undone");
+
+    // Pushed against the edge of the room, the group keeps its spacing.
+    s.run("layout.update", &json!({"element": g, "x": 5000})).unwrap();
+    let l = &s.project.layouts[li];
+    let (ax, bx) = (l.element(a).unwrap().x, l.element(b).unwrap().x);
+    assert_eq!((ax, bx), (4980.0, 5000.0));
+    s.run("layout.update", &json!({"element": g, "x": 15})).unwrap();
 
     // Groups nest 8 deep: a ninth is refused, and a file nesting 9 deep is flattened.
     let mut inner = g;

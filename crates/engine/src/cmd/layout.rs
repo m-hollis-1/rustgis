@@ -1920,8 +1920,7 @@ fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
         if l.elements.len() + n > MAX_ELEMENTS {
             return Err(format!("a layout holds at most {MAX_ELEMENTS} elements"));
         }
-        let mut budget = n;
-        let copy = copy_tree(l, id, (dx, dy), 0, &mut budget).ok_or_else(|| format!("no element {id}"))?;
+        let copy = copy_group(l, id, (dx, dy)).ok_or_else(|| format!("no element {id}"))?;
         let name = l.element(copy).map(|c| c.name.clone()).unwrap_or_default();
         return Ok(json!({"element": copy, "name": name}));
     }
@@ -1929,31 +1928,35 @@ fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
     let copy = l.add(name.clone(), (e.x + dx, e.y + dy, e.w, e.h), e.kind);
     if let Some(c) = l.element_mut(copy) {
         c.visible = e.visible;
+        c.frame_style = e.frame_style;
     }
     Ok(json!({"element": copy, "name": name}))
 }
 
-/// Copies element `id` offset by `(dx, dy)`, a group with copies of everything in it (each a
-/// new element, on top), at most `budget` elements in all. The copy's id.
-fn copy_tree(l: &mut Layout, id: u32, (dx, dy): (f64, f64), steps: usize, budget: &mut usize) -> Option<u32> {
-    if *budget == 0 {
-        return None;
-    }
-    *budget -= 1;
-    let e = l.element(id)?.clone();
-    let kind = match &e.kind {
-        ElementKind::Group { children } => {
-            let kids = if steps < MAX_GROUP_DEPTH { children.clone() } else { Vec::new() };
-            ElementKind::Group { children: kids.into_iter().filter_map(|c| copy_tree(l, c, (dx, dy), steps + 1, budget)).collect() }
+/// Copies group `id` and everything in it, offset by `(dx, dy)`: each a new element on top, in the
+/// drawing order the originals have, with its frame style, the copied groups holding the copies.
+/// References between copied elements (a surround's or a text's frame, an extent indicator, a
+/// link) point at the copies; those to elements outside the group stay. The copy's id.
+fn copy_group(l: &mut Layout, id: u32, (dx, dy): (f64, f64)) -> Option<u32> {
+    let members: Vec<u32> = std::iter::once(id).chain(l.descendants(id)).collect();
+    // In drawing order, so the copy stacks as the original does.
+    let originals: Vec<rustgis_map::layout::Element> = l.elements.iter().filter(|e| members.contains(&e.id)).cloned().collect();
+    let mut copies: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for e in &originals {
+        let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
+        let copy = l.add(name, (e.x + dx, e.y + dy, e.w, e.h), e.kind.clone());
+        if let Some(c) = l.element_mut(copy) {
+            c.visible = e.visible;
+            c.frame_style = e.frame_style.clone();
         }
-        k => k.clone(),
-    };
-    let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
-    let copy = l.add(name, (e.x + dx, e.y + dy, e.w, e.h), kind);
-    if let Some(c) = l.element_mut(copy) {
-        c.visible = e.visible;
+        copies.insert(e.id, copy);
     }
-    Some(copy)
+    for copy in copies.values() {
+        if let Some(c) = l.element_mut(*copy) {
+            c.kind.remap(|r| copies.get(&r).copied());
+        }
+    }
+    copies.get(&id).copied()
 }
 
 /// The ids in "elements", each once, in the order given.
@@ -2009,13 +2012,8 @@ fn group(s: &mut Session, p: &Value) -> CmdResult {
     }
     // Listed in drawing order.
     let children: Vec<u32> = l.elements.iter().map(|e| e.id).filter(|id| ids.contains(id)).collect();
-    let id = l.add(name, (0.0, 0.0, 1.0, 1.0), ElementKind::Group { children });
-    // Its own box means nothing; it's kept where its elements are, for whoever reads the file.
-    if let Some((x, y, w, h)) = l.group_box(id)
-        && let Some(e) = l.element_mut(id)
-    {
-        (e.x, e.y, e.w, e.h) = (x, y, w.max(MIN_ELEMENT_MM), h.max(MIN_ELEMENT_MM));
-    }
+    // Its own box means nothing (`Layout::group_box` is where it is).
+    let id = l.add(name, (0.0, 0.0, 0.0, 0.0), ElementKind::Group { children });
     if let Some(ElementKind::Group { children }) = parent.and_then(|g| l.element_mut(g)).map(|e| &mut e.kind) {
         children.retain(|c| !ids.contains(c));
         children.push(id);
@@ -2084,13 +2082,18 @@ fn update_group(s: &mut Session, li: usize, id: u32, p: &Value, frame_style: Fra
         (None, None) => None,
         _ => {
             let (gx, gy, _, _) = l.group_box(id).ok_or("the group is empty: there is nothing to move")?;
-            Some((x.map_or(0.0, |x| x.clamp(-5000.0, 5000.0) - gx), y.map_or(0.0, |y| y.clamp(-5000.0, 5000.0) - gy)))
+            // One shift for all, kept to what leaves every element's corner within ±5000 mm, so
+            // the elements keep their spacing.
+            let corners: Vec<(f64, f64)> = l.elements.iter().filter(|e| all.contains(&e.id) && !e.is_group()).map(|e| (e.x, e.y)).collect();
+            let (hi_x, hi_y) = corners.iter().fold((gx, gy), |(a, b), (x, y)| (a.max(*x), b.max(*y)));
+            let within = |d: f64, lo: f64, hi: f64| d.clamp(-5000.0 - lo, (5000.0 - hi).max(-5000.0 - lo));
+            Some((x.map_or(0.0, |x| within(x - gx, gx, hi_x)), y.map_or(0.0, |y| within(y - gy, gy, hi_y))))
         }
     };
     for e in l.elements.iter_mut().filter(|e| all.contains(&e.id)) {
         if let Some((dx, dy)) = shift.filter(|_| !e.is_group()) {
-            e.x = (e.x + dx).clamp(-5000.0, 5000.0);
-            e.y = (e.y + dy).clamp(-5000.0, 5000.0);
+            e.x += dx;
+            e.y += dy;
         }
         if let Some(v) = b(p, "visible") {
             e.visible = v;

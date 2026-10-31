@@ -385,7 +385,7 @@ fn draw_page(
                 };
                 text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
             }
-            ElementKind::Picture { image } => {
+            ElementKind::Picture { image, source } => {
                 if let Some(img) = crate::picture::decode(image) {
                     let (iw, ih) = (img.width() as f32, img.height() as f32);
                     let s = (ew / iw).min(eh / ih);
@@ -400,7 +400,7 @@ fn draw_page(
                         None,
                     );
                 } else {
-                    placeholder(&mut pm, r, "Picture", ppp);
+                    placeholder(&mut pm, r, &picture_label(source.as_deref()), ppp);
                 }
             }
             ElementKind::Table { frame: f, layer, rows } => {
@@ -1013,6 +1013,14 @@ fn rotated_text(pm: &mut Pixmap, s: &str, cx: f32, cy: f32, px: f32, color: Rgba
     let (x, y) = ((cx - th / 2.0).round(), (cy + tw / 2.0).round());
     let t = Transform::from_row(0.0, -1.0, 1.0, 0.0, x, y);
     pm.draw_pixmap(0, 0, tmp.as_ref(), &PixmapPaint { quality: tiny_skia::FilterQuality::Nearest, ..PixmapPaint::default() }, t, None);
+}
+
+/// What a picture without an image says: the file name it was read from (the last segment of
+/// its path, split on `/` and `\`), or "Picture" when it has no source.
+fn picture_label(source: Option<&str>) -> String {
+    source
+        .and_then(|s| s.rsplit(['/', '\u{5c}']).find(|part| !part.trim().is_empty()))
+        .map_or_else(|| "Picture".to_string(), |name| name.trim().to_string())
 }
 
 fn placeholder(pm: &mut Pixmap, r: Rect, label: &str, ppp: f64) {
@@ -2483,6 +2491,16 @@ fn chart(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, field: &str, labe
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn a_picture_without_an_image_is_labelled_with_its_file_name() {
+        assert_eq!(picture_label(None), "Picture");
+        assert_eq!(picture_label(Some("")), "Picture");
+        assert_eq!(picture_label(Some("C:/logos/north.png")), "north.png");
+        assert_eq!(picture_label(Some("\u{5c}\u{5c}server\u{5c}share\u{5c}logo.jpg")), "logo.jpg");
+        assert_eq!(picture_label(Some("logo.png")), "logo.png");
+        assert_eq!(picture_label(Some("dir/")), "dir");
+    }
+
     use super::*;
 
     /// A grey page with `kind` at (20, 20) 40 × 20 mm, framed in `frame`, drawn at 96 dpi (one
@@ -2522,7 +2540,7 @@ pub(crate) mod tests {
         assert_eq!(rgb_at(&pm, 70, 100), [128, 128, 128]);
         // An element that draws nothing of its own, and one that `continue`s past the rest of its
         // drawing (a frame whose map is missing), are framed the same way.
-        let (layout, _) = framed_page(ElementKind::Picture { image: String::new() }, frame.clone());
+        let (layout, _) = framed_page(ElementKind::Picture { image: String::new(), source: None }, frame.clone());
         let pm = render(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
         // (Its placeholder covers the background.)
         assert_eq!((rgb_at(&pm, 100, 75), rgb_at(&pm, 100, 70)), ([255, 0, 0], [128, 128, 128]));
@@ -2619,7 +2637,7 @@ pub(crate) mod tests {
         let mut maps = Vec::new();
         let frame =
             FrameStyle { border: Some(Rgba::rgb(255, 0, 0)), border_width: 2.0, background: Some(Rgba::rgb(255, 255, 255)), gap: 5.0 };
-        let (mut layout, id) = framed_page(ElementKind::Picture { image: String::new() }, frame);
+        let (mut layout, id) = framed_page(ElementKind::Picture { image: String::new(), source: None }, frame);
         let info = PageInfo::default();
         let (pm, [x, y, w, h]) = render_element(&layout, id, &mut maps, 96.0, &info, true).unwrap().unwrap();
         let reach = 5.0 + 1.0 / PT_PER_MM;

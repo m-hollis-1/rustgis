@@ -1969,6 +1969,62 @@ fn a_picture_is_a_marker_on_points() {
     assert_eq!((s.undo_depth(), symbol(&s).marker), (depth, Marker::Image(img)));
 }
 
+/// A layout picture added from a file remembers it, and `path` relinks it to another.
+#[test]
+fn pictures_keep_their_path_and_relink() {
+    use base64::Engine;
+    use rustgis_map::layout::ElementKind;
+    let dot = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    // A second, different picture: one red pixel.
+    let red = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let dir = std::env::temp_dir().join(format!("rustgis-picture-source-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, b64: &str| {
+        let file = dir.join(name);
+        std::fs::write(&file, base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+        file.display().to_string()
+    };
+    let (first, second) = (write("first.png", dot), write("second.png", red));
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "L"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let id = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].as_u64().unwrap() as u32;
+    let picture = |s: &Session| match &s.project.layouts[li].element(id).unwrap().kind {
+        ElementKind::Picture { image, source } => (image.clone(), source.clone()),
+        k => panic!("{k:?}"),
+    };
+    assert_eq!(picture(&s), (dot.to_string(), Some(first.clone())));
+    // `path` relinks it: the new file's image, and the new file as the source.
+    s.run("layout.update", &json!({"element": id, "path": second})).unwrap();
+    let relinked = picture(&s);
+    assert_eq!(relinked, (red.to_string(), Some(second.clone())));
+    // A file that is missing, or isn't a picture, is refused and the element stays as it was.
+    let text = dir.join("not-a-picture.png");
+    std::fs::write(&text, b"plain text").unwrap();
+    let depth = s.undo_depth();
+    for bad in [dir.join("gone.png").display().to_string(), text.display().to_string(), String::new()] {
+        assert!(s.run("layout.update", &json!({"element": id, "path": bad, "x": 5})).is_err(), "{bad}");
+        assert_eq!(picture(&s), relinked, "{bad}");
+    }
+    assert_eq!(s.undo_depth(), depth);
+    // An image given directly changes the picture and keeps the file it was linked to.
+    s.run("layout.update", &json!({"element": id, "image": dot})).unwrap();
+    assert_eq!(picture(&s), (dot.to_string(), Some(second.clone())));
+    // Only pictures take one.
+    let title = s.run("layout.addElement", &json!({"kind": "text", "text": "T"})).unwrap()["element"].as_u64().unwrap();
+    assert!(s.run("layout.update", &json!({"element": title, "path": first})).is_err());
+    // A locked picture refuses a new file.
+    s.run("layout.update", &json!({"element": id, "locked": true})).unwrap();
+    let err = s.run("layout.update", &json!({"element": id, "path": first})).unwrap_err();
+    assert!(err.contains("locked"), "{err}");
+    assert_eq!(picture(&s), (dot.to_string(), Some(second.clone())));
+    // A picture added from an image has no file, and one added from a missing file isn't added.
+    let bare = s.run("layout.addElement", &json!({"kind": "picture", "image": dot})).unwrap()["element"].as_u64().unwrap() as u32;
+    assert!(matches!(&s.project.layouts[li].element(bare).unwrap().kind, ElementKind::Picture { source: None, .. }));
+    assert!(s.run("layout.addElement", &json!({"kind": "picture", "path": dir.join("gone.png").display().to_string()})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Every command with junk parameters returns Ok or Err, never panics, and leaves a usable session.
 #[test]
 fn hostile_params_never_panic() {
@@ -1979,6 +2035,9 @@ fn hostile_params_never_panic() {
         json!({"layer": "Cities", "image": "***"}),
         json!({"layer": "Cities", "image": 7}),
         json!({"layer": "Cities", "imagePath": "nope.png"}),
+        // A picture's file: missing, junk, of the wrong type.
+        json!({"element": 1, "path": "nope.png", "image": 7}),
+        json!({"kind": "picture", "element": 1, "path": ["a"], "x": "NaN"}),
         Value::Null,
         json!({}),
         // Shared vertex moves: valid row/destination, hostile node addresses and coordinate types.

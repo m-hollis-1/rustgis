@@ -2045,6 +2045,32 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                         ui.end_row();
                     }
+                    // A picture remembers the file it came from, so a missing one can be linked to
+                    // the file's new place.
+                    ElementKind::Picture { image, source } => {
+                        ui.label(tl!("File"));
+                        match source {
+                            Some(path) => ui.add(egui::Label::new(path.as_str()).truncate()).on_hover_text(path.as_str()),
+                            None => ui.label(tl!("no file")),
+                        };
+                        ui.end_row();
+                        if image.is_empty() {
+                            ui.label("");
+                            ui.label(tl!("The picture is missing."));
+                            ui.end_row();
+                        }
+                        // The system's file dialog is not available in the browser.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            ui.label("");
+                            if ui.button(tl!("Relink…")).on_hover_text(tl!("Pick the picture's file again")).clicked()
+                                && let Some(path) = crate::dialogs::pick_open(&["png", "jpg", "jpeg"], tl!("Pictures"))
+                            {
+                                update(app, json!({"path": path}));
+                            }
+                            ui.end_row();
+                        }
+                    }
                     _ => {}
                 }
             },
@@ -2952,6 +2978,58 @@ mod tests {
         assert_eq!(symbol_of(h.state()), 0);
         assert!(h.query_by_label("Custom symbol (from import)").is_none());
         h.get_by_label("Fill");
+    }
+
+    /// A picture's Format pane shows the file it came from; Relink… picks another and the
+    /// picture follows it.
+    #[test]
+    fn a_picture_shows_its_file_and_relinks() {
+        use base64::Engine;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let dot = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let dir = std::env::temp_dir().join(format!("rustgis-picture-relink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(dot).unwrap();
+        let (first, second) = (dir.join("first.png"), dir.join("second.png"));
+        std::fs::write(&first, &bytes).unwrap();
+        std::fs::write(&second, &bytes).unwrap();
+        let (first, second) = (first.display().to_string(), second.display().to_string());
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Pic"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let id = app.run("layout.addElement", json!({"layout": li, "kind": "picture", "path": first})).unwrap()["element"].as_u64().unwrap()
+            as u32;
+        let source_of = |app: &RustGisApp| match app.session.project.layouts[li].element(id).map(|e| &e.kind) {
+            Some(ElementKind::Picture { source, .. }) => source.clone(),
+            _ => panic!("not a picture"),
+        };
+        app.layout.selected = Some(id);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label(&first);
+        // Cancelled, the picker changes nothing.
+        h.get_by_label("Relink…").click();
+        h.run_steps(3);
+        assert_eq!(source_of(h.state()), Some(first.clone()));
+        // A file picked is read, and remembered.
+        crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(second.clone()));
+        h.get_by_label("Relink…").click();
+        h.run_steps(3);
+        assert_eq!(source_of(h.state()), Some(second.clone()));
+        h.get_by_label(&second);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Dragging the map in a turned frame moves it the way the pointer goes, as in the map view.

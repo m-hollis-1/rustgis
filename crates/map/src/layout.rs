@@ -1388,8 +1388,11 @@ pub enum ElementKind {
         case: TextCase,
     },
     Picture {
-        /// Base64 PNG or JPEG.
+        /// Base64 PNG or JPEG. Empty when the file is missing (the picture shows a placeholder).
         image: String,
+        /// The file the picture was read from, kept so a missing one can be relinked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// The attribute table of a layer in a frame's map.
     Table {
@@ -1678,6 +1681,9 @@ pub struct MapSeries {
 fn margin() -> f64 {
     0.1
 }
+
+/// Longest path a picture remembers as its source (characters).
+pub const MAX_PICTURE_SOURCE: usize = 1000;
 
 /// Most guides a layout keeps in each direction.
 pub const MAX_GUIDES: usize = 64;
@@ -2079,6 +2085,14 @@ impl Layout {
                     *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
                 }
                 ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
+                ElementKind::Picture { source, .. } => {
+                    if let Some(s) = source {
+                        s.truncate(s.char_indices().nth(MAX_PICTURE_SOURCE).map_or(s.len(), |(i, _)| i));
+                    }
+                    if source.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                        *source = None;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2522,6 +2536,32 @@ mod tests {
         assert_eq!(serde_json::from_str::<FrameStyle>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
         assert_eq!(serde_json::from_str::<FrameStyle>("{}").unwrap(), FrameStyle::default());
         assert_eq!(FrameStyle::default().border_width, 1.0);
+    }
+
+    #[test]
+    fn pictures_remember_their_source_and_old_files_save_the_same() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":"abc"}}}"#;
+        let e: Element = serde_json::from_str(j).unwrap();
+        assert!(matches!(&e.kind, ElementKind::Picture { source: None, .. }));
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        let with = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":"","source":"C:/logos/a.png"}}}"#;
+        let e: Element = serde_json::from_str(with).unwrap();
+        assert!(matches!(&e.kind, ElementKind::Picture { source: Some(s), .. } if s == "C:/logos/a.png"));
+        assert_eq!(serde_json::to_string(&e).unwrap(), with);
+    }
+
+    #[test]
+    fn loaded_picture_sources_are_limited() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let long = l.add("long", (0.0, 0.0, 10.0, 10.0), ElementKind::Picture { image: String::new(), source: Some("é".repeat(1500)) });
+        let blank = l.add("blank", (0.0, 0.0, 10.0, 10.0), ElementKind::Picture { image: String::new(), source: Some("  ".into()) });
+        l.clamp();
+        let source = |id| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Picture { source, .. }) => source.clone(),
+            _ => panic!("not a picture"),
+        };
+        assert_eq!(source(long).map(|s| s.chars().count()), Some(MAX_PICTURE_SOURCE));
+        assert_eq!(source(blank), None);
     }
 
     #[test]

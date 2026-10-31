@@ -511,7 +511,7 @@ mod tests {
             gap: 3.0,
         };
         let text = layout.add("Words", (10.0, 10.0, 40.0, 20.0), ElementKind::text("hi", 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false));
-        let picture = layout.add("Pic", (10.0, 40.0, 20.0, 20.0), ElementKind::Picture { image: String::new() });
+        let picture = layout.add("Pic", (10.0, 40.0, 20.0, 20.0), ElementKind::Picture { image: String::new(), source: None });
         for id in [text, picture] {
             if let Some(e) = layout.element_mut(id) {
                 e.frame_style = Some(frame.clone());
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn cropped_images_use_their_actual_pixel_bounds() {
         let (mut layout, mut maps, _) = page();
-        let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new() });
+        let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new(), source: None });
         let info = PageInfo::default();
         let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info, false).unwrap().unwrap();
         let [x, y, w, h] = bounds;

@@ -338,7 +338,11 @@ pub fn page_layout(s: &Session, pres: &Presentation, page: &Page) -> Layout {
                 let k = (bw / iw.max(1) as f64).min(bh / ih.max(1) as f64);
                 (iw as f64 * k, ih as f64 * k)
             });
-            l.add("Picture", (m + (bw - pw) / 2.0, top + (bh - ph) / 2.0, pw, ph), ElementKind::Picture { image: image.clone() });
+            l.add(
+                "Picture",
+                (m + (bw - pw) / 2.0, top + (bh - ph) / 2.0, pw, ph),
+                ElementKind::Picture { image: image.clone(), source: None },
+            );
             if let PageKind::Video { source, .. } = &page.kind {
                 l.add(
                     "Play",

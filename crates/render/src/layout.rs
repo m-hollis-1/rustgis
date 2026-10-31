@@ -5,8 +5,8 @@ use rustgis_data::GeometryType;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::graphics::decimal;
 use rustgis_map::layout::{
-    ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, Layout, LineHead, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits,
-    TextAlign, TickSide, VAlign, frame_camera,
+    ArrowStyle, ColorScale, Element, ElementKind, FrameShape, FrameStyle, Grid, GridKind, Layout, LineHead, Orientation, PT_PER_MM,
+    ScaleBarStyle, ScaleUnits, TextAlign, TickSide, VAlign, frame_camera,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -57,7 +57,7 @@ pub(crate) fn frame_requires_complete(map: &Map, view: &View) -> bool {
 pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<Pixmap> {
     let (w, h, k) = page_geometry(layout, dpi);
     let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
-    draw_page(layout, maps, info, k, bounds, None)
+    draw_page(layout, maps, info, k, bounds, None, true)
 }
 
 /// Page pixel dimensions and the shared millimetre scale, capped to the renderer's budget.
@@ -71,17 +71,28 @@ pub(crate) fn page_geometry(layout: &Layout, dpi: f64) -> (u32, u32, f64) {
 
 /// One element on transparency, allocating only its on-page pixel bounds.
 /// Outer `None` means rendering failed; inner `None` means the element is off-page.
-pub(crate) fn render_element(layout: &Layout, id: u32, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<Option<(Pixmap, [f64; 4])>> {
+/// With `framed`, its frame style's background and border are drawn and the pixels reach out to them;
+/// the SVG draws those as shapes of its own around the picture, so leaves them out.
+pub(crate) fn render_element(
+    layout: &Layout,
+    id: u32,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+    framed: bool,
+) -> Option<Option<(Pixmap, [f64; 4])>> {
     let e = layout.element(id)?;
     let (w, h, k) = page_geometry(layout, dpi);
-    let x0 = (e.x * k).floor().clamp(0.0, f64::from(w));
-    let y0 = (e.y * k).floor().clamp(0.0, f64::from(h));
-    let x1 = ((e.x + e.w) * k).ceil().clamp(0.0, f64::from(w));
-    let y1 = ((e.y + e.h) * k).ceil().clamp(0.0, f64::from(h));
+    // The box, grown to take in the frame's gap and border.
+    let out = e.frame_style.as_ref().filter(|_| framed).map_or(0.0, FrameStyle::outset);
+    let x0 = ((e.x - out) * k).floor().clamp(0.0, f64::from(w));
+    let y0 = ((e.y - out) * k).floor().clamp(0.0, f64::from(h));
+    let x1 = ((e.x + e.w + out) * k).ceil().clamp(0.0, f64::from(w));
+    let y1 = ((e.y + e.h + out) * k).ceil().clamp(0.0, f64::from(h));
     let Some(bounds) = tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32) else {
         return Some(None);
     };
-    let pm = draw_page(layout, maps, info, k, bounds, Some(id))?;
+    let pm = draw_page(layout, maps, info, k, bounds, Some(id), framed)?;
     Some(Some((pm, [x0 / k, y0 / k, (x1 - x0) / k, (y1 - y0) / k])))
 }
 
@@ -93,13 +104,14 @@ fn draw_page(
     k: f64,
     bounds: tiny_skia::IntRect,
     element: Option<u32>,
+    framed: bool,
 ) -> Option<Pixmap> {
     let ppp = k / PT_PER_MM;
     let mut pm = Pixmap::new(bounds.width(), bounds.height())?;
     if element.is_none() {
         pm.fill(tiny_skia::Color::WHITE);
     }
-    let visible = |e: &&rustgis_map::layout::Element| e.visible && element.is_none_or(|id| e.id == id);
+    let visible = |e: &&Element| e.visible && element.is_none_or(|id| e.id == id);
     // Frame cameras first: surrounds and extent indicators read them.
     let frames: Vec<(u32, usize, rustgis_map::Camera, f64, f64)> = layout
         .elements
@@ -131,7 +143,17 @@ fn draw_page(
             shown.push((*f, complete_shown_legends(map, scale)?));
         }
     }
+    // An element's border is drawn once the element is, which is at the top of the next turn
+    // (the arms below leave the turn early) and after the last.
+    let mut bordered: Option<&Element> = None;
     for e in layout.elements.iter().filter(visible) {
+        if let Some(done) = bordered.take() {
+            frame_border(&mut pm, done, k, bounds);
+        }
+        if framed && let Some(f) = &e.frame_style {
+            frame_background(&mut pm, e, f, k, bounds);
+            bordered = Some(e);
+        }
         let (x, y, ew, eh) =
             ((e.x * k - f64::from(bounds.x())) as f32, (e.y * k - f64::from(bounds.y())) as f32, (e.w * k) as f32, (e.h * k) as f32);
         let Some(r) = Rect::from_xywh(x, y, ew.max(1.0), eh.max(1.0)) else { continue };
@@ -375,7 +397,34 @@ fn draw_page(
             }
         }
     }
+    if let Some(done) = bordered {
+        frame_border(&mut pm, done, k, bounds);
+    }
     Some(pm)
+}
+
+/// The element's box grown by its frame's gap, in pixels of the region drawn.
+fn frame_rect(e: &Element, f: &FrameStyle, k: f64, bounds: tiny_skia::IntRect) -> Option<Rect> {
+    let (x, y, w, h) = f.grown(e.x, e.y, e.w, e.h);
+    Rect::from_xywh((x * k - f64::from(bounds.x())) as f32, (y * k - f64::from(bounds.y())) as f32, (w * k) as f32, (h * k) as f32)
+}
+
+/// The frame style's background, behind the element.
+fn frame_background(pm: &mut Pixmap, e: &Element, f: &FrameStyle, k: f64, bounds: tiny_skia::IntRect) {
+    if let (Some(bg), Some(r)) = (f.background, frame_rect(e, f, k, bounds)) {
+        pm.fill_rect(r, &paint(bg, 1.0), Transform::identity(), None);
+    }
+}
+
+/// The frame style's border, over the element: a line centred on the grown box's edge.
+fn frame_border(pm: &mut Pixmap, e: &Element, k: f64, bounds: tiny_skia::IntRect) {
+    let Some(f) = &e.frame_style else { return };
+    if let (Some(c), Some(r)) = (f.border, frame_rect(e, f, k, bounds))
+        && f.border_width > 0.0
+    {
+        let stroke = Stroke { width: (f.border_width * k / PT_PER_MM) as f32, ..Stroke::default() };
+        pm.stroke_path(&PathBuilder::from_rect(r), &paint(c, 1.0), &stroke, Transform::identity(), None);
+    }
 }
 
 /// A map frame's map, `w` × `h` points at `ppp` pixels a point, labels and attribution included:
@@ -1890,6 +1939,115 @@ fn chart(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, field: &str, labe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grey page with `kind` at (20, 20) 40 × 20 mm, framed in `frame`, drawn at 96 dpi (one
+    /// pixel a point, 3.78 to the millimetre).
+    fn framed_page(kind: ElementKind, frame: rustgis_map::layout::FrameStyle) -> (Layout, u32) {
+        let mut layout = Layout::new("Frames", 100.0, 100.0);
+        layout.add(
+            "Ground",
+            (0.0, 0.0, 100.0, 100.0),
+            ElementKind::Rectangle { fill: Rgba::rgb(128, 128, 128), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 },
+        );
+        let id = layout.add("Framed", (20.0, 20.0, 40.0, 20.0), kind);
+        if let Some(e) = layout.element_mut(id) {
+            e.frame_style = Some(frame);
+        }
+        (layout, id)
+    }
+
+    fn rgb_at(pm: &Pixmap, x: u32, y: u32) -> [u8; 3] {
+        pm.pixel(x, y).map(|p| [p.red(), p.green(), p.blue()]).unwrap_or_default()
+    }
+
+    /// A background and a border draw around an element of any kind, the border over the element.
+    #[test]
+    fn a_background_and_border_draw_around_any_element() {
+        use rustgis_map::layout::FrameStyle;
+        let red = Rgba::rgb(255, 0, 0);
+        let frame = FrameStyle { border: Some(red), border_width: 2.0, background: Some(Rgba::rgb(255, 255, 255)), gap: 0.0 };
+        let mut maps = Vec::new();
+        // The box is at pixel 75.6, 75.6; text is empty so only the frame is in these probes.
+        let (layout, _) = framed_page(ElementKind::text("", 12.0, Rgba::rgb(0, 0, 0), false), frame.clone());
+        let pm = render(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        assert_eq!(rgb_at(&pm, 80, 80), [255, 255, 255], "just inside the top-left corner is the background");
+        assert_eq!(rgb_at(&pm, 100, 75), [255, 0, 0], "the top edge is the border");
+        assert_eq!(rgb_at(&pm, 75, 100), [255, 0, 0], "the left edge is the border");
+        assert_eq!(rgb_at(&pm, 100, 70), [128, 128, 128], "outside is the page");
+        assert_eq!(rgb_at(&pm, 70, 100), [128, 128, 128]);
+        // An element that draws nothing of its own, and one that `continue`s past the rest of its
+        // drawing (a frame whose map is missing), are framed the same way.
+        let (layout, _) = framed_page(ElementKind::Picture { image: String::new() }, frame.clone());
+        let pm = render(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        // (Its placeholder covers the background.)
+        assert_eq!((rgb_at(&pm, 100, 75), rgb_at(&pm, 100, 70)), ([255, 0, 0], [128, 128, 128]));
+        let missing: ElementKind = serde_json::from_value(serde_json::json!({"MapFrame": {
+            "map": "Nowhere", "center": {"x": 0, "y": 0}, "scale": 1000000
+        }}))
+        .unwrap();
+        let (layout, _) = framed_page(missing, frame);
+        let pm = render(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        assert_eq!(rgb_at(&pm, 100, 75), [255, 0, 0]);
+    }
+
+    /// The gap pushes the background and border out from the box; each is drawn alone when the
+    /// other is off, and an element without a frame style is drawn as before.
+    #[test]
+    fn a_frame_style_grows_by_its_gap_and_either_part_may_be_off() {
+        use rustgis_map::layout::FrameStyle;
+        let mut maps = Vec::new();
+        let info = PageInfo::default();
+        let blue = Rgba::rgb(0, 0, 255);
+        let white = Rgba::rgb(255, 255, 255);
+        // 5 mm of gap is 18.9 pixels: the background reaches 56.7 and the 2 px border is centred there.
+        let kind = || ElementKind::text("", 12.0, Rgba::rgb(0, 0, 0), false);
+        let (layout, _) = framed_page(kind(), FrameStyle { border: Some(blue), border_width: 2.0, background: Some(white), gap: 5.0 });
+        let pm = render(&layout, &mut maps, 96.0, &info).unwrap();
+        assert_eq!(rgb_at(&pm, 100, 56), [0, 0, 255], "the border sits outside the gap");
+        assert_eq!(rgb_at(&pm, 100, 65), [255, 255, 255], "the background fills the gap");
+        assert_eq!(rgb_at(&pm, 100, 50), [128, 128, 128], "and no further");
+        // A border alone leaves the inside as it was, a background alone has no edge.
+        let (layout, _) = framed_page(kind(), FrameStyle { border: Some(blue), border_width: 2.0, ..FrameStyle::default() });
+        let pm = render(&layout, &mut maps, 96.0, &info).unwrap();
+        assert_eq!((rgb_at(&pm, 100, 75), rgb_at(&pm, 100, 85)), ([0, 0, 255], [128, 128, 128]));
+        let (layout, _) = framed_page(kind(), FrameStyle { background: Some(white), ..FrameStyle::default() });
+        let pm = render(&layout, &mut maps, 96.0, &info).unwrap();
+        assert_eq!((rgb_at(&pm, 100, 85), rgb_at(&pm, 100, 73)), ([255, 255, 255], [128, 128, 128]));
+        // A zero-width border draws nothing; no frame style changes no pixel.
+        let (mut layout, id) = framed_page(kind(), FrameStyle { border: Some(blue), border_width: 0.0, ..FrameStyle::default() });
+        let off = render(&layout, &mut maps, 96.0, &info).unwrap();
+        if let Some(e) = layout.element_mut(id) {
+            e.frame_style = None;
+        }
+        let bare = render(&layout, &mut maps, 96.0, &info).unwrap();
+        assert_eq!(off.data(), bare.data());
+    }
+
+    /// The element drawn alone (as the SVG does a surround) reaches out to its frame.
+    #[test]
+    fn an_element_drawn_alone_includes_its_frame() {
+        use rustgis_map::layout::FrameStyle;
+        let mut maps = Vec::new();
+        let frame =
+            FrameStyle { border: Some(Rgba::rgb(255, 0, 0)), border_width: 2.0, background: Some(Rgba::rgb(255, 255, 255)), gap: 5.0 };
+        let (mut layout, id) = framed_page(ElementKind::Picture { image: String::new() }, frame);
+        let info = PageInfo::default();
+        let (pm, [x, y, w, h]) = render_element(&layout, id, &mut maps, 96.0, &info, true).unwrap().unwrap();
+        let reach = 5.0 + 1.0 / PT_PER_MM;
+        assert!(x <= 20.0 - reach && y <= 20.0 - reach && w >= 40.0 + 2.0 * reach && h >= 20.0 + 2.0 * reach, "{x} {y} {w} {h}");
+        // Placed where it says, it is the page's pixels over the element's frame.
+        let full = render(&layout, &mut maps, 96.0, &info).unwrap();
+        let (ox, oy) = ((x * PT_PER_MM).round() as u32, (y * PT_PER_MM).round() as u32);
+        assert_eq!(rgb_at(&pm, 100 - ox, 56 - oy), rgb_at(&full, 100, 56));
+        assert_eq!(rgb_at(&pm, 100 - ox, 56 - oy), [255, 0, 0]);
+        assert_eq!(pm.pixel(100 - ox, 65 - oy).map(|p| p.alpha()), Some(255));
+        // The page's own render without a frame is unchanged; the element alone is its own size.
+        if let Some(e) = layout.element_mut(id) {
+            e.frame_style = None;
+        }
+        let (_, [_, _, w, _]) = render_element(&layout, id, &mut maps, 96.0, &info, true).unwrap().unwrap();
+        assert!((w - 40.0).abs() < 0.5);
+    }
 
     /// A picture marker's legend swatch is its picture, not a circle in the symbol's colours.
     #[test]

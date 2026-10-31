@@ -1738,6 +1738,56 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             },
         );
     });
+    // A border and background round the element, whatever it is: each a colour or none, a gap
+    // between them and the element. Cleared and at their defaults, the element has no frame style.
+    let fs = e.frame_style.clone().unwrap_or_default();
+    crate::textform::section(ui, "Frame", |ui| {
+        egui::Grid::new(("layout_frame", id)).num_columns(2).min_col_width(crate::textform::LABEL_W).spacing(vec2(8.0, 6.0)).show(
+            ui,
+            |ui| {
+                let black = rustgis_engine::map::Rgba::rgb(0, 0, 0);
+                let white = rustgis_engine::map::Rgba::rgb(255, 255, 255);
+                for (label, key, current, on_none) in
+                    [("Border", "border", fs.border, black), ("Background", "background", fs.background, white)]
+                {
+                    ui.label(tl!(label));
+                    ui.horizontal(|ui| {
+                        let mut c = crate::theme::c32(current.unwrap_or(on_none));
+                        if ui.add_enabled_ui(current.is_some(), |ui| crate::widgets::color_button(ui, &mut c)).inner.changed() {
+                            update(app, json!({key: crate::theme::rgba(c).hex()}));
+                        }
+                        let mut none = current.is_none();
+                        if ui.checkbox(&mut none, tl!("None")).changed() {
+                            update(app, json!({key: if none { Value::Null } else { json!(on_none.hex()) }}));
+                        }
+                    });
+                    ui.end_row();
+                    if key == "border" {
+                        let input_label = ui.label(tl!("Width"));
+                        let mut wd = fs.border_width;
+                        let drag = Dragged::lend(ui, drag_key("borderWidth"), &mut wd);
+                        let r = ui
+                            .add(egui::DragValue::new(&mut wd).range(0.0..=50.0).speed(0.1).max_decimals(1).suffix(" pt"))
+                            .labelled_by(input_label.id);
+                        if drag.settled(ui, &r, &mut wd) && (wd - fs.border_width).abs() > 1e-6 {
+                            update(app, json!({"borderWidth": wd}));
+                        }
+                        ui.end_row();
+                    }
+                }
+                let input_label = ui.label(tl!("Gap"));
+                let mut gap = fs.gap;
+                let drag = Dragged::lend(ui, drag_key("gap"), &mut gap);
+                let r = ui
+                    .add(egui::DragValue::new(&mut gap).range(0.0..=50.0).speed(0.1).max_decimals(1).suffix(" mm"))
+                    .labelled_by(input_label.id);
+                if drag.settled(ui, &r, &mut gap) && (gap - fs.gap).abs() > 1e-6 {
+                    update(app, json!({"gap": gap}));
+                }
+                ui.end_row();
+            },
+        );
+    });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
     if let ElementKind::Text {
         text,
@@ -2799,7 +2849,6 @@ mod tests {
 
     #[test]
     fn dragging_the_angle_in_the_format_pane_turns_the_arrow() {
-        use egui::accesskit::Role;
         use egui_kittest::kittest::Queryable;
         use rustgis_engine::map::layout::{ElementKind, line_angle};
         let mut app = RustGisApp::with_sample();
@@ -2821,8 +2870,8 @@ mod tests {
             app,
         );
         h.run_steps(3);
-        // Angle is the line's last number, the bottommost.
-        let at = h.query_all_by_role(Role::SpinButton).map(|n| n.rect()).max_by(|a, b| a.min.y.total_cmp(&b.min.y)).unwrap().center();
+        // The Angle number: the last of the Element section's (the Frame section is below it).
+        let at = h.get_by_label("Angle").rect().center();
         let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
         let undo = h.state().session.undo_depth();
         h.event(Event::PointerMoved(at));

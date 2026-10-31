@@ -1220,7 +1220,61 @@ pub struct Element {
     /// Locked, it can be selected but not moved, resized, deleted or edited until unlocked.
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
+    /// A border and background drawn around the element, whatever it is; none when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_style: Option<FrameStyle>,
     pub kind: ElementKind,
+}
+
+/// The widest a frame border may be (points) and the largest gap between it and the element (mm).
+pub const MAX_FRAME_WIDTH: f64 = 50.0;
+pub const MAX_FRAME_GAP: f64 = 50.0;
+
+/// An optional border and background drawn around an element, `gap` millimetres outside its box.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FrameStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<Rgba>,
+    /// The border's width in points (1/96 inch).
+    #[serde(skip_serializing_if = "is_frame_width")]
+    pub border_width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<Rgba>,
+    /// Millimetres between the element's box and the border and background.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gap: f64,
+}
+
+impl Default for FrameStyle {
+    fn default() -> Self {
+        FrameStyle { border: None, border_width: 1.0, background: None, gap: 0.0 }
+    }
+}
+
+fn is_frame_width(w: &f64) -> bool {
+    *w == 1.0
+}
+
+impl FrameStyle {
+    /// Keeps the width and gap finite and within their limits (a bad value takes its default).
+    pub fn clamp(&mut self) {
+        self.border_width = finite_or(self.border_width, 1.0).clamp(0.0, MAX_FRAME_WIDTH);
+        self.gap = finite_or(self.gap, 0.0).clamp(0.0, MAX_FRAME_GAP);
+    }
+
+    /// How far outside the element's box the frame reaches, in millimetres: the gap, and half the
+    /// border centred on the grown box's edge.
+    pub fn outset(&self) -> f64 {
+        let half = if self.border.is_some() { self.border_width / 2.0 / PT_PER_MM } else { 0.0 };
+        self.gap + half
+    }
+
+    /// The element's box `(x, y, w, h)` grown by the gap on every side: where the background
+    /// is drawn and the border centred.
+    pub fn grown(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+        (x - self.gap, y - self.gap, w + 2.0 * self.gap, h + 2.0 * self.gap)
+    }
 }
 
 impl Element {
@@ -1310,7 +1364,7 @@ impl Layout {
         self.next_id = id.saturating_add(1);
         // Templates on tiny pages can compute sizes near zero.
         let (w, h) = (finite_or(w, 1.0).clamp(MIN_ELEMENT_MM, 5000.0), finite_or(h, 1.0).clamp(MIN_ELEMENT_MM, 5000.0));
-        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, kind });
+        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, frame_style: None, kind });
         id
     }
 
@@ -1403,6 +1457,9 @@ impl Layout {
             e.x = finite_or(e.x, 0.0).clamp(-5000.0, 5000.0);
             e.y = finite_or(e.y, 0.0).clamp(-5000.0, 5000.0);
             e.name = e.name.chars().take(200).collect();
+            if let Some(f) = &mut e.frame_style {
+                f.clamp();
+            }
             match &mut e.kind {
                 ElementKind::MapFrame { center, scale, shape, grid, bearing, pitch, extent_width, .. } => {
                     *scale = finite_or(*scale, 50_000_000.0).clamp(MIN_FRAME_SCALE, MAX_FRAME_SCALE);
@@ -1643,6 +1700,49 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elements_without_frame_style_save_as_before() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":""}}}"#;
+        let e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(e.frame_style, None);
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        // A frame style at its defaults writes only what is set, and reads back.
+        let set = Element { frame_style: Some(FrameStyle { border: Some(Rgba::rgb(255, 0, 0)), ..FrameStyle::default() }), ..e };
+        let s = serde_json::to_string(&set).unwrap();
+        assert!(s.contains(r#""frame_style":{"border":[255,0,0,255]}"#), "{s}");
+        assert_eq!(serde_json::from_str::<Element>(&s).unwrap(), set);
+        let full = FrameStyle { border: None, border_width: 2.5, background: Some(Rgba::rgb(1, 2, 3)), gap: 4.0 };
+        assert_eq!(serde_json::from_str::<FrameStyle>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
+        assert_eq!(serde_json::from_str::<FrameStyle>("{}").unwrap(), FrameStyle::default());
+        assert_eq!(FrameStyle::default().border_width, 1.0);
+    }
+
+    #[test]
+    fn loaded_frame_styles_are_limited() {
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}},
+             "frame_style":{"border":[0,0,0,255],"border_width":1e9,"gap":-3}},
+            {"id":2,"name":"b","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}},
+             "frame_style":{"border_width":-1,"gap":1e9}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        let f = |id| l.element(id).and_then(|e| e.frame_style.clone()).unwrap();
+        assert_eq!((f(1).border_width, f(1).gap), (MAX_FRAME_WIDTH, 0.0));
+        assert_eq!((f(2).border_width, f(2).gap), (0.0, MAX_FRAME_GAP));
+        let mut fs = FrameStyle { border_width: f64::NAN, gap: f64::INFINITY, ..FrameStyle::default() };
+        fs.clamp();
+        assert_eq!((fs.border_width, fs.gap), (1.0, 0.0));
+    }
+
+    #[test]
+    fn a_frame_style_grows_the_box_by_its_gap_and_half_its_border() {
+        let fs = FrameStyle { border: Some(Rgba::rgb(0, 0, 0)), border_width: PT_PER_MM, gap: 2.0, ..FrameStyle::default() };
+        assert_eq!(fs.grown(10.0, 20.0, 30.0, 40.0), (8.0, 18.0, 34.0, 44.0));
+        assert!((fs.outset() - 2.5).abs() < 1e-9);
+        // Without a border the box grows by the gap alone.
+        assert_eq!(FrameStyle { border: None, background: Some(Rgba::rgb(0, 0, 0)), ..fs }.outset(), 2.0);
+    }
 
     #[test]
     fn text_elements_saved_before_read_and_save_the_same() {

@@ -35,6 +35,21 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
     for e in layout.elements.iter().filter(|e| e.visible) {
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
+        // The frame's background first, behind the element; its border after.
+        let framed = e.frame_style.as_ref().map(|f| (f, f.grown(x, y, w, h)));
+        if let Some((f, (fx, fy, fw, fh))) = framed
+            && let Some(bg) = f.background
+        {
+            let _ = writeln!(
+                s,
+                r#"<rect x="{}" y="{}" width="{}" height="{}"{} stroke="none"/>"#,
+                num(fx),
+                num(fy),
+                num(fw),
+                num(fh),
+                paint("fill", bg)
+            );
+        }
         match &e.kind {
             ElementKind::Text {
                 text: t,
@@ -148,7 +163,7 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
             }
             ElementKind::Line { color, width, dir, head } => line(&mut s, dir.ends((x, y, w, h)), *color, *width, *head, ppp),
             _ => {
-                if let Some((image, [ix, iy, iw, ih])) = render_element(layout, e.id, maps, picture_dpi, info)? {
+                if let Some((image, [ix, iy, iw, ih])) = render_element(layout, e.id, maps, picture_dpi, info, false)? {
                     let png = image.encode_png().ok()?;
                     let _ = writeln!(
                         s,
@@ -161,6 +176,20 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                     );
                 }
             }
+        }
+        if let Some((f, (fx, fy, fw, fh))) = framed
+            && let Some(c) = f.border
+            && f.border_width > 0.0
+        {
+            let _ = writeln!(
+                s,
+                r#"<rect x="{}" y="{}" width="{}" height="{}" fill="none"{}/>"#,
+                num(fx),
+                num(fy),
+                num(fw),
+                num(fh),
+                stroke(c, f.border_width)
+            );
         }
         s.push_str("</g>\n");
     }
@@ -381,6 +410,49 @@ mod tests {
     }
 
     #[test]
+    fn frame_styles_are_rects_around_every_kind_of_element() {
+        use rustgis_map::layout::FrameStyle;
+        let (mut layout, mut maps, _) = page();
+        let frame = FrameStyle {
+            border: Some(rustgis_map::Rgba::rgb(255, 0, 0)),
+            border_width: PT_PER_MM * 2.0,
+            background: Some(rustgis_map::Rgba::new(0, 0, 255, 128)),
+            gap: 3.0,
+        };
+        let text = layout.add("Words", (10.0, 10.0, 40.0, 20.0), ElementKind::text("hi", 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false));
+        let picture = layout.add("Pic", (10.0, 40.0, 20.0, 20.0), ElementKind::Picture { image: String::new() });
+        for id in [text, picture] {
+            if let Some(e) = layout.element_mut(id) {
+                e.frame_style = Some(frame.clone());
+            }
+        }
+        let svg = layout_svg(&layout, &mut maps, 72.0, &PageInfo::default()).unwrap();
+        let group = |id: u32| svg.split(&format!("<g id=\"element-{id}\"")).nth(1).unwrap().split("</g>").next().unwrap().to_string();
+        let back = r##"<rect x="7" y="7" width="46" height="26" fill="#0000ff" fill-opacity="0.502" stroke="none"/>"##;
+        let edge = r##"<rect x="7" y="7" width="46" height="26" fill="none" stroke="#ff0000" stroke-width="2"/>"##;
+        let g = group(text);
+        let (b, t, e) = (g.find(back), g.find("<text"), g.find(edge));
+        assert!(b.is_some() && t.is_some() && e.is_some(), "{g}");
+        assert!(b < t && t < e, "background, the text, then the border: {g}");
+        // A picture is framed the same, and its image stays the box's own size.
+        let g = group(picture);
+        let back = back.replace(r#"x="7" y="7" width="46" height="26""#, r#"x="7" y="37" width="26" height="26""#);
+        let edge = edge.replace(r#"x="7" y="7" width="46" height="26""#, r#"x="7" y="37" width="26" height="26""#);
+        let (b, i, e) = (g.find(&back), g.find("<image"), g.find(&edge));
+        assert!(b.is_some() && i.is_some() && e.is_some(), "{g}");
+        assert!(b < i && i < e, "{g}");
+        let image_x: f64 = g.split(r#"<image x=""#).nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+        assert!((image_x - 10.0).abs() < 0.5, "the picture is the box's, not the frame's: {g}");
+        // A border of no width, or none, leaves a rect out.
+        if let Some(e) = layout.element_mut(text) {
+            e.frame_style = Some(FrameStyle { border_width: 0.0, ..frame });
+        }
+        let svg = layout_svg(&layout, &mut maps, 72.0, &PageInfo::default()).unwrap();
+        let g = svg.split(&format!("<g id=\"element-{text}\"")).nth(1).unwrap().split("</g>").next().unwrap().to_string();
+        assert_eq!(g.matches("<rect").count(), 1, "{g}");
+    }
+
+    #[test]
     fn embedded_surrounds_preserve_transparency_and_page_context() {
         let (mut layout, mut maps, frame) = page();
         let legend = layout.add(
@@ -399,7 +471,7 @@ mod tests {
         let (mut base, mut maps, _) = page();
         let mut expected = crate::layout::render(&base, &mut maps, 72.0, &info).unwrap();
         assert!(pm.width() < expected.width() / 2 && pm.height() < expected.height() / 2, "only the surround's bounds are allocated");
-        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info).unwrap().unwrap();
+        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info, false).unwrap().unwrap();
         let k = PT_PER_MM * 72.0 / 96.0;
         expected.draw_pixmap(
             (x * k).round() as i32,
@@ -421,7 +493,7 @@ mod tests {
         let (mut layout, mut maps, _) = page();
         let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new() });
         let info = PageInfo::default();
-        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info).unwrap().unwrap();
+        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info, false).unwrap().unwrap();
         let [x, y, w, h] = bounds;
         let k = PT_PER_MM * 36.0 / 96.0;
         assert_eq!(x, 0.0);
@@ -431,7 +503,7 @@ mod tests {
         let svg = layout_svg(&layout, &mut maps, 36.0, &info).unwrap();
         assert!(svg.contains(&format!(r#"<image x="{}" y="{}" width="{}" height="{}""#, num(x), num(y), num(w), num(h))));
         layout.element_mut(id).unwrap().x = 110.0;
-        assert!(render_element(&layout, id, &mut maps, 36.0, &info).unwrap().is_none());
+        assert!(render_element(&layout, id, &mut maps, 36.0, &info, false).unwrap().is_none());
         assert!(layout_svg(&layout, &mut maps, 36.0, &info).is_some(), "an off-page image is harmless");
     }
 

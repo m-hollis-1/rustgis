@@ -2006,6 +2006,9 @@ fn hostile_params_never_panic() {
         // A publication sheet's style, accent and orientation, and a shape's rounded corners.
         // (The profile left out or valid, so the style and accent are reached.)
         json!({"style": 7, "accent": "#XYZ", "kind": "ellipse", "element": 1, "radius": "x"}),
+        // A frame style's border, background, width and gap: of the wrong type, out of range.
+        json!({"kind": "text", "element": 1, "border": 7, "background": [], "borderWidth": "x", "gap": 1e308}),
+        json!({"kind": "rectangle", "element": 1, "border": "#12", "background": {}, "borderWidth": -1e308, "gap": f64::MAX}),
         json!({"style": "", "accent": [], "kind": "rectangle", "element": 1, "radius": -1e308}),
         json!({"profile": "a3", "style": "poster", "accent": "#ZZZZZZ", "kind": "rectangle", "radius": 1e308}),
         // A STAC trend's source: a valid band and period so the junk after them is reached, and an
@@ -3939,6 +3942,87 @@ fn a_frames_grid_can_be_a_measured_grid() {
     s.run("layout.export", &json!({"path": path, "dpi": 72})).unwrap();
     assert!(std::fs::metadata(&path).is_ok_and(|m| m.len() > 1000));
     let _ = std::fs::remove_file(&path);
+}
+
+/// `layout.addElement` and `layout.update` set a border and background on any element: absent
+/// keeps, `null` clears, a bad value changes nothing, and a locked element takes none.
+#[test]
+fn layout_update_sets_and_clears_border_and_background() {
+    use rustgis_map::Rgba;
+    use rustgis_map::layout::FrameStyle;
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let frame_style = |s: &Session, id: u64| s.project.layouts[0].element(id as u32).unwrap().frame_style.clone();
+    let red = Rgba::rgb(255, 0, 0);
+    // Added with a frame style, on a kind with no outline of its own.
+    let add = |s: &mut Session, extra: serde_json::Value| {
+        let mut p = json!({"kind": "text", "text": "Hello", "x": 5, "y": 5, "w": 30, "h": 10});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        s.run("layout.addElement", &p).unwrap()["element"].as_u64().unwrap()
+    };
+    let bare = add(&mut s, json!({}));
+    assert_eq!(frame_style(&s, bare), None, "none unless asked for");
+    let id = add(&mut s, json!({"border": "#FF0000", "borderWidth": 2.5, "background": "#FFFFFF80", "gap": 3}));
+    assert_eq!(
+        frame_style(&s, id),
+        Some(FrameStyle { border: Some(red), border_width: 2.5, background: Some(Rgba::new(255, 255, 255, 128)), gap: 3.0 })
+    );
+    // Updated: what isn't given stays; any of the four on a bare element starts one with defaults.
+    s.run("layout.update", &json!({"element": bare, "gap": 4})).unwrap();
+    assert_eq!(frame_style(&s, bare), Some(FrameStyle { gap: 4.0, ..FrameStyle::default() }));
+    s.run("layout.update", &json!({"element": id, "borderWidth": 1})).unwrap();
+    let fs = frame_style(&s, id).unwrap();
+    assert_eq!((fs.border, fs.border_width, fs.gap), (Some(red), 1.0, 3.0));
+    s.run("layout.update", &json!({"element": id, "border": "#0000FF"})).unwrap();
+    assert_eq!(frame_style(&s, id).unwrap().border, Some(Rgba::rgb(0, 0, 255)));
+    assert_eq!(frame_style(&s, id).unwrap().background, Some(Rgba::new(255, 255, 255, 128)));
+    // null clears one and keeps the other; with neither left and the rest at their defaults the
+    // element has no frame style at all.
+    s.run("layout.update", &json!({"element": id, "border": null})).unwrap();
+    let fs = frame_style(&s, id).unwrap();
+    assert_eq!((fs.border, fs.background.is_some(), fs.gap), (None, true, 3.0));
+    s.run("layout.update", &json!({"element": id, "background": null})).unwrap();
+    assert_eq!(frame_style(&s, id), Some(FrameStyle { gap: 3.0, ..FrameStyle::default() }), "the gap is still set");
+    s.run("layout.update", &json!({"element": id, "gap": 0})).unwrap();
+    assert_eq!(frame_style(&s, id), None);
+    // Limits: 0 to 50 points and millimetres.
+    s.run("layout.update", &json!({"element": id, "border": "#00FF00", "borderWidth": 500, "gap": -2})).unwrap();
+    let fs = frame_style(&s, id).unwrap();
+    assert_eq!((fs.border_width, fs.gap), (50.0, 0.0));
+    s.run("layout.update", &json!({"element": id, "gap": 1e300})).unwrap();
+    assert_eq!(frame_style(&s, id).unwrap().gap, 50.0);
+    // A bad value is refused and changes nothing, in the same call too.
+    let before = s.project.layouts[0].clone();
+    for bad in [
+        json!({"border": "red"}),
+        json!({"border": 5}),
+        json!({"background": "#12"}),
+        json!({"borderWidth": "wide"}),
+        json!({"gap": [1]}),
+        json!({"x": 99, "border": "nope"}),
+    ] {
+        let mut p = bad.clone();
+        p["element"] = json!(id);
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+        assert_eq!(s.project.layouts[0], before, "{bad}");
+    }
+    let mut p = json!({"kind": "rectangle", "border": "red"});
+    assert!(s.run("layout.addElement", &p).is_err());
+    p = json!({"kind": "grid", "border": "#FF0000"});
+    assert!(s.run("layout.addElement", &p).is_err(), "a grid is not an element");
+    // The same on a kind that draws its own outline, and a locked element takes none, not even a clear.
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20, "border": "#FF0000"})).unwrap()["element"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(frame_style(&s, rect).unwrap().border, Some(red));
+    s.run("layout.update", &json!({"element": rect, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": rect, "border": null})).is_err());
+    assert!(s.run("layout.update", &json!({"element": rect, "background": "#000000"})).is_err());
+    assert_eq!(frame_style(&s, rect).unwrap().border, Some(red));
+    s.run("layout.update", &json!({"element": rect, "locked": false, "border": null})).unwrap();
+    assert_eq!(frame_style(&s, rect), None);
 }
 
 /// A layout's text is bound to a map frame, wrapped, aligned down its box, spaced and cased by

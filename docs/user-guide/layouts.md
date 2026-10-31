@@ -227,6 +227,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.addElement` and `layout.update`. **Picture** places a PNG or JPEG.
 - **Map Series**: one page per feature of an index layer, with the frame zoomed to each feature;
   step through pages, refresh, and export every page into one PDF.
+- Any element can have a border and a background. The Format pane's **Frame** section sets each as a colour
+  or None, the border's **Width** (0 to 50 pt) and the **Gap** (0 to 50 mm) between the element and
+  them; the background is drawn behind the element and the border over it, in the PNG, PDF and SVG
+  exports. Scripts give `border` and `background` (`"#RRGGBB"`, `"#RRGGBBAA"` or `null` for none),
+  `borderWidth` (points) and `gap` (millimetres) to `layout.addElement` and `layout.update`; one not
+  given keeps what the element has.
 - Click an element to select it, drag to move, drag its handles to resize, and edit it in the
   **Format** pane, which opens as a tab beside the other right-hand panes. Closing the pane keeps
   the element selected; selecting an element, or clicking the selected one, opens it again. The

@@ -5125,6 +5125,29 @@ mod tests {
         assert_eq!((text::line_count(&p.text), p.angle), (1, Some(0.5)));
     }
 
+    /// A layout text is filled the way Pro fills it: whole lines, then a tail; a label is balanced.
+    #[test]
+    fn layout_text_fills_lines_where_labels_are_balanced() {
+        let face = text::Face::default();
+        let width = |s: &str| text::measure(s, 10.0, false);
+        let four = width("a b c d") + 0.01;
+        assert_eq!(text::fill_wrap("a b c d e", 10.0, face, 0.0, four), ["a b c d", "e"]);
+        // The balanced wrap splits the same words into two near-equal lines.
+        let balanced = text::wrap("a b c d e", 10.0, face, 0.0, four);
+        assert_eq!(balanced.len(), 2);
+        assert_ne!(balanced, ["a b c d", "e"], "{balanced:?}");
+        // Dashes break; a piece wider than the box stays whole; what fits is left alone; junk is safe.
+        assert_eq!(text::fill_wrap("one-two three", 10.0, face, 0.0, width("one-two") + 0.01), ["one-two", "three"]);
+        assert_eq!(text::fill_wrap("Unbreakable", 10.0, face, 0.0, 1.0), ["Unbreakable"]);
+        assert_eq!(text::fill_wrap("Short words", 10.0, face, 0.0, 1000.0), ["Short words"]);
+        assert!(!text::fill_wrap("a b c", f32::NAN, face, f32::INFINITY, -1.0).is_empty());
+        // A layout text's 5,000 characters are all broken; none are lost.
+        let long = "word ".repeat(1000);
+        let lines = text::fill_wrap(long.trim_end(), 10.0, face, 0.0, width("word word word word"));
+        assert_eq!(lines.join(" "), long.trim_end());
+        assert!(lines.len() > 200 && lines.iter().all(|l| width(l) <= width("word word word word")));
+    }
+
     #[test]
     fn wraps_balanced_at_spaces_and_dashes() {
         let width = |s: &str| text::measure(s, 9.0, false);

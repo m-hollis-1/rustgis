@@ -1731,7 +1731,7 @@ pub(crate) fn text_lines(s: &str, size: f32, face: text::Face, spacing: f32, wra
     let lines = s.lines().take(TEXT_LINES);
     match wrap_w {
         None => lines.map(str::to_string).collect(),
-        Some(w) => lines.flat_map(|l| text::wrap(l, size, face, spacing, w)).take(WRAPPED_LINES).collect(),
+        Some(w) => lines.flat_map(|l| text::fill_wrap(l, size, face, spacing, w)).take(WRAPPED_LINES).collect(),
     }
 }
 

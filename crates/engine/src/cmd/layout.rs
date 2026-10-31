@@ -7,9 +7,9 @@ use rustgis_geom::{Coord, Extent};
 use rustgis_map::Rgba;
 use rustgis_map::layout::{
     Arrange, ArrowStyle, CoordFormat, ElementKind, FontFamily, FrameLink, FrameShape, FrameStyle, Grid, GridEdges, GridKind, GridStyle,
-    Guides, Layout, LineDir, LineHead, LinkMode, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES, MAX_LINK_STEPS, MAX_SCALE_DIVISIONS,
-    MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TextCase, TickSide, VAlign,
-    fit_scale, line_angle, line_at_angle, line_length,
+    Guides, Layout, LineDir, LineHead, LinkMode, MAX_COLORBAR_TICKS, MAX_ELEMENTS, MAX_GRID_WIDTH, MAX_GROUP_DEPTH, MAX_GUIDES,
+    MAX_LINK_STEPS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign,
+    TextCase, TickSide, VAlign, fit_scale, line_angle, line_at_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -89,16 +89,22 @@ pub fn commands() -> Vec<C> {
             r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame; for text and dynamicText, the map frame whose map its tokens ({scale}, {map}, {extent}…) read, default none: the first frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "wrap"?: bool (text, dynamicText: break each line at the element's width; a word wider than it stays whole), "valign"?: "top"|"middle"|"bottom" (text, dynamicText: where the block of lines sits down the element, default top), "lineSpacing"?: 0.5 to 3 (text, dynamicText: the distance between lines as a multiple of the usual, default 1), "case"?: "none"|"upper"|"lower" (text, dynamicText: applied once the tokens have expanded; wrap, valign, lineSpacing and case are refused for other kinds), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "x"?, "y"?, "w"?, "h"?: mm; "border"?: "#RRGGBB"|"#RRGGBBAA" (a line round the element, whatever it is; not for a grid or extentIndicator), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA" (a fill behind it), "gap"?: mm, 0 to 50 (between the element and its border and background)}"##,
         ),
         C::new("layout.update", "Element Properties", "Publish › Element", update).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"?, "frame"?: map frame id | null (text: the frame its tokens read; null: the first frame), "wrap"?: bool, "valign"?: "top"|"middle"|"bottom", "lineSpacing"?: 0.5 to 3, "case"?: "none"|"upper"|"lower" (text only: refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?, "border"?: "#RRGGBB"|"#RRGGBBAA"|null (a line round the element, whatever it is; null for none), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA"|null (a fill behind it; null for none), "gap"?: mm, 0 to 50 (between the element and its border and background; the frame style the four make is kept for any element kind, and not given keeps what it has), "link"?: {"frame": map frame id, "mode"?: "center"|"extent"|"scale", "rotation"?: bool} | null (map frame: follow another frame, taking its centre (the default; the frame keeps its scale), the scale that fits what it shows, or its scale (the frame keeps its centre), and with rotation its bearing too; a frame's own view returns when it's unlinked; null unlinks; a loop, the frame itself or an element that isn't a map frame is refused; so is the frame of a map series). center, scale and bearing on a frame that follows another change the view it keeps, shown again when it is unlinked}"##,
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"?, "frame"?: map frame id | null (text: the frame its tokens read; null: the first frame), "wrap"?: bool, "valign"?: "top"|"middle"|"bottom", "lineSpacing"?: 0.5 to 3, "case"?: "none"|"upper"|"lower" (text only: refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?, "border"?: "#RRGGBB"|"#RRGGBBAA"|null (a line round the element, whatever it is; null for none), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA"|null (a fill behind it; null for none), "gap"?: mm, 0 to 50 (between the element and its border and background; the frame style the four make is kept for any element kind, and not given keeps what it has), "link"?: {"frame": map frame id, "mode"?: "center"|"extent"|"scale", "rotation"?: bool} | null (map frame: follow another frame, taking its centre (the default; the frame keeps its scale), the scale that fits what it shows, or its scale (the frame keeps its centre), and with rotation its bearing too; a frame's own view returns when it's unlinked; null unlinks; a loop, the frame itself or an element that isn't a map frame is refused; so is the frame of a map series). center, scale and bearing on a frame that follows another change the view it keeps, shown again when it is unlinked. A group takes x and y (where its box goes: everything in it moves as far), name, visible and locked (given to everything in it too) and the frame style, drawn round its box; w, h and any other property are refused}"##,
         ),
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
         ),
         C::new("layout.duplicateElement", "Duplicate Element", "Publish › Element", duplicate_element).params(
-            r#"{"layout"?, "element": id, "dx"?, "dy"?: mm (offset of the copy, default 5)}"#,
+            r#"{"layout"?, "element": id, "dx"?, "dy"?: mm (offset of the copy, default 5; a group is copied with everything in it, the copies in a new group)}"#,
         ),
         C::new("layout.arrange", "Arrange Element", "Publish › Element", arrange).params(
-            r#"{"layout"?, "element": id, "to": "front"|"forward"|"backward"|"back" (later elements are drawn over earlier ones: front puts it over every other, forward over the one above it, backward under the one below, back under every other)}"#,
+            r#"{"layout"?, "element": id, "to": "front"|"forward"|"backward"|"back" (later elements are drawn over earlier ones: front puts it over every other, forward over the one above it, backward under the one below, back under every other; a group's elements move together, keeping their order)}"#,
+        ),
+        C::new("layout.group", "Group", "Publish › Element", group).params(
+            r#"{"layout"?, "elements": [element ids] (two or more; each in no group, or all in the same one, which the new group then joins), "name"?: string (default "Group")} → {"element": the new group's id}: grouped elements move, copy, reorder and delete together, and a click on one picks it alone; groups nest up to 8 deep"#,
+        ),
+        C::new("layout.ungroup", "Ungroup", "Publish › Element", ungroup).params(
+            r#"{"layout"?, "element": group id} → {"elements": [what it held]}: the group goes and its elements stay where they are, in the group it was in, if any"#,
         ),
         C::new("layout.removeElement", "Delete Element", "Publish › Element", |s, p| {
             let id = element_id(p)?;
@@ -109,7 +115,7 @@ pub fn commands() -> Vec<C> {
             }
             if l.remove(id) { Ok(Value::Null) } else { Err(format!("no element {id}")) }
         })
-        .params(r#"{"layout"?, "element": id}"#),
+        .params(r#"{"layout"?, "element": id (a map frame goes with its surrounds, a group with everything in it)}"#),
         C::new("layout.frameZoom", "Zoom Frame", "Publish › Map Frame", frame_zoom).params(
             r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?; refused for a frame that follows another: unlink it first with layout.update}"#,
         ),
@@ -200,12 +206,16 @@ fn arrange(s: &mut Session, p: &Value) -> CmdResult {
     if l.element(id).is_none() {
         return Err(format!("no element {id}"));
     }
-    unlocked(l, id)?;
-    let before = l.draw_order(id).map(|(i, _)| i);
+    // A group's elements move with it.
+    for e in std::iter::once(id).chain(l.descendants(id)) {
+        unlocked(l, e)?;
+    }
+    let order = |l: &Layout| l.elements.iter().map(|e| e.id).collect::<Vec<u32>>();
+    let before = order(l);
     let index = l.arrange(id, to).ok_or_else(|| format!("no element {id}"))?;
     let of = l.elements.len();
     // A move that changes nothing (front for the element already on top) is no step to undo.
-    if before == Some(index) {
+    if before == order(l) {
         s.request_only = true;
     }
     Ok(json!({"element": id, "index": index, "of": of}))
@@ -1905,12 +1915,197 @@ fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
     }
     let l = active(s, p)?;
     let e = l.element(id).cloned().ok_or_else(|| format!("no element {id}"))?;
+    if e.is_group() {
+        let n = 1 + l.descendants(id).len();
+        if l.elements.len() + n > MAX_ELEMENTS {
+            return Err(format!("a layout holds at most {MAX_ELEMENTS} elements"));
+        }
+        let mut budget = n;
+        let copy = copy_tree(l, id, (dx, dy), 0, &mut budget).ok_or_else(|| format!("no element {id}"))?;
+        let name = l.element(copy).map(|c| c.name.clone()).unwrap_or_default();
+        return Ok(json!({"element": copy, "name": name}));
+    }
     let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
     let copy = l.add(name.clone(), (e.x + dx, e.y + dy, e.w, e.h), e.kind);
     if let Some(c) = l.element_mut(copy) {
         c.visible = e.visible;
     }
     Ok(json!({"element": copy, "name": name}))
+}
+
+/// Copies element `id` offset by `(dx, dy)`, a group with copies of everything in it (each a
+/// new element, on top), at most `budget` elements in all. The copy's id.
+fn copy_tree(l: &mut Layout, id: u32, (dx, dy): (f64, f64), steps: usize, budget: &mut usize) -> Option<u32> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    let e = l.element(id)?.clone();
+    let kind = match &e.kind {
+        ElementKind::Group { children } => {
+            let kids = if steps < MAX_GROUP_DEPTH { children.clone() } else { Vec::new() };
+            ElementKind::Group { children: kids.into_iter().filter_map(|c| copy_tree(l, c, (dx, dy), steps + 1, budget)).collect() }
+        }
+        k => k.clone(),
+    };
+    let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
+    let copy = l.add(name, (e.x + dx, e.y + dy, e.w, e.h), kind);
+    if let Some(c) = l.element_mut(copy) {
+        c.visible = e.visible;
+    }
+    Some(copy)
+}
+
+/// The ids in "elements", each once, in the order given.
+fn element_ids(p: &Value) -> Result<Vec<u32>, String> {
+    let list = p.get("elements").and_then(Value::as_array).ok_or("elements is a list of element ids")?;
+    if list.len() > MAX_ELEMENTS {
+        return Err(format!("a layout holds at most {MAX_ELEMENTS} elements"));
+    }
+    let mut out: Vec<u32> = Vec::new();
+    for v in list {
+        let id = v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("elements is a list of element ids")?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Groups elements: a new group, on top, holding them. They must be in no group, or all in the
+/// same one, which the new group joins in their place.
+fn group(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = element_ids(p)?;
+    let name = match p.get("name") {
+        None | Some(Value::Null) => "Group".to_string(),
+        Some(Value::String(n)) if n.trim().is_empty() => "Group".to_string(),
+        Some(Value::String(n)) => n.trim().chars().take(200).collect(),
+        Some(_) => return Err("name is text".into()),
+    };
+    let l = active(s, p)?;
+    if ids.len() < 2 {
+        return Err("group two elements or more".into());
+    }
+    for id in &ids {
+        if l.element(*id).is_none() {
+            return Err(format!("no element {id}"));
+        }
+        unlocked(l, *id)?;
+    }
+    let parent = ids.first().and_then(|id| l.group_of(*id));
+    if ids.iter().any(|id| l.group_of(*id) != parent) {
+        return Err("the elements are in different groups: group ungrouped elements, or elements of one group".into());
+    }
+    if let Some(g) = parent {
+        unlocked(l, g)?;
+    }
+    let below = ids.iter().map(|id| l.group_depth(*id)).max().unwrap_or(0);
+    let above = parent.map_or(0, |g| 1 + l.groups_of(g).len());
+    if above + below + 1 > MAX_GROUP_DEPTH {
+        return Err(format!("groups nest at most {MAX_GROUP_DEPTH} deep"));
+    }
+    if l.elements.len() >= MAX_ELEMENTS {
+        return Err(format!("a layout holds at most {MAX_ELEMENTS} elements"));
+    }
+    // Listed in drawing order.
+    let children: Vec<u32> = l.elements.iter().map(|e| e.id).filter(|id| ids.contains(id)).collect();
+    let id = l.add(name, (0.0, 0.0, 1.0, 1.0), ElementKind::Group { children });
+    // Its own box means nothing; it's kept where its elements are, for whoever reads the file.
+    if let Some((x, y, w, h)) = l.group_box(id)
+        && let Some(e) = l.element_mut(id)
+    {
+        (e.x, e.y, e.w, e.h) = (x, y, w.max(MIN_ELEMENT_MM), h.max(MIN_ELEMENT_MM));
+    }
+    if let Some(ElementKind::Group { children }) = parent.and_then(|g| l.element_mut(g)).map(|e| &mut e.kind) {
+        children.retain(|c| !ids.contains(c));
+        children.push(id);
+    }
+    Ok(json!({"element": id}))
+}
+
+/// Ungroups a group: it goes, and what it held stays where it is, in the group it was in.
+fn ungroup(s: &mut Session, p: &Value) -> CmdResult {
+    let id = element_id(p)?;
+    let l = active(s, p)?;
+    let e = l.element(id).ok_or_else(|| format!("no element {id}"))?;
+    if !e.is_group() {
+        return Err("not a group".into());
+    }
+    let children = e.children().to_vec();
+    unlocked(l, id)?;
+    let parent = l.group_of(id);
+    if let Some(g) = parent {
+        unlocked(l, g)?;
+    }
+    l.elements.retain(|e| e.id != id);
+    if let Some(ElementKind::Group { children: up }) = parent.and_then(|g| l.element_mut(g)).map(|e| &mut e.kind)
+        && let Some(i) = up.iter().position(|c| *c == id)
+    {
+        up.splice(i..=i, children.iter().copied());
+    }
+    Ok(json!({"elements": children}))
+}
+
+/// What `layout.update` changes on a group: where it is (everything in it moves as far), its
+/// name, visibility and lock (given to everything in it), and its frame style.
+fn update_group(s: &mut Session, li: usize, id: u32, p: &Value, frame_style: FrameParams) -> CmdResult {
+    const TAKES: [&str; 11] = ["layout", "element", "x", "y", "name", "visible", "locked", "border", "borderWidth", "background", "gap"];
+    if ["w", "h"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        return Err("a group has no size of its own".into());
+    }
+    if let Some((k, _)) = p.as_object().and_then(|o| o.iter().find(|(k, v)| !v.is_null() && !TAKES.contains(&k.as_str()))) {
+        return Err(format!("a group has no {k}: change the elements in it"));
+    }
+    let (x, y) = (given_num(p, "x", "a number of mm")?, given_num(p, "y", "a number of mm")?);
+    for k in ["visible", "locked"] {
+        if p.get(k).is_some_and(|v| !v.is_null() && !v.is_boolean()) {
+            return Err(format!("{k} is true or false"));
+        }
+    }
+    let name = match p.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) => Some(n.trim().chars().take(200).collect::<String>()).filter(|n| !n.is_empty()),
+        Some(_) => return Err("name is text".into()),
+    };
+    let l = s.project.layouts.get_mut(li).ok_or("no layout")?;
+    let all: Vec<u32> = std::iter::once(id).chain(l.descendants(id)).collect();
+    // Locked, it (and whatever in it is locked) takes no change but being unlocked.
+    let changes = p.as_object().is_some_and(|o| {
+        o.iter().any(|(k, v)| {
+            (!v.is_null() || matches!(k.as_str(), "border" | "background")) && !matches!(k.as_str(), "layout" | "element" | "locked")
+        })
+    });
+    if changes && b(p, "locked") != Some(false) {
+        for e in &all {
+            unlocked(l, *e)?;
+        }
+    }
+    let shift = match (x, y) {
+        (None, None) => None,
+        _ => {
+            let (gx, gy, _, _) = l.group_box(id).ok_or("the group is empty: there is nothing to move")?;
+            Some((x.map_or(0.0, |x| x.clamp(-5000.0, 5000.0) - gx), y.map_or(0.0, |y| y.clamp(-5000.0, 5000.0) - gy)))
+        }
+    };
+    for e in l.elements.iter_mut().filter(|e| all.contains(&e.id)) {
+        if let Some((dx, dy)) = shift.filter(|_| !e.is_group()) {
+            e.x = (e.x + dx).clamp(-5000.0, 5000.0);
+            e.y = (e.y + dy).clamp(-5000.0, 5000.0);
+        }
+        if let Some(v) = b(p, "visible") {
+            e.visible = v;
+        }
+        if let Some(v) = b(p, "locked") {
+            e.locked = v;
+        }
+        if e.id == id {
+            if let Some(n) = &name {
+                e.name = n.clone();
+            }
+            e.frame_style = frame_style.apply(e.frame_style.as_ref());
+        }
+    }
+    Ok(Value::Null)
 }
 
 /// A shape's "width" in points: `default` when it's not given (or null), an error when it's not a
@@ -2851,6 +3046,9 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     }
     let frame_style = FrameParams::read(p)?;
     let li = index(s, p)?;
+    if s.project.layouts.get(li).and_then(|l| l.element(id)).is_some_and(|e| e.is_group()) {
+        return update_group(s, li, id, p, frame_style);
+    }
     // Locked, it takes no change but being unlocked, which may come with other changes.
     // Unbinding a text from its frame (`"frame": null`) is one.
     let unbinds = p.get("frame").is_some_and(Value::is_null)

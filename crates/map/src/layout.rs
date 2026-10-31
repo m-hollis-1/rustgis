@@ -1175,7 +1175,22 @@ pub enum ElementKind {
         #[serde(default)]
         head: LineHead,
     },
+    /// Elements that move, delete and copy together, by id. A group draws nothing of its own
+    /// (its frame style goes round [`Layout::group_box`]), its own box means nothing, and a click
+    /// picks the child under it. An element is in one group at most; groups nest
+    /// [`MAX_GROUP_DEPTH`] deep.
+    Group {
+        #[serde(default)]
+        children: Vec<u32>,
+    },
 }
+
+/// How deep groups nest: a group of groups is 2 deep.
+pub const MAX_GROUP_DEPTH: usize = 8;
+/// Most elements one group holds (a layout holds at most [`MAX_ELEMENTS`]).
+pub const MAX_GROUP_CHILDREN: usize = 500;
+/// Most elements a layout holds.
+pub const MAX_ELEMENTS: usize = 500;
 
 fn rows() -> usize {
     12
@@ -1226,6 +1241,7 @@ impl ElementKind {
             ElementKind::Rectangle { .. } => "rectangle",
             ElementKind::Ellipse { .. } => "ellipse",
             ElementKind::Line { .. } => "line",
+            ElementKind::Group { .. } => "group",
         }
     }
     pub fn label(&self) -> &'static str {
@@ -1242,6 +1258,7 @@ impl ElementKind {
             ElementKind::Rectangle { .. } => "Rectangle",
             ElementKind::Ellipse { .. } => "Ellipse",
             ElementKind::Line { .. } => "Line",
+            ElementKind::Group { .. } => "Group",
         }
     }
     /// The map frame this element belongs to.
@@ -1333,6 +1350,18 @@ impl FrameStyle {
 impl Element {
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+
+    pub fn is_group(&self) -> bool {
+        matches!(self.kind, ElementKind::Group { .. })
+    }
+
+    /// A group's children (none for any other element).
+    pub fn children(&self) -> &[u32] {
+        match &self.kind {
+            ElementKind::Group { children } => children,
+            _ => &[],
+        }
     }
 }
 
@@ -1435,7 +1464,7 @@ impl Layout {
 
     /// The topmost element at a page point (mm).
     pub fn hit(&self, x: f64, y: f64) -> Option<u32> {
-        self.elements.iter().rev().find(|e| e.visible && e.contains(x, y)).map(|e| e.id)
+        self.elements.iter().rev().find(|e| e.visible && !e.is_group() && e.contains(x, y)).map(|e| e.id)
     }
 
     /// Where element `id` is drawn among the others, and how many there are: 0 is drawn first,
@@ -1448,6 +1477,9 @@ impl Layout {
     /// under every other. Its new place, or None when there's no such element.
     pub fn arrange(&mut self, id: u32, to: Arrange) -> Option<usize> {
         let (i, n) = self.draw_order(id)?;
+        if self.element(id).is_some_and(Element::is_group) {
+            return self.arrange_group(id, to);
+        }
         let last = n - 1;
         let j = match to {
             Arrange::Front => last,
@@ -1460,34 +1492,200 @@ impl Layout {
         Some(j)
     }
 
+    /// Moves group `id` in the drawing order with everything in it, as one block in the order
+    /// they were: over every other element, over the one above its top, under the one below its
+    /// bottom, or under every other. The group's new place.
+    fn arrange_group(&mut self, id: u32, to: Arrange) -> Option<usize> {
+        let members: std::collections::HashSet<u32> = std::iter::once(id).chain(self.descendants(id)).collect();
+        let places: Vec<usize> = self.elements.iter().enumerate().filter(|(_, e)| members.contains(&e.id)).map(|(i, _)| i).collect();
+        let (first, last) = (*places.first()?, *places.last()?);
+        let others_below = |at: usize| self.elements.iter().take(at).filter(|e| !members.contains(&e.id)).count();
+        let (below_first, below_last) = (others_below(first), others_below(last));
+        let (block, others): (Vec<Element>, Vec<Element>) =
+            std::mem::take(&mut self.elements).into_iter().partition(|e| members.contains(&e.id));
+        let at = match to {
+            Arrange::Front => others.len(),
+            Arrange::Forward => (below_last + 1).min(others.len()),
+            Arrange::Backward => below_first.saturating_sub(1),
+            Arrange::Back => 0,
+        };
+        let mut others = others;
+        let above = others.split_off(at.min(others.len()));
+        self.elements = others.into_iter().chain(block).chain(above).collect();
+        self.elements.iter().position(|e| e.id == id)
+    }
+
     /// The locked element that removing `id` would take with it: the element itself, or one of
     /// the surrounds that belong to it.
     pub fn locked_in_removal(&self, id: u32) -> Option<&Element> {
-        self.elements.iter().find(|e| e.locked && (e.id == id || e.kind.frame() == Some(id)))
+        let gone = self.removal(id);
+        self.elements.iter().find(|e| e.locked && gone.contains(&e.id))
     }
 
-    /// Removes an element and the surrounds that belong to it.
+    /// What removing `id` removes: the element, everything in it when it's a group, and the
+    /// surrounds of the map frames among them.
+    fn removal(&self, id: u32) -> std::collections::HashSet<u32> {
+        let mut gone: std::collections::HashSet<u32> = std::iter::once(id).chain(self.descendants(id)).collect();
+        let surrounds: Vec<u32> =
+            self.elements.iter().filter(|e| e.kind.frame().is_some_and(|f| gone.contains(&f))).map(|e| e.id).collect();
+        gone.extend(surrounds);
+        gone
+    }
+
+    /// Removes an element, the surrounds that belong to it, and, for a group, everything in it.
+    /// An element removed leaves its group; a group left with nothing in it goes too.
     pub fn remove(&mut self, id: u32) -> bool {
-        let before = self.elements.len();
-        self.elements.retain(|e| e.id != id && e.kind.frame() != Some(id));
+        if self.element(id).is_none() {
+            return false;
+        }
+        let mut gone = self.removal(id);
+        // Groups emptied by the removal, then the groups those empty, up to the top.
+        for _ in 0..=MAX_GROUP_DEPTH {
+            let emptied: Vec<u32> = self
+                .elements
+                .iter()
+                .filter(|e| !gone.contains(&e.id) && !e.children().is_empty() && e.children().iter().all(|c| gone.contains(c)))
+                .map(|e| e.id)
+                .collect();
+            if emptied.is_empty() {
+                break;
+            }
+            gone.extend(emptied);
+        }
+        self.elements.retain(|e| !gone.contains(&e.id));
         for e in &mut self.elements {
             match &mut e.kind {
                 ElementKind::MapFrame { extent_of, link, .. } => {
-                    if *extent_of == Some(id) {
+                    if extent_of.is_some_and(|o| gone.contains(&o)) {
                         *extent_of = None;
                     }
-                    if link.is_some_and(|l| l.frame == id) {
+                    if link.is_some_and(|l| gone.contains(&l.frame)) {
                         *link = None;
                     }
                 }
-                ElementKind::Text { frame, .. } if *frame == Some(id) => *frame = None,
+                ElementKind::Text { frame, .. } if frame.is_some_and(|f| gone.contains(&f)) => *frame = None,
+                ElementKind::Group { children } => children.retain(|c| !gone.contains(c)),
                 _ => {}
             }
         }
-        if self.series.as_ref().is_some_and(|s| s.frame == id) {
+        if self.series.as_ref().is_some_and(|s| gone.contains(&s.frame)) {
             self.series = None;
         }
-        self.elements.len() != before
+        true
+    }
+
+    /// The group element `id` is in.
+    pub fn group_of(&self, id: u32) -> Option<u32> {
+        self.elements.iter().find(|e| e.children().contains(&id)).map(|e| e.id)
+    }
+
+    /// The groups element `id` is in, the innermost first (none when it's in none). The walk is
+    /// bounded, so a loop in a hand-edited layout (which `clamp` cuts) can't hang it.
+    pub fn groups_of(&self, id: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut at = id;
+        while let Some(g) = self.group_of(at) {
+            if g == id || out.contains(&g) || out.len() > MAX_ELEMENTS {
+                break;
+            }
+            out.push(g);
+            at = g;
+        }
+        out
+    }
+
+    /// The outermost group element `id` is in, or itself when it's in none.
+    pub fn top_group(&self, id: u32) -> u32 {
+        self.groups_of(id).last().copied().unwrap_or(id)
+    }
+
+    /// Everything in group `id`, its own groups' contents too: the children first, in the order
+    /// the group lists them, then theirs (empty for any other element). Each comes once, and the
+    /// walk stops [`MAX_GROUP_DEPTH`] down.
+    pub fn descendants(&self, id: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        let mut level = vec![id];
+        for _ in 0..MAX_GROUP_DEPTH {
+            let mut next = Vec::new();
+            for g in &level {
+                for c in self.element(*g).map(Element::children).unwrap_or(&[]) {
+                    if *c != id && !out.contains(c) {
+                        out.push(*c);
+                        next.push(*c);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            level = next;
+        }
+        out
+    }
+
+    /// How deep group `id` goes: 1 for a group of plain elements, 2 for a group holding one, and
+    /// so on (0 for an element that isn't a group).
+    pub fn group_depth(&self, id: u32) -> usize {
+        self.depth_below(id, 0)
+    }
+
+    fn depth_below(&self, id: u32, steps: usize) -> usize {
+        match self.element(id) {
+            Some(e) if e.is_group() && steps < MAX_GROUP_DEPTH => {
+                1 + e.children().iter().map(|c| self.depth_below(*c, steps + 1)).max().unwrap_or(0)
+            }
+            Some(e) if e.is_group() => 1,
+            _ => 0,
+        }
+    }
+
+    /// Group `id`'s box: the union of its children's boxes, a group child's its own union
+    /// (x, y, width, height in mm). None for an empty group or an element that isn't a group.
+    pub fn group_box(&self, id: u32) -> Option<(f64, f64, f64, f64)> {
+        self.element(id).filter(|e| e.is_group())?;
+        self.union_box(id, 0)
+    }
+
+    fn union_box(&self, id: u32, steps: usize) -> Option<(f64, f64, f64, f64)> {
+        let e = self.element(id)?;
+        if !e.is_group() {
+            return Some((e.x, e.y, e.w, e.h));
+        }
+        if steps >= MAX_GROUP_DEPTH {
+            return None;
+        }
+        let boxes = e.children().iter().filter(|c| **c != id).filter_map(|c| self.union_box(*c, steps + 1));
+        boxes.fold(None, |acc: Option<(f64, f64, f64, f64)>, (x, y, w, h)| {
+            Some(match acc {
+                None => (x, y, w, h),
+                Some((ax, ay, aw, ah)) => {
+                    let (x0, y0) = (ax.min(x), ay.min(y));
+                    (x0, y0, (ax + aw).max(x + w) - x0, (ay + ah).max(y + h) - y0)
+                }
+            })
+        })
+    }
+
+    /// Where element `id` is on the page: its box, or a group's [`Layout::group_box`].
+    pub fn element_box(&self, id: u32) -> Option<(f64, f64, f64, f64)> {
+        let e = self.element(id)?;
+        if e.is_group() { self.group_box(id) } else { Some((e.x, e.y, e.w, e.h)) }
+    }
+
+    /// The visible groups with a frame style: where in the drawing order its background goes
+    /// (under the lowest of the group and the elements in it) and its border (over the highest),
+    /// and the box the frame goes round.
+    pub fn group_frames(&self) -> Vec<GroupFrame<'_>> {
+        self.elements
+            .iter()
+            .filter(|e| e.visible && e.is_group() && e.frame_style.is_some())
+            .filter_map(|g| {
+                let at = |id: u32| self.elements.iter().position(|e| e.id == id);
+                let places: Vec<usize> = std::iter::once(g.id).chain(self.descendants(g.id)).filter_map(at).collect();
+                let (first, last) = (places.iter().min().copied()?, places.iter().max().copied()?);
+                Some(GroupFrame { group: g, first, last, rect: self.group_box(g.id)? })
+            })
+            .collect()
     }
 
     /// Keeps the page and elements sane after loading or editing (layout files are untrusted):
@@ -1500,7 +1698,7 @@ impl Layout {
             list.retain(|v| v.is_finite() && v.abs() <= 5000.0);
             list.truncate(MAX_GUIDES);
         }
-        self.elements.truncate(500);
+        self.elements.truncate(MAX_ELEMENTS);
         let mut seen = std::collections::HashSet::new();
         let mut next = self.elements.iter().map(|e| e.id).filter(|id| *id <= MAX_ID).max().unwrap_or(0).saturating_add(1);
         for e in &mut self.elements {
@@ -1588,6 +1786,7 @@ impl Layout {
             }
         }
         self.clamp_links(&frames);
+        self.clamp_groups();
         if let Some(s) = &mut self.series {
             if !frames.contains(&s.frame) {
                 self.series = None;
@@ -1599,6 +1798,84 @@ impl Layout {
 }
 
 impl Layout {
+    /// Keeps groups sane: a group lists only elements that exist, never itself, each once, and
+    /// an element is in the first group (in element order) that lists it. A group that would hold
+    /// itself through others loses that child, and groups deeper than [`MAX_GROUP_DEPTH`] are
+    /// dissolved, what they held going to the deepest group kept above them.
+    fn clamp_groups(&mut self) {
+        use std::collections::{HashMap, HashSet};
+        let ids: HashSet<u32> = self.elements.iter().map(|e| e.id).collect();
+        let mut claimed: HashSet<u32> = HashSet::new();
+        for e in &mut self.elements {
+            let gid = e.id;
+            let ElementKind::Group { children } = &mut e.kind else { continue };
+            children.retain(|c| *c != gid && ids.contains(c) && claimed.insert(*c));
+            children.truncate(MAX_GROUP_CHILDREN);
+        }
+        // Rebuilt from what the groups kept (a child cut by `truncate` belongs to none).
+        let mut parent: HashMap<u32, u32> = self.elements.iter().flat_map(|e| e.children().iter().map(move |c| (*c, e.id))).collect();
+        // Loops: walking up from a group back to itself, it leaves its parent.
+        let groups: Vec<u32> = self.elements.iter().filter(|e| e.is_group()).map(|e| e.id).collect();
+        for g in &groups {
+            let mut at = *g;
+            for _ in 0..=self.elements.len() {
+                match parent.get(&at).copied() {
+                    Some(p) if p == *g => {
+                        if let Some(up) = parent.remove(g)
+                            && let Some(ElementKind::Group { children }) = self.element_mut(up).map(|e| &mut e.kind)
+                        {
+                            children.retain(|c| c != g);
+                        }
+                        break;
+                    }
+                    Some(p) => at = p,
+                    None => break,
+                }
+            }
+        }
+        // Each element's groups, the innermost first; the loops are gone, so this ends.
+        let limit = self.elements.len();
+        let chain = |id: u32| {
+            let mut out = Vec::new();
+            let mut at = id;
+            while let Some(&p) = parent.get(&at) {
+                if out.len() > limit {
+                    break;
+                }
+                out.push(p);
+                at = p;
+            }
+            out
+        };
+        // A group with MAX_GROUP_DEPTH groups round it is too deep, and dissolved.
+        let dissolved: HashSet<u32> = groups.iter().copied().filter(|g| chain(*g).len() >= MAX_GROUP_DEPTH).collect();
+        if dissolved.is_empty() {
+            return;
+        }
+        // What a dissolved group held, at whatever depth, goes to the deepest group kept.
+        let moved: Vec<(u32, u32)> = self
+            .elements
+            .iter()
+            .filter(|e| !dissolved.contains(&e.id))
+            .filter_map(|e| {
+                let up = chain(e.id);
+                if up.first().is_none_or(|p| !dissolved.contains(p)) {
+                    return None;
+                }
+                up.iter().find(|p| !dissolved.contains(p)).map(|p| (e.id, *p))
+            })
+            .collect();
+        self.elements.retain(|e| !dissolved.contains(&e.id));
+        for e in &mut self.elements {
+            let gid = e.id;
+            if let ElementKind::Group { children } = &mut e.kind {
+                children.retain(|c| !dissolved.contains(c));
+                children.extend(moved.iter().filter(|(_, p)| *p == gid).map(|(c, _)| *c));
+                children.truncate(MAX_GROUP_CHILDREN);
+            }
+        }
+    }
+
     /// Drops the links that point at something that isn't a map frame, at the frame itself, or
     /// that close a loop. Frames are taken in element order and a link stays unless it would
     /// close a loop with those kept before it, so of a pair that follow each other the first
@@ -1694,6 +1971,17 @@ impl Layout {
         }
         frames.iter().zip(&done).map(|(f, v)| (f.id, camera(f, v.unwrap_or(f.own)))).collect()
     }
+}
+
+/// A group's frame style, as [`Layout::group_frames`] gives it.
+pub struct GroupFrame<'a> {
+    pub group: &'a Element,
+    /// The background is drawn before element `first` of the drawing order, the border after
+    /// element `last`.
+    pub first: usize,
+    pub last: usize,
+    /// The group's box (mm).
+    pub rect: (f64, f64, f64, f64),
 }
 
 /// The most links followed in a row, and the most passes resolving them.
@@ -2575,5 +2863,143 @@ mod tests {
             (1000.0, MAX_MEASURED_STEP, MIN_MEASURED_STEP)
         );
         assert_eq!(step("measured", 0.0), 0.0, "Auto");
+    }
+
+    fn rect(l: &mut Layout, (x, y, w, h): (f64, f64, f64, f64)) -> u32 {
+        let k = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0 };
+        l.add("r", (x, y, w, h), k)
+    }
+
+    fn group(l: &mut Layout, children: Vec<u32>) -> u32 {
+        l.add("Group", (0.0, 0.0, 1.0, 1.0), ElementKind::Group { children })
+    }
+
+    fn children(l: &Layout, id: u32) -> Vec<u32> {
+        match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Group { children }) => children.clone(),
+            other => panic!("not a group: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn groups_round_trip_and_clamp_drops_bad_children() {
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}},
+            {"id":2,"name":"b","x":20,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}},
+            {"id":3,"name":"g","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,99,3,2,1]}}},
+            {"id":4,"name":"h","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,5]}}},
+            {"id":5,"name":"loop","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[4]}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        // The missing child, the group itself and the repeat are gone; 1 stays with the first
+        // group that lists it.
+        assert_eq!(children(&l, 3), vec![1, 2]);
+        // 4 and 5 hold each other: the first in element order keeps its child.
+        assert_eq!(children(&l, 4), vec![5]);
+        assert_eq!(children(&l, 5), Vec::<u32>::new());
+        assert_eq!((l.group_of(1), l.group_of(2), l.group_of(5), l.group_of(4)), (Some(3), Some(3), Some(4), None));
+        // A group reads back as it was saved.
+        let s = serde_json::to_string(&l).unwrap();
+        assert!(s.contains(r#""kind":{"Group":{"children":[1,2]}}"#), "{s}");
+        assert_eq!(serde_json::from_str::<Layout>(&s).unwrap(), l);
+        let g = ElementKind::Group { children: vec![] };
+        assert_eq!((g.code(), g.label()), ("group", "Group"));
+        // Layouts without groups save as before.
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":""}}}"#;
+        assert_eq!(serde_json::to_string(&serde_json::from_str::<Element>(j).unwrap()).unwrap(), j);
+        assert_eq!(serde_json::from_str::<ElementKind>(r#"{"Group":{}}"#).unwrap(), g);
+    }
+
+    #[test]
+    fn groups_nest_at_most_eight_deep() {
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let leaf = rect(&mut l, (0.0, 0.0, 10.0, 10.0));
+        let mut chain = vec![];
+        let mut inner = leaf;
+        for _ in 0..9 {
+            inner = group(&mut l, vec![inner]);
+            chain.push(inner);
+        }
+        l.clamp();
+        // The innermost group, ninth from the top, is gone: its leaf belongs to the eighth.
+        assert!(l.element(chain[0]).is_none());
+        assert_eq!(children(&l, chain[1]), vec![leaf]);
+        assert_eq!(l.group_depth(chain[8]), 8);
+        assert_eq!(l.group_box(chain[8]), Some((0.0, 0.0, 10.0, 10.0)));
+    }
+
+    #[test]
+    fn removing_a_group_removes_its_children() {
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let (a, b, c) = (rect(&mut l, (0.0, 0.0, 5.0, 5.0)), rect(&mut l, (10.0, 0.0, 5.0, 5.0)), rect(&mut l, (20.0, 0.0, 5.0, 5.0)));
+        let inner = group(&mut l, vec![a, b]);
+        let outer = group(&mut l, vec![inner, c]);
+        let other = rect(&mut l, (50.0, 50.0, 5.0, 5.0));
+        // A locked child keeps the group it's in.
+        l.element_mut(b).unwrap().locked = true;
+        assert_eq!(l.locked_in_removal(outer).map(|e| e.id), Some(b));
+        l.element_mut(b).unwrap().locked = false;
+        assert!(l.remove(outer));
+        assert_eq!(l.elements.iter().map(|e| e.id).collect::<Vec<_>>(), vec![other]);
+        // Removing a child takes it out of its group; the group that loses its last one goes too.
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let (a, b) = (rect(&mut l, (0.0, 0.0, 5.0, 5.0)), rect(&mut l, (10.0, 0.0, 5.0, 5.0)));
+        let g = group(&mut l, vec![a, b]);
+        let top = group(&mut l, vec![g]);
+        assert!(l.remove(a));
+        assert_eq!(children(&l, g), vec![b]);
+        assert!(l.remove(b));
+        assert!(l.element(g).is_none() && l.element(top).is_none(), "emptied groups go with their last child");
+        // A frame's surround in a group leaves it with the frame.
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let frame = l.add(
+            "f",
+            (0.0, 0.0, 50.0, 50.0),
+            ElementKind::MapFrame {
+                map: "M".into(),
+                center: Coord::new(0.0, 0.0),
+                scale: 1e6,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: indicator_color(),
+                extent_width: INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+                link: None,
+            },
+        );
+        let bar = l.add("bar", (0.0, 60.0, 30.0, 5.0), ElementKind::scale_bar(frame));
+        let note = rect(&mut l, (40.0, 60.0, 5.0, 5.0));
+        let g = group(&mut l, vec![bar, note]);
+        assert!(l.remove(frame));
+        assert_eq!(children(&l, g), vec![note]);
+    }
+
+    #[test]
+    fn group_box_is_the_union_of_its_children() {
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let a = rect(&mut l, (10.0, 10.0, 20.0, 20.0));
+        let b = rect(&mut l, (50.0, 40.0, 10.0, 10.0));
+        let c = rect(&mut l, (5.0, 60.0, 5.0, 5.0));
+        let inner = group(&mut l, vec![a, b]);
+        assert_eq!(l.group_box(inner), Some((10.0, 10.0, 50.0, 40.0)));
+        let outer = group(&mut l, vec![inner, c]);
+        assert_eq!(l.group_box(outer), Some((5.0, 10.0, 55.0, 55.0)));
+        assert_eq!(l.element_box(outer), l.group_box(outer));
+        assert_eq!(l.element_box(c), Some((5.0, 60.0, 5.0, 5.0)));
+        assert_eq!(l.group_box(a), None, "not a group");
+        let empty = group(&mut l, vec![]);
+        assert_eq!(l.group_box(empty), None);
+        // Hits go to the children, never the group.
+        assert_eq!(l.hit(15.0, 15.0), Some(a));
+        assert_eq!(l.hit(40.0, 35.0), None, "between the children");
+        assert_eq!(l.descendants(outer), vec![inner, c, a, b]);
+        // A hand-made loop (only `clamp` cuts them) doesn't hang the walks.
+        if let Some(ElementKind::Group { children }) = l.element_mut(inner).map(|e| &mut e.kind) {
+            children.push(outer);
+        }
+        assert_eq!(l.group_box(outer), Some((5.0, 10.0, 55.0, 55.0)));
+        assert_eq!(l.descendants(outer).len(), 4);
     }
 }

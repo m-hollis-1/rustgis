@@ -83,12 +83,14 @@ pub(crate) fn render_element(
 ) -> Option<Option<(Pixmap, [f64; 4])>> {
     let e = layout.element(id)?;
     let (w, h, k) = page_geometry(layout, dpi);
+    // An empty group is nowhere on the page.
+    let Some((ex, ey, ew, eh)) = layout.element_box(id) else { return Some(None) };
     // The box, grown to take in the frame's gap and border.
     let out = e.frame_style.as_ref().filter(|_| framed).map_or(0.0, FrameStyle::outset);
-    let x0 = ((e.x - out) * k).floor().clamp(0.0, f64::from(w));
-    let y0 = ((e.y - out) * k).floor().clamp(0.0, f64::from(h));
-    let x1 = ((e.x + e.w + out) * k).ceil().clamp(0.0, f64::from(w));
-    let y1 = ((e.y + e.h + out) * k).ceil().clamp(0.0, f64::from(h));
+    let x0 = ((ex - out) * k).floor().clamp(0.0, f64::from(w));
+    let y0 = ((ey - out) * k).floor().clamp(0.0, f64::from(h));
+    let x1 = ((ex + ew + out) * k).ceil().clamp(0.0, f64::from(w));
+    let y1 = ((ey + eh + out) * k).ceil().clamp(0.0, f64::from(h));
     let Some(bounds) = tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32) else {
         return Some(None);
     };
@@ -146,14 +148,32 @@ fn draw_page(
         }
     }
     // An element's border is drawn once the element is, which is at the top of the next turn
-    // (the arms below leave the turn early) and after the last.
+    // (the arms below leave the turn early) and after the last. A group's frame goes round all
+    // it holds: its background under the lowest of them, its border over the highest.
     let mut bordered: Option<&Element> = None;
-    for e in layout.elements.iter().filter(visible) {
+    let mut groups: Vec<(rustgis_map::layout::GroupFrame, bool)> =
+        if framed { layout.group_frames().into_iter().filter(|g| visible(&g.group)).map(|g| (g, false)).collect() } else { Vec::new() };
+    for (i, e) in layout.elements.iter().enumerate().filter(|(_, e)| visible(e)) {
         if let Some(done) = bordered.take() {
-            frame_border(&mut pm, done, k, bounds);
+            frame_border(&mut pm, done, (done.x, done.y, done.w, done.h), k, bounds);
         }
-        if framed && let Some(f) = &e.frame_style {
-            frame_background(&mut pm, e, f, k, bounds);
+        groups.retain(|(g, _)| {
+            if g.last < i {
+                frame_border(&mut pm, g.group, g.rect, k, bounds);
+            }
+            g.last >= i
+        });
+        for (g, drawn) in groups.iter_mut().filter(|(g, drawn)| !drawn && g.first <= i) {
+            if let Some(f) = &g.group.frame_style {
+                frame_background(&mut pm, g.rect, f, k, bounds);
+            }
+            *drawn = true;
+        }
+        if framed
+            && !e.is_group()
+            && let Some(f) = &e.frame_style
+        {
+            frame_background(&mut pm, (e.x, e.y, e.w, e.h), f, k, bounds);
             bordered = Some(e);
         }
         let (x, y, ew, eh) =
@@ -356,6 +376,8 @@ fn draw_page(
                     }
                 }
             }
+            // Its elements draw themselves; its frame style goes round them all.
+            ElementKind::Group { .. } => {}
             ElementKind::Line { color, width, dir, head } => {
                 let [(x0, y0), (x1, y1)] = dir.ends((r.x().into(), r.y().into(), r.width().into(), r.height().into()));
                 let (a, b) = ((x0 as f32, y0 as f32), (x1 as f32, y1 as f32));
@@ -400,28 +422,32 @@ fn draw_page(
         }
     }
     if let Some(done) = bordered {
-        frame_border(&mut pm, done, k, bounds);
+        frame_border(&mut pm, done, (done.x, done.y, done.w, done.h), k, bounds);
+    }
+    for (g, _) in &groups {
+        frame_border(&mut pm, g.group, g.rect, k, bounds);
     }
     Some(pm)
 }
 
-/// The element's box grown by its frame's gap, in pixels of the region drawn.
-fn frame_rect(e: &Element, f: &FrameStyle, k: f64, bounds: tiny_skia::IntRect) -> Option<Rect> {
-    let (x, y, w, h) = f.grown(e.x, e.y, e.w, e.h);
+/// The box (mm; an element's, or a group's union) grown by its frame's gap, in pixels of the
+/// region drawn.
+fn frame_rect(b: (f64, f64, f64, f64), f: &FrameStyle, k: f64, bounds: tiny_skia::IntRect) -> Option<Rect> {
+    let (x, y, w, h) = f.grown(b.0, b.1, b.2, b.3);
     Rect::from_xywh((x * k - f64::from(bounds.x())) as f32, (y * k - f64::from(bounds.y())) as f32, (w * k) as f32, (h * k) as f32)
 }
 
-/// The frame style's background, behind the element.
-fn frame_background(pm: &mut Pixmap, e: &Element, f: &FrameStyle, k: f64, bounds: tiny_skia::IntRect) {
-    if let (Some(bg), Some(r)) = (f.background, frame_rect(e, f, k, bounds)) {
+/// The frame style's background, behind the element (or the elements of a group) in box `b`.
+fn frame_background(pm: &mut Pixmap, b: (f64, f64, f64, f64), f: &FrameStyle, k: f64, bounds: tiny_skia::IntRect) {
+    if let (Some(bg), Some(r)) = (f.background, frame_rect(b, f, k, bounds)) {
         pm.fill_rect(r, &paint(bg, 1.0), Transform::identity(), None);
     }
 }
 
-/// The frame style's border, over the element: a line centred on the grown box's edge.
-fn frame_border(pm: &mut Pixmap, e: &Element, k: f64, bounds: tiny_skia::IntRect) {
+/// The frame style's border, over the element: a line centred on the edge of box `b` grown.
+fn frame_border(pm: &mut Pixmap, e: &Element, b: (f64, f64, f64, f64), k: f64, bounds: tiny_skia::IntRect) {
     let Some(f) = &e.frame_style else { return };
-    if let (Some(c), Some(r)) = (f.border, frame_rect(e, f, k, bounds))
+    if let (Some(c), Some(r)) = (f.border, frame_rect(b, f, k, bounds))
         && f.border_width > 0.0
     {
         let stroke = Stroke { width: (f.border_width * k / PT_PER_MM) as f32, ..Stroke::default() };
@@ -1940,7 +1966,7 @@ fn chart(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, field: &str, labe
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A grey page with `kind` at (20, 20) 40 × 20 mm, framed in `frame`, drawn at 96 dpi (one
@@ -2024,6 +2050,50 @@ mod tests {
         }
         let bare = render(&layout, &mut maps, 96.0, &info).unwrap();
         assert_eq!(off.data(), bare.data());
+    }
+
+    /// A grey page with two blue squares, (20, 20) and (50, 50), 10 mm each, grouped, the group
+    /// framed in `frame`; its own box (0, 0, 1, 1) means nothing.
+    pub(crate) fn grouped_page(frame: rustgis_map::layout::FrameStyle) -> (Layout, u32) {
+        let mut layout = Layout::new("Groups", 100.0, 100.0);
+        let ground = ElementKind::Rectangle { fill: Rgba::rgb(128, 128, 128), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
+        layout.add("Ground", (0.0, 0.0, 100.0, 100.0), ground);
+        let blue = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 255), outline: Rgba::rgb(0, 0, 255), width: 0.0, radius: 0.0 };
+        let a = layout.add("A", (20.0, 20.0, 10.0, 10.0), blue());
+        let b = layout.add("B", (50.0, 50.0, 10.0, 10.0), blue());
+        let g = layout.add("Group", (0.0, 0.0, 1.0, 1.0), ElementKind::Group { children: vec![a, b] });
+        if let Some(e) = layout.element_mut(g) {
+            e.frame_style = Some(frame);
+        }
+        (layout, g)
+    }
+
+    /// A group draws nothing of its own; its frame goes round its children, the background under
+    /// them and the border over them.
+    #[test]
+    fn a_group_frame_goes_round_its_children() {
+        use rustgis_map::layout::FrameStyle;
+        let red = Rgba::rgb(255, 0, 0);
+        let frame = FrameStyle { border: Some(red), border_width: 2.0, background: Some(Rgba::rgb(255, 255, 255)), gap: 0.0 };
+        let mut maps = Vec::new();
+        let info = PageInfo::default();
+        let (mut layout, g) = grouped_page(frame);
+        let pm = render(&layout, &mut maps, 96.0, &info).unwrap();
+        // The group's box is (20, 20) to (60, 60) mm: 75.6 to 226.8 pixels.
+        assert_eq!(rgb_at(&pm, 150, 75), [255, 0, 0], "the top edge is the border");
+        assert_eq!(rgb_at(&pm, 226, 150), [255, 0, 0], "the right edge is the border");
+        assert_eq!(rgb_at(&pm, 150, 150), [255, 255, 255], "between the children is the background");
+        assert_eq!(rgb_at(&pm, 95, 95), [0, 0, 255], "the children are over the background");
+        assert_eq!(rgb_at(&pm, 95, 75), [255, 0, 0], "and the border over them");
+        assert_eq!(rgb_at(&pm, 150, 70), [128, 128, 128], "outside is the page");
+        assert_eq!(rgb_at(&pm, 2, 2), [128, 128, 128], "the group's own box is not framed");
+        // Without a frame style, the group changes no pixel.
+        if let Some(e) = layout.element_mut(g) {
+            e.frame_style = None;
+        }
+        let bare = render(&layout, &mut maps, 96.0, &info).unwrap();
+        layout.elements.retain(|e| e.id != g);
+        assert_eq!(bare.data(), render(&layout, &mut maps, 96.0, &info).unwrap().data());
     }
 
     /// The element drawn alone (as the SVG does a surround) reaches out to its frame.

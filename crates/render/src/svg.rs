@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use base64::Engine;
 use rustgis_map::Map;
-use rustgis_map::layout::{ElementKind, FontFamily, Layout, LineHead, PT_PER_MM, TextAlign};
+use rustgis_map::layout::{ElementKind, FontFamily, FrameStyle, GroupFrame, Layout, LineHead, PT_PER_MM, TextAlign};
 
 use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, render_element};
 
@@ -34,23 +34,26 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
     );
     // Linked frames take their view from the frame they follow.
     let cameras = layout.resolved_cameras(maps);
-    for e in layout.elements.iter().filter(|e| e.visible) {
+    // A group's frame goes round all it holds: its background under the lowest of them, its
+    // border over the highest. The group itself draws nothing; its elements draw themselves.
+    let mut groups: Vec<(GroupFrame, bool)> = layout.group_frames().into_iter().map(|g| (g, false)).collect();
+    for (i, e) in layout.elements.iter().enumerate().filter(|(_, e)| e.visible) {
+        groups.retain(|(g, _)| {
+            if g.last < i {
+                group_frame(&mut s, g, false);
+            }
+            g.last >= i
+        });
+        for (g, drawn) in groups.iter_mut().filter(|(g, drawn)| !drawn && g.first <= i) {
+            group_frame(&mut s, g, true);
+            *drawn = true;
+        }
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
         // The frame's background first, behind the element; its border after.
-        let framed = e.frame_style.as_ref().map(|f| (f, f.grown(x, y, w, h)));
-        if let Some((f, (fx, fy, fw, fh))) = framed
-            && let Some(bg) = f.background
-        {
-            let _ = writeln!(
-                s,
-                r#"<rect x="{}" y="{}" width="{}" height="{}"{} stroke="none"/>"#,
-                num(fx),
-                num(fy),
-                num(fw),
-                num(fh),
-                paint("fill", bg)
-            );
+        let framed = e.frame_style.as_ref().filter(|_| !e.is_group()).map(|f| (f, f.grown(x, y, w, h)));
+        if let Some((f, fr)) = framed {
+            frame_background(&mut s, f, fr);
         }
         match &e.kind {
             ElementKind::Text {
@@ -165,6 +168,7 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                 );
             }
             ElementKind::Line { color, width, dir, head } => line(&mut s, dir.ends((x, y, w, h)), *color, *width, *head, ppp),
+            ElementKind::Group { .. } => {}
             _ => {
                 if let Some((image, [ix, iy, iw, ih])) = render_element(layout, e.id, maps, picture_dpi, info, false)? {
                     let png = image.encode_png().ok()?;
@@ -180,24 +184,65 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                 }
             }
         }
-        if let Some((f, (fx, fy, fw, fh))) = framed
-            && let Some(c) = f.border
-            && f.border_width > 0.0
-        {
-            let _ = writeln!(
-                s,
-                r#"<rect x="{}" y="{}" width="{}" height="{}" fill="none"{}/>"#,
-                num(fx),
-                num(fy),
-                num(fw),
-                num(fh),
-                stroke(c, f.border_width)
-            );
+        if let Some((f, fr)) = framed {
+            frame_border(&mut s, f, fr);
         }
         s.push_str("</g>\n");
     }
+    for (g, _) in &groups {
+        group_frame(&mut s, g, false);
+    }
     s.push_str("</svg>\n");
     Some(s)
+}
+
+/// A frame style's background: a rect filling `(x, y, w, h)` (mm, already grown by the gap).
+fn frame_background(s: &mut String, f: &FrameStyle, (x, y, w, h): (f64, f64, f64, f64)) {
+    if let Some(bg) = f.background {
+        let _ = writeln!(
+            s,
+            r#"<rect x="{}" y="{}" width="{}" height="{}"{} stroke="none"/>"#,
+            num(x),
+            num(y),
+            num(w),
+            num(h),
+            paint("fill", bg)
+        );
+    }
+}
+
+/// A frame style's border: an unfilled rect along `(x, y, w, h)` (mm, already grown by the gap).
+fn frame_border(s: &mut String, f: &FrameStyle, (x, y, w, h): (f64, f64, f64, f64)) {
+    if let Some(c) = f.border
+        && f.border_width > 0.0
+    {
+        let _ = writeln!(
+            s,
+            r#"<rect x="{}" y="{}" width="{}" height="{}" fill="none"{}/>"#,
+            num(x),
+            num(y),
+            num(w),
+            num(h),
+            stroke(c, f.border_width)
+        );
+    }
+}
+
+/// A group's frame background (`under`) or border, round its box, in a layer of its own.
+fn group_frame(s: &mut String, g: &GroupFrame, under: bool) {
+    let Some(f) = &g.group.frame_style else { return };
+    if (under && f.background.is_none()) || (!under && (f.border.is_none() || f.border_width <= 0.0)) {
+        return;
+    }
+    let (x, y, w, h) = g.rect;
+    let part = if under { "background" } else { "border" };
+    let _ = writeln!(s, r#"<g id="element-{}-{part}" inkscape:label="{}" inkscape:groupmode="layer">"#, g.group.id, esc(&g.group.name));
+    if under {
+        frame_background(s, f, f.grown(x, y, w, h));
+    } else {
+        frame_border(s, f, f.grown(x, y, w, h));
+    }
+    s.push_str("</g>\n");
 }
 
 /// The resolution the pictures are drawn at: `dpi`, unless together they would take more than
@@ -212,7 +257,11 @@ fn picture_dpi(layout: &Layout, dpi: f64) -> f64 {
         .filter(|e| {
             !matches!(
                 e.kind,
-                ElementKind::Text { .. } | ElementKind::Rectangle { .. } | ElementKind::Ellipse { .. } | ElementKind::Line { .. }
+                ElementKind::Text { .. }
+                    | ElementKind::Rectangle { .. }
+                    | ElementKind::Ellipse { .. }
+                    | ElementKind::Line { .. }
+                    | ElementKind::Group { .. }
             )
         })
         .map(|e| on_page(e.x, e.w, layout.width) * on_page(e.y, e.h, layout.height))
@@ -379,6 +428,36 @@ mod tests {
         };
         assert!(unbound.contains("1:10,000") && !unbound.contains("1:50,000"));
         assert!(unbound.contains(&format!("y=\"{}\"", num(10.0 + em * 0.6))), "top: {unbound}");
+    }
+
+    /// A group is vector and draws nothing of its own; its frame is rects round its children,
+    /// the background before the first and the border after the last.
+    #[test]
+    fn a_group_frame_is_rects_round_its_children() {
+        use rustgis_map::layout::FrameStyle;
+        let frame = FrameStyle {
+            border: Some(rustgis_map::Rgba::rgb(255, 0, 0)),
+            border_width: 2.0,
+            background: Some(rustgis_map::Rgba::rgb(255, 255, 255)),
+            gap: 1.0,
+        };
+        let (layout, g) = crate::layout::tests::grouped_page(frame);
+        assert_eq!(picture_dpi(&layout, 600.0), 600.0, "nothing to draw as a picture");
+        let svg = layout_svg(&layout, &mut [], 72.0, &PageInfo::default()).unwrap();
+        let at = |needle: &str| svg.find(needle).unwrap_or_else(|| panic!("no {needle} in {svg}"));
+        let background = at(r##"<rect x="19" y="19" width="42" height="42" fill="#ffffff""##);
+        let border = at(r#"<rect x="19" y="19" width="42" height="42" fill="none""#);
+        let (a, b) = (at(r#"inkscape:label="A""#), at(r#"inkscape:label="B""#));
+        assert!(background < a && b < border, "{svg}");
+        assert!(!svg.contains("<image"), "{svg}");
+        // The group's own layer is empty.
+        assert!(
+            svg.contains(&format!(
+                "<g id=\"element-{g}\" inkscape:label=\"Group\" inkscape:groupmode=\"layer\">
+</g>"
+            )),
+            "{svg}"
+        );
     }
 
     #[test]

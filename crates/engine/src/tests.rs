@@ -2016,6 +2016,8 @@ fn hostile_params_never_panic() {
         json!({"element": 1, "link": {"frame": 1e300, "rotation": "yes"}}),
         json!({"element": 1, "link": [7], "x": 1e308}),
         json!({"element": 1, "link": 7}),
+        // Groups: elements of the wrong types.
+        json!({"elements": [1, "x", null]}),
         json!({"style": "", "accent": [], "kind": "rectangle", "element": 1, "radius": -1e308}),
         json!({"profile": "a3", "style": "poster", "accent": "#ZZZZZZ", "kind": "rectangle", "radius": 1e308}),
         // A STAC trend's source: a valid band and period so the junk after them is reached, and an
@@ -15623,6 +15625,113 @@ fn layout_elements_are_brought_to_the_front_and_sent_to_the_back() {
     let r = s.run("layout.arrange", &json!({"element": legend.id, "to": "back"})).unwrap();
     assert_eq!(r["index"].as_u64(), Some(0));
     assert_eq!(s.undo_depth(), depth, "no empty undo step");
+}
+
+/// Grouped elements move, copy, reorder and delete together; a group's box is its children's.
+#[test]
+fn layout_group_and_ungroup_move_and_delete_together() {
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Groups", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let id = |v: Value| v["element"].as_u64().unwrap() as u32;
+    let add =
+        |s: &mut Session, x: f64| id(s.run("layout.addElement", &json!({"kind": "rectangle", "x": x, "y": 10, "w": 10, "h": 10})).unwrap());
+    let (a, b, c) = (add(&mut s, 10.0), add(&mut s, 30.0), add(&mut s, 60.0));
+    let g = id(s.run("layout.group", &json!({"elements": [a, b]})).unwrap());
+    let l = &s.project.layouts[li];
+    assert_eq!((l.element(g).unwrap().name.as_str(), l.elements.last().map(|e| e.id)), ("Group", Some(g)));
+    assert_eq!((l.group_of(a), l.group_of(b), l.group_of(c)), (Some(g), Some(g), None));
+    assert_eq!(l.group_box(g), Some((10.0, 10.0, 30.0, 10.0)));
+    // Moving the group moves both by the same delta: x and y are where its box goes.
+    s.run("layout.update", &json!({"element": g, "x": 15, "y": 20})).unwrap();
+    let l = &s.project.layouts[li];
+    let at = |l: &rustgis_map::layout::Layout, id: u32| l.element(id).map(|e| (e.x, e.y)).unwrap();
+    assert_eq!((at(l, a), at(l, b), at(l, c)), ((15.0, 20.0), (35.0, 20.0), (60.0, 10.0)));
+    // A group has no size, nor a kind's properties; bad values change nothing.
+    let before = s.project.layouts[li].clone();
+    assert_eq!(s.run("layout.update", &json!({"element": g, "w": 50})).unwrap_err(), "a group has no size of its own");
+    assert_eq!(s.run("layout.update", &json!({"element": g, "x": 0, "h": 5})).unwrap_err(), "a group has no size of its own");
+    for bad in [json!({"element": g, "x": "far"}), json!({"element": g, "fill": "#ff0000"}), json!({"element": g, "border": 7})] {
+        assert!(s.run("layout.update", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.project.layouts[li], before);
+    // Groups take two elements or more, that exist, ungrouped or in the same group.
+    for bad in [
+        json!({"elements": [a]}),
+        json!({"elements": [c, c]}),
+        json!({"elements": [c, 9999]}),
+        json!({"elements": [a, c]}),
+        json!({"elements": "all"}),
+        json!({"elements": [c, "x"]}),
+        json!({}),
+        json!({"elements": [c, g], "name": 7}),
+    ] {
+        assert!(s.run("layout.group", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.project.layouts[li], before);
+    assert_eq!(s.run("layout.ungroup", &json!({"element": c})).unwrap_err(), "not a group");
+    // A group of a group nests; ungrouped, the inner group stays whole.
+    let outer = id(s.run("layout.group", &json!({"elements": [g, c], "name": "Both"})).unwrap());
+    let l = &s.project.layouts[li];
+    assert_eq!((l.element(outer).unwrap().name.as_str(), l.group_of(g), l.group_depth(outer)), ("Both", Some(outer), 2));
+    assert_eq!(l.descendants(outer), vec![c, g, a, b], "listed in drawing order");
+    s.run("layout.ungroup", &json!({"element": outer})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(outer).is_none());
+    assert_eq!((l.group_of(g), l.group_of(c), l.group_of(a)), (None, None, Some(g)));
+    // Copied, the group's copy holds copies of its children, in new places.
+    let n = s.project.layouts[li].elements.len();
+    let copy = id(s.run("layout.duplicateElement", &json!({"element": g})).unwrap());
+    let l = &s.project.layouts[li];
+    assert_eq!(l.elements.len(), n + 3);
+    let kids = l.descendants(copy);
+    assert_eq!(kids.len(), 2);
+    assert!(kids.iter().all(|k| ![a, b, g].contains(k)), "fresh ids");
+    assert_eq!(l.group_box(copy), Some((20.0, 25.0, 30.0, 10.0)));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.project.layouts[li].elements.len(), n, "one undo step");
+    // Sent to the back, the group's elements go together and keep their order.
+    s.run("layout.arrange", &json!({"element": g, "to": "back"})).unwrap();
+    let order: Vec<u32> = s.project.layouts[li].elements.iter().map(|e| e.id).collect();
+    assert_eq!(order, vec![a, b, g, c]);
+    s.run("layout.arrange", &json!({"element": g, "to": "forward"})).unwrap();
+    let order: Vec<u32> = s.project.layouts[li].elements.iter().map(|e| e.id).collect();
+    assert_eq!(order, vec![c, a, b, g]);
+    // A locked child holds the group still, and keeps it from being deleted.
+    s.run("layout.update", &json!({"element": a, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": g, "x": 0})).is_err());
+    assert!(s.run("layout.removeElement", &json!({"element": g})).is_err());
+    s.run("layout.update", &json!({"element": a, "locked": false})).unwrap();
+    // Locking and hiding the group locks and hides what it holds.
+    s.run("layout.update", &json!({"element": g, "locked": true, "visible": false})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(a).is_some_and(|e| e.locked && !e.visible) && l.element(b).is_some_and(|e| e.locked && !e.visible));
+    s.run("layout.update", &json!({"element": g, "locked": false, "visible": true})).unwrap();
+    // Deleting the group deletes its children.
+    s.run("layout.removeElement", &json!({"element": g})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(a).is_none() && l.element(b).is_none() && l.element(g).is_none() && l.element(c).is_some());
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(s.project.layouts[li].element(a).is_some(), "undone");
+
+    // Groups nest 8 deep: a ninth is refused, and a file nesting 9 deep is flattened.
+    let mut inner = g;
+    for _ in 1..8 {
+        let other = add(&mut s, 80.0);
+        inner = id(s.run("layout.group", &json!({"elements": [inner, other]})).unwrap());
+    }
+    assert_eq!(s.project.layouts[li].group_depth(inner), 8);
+    let other = add(&mut s, 90.0);
+    assert!(s.run("layout.group", &json!({"elements": [inner, other]})).unwrap_err().contains("8 deep"));
+    let mut elements = vec![json!({"id": 1, "name": "leaf", "x": 0, "y": 0, "w": 10, "h": 10, "kind": {"Picture": {"image": ""}}})];
+    for i in 2..=10u32 {
+        elements.push(json!({"id": i, "name": "g", "x": 0, "y": 0, "w": 1, "h": 1, "kind": {"Group": {"children": [i - 1]}}}));
+    }
+    let text = json!({"name": "Deep", "width": 100, "height": 100, "elements": elements}).to_string();
+    let r = s.run("layout.import", &json!({"text": text})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    assert!(l.element(2).is_none(), "the ninth group down is dissolved");
+    assert_eq!((l.group_of(1), l.group_depth(10)), (Some(3), 8));
 }
 
 #[test]

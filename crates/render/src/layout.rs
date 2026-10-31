@@ -10,7 +10,7 @@ use rustgis_map::layout::{
     VAlign, frame_camera,
 };
 use rustgis_map::symbology::LegendEntry;
-use rustgis_map::{Map, Rgba};
+use rustgis_map::{Map, Rgba, Symbol};
 use tiny_skia::{FillRule, Mask, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform};
 
 use crate::{View, paint, text};
@@ -274,10 +274,10 @@ fn draw_page(
                     );
                 }
             }
-            ElementKind::NorthArrow { frame: f, style, fill, outline } => {
+            ElementKind::NorthArrow { frame: f, style, fill, outline, symbol } => {
                 // Turned with its frame's map.
                 let bearing = frame(*f).map_or(0.0, |fr| fr.2.bearing);
-                north_arrow(&mut pm, r, *style, *fill, *outline, ppp, bearing)
+                north_arrow(&mut pm, r, *style, *fill, *outline, symbol, ppp, bearing)
             }
             ElementKind::ScaleBar {
                 frame: f,
@@ -1051,9 +1051,58 @@ fn shape(pm: &mut Pixmap, pts: &[(f32, f32)], fill: Rgba, outline: Rgba, width: 
     }
 }
 
+/// Widest a rotated north arrow symbol's scratch pixmap is, in pixels: a bigger arrow is drawn
+/// smaller and scaled up.
+const MAX_ARROW_SCRATCH: f32 = 4096.0;
+
+/// A north arrow's point `symbol` (bottom layer first) centred in `r`, the largest layer's size
+/// filling `r`'s shorter side and the others keeping their ratio to it, turned about the middle of
+/// `r` as a north arrow is (see [`north_arrow`]). `false` when there is nothing to size it by (no
+/// layer has a size), so the caller draws the style instead.
+fn symbol_arrow(pm: &mut Pixmap, r: Rect, symbol: &[Symbol], bearing: f64) -> bool {
+    let largest = symbol.iter().map(|s| s.size).filter(|z| z.is_finite()).fold(0.0f32, f32::max);
+    let side = r.width().min(r.height());
+    if largest <= 0.0 || !(side.is_finite() && side > 0.0) {
+        return false;
+    }
+    // Pixels per unit of symbol size.
+    let k = side / largest;
+    let (mx, my) = (r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
+    let (sin, cos) = if bearing.is_finite() { (-bearing.to_radians()).sin_cos() } else { (0.0, 1.0) };
+    let (sin, cos) = (sin as f32, cos as f32);
+    let draw = |pm: &mut Pixmap, k: f32, x: f32, y: f32| {
+        for s in symbol.iter().filter(|s| s.size.is_finite() && s.size > 0.0) {
+            // Sized in pixels, so one pixel to the point.
+            let scaled = Symbol { size: s.size * k, stroke_width: s.stroke_width * k, ..*s };
+            crate::draw_marker(pm, x, y, &scaled, 1.0, None, 1.0);
+        }
+    };
+    if sin.abs() < 1e-6 && cos > 0.0 {
+        draw(pm, k, mx, my);
+        return true;
+    }
+    // Drawn upright on a scratch pixmap (room for markers that reach past their size, as a star's
+    // points do), then turned onto the page.
+    let want = (side * 1.5).ceil().max(1.0);
+    let u = (MAX_ARROW_SCRATCH / want).min(1.0);
+    let edge = (want * u).ceil().max(1.0);
+    let Some(mut scratch) = Pixmap::new(edge as u32, edge as u32) else { return true };
+    draw(&mut scratch, k * u, edge / 2.0, edge / 2.0);
+    let c = edge / 2.0;
+    let place = Transform::from_row(cos / u, sin / u, -sin / u, cos / u, mx - (cos * c - sin * c) / u, my - (sin * c + cos * c) / u);
+    let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() };
+    pm.draw_pixmap(0, 0, scratch.as_ref(), &paint, place, None);
+    true
+}
+
 /// A north arrow in `style`, with an `N` above it, pointing north on a map turned to `bearing`
-/// (degrees clockwise from north): turned about the middle of `r`, the `N` kept upright.
-fn north_arrow(pm: &mut Pixmap, r: Rect, style: ArrowStyle, fill: Rgba, outline: Rgba, ppp: f64, bearing: f64) {
+/// (degrees clockwise from north): turned about the middle of `r`, the `N` kept upright. A point
+/// `symbol` (an imported arrow's own) draws instead, when it has a size, and no `N`.
+#[allow(clippy::too_many_arguments)]
+fn north_arrow(pm: &mut Pixmap, r: Rect, style: ArrowStyle, fill: Rgba, outline: Rgba, symbol: &[Symbol], ppp: f64, bearing: f64) {
+    if symbol_arrow(pm, r, symbol, bearing) {
+        return;
+    }
     let white = Rgba::rgb(0xFF, 0xFF, 0xFF);
     let sw = 0.8 * ppp as f32;
     let (cx, top) = (r.x() + r.width() / 2.0, r.y());
@@ -3829,7 +3878,7 @@ pub(crate) mod tests {
         let draw = |style, fill| {
             let mut pm = Pixmap::new(80, 120).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
-            north_arrow(&mut pm, Rect::from_xywh(0.0, 0.0, 80.0, 120.0).unwrap(), style, fill, Rgba::rgb(0x22, 0x22, 0x22), 1.0, 0.0);
+            north_arrow(&mut pm, Rect::from_xywh(0.0, 0.0, 80.0, 120.0).unwrap(), style, fill, Rgba::rgb(0x22, 0x22, 0x22), &[], 1.0, 0.0);
             pm
         };
         let red_fill = Rgba::rgb(0xFF, 0, 0);
@@ -3851,7 +3900,7 @@ pub(crate) mod tests {
             let mut pm = Pixmap::new(80, 120).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let r = Rect::from_xywh(0.0, 0.0, 80.0, 120.0).unwrap();
-            north_arrow(&mut pm, r, ArrowStyle::Triangle, Rgba::rgb(0xFF, 0, 0), Rgba::rgb(0x22, 0x22, 0x22), 1.0, bearing);
+            north_arrow(&mut pm, r, ArrowStyle::Triangle, Rgba::rgb(0xFF, 0, 0), Rgba::rgb(0x22, 0x22, 0x22), &[], 1.0, bearing);
             let pts: Vec<(f64, f64)> = (0..120)
                 .flat_map(|y| (0..80).map(move |x| (x, y)))
                 .filter(|&(x, y)| pm.pixel(x, y).is_some_and(red))
@@ -3868,6 +3917,89 @@ pub(crate) mod tests {
         assert!(x > 3.0 && y.abs() < 1.0, "{x}, {y}");
         let (x, _) = lean(-90.0);
         assert!(x < -3.0, "{x}");
+    }
+
+    /// A 2 x 2 opaque red PNG.
+    const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
+
+    fn symbol(marker: rustgis_map::Marker, size: f32, fill: Rgba) -> Symbol {
+        Symbol { fill, stroke: fill, stroke_width: 0.0, size, marker }
+    }
+
+    /// An 80 x 120 white page with a north arrow in a triangle style in ink, over the whole of it.
+    fn arrow_page(symbol: &[Symbol], bearing: f64) -> Pixmap {
+        let mut pm = Pixmap::new(80, 120).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let r = Rect::from_xywh(0.0, 0.0, 80.0, 120.0).unwrap();
+        let ink = Rgba::rgb(0x22, 0x22, 0x22);
+        north_arrow(&mut pm, r, ArrowStyle::Triangle, ink, ink, symbol, 1.0, bearing);
+        pm
+    }
+
+    #[test]
+    fn a_north_arrow_with_a_symbol_draws_the_symbol_not_the_style() {
+        let image = rustgis_map::ImageRef::new(RED_PNG).unwrap();
+        let picture = [symbol(rustgis_map::Marker::Image(image), 10.0, Rgba::rgb(0, 0, 0))];
+        let with = arrow_page(&picture, 0.0);
+        assert!(with.pixel(40, 60).is_some_and(red), "the picture fills the middle of the box");
+        // It fills the box's shorter side (80), centred, and nothing else is drawn: no N, no style.
+        assert!(with.pixel(5, 60).is_some_and(red) && with.pixel(75, 60).is_some_and(red));
+        let white = |p: tiny_skia::PremultipliedColorU8| p.red() > 240 && p.green() > 240 && p.blue() > 240;
+        assert!(with.pixel(40, 10).is_some_and(white), "no N above the symbol");
+        assert!(with.pixel(40, 115).is_some_and(white));
+        // Without one the style draws, and the middle is not red.
+        let without = arrow_page(&[], 0.0);
+        assert!(without.pixel(40, 60).is_some_and(|p| !red(p)));
+        assert_ne!(with.data(), without.data());
+    }
+
+    #[test]
+    fn a_north_arrow_symbol_keeps_the_layers_in_proportion_and_order() {
+        use rustgis_map::Marker;
+        let (green, blue) = (Rgba::rgb(0, 0xC0, 0), Rgba::rgb(0, 0, 0xFF));
+        // A square the size of the box's shorter side, a smaller one over it.
+        let pm = arrow_page(&[symbol(Marker::Square, 100.0, green), symbol(Marker::Square, 50.0, blue)], 0.0);
+        let is = |x, y, c: Rgba| pm.pixel(x, y).is_some_and(|p| p.red() == c.r() && p.green() == c.g() && p.blue() == c.b());
+        // The big square reaches 0.9 of 40 = 36 pixels from the middle, the small half as far.
+        assert!(is(40, 60, blue), "the later layer is on top");
+        assert!(is(40 + 16, 60, blue) && is(40 + 25, 60, green));
+        assert!(is(40 + 34, 60, green) && is(40 + 39, 60, Rgba::rgb(255, 255, 255)));
+    }
+
+    #[test]
+    fn a_north_arrow_symbol_turns_with_the_map_and_survives_bad_layers() {
+        use rustgis_map::Marker;
+        let red_fill = Rgba::rgb(0xFF, 0, 0);
+        // The mean row of a triangle marker: its bulk lies below the middle, upside down above it.
+        let lean = |bearing| {
+            let pm = arrow_page(&[symbol(Marker::Triangle, 40.0, red_fill)], bearing);
+            let pts: Vec<(f64, f64)> = (0..120)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .filter(|&(x, y)| pm.pixel(x, y).is_some_and(red))
+                .map(|(x, y)| (f64::from(x), f64::from(y)))
+                .collect();
+            let n = pts.len().max(1) as f64;
+            (pts.iter().map(|p| p.0).sum::<f64>() / n - 40.0, pts.iter().map(|p| p.1).sum::<f64>() / n - 60.0)
+        };
+        let (x, y) = lean(0.0);
+        assert!(x.abs() < 1.0 && y > 1.0, "{x}, {y}");
+        let (x, y) = lean(180.0);
+        assert!(x.abs() < 1.0 && y < -1.0, "{x}, {y}");
+        let (x, y) = lean(90.0);
+        assert!(x > 1.0 && y.abs() < 1.0, "{x}, {y}");
+        // Sizes that are zero, negative or not numbers are skipped; the others still draw.
+        let bad =
+            [symbol(Marker::Circle, f32::NAN, red_fill), symbol(Marker::Circle, -3.0, red_fill), symbol(Marker::Circle, 20.0, red_fill)];
+        assert!(arrow_page(&bad, 0.0).pixel(40, 60).is_some_and(red));
+        // With no size at all there is nothing to scale by: the style draws.
+        let zero = [symbol(Marker::Circle, 0.0, red_fill)];
+        assert_eq!(arrow_page(&zero, 0.0).data(), arrow_page(&[], 0.0).data());
+        // A picture that can't be decoded draws nothing, and the layers around it still do.
+        let broken = rustgis_map::ImageRef::new("iVBORw0KGgoAAAANSUhEUgAAAAIAAAAC").map(Marker::Image);
+        assert!(broken.is_some(), "a signature is all ImageRef checks");
+        let mut layers = vec![symbol(Marker::Circle, 30.0, red_fill)];
+        layers.extend(broken.map(|m| symbol(m, 30.0, red_fill)));
+        assert!(arrow_page(&layers, 0.0).pixel(40, 60).is_some_and(red));
     }
 
     /// A 300 x 60 page with a scale bar drawn on it: 100 m of ground per point, so the bar runs

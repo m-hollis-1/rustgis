@@ -1988,6 +1988,9 @@ fn hostile_params_never_panic() {
         json!({"layer": "Countries", "row": 1e30, "field": "nope", "value": [1], "scale": -1, "lon": 1e300, "lat": "x", "classes": 1e9, "type": "graduated"}),
         // Label halos and spacing: out of range, of the wrong type.
         json!({"layer": "Cities", "haloWidth": 1e308, "haloColor": 7, "spacing": "NaN"}),
+        // A north arrow's symbol: only null clears it.
+        json!({"kind": "northArrow", "element": 1, "symbol": [{"size": 1e308, "marker": {"Image": "***"}}], "style": "star"}),
+        json!({"kind": "northArrow", "element": 1, "symbol": null}),
         json!({"layer": "Cities", "haloWidth": -1, "haloColor": "#zzz", "spacing": -1e9}),
         json!({"layer": "Cities", "rows": [1, 99999999], "geometry": {"type": "Polygon", "coordinates": [[]]}, "width": 1e9, "height": -3, "expression": "'"}),
         json!({"band": -1, "red": 1e12, "green": "x", "blue": f64::MAX, "preset": "", "ramp": "nope", "classes": -5, "n": 1e308, "low": -50, "high": 900, "gamma": 0, "zFactor": -1, "fileName": "a.tif", "data": "!!!"}),
@@ -4041,6 +4044,65 @@ fn layout_update_sets_and_clears_border_and_background() {
     assert_eq!(frame_style(&s, rect).unwrap().border, Some(red));
     s.run("layout.update", &json!({"element": rect, "locked": false, "border": null})).unwrap();
     assert_eq!(frame_style(&s, rect), None);
+}
+
+/// A north arrow drawn from an imported point symbol: `symbol: null` clears it so the style draws
+/// again, nothing else sets it, the rest of the arrow is kept, and a locked arrow keeps it.
+#[test]
+fn layout_update_clears_a_north_arrow_symbol() {
+    use rustgis_map::layout::{ArrowStyle, ElementKind};
+    use rustgis_map::{Marker, Rgba, Symbol};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let arrow = s.run("layout.addElement", &json!({"kind": "northArrow", "style": "star", "fill": "#AA0000"})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    let symbol_of = |s: &Session| match &s.project.layouts[0].element(arrow).unwrap().kind {
+        ElementKind::NorthArrow { symbol, .. } => symbol.clone(),
+        _ => panic!("not a north arrow"),
+    };
+    assert!(symbol_of(&s).is_empty());
+    // Nothing sets one by command, on a new arrow or an old one.
+    for bad in [json!([]), json!({"size": 4}), json!("x"), json!(true)] {
+        assert!(s.run("layout.update", &json!({"element": arrow, "symbol": bad})).unwrap_err().contains("import"), "{bad}");
+        assert!(s.run("layout.addElement", &json!({"kind": "northArrow", "symbol": bad})).is_err(), "{bad}");
+    }
+    assert!(symbol_of(&s).is_empty());
+    // As an import leaves it.
+    let imported =
+        vec![Symbol { fill: Rgba::rgb(1, 2, 3), stroke: Rgba::rgb(0, 0, 0), stroke_width: 1.0, size: 20.0, marker: Marker::Star }];
+    let set = |s: &mut Session, symbols: Vec<Symbol>| {
+        if let Some(ElementKind::NorthArrow { symbol, .. }) =
+            s.project.layouts[0].elements.iter_mut().find(|e| e.id == arrow).map(|e| &mut e.kind)
+        {
+            *symbol = symbols;
+        }
+    };
+    set(&mut s, imported.clone());
+    // Other changes keep it; a bad value in the same call changes nothing.
+    s.run("layout.update", &json!({"element": arrow, "outline": "#222222"})).unwrap();
+    assert_eq!(symbol_of(&s), imported);
+    let before = s.project.layouts[0].clone();
+    assert!(s.run("layout.update", &json!({"element": arrow, "symbol": null, "style": "sundial"})).is_err());
+    assert_eq!(s.project.layouts[0], before);
+    // A locked arrow keeps it.
+    s.run("layout.update", &json!({"element": arrow, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": arrow, "symbol": null})).is_err());
+    assert_eq!(symbol_of(&s), imported);
+    s.run("layout.update", &json!({"element": arrow, "locked": false})).unwrap();
+    // Cleared, the style, colours and the rest are as they were.
+    s.run("layout.update", &json!({"element": arrow, "symbol": null})).unwrap();
+    assert!(symbol_of(&s).is_empty());
+    assert!(matches!(
+        s.project.layouts[0].element(arrow).unwrap().kind,
+        ElementKind::NorthArrow { style: ArrowStyle::Star, fill, outline, .. } if fill == Rgba::rgb(0xAA, 0, 0) && outline == Rgba::rgb(0x22, 0x22, 0x22)
+    ));
+    // Clearing what isn't there is fine, and one undo brings the symbol back.
+    s.run("layout.update", &json!({"element": arrow, "symbol": null})).unwrap();
+    set(&mut s, imported.clone());
+    s.run("layout.update", &json!({"element": arrow, "symbol": null})).unwrap();
+    assert!(s.undo());
+    assert_eq!(symbol_of(&s), imported);
 }
 
 /// `layout.update` makes a map frame follow another (`link`), unlinks it with `null`, keeps it when

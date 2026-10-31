@@ -1817,6 +1817,14 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                         frame_link_controls(app, ui, layout, id, *link, &update);
                     }
+                    // An imported arrow drawn from its own symbol has no style or colours to pick.
+                    ElementKind::NorthArrow { symbol, .. } if !symbol.is_empty() => {
+                        ui.label(tl!("Custom symbol (from import)"));
+                        if ui.button(tl!("Clear")).on_hover_text(tl!("Draw the arrow in a style again")).clicked() {
+                            update(app, json!({"symbol": null}));
+                        }
+                        ui.end_row();
+                    }
                     ElementKind::NorthArrow { style, fill, outline, .. } => {
                         let input_label = ui.label(tl!("Style"));
                         egui::ComboBox::from_id_salt(("arrow_style", id))
@@ -2895,6 +2903,55 @@ mod tests {
         h.run_steps(3);
         assert!(h.query_by_label("Takes").is_none());
         assert!(!h.get_by_label("Scale 1:").accesskit_node().is_disabled());
+    }
+
+    /// An imported north arrow drawn from its own symbol says so in the Format pane, without the
+    /// style and colour pickers, and Clear hands it back to its style.
+    #[test]
+    fn a_north_arrow_with_a_symbol_offers_clear_not_a_style() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        use rustgis_engine::map::{Marker, Rgba, Symbol};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Arrow"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let arrow = app.run("layout.addElement", json!({"layout": li, "kind": "northArrow"})).unwrap()["element"].as_u64().unwrap() as u32;
+        let symbol_of = |app: &RustGisApp| match app.session.project.layouts[li].element(arrow).map(|e| &e.kind) {
+            Some(ElementKind::NorthArrow { symbol, .. }) => symbol.len(),
+            _ => panic!("not a north arrow"),
+        };
+        if let Some(ElementKind::NorthArrow { symbol, .. }) =
+            app.session.project.layouts[li].elements.iter_mut().find(|e| e.id == arrow).map(|e| &mut e.kind)
+        {
+            symbol.push(Symbol {
+                fill: Rgba::rgb(1, 2, 3),
+                stroke: Rgba::rgb(0, 0, 0),
+                stroke_width: 1.0,
+                size: 20.0,
+                marker: Marker::Star,
+            });
+        }
+        app.layout.selected = Some(arrow);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label("Custom symbol (from import)");
+        assert!(h.query_by_label("Fill").is_none() && h.query_by_label("Outline").is_none(), "no colours to pick");
+        h.get_by_label("Clear").click();
+        h.run_steps(3);
+        assert_eq!(symbol_of(h.state()), 0);
+        assert!(h.query_by_label("Custom symbol (from import)").is_none());
+        h.get_by_label("Fill");
     }
 
     /// Dragging the map in a turned frame moves it the way the pointer goes, as in the map view.

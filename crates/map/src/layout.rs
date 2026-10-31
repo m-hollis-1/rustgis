@@ -8,6 +8,7 @@ use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 
 use crate::raster::{Colorizer, Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle};
+use crate::symbology::Symbol;
 use crate::{Camera, Layer, Map, Rgba};
 
 /// Logical points per millimetre (96 points per inch).
@@ -1104,6 +1105,10 @@ fn is_default_value<T: Default + PartialEq>(v: &T) -> bool {
 
 /// The most divisions a scale bar has.
 pub const MAX_SCALE_DIVISIONS: usize = 10;
+/// Most symbols (layers) a north arrow's point symbol keeps.
+pub const MAX_NORTH_ARROW_SYMBOLS: usize = 8;
+/// Largest marker size in a north arrow's symbol, in points.
+pub const MAX_NORTH_ARROW_SYMBOL_SIZE: f32 = 1000.0;
 
 /// The divisions a scale bar has unless set.
 pub const DEFAULT_SCALE_DIVISIONS: usize = 4;
@@ -1247,6 +1252,11 @@ pub enum ElementKind {
         /// The outline and the `N`.
         #[serde(default = "ink")]
         outline: Rgba,
+        /// A point symbol the arrow is drawn from instead of its style (an imported north arrow
+        /// keeps its own picture or vector symbol), bottom layer first, at most
+        /// [`MAX_NORTH_ARROW_SYMBOLS`]. Empty: the style draws.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        symbol: Vec<Symbol>,
     },
     ScaleBar {
         frame: u32,
@@ -1463,7 +1473,7 @@ impl ElementKind {
 
     /// A north arrow for `frame`, in the default style.
     pub fn north_arrow(frame: u32) -> ElementKind {
-        ElementKind::NorthArrow { frame, style: ArrowStyle::default(), fill: ink(), outline: ink() }
+        ElementKind::NorthArrow { frame, style: ArrowStyle::default(), fill: ink(), outline: ink(), symbol: Vec::new() }
     }
 
     /// A scale bar for `frame`, in the default style.
@@ -2046,6 +2056,14 @@ impl Layout {
                     text.truncate(text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i));
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
+                ElementKind::NorthArrow { symbol, .. } => {
+                    symbol.truncate(MAX_NORTH_ARROW_SYMBOLS);
+                    for s in symbol.iter_mut() {
+                        s.size = if s.size.is_finite() { s.size.clamp(0.0, MAX_NORTH_ARROW_SYMBOL_SIZE) } else { 0.0 };
+                        s.stroke_width =
+                            if s.stroke_width.is_finite() { s.stroke_width.clamp(0.0, MAX_NORTH_ARROW_SYMBOL_SIZE) } else { 0.0 };
+                    }
+                }
                 ElementKind::ScaleBar { divisions, subdivisions, divisions_before_zero, unit_label, decimals, label_size, .. } => {
                     *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS);
                     *subdivisions = (*subdivisions).min(MAX_SCALE_SUBDIVISIONS);
@@ -3233,6 +3251,35 @@ mod tests {
         assert_eq!(grid, Grid { step: 10.0, ..Grid::default() });
         assert_eq!(grid.edges, GridEdges { top: false, bottom: true, left: true, right: false });
         assert_eq!(grid.style, GridStyle::Lines);
+    }
+
+    #[test]
+    fn north_arrows_without_a_symbol_save_as_before_and_a_loaded_symbol_is_limited() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"NorthArrow":{"frame":2,"style":"Classic","fill":[0,0,0,255],"outline":[0,0,0,255]}}}"#;
+        let e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), j, "an empty symbol is not written");
+        // A symbol survives a round trip, and a long one is cut to the limit with sane sizes.
+        let one =
+            Symbol { fill: Rgba::rgb(1, 2, 3), stroke: Rgba::rgb(0, 0, 0), stroke_width: 1.0, size: 1e9, marker: crate::Marker::Square };
+        let mut kind = ElementKind::north_arrow(2);
+        if let ElementKind::NorthArrow { symbol, .. } = &mut kind {
+            *symbol = vec![one; MAX_NORTH_ARROW_SYMBOLS + 5];
+        }
+        let element =
+            Element { id: 1, name: "a".into(), x: 0.0, y: 0.0, w: 10.0, h: 10.0, visible: true, locked: false, frame_style: None, kind };
+        let mut l: Layout = serde_json::from_str(
+            r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":2,"name":"frame","x":0,"y":0,"w":100,"h":80,"kind":{"MapFrame":{"map":"M","center":{"x":0,"y":0},"scale":1e7}}}]}"#,
+        )
+        .unwrap();
+        l.elements.push(element);
+        let again: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(again, l);
+        let mut again = again;
+        again.clamp();
+        let Some(ElementKind::NorthArrow { symbol, .. }) = again.element(1).map(|e| &e.kind) else { panic!("not a north arrow") };
+        assert_eq!(symbol.len(), MAX_NORTH_ARROW_SYMBOLS);
+        assert!(symbol.iter().all(|s| s.size == MAX_NORTH_ARROW_SYMBOL_SIZE));
     }
 
     #[test]

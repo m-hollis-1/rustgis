@@ -1588,3 +1588,269 @@ fn hostile_surrounds_never_crash() {
     assert!(imp.layout.elements.iter().all(|e| e.name != "SHAPELESS" && e.name != "CIMTableFrame"));
     assert!(notes(&report).iter().any(|n| n == "SHAPELESS: no shape, left out"), "{:?}", notes(&report));
 }
+
+// ---- groups, draw order and hostile layouts ----
+
+/// A group element of `children`, with `extra` keys set on it.
+fn group_element(name: &str, children: Vec<serde_json::Value>, extra: serde_json::Value) -> serde_json::Value {
+    let mut g = json!({"type": "CIMGroupElement", "name": name, "visible": true, "elements": children});
+    if let (Some(o), Some(e)) = (g.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    g
+}
+
+fn picture_element(name: &str) -> serde_json::Value {
+    json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint",
+        "graphic": {"type": "CIMPictureGraphic", "referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Logo.png",
+            "box": {"xmin": 0.76, "ymin": 9.0, "xmax": 1.83, "ymax": 9.41}}})
+}
+
+fn id_of(imp: &LayoutImport, name: &str) -> u32 {
+    imp.layout.elements.iter().find(|e| e.name == name).map(|e| e.id).unwrap()
+}
+
+#[test]
+fn groups_keep_their_children_and_nesting() {
+    let link = text_element("CIMTextGraphic", "LINK", json!({"x": 2.0, "y": 9.5}), "www.example.com", text_symbol(json!({})));
+    let (imp, report) = read(&[group_element("LOGO AND LINK", vec![picture_element("LOGO"), link], json!({}))]);
+    let l = &imp.layout;
+    let (logo, link, group) = (id_of(&imp, "LOGO"), id_of(&imp, "LINK"), id_of(&imp, "LOGO AND LINK"));
+    assert_eq!(l.element(group).unwrap().children(), [logo, link]);
+    assert!(group > logo && group > link, "the group is added after its children");
+    assert_eq!(l.group_of(logo), Some(group));
+    assert_eq!(l.group_of(link), Some(group));
+    assert_eq!(l.group_of(group), None);
+    assert_eq!(l.elements.last().map(|e| e.id), Some(group));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // A group in a group: the outer one holds the inner one, and the inner one's children are two deep.
+    let inner = group_element(
+        "INNER",
+        vec![rectangle_element("A", corner_ring(1.0, 1.0, 2.0, 2.0)), rectangle_element("B", corner_ring(3.0, 3.0, 4.0, 4.0))],
+        json!({}),
+    );
+    let outer = group_element("OUTER", vec![inner, rectangle_element("C", corner_ring(5.0, 5.0, 6.0, 6.0))], json!({}));
+    let (imp, _) = read(&[outer]);
+    let l = &imp.layout;
+    let (a, b, c) = (id_of(&imp, "A"), id_of(&imp, "B"), id_of(&imp, "C"));
+    let (inner, outer) = (id_of(&imp, "INNER"), id_of(&imp, "OUTER"));
+    assert_eq!(l.element(inner).unwrap().children(), [a, b]);
+    assert_eq!(l.element(outer).unwrap().children(), [inner, c]);
+    assert!(inner > a && inner > b && outer > inner && outer > c);
+    assert_eq!(l.group_of(inner), Some(outer));
+    assert_eq!(l.groups_of(a), vec![inner, outer]);
+    assert_eq!(l.groups_of(c), vec![outer]);
+    assert_eq!(l.groups_of(outer), Vec::<u32>::new());
+    assert_eq!(l.group_depth(outer), 2);
+
+    // A group's own graphic frame becomes its border and background.
+    let line_sym = |c: serde_json::Value| json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(c, 1.0)]}});
+    let frame = json!({"type": "CIMGraphicFrame", "borderSymbol": line_sym(rgb(0, 0, 0)),
+        "backgroundSymbol": {"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![solid_fill(rgb(255, 255, 255))])}});
+    let framed = group_element("FRAMED", vec![rectangle_element("D", corner_ring(1.0, 1.0, 2.0, 2.0))], json!({"graphicFrame": frame}));
+    let (imp, _) = read(&[framed]);
+    let g = imp.layout.element(id_of(&imp, "FRAMED")).unwrap();
+    let fs = g.frame_style.clone().unwrap();
+    assert_eq!((fs.border, fs.background), (Some(Rgba::rgb(0, 0, 0)), Some(Rgba::rgb(255, 255, 255))));
+    assert_eq!(imp.layout.element(id_of(&imp, "D")).unwrap().frame_style, None);
+}
+
+#[test]
+fn elements_keep_pros_draw_order() {
+    // Pro lists the bottom element first: the map frame under the rectangle, the group and the text.
+    let text = text_element("CIMTextGraphic", "TITLE", json!({"x": 2.0, "y": 10.0}), "Title", text_symbol(json!({})));
+    let (imp, _) = read_with_maps(
+        &[embedded_map("CIMPATH=map/m.json", 4326, json!({}))],
+        &[
+            map_frame_element("MAIN MAP", (1.0, 1.0, 9.0, 8.0), json!({"mapURI": "CIMPATH=map/m.json"})),
+            rectangle_element("BOX", corner_ring(1.0, 1.0, 2.0, 2.0)),
+            group_element("G", vec![rectangle_element("IN1", corner_ring(3.0, 3.0, 4.0, 4.0)), picture_element("IN2")], json!({})),
+            text,
+        ],
+    );
+    let l = &imp.layout;
+    let names: Vec<&str> = l.elements.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["MAIN MAP", "BOX", "IN1", "IN2", "G", "TITLE"]);
+    let n = names.len();
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(l.draw_order(id_of(&imp, name)), Some((i, n)), "{name}");
+    }
+    // The first listed is drawn first (underneath), and each group comes after its children.
+    let group = l.element(id_of(&imp, "G")).unwrap();
+    for child in group.children() {
+        assert!(l.draw_order(*child) < l.draw_order(group.id));
+    }
+    assert!(matches!(l.elements.first().map(|e| &e.kind), Some(ElementKind::MapFrame { .. })));
+}
+
+/// Every path to a node of `v` (the root's is empty).
+fn json_paths(v: &serde_json::Value, at: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    out.push(at.clone());
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, c) in m {
+                at.push(k.clone());
+                json_paths(c, at, out);
+                at.pop();
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for (i, c) in a.iter().enumerate() {
+                at.push(i.to_string());
+                json_paths(c, at, out);
+                at.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn node_at<'a>(v: &'a mut serde_json::Value, path: &[String]) -> Option<&'a mut serde_json::Value> {
+    let Some((first, rest)) = path.split_first() else { return Some(v) };
+    let next = match v {
+        serde_json::Value::Object(m) => m.get_mut(first)?,
+        serde_json::Value::Array(a) => a.get_mut(first.parse::<usize>().ok()?)?,
+        _ => return None,
+    };
+    node_at(next, rest)
+}
+
+/// What a node is replaced with, one at a time: junk suited to its kind, and junk of another.
+fn replacements(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut out = vec![json!(null), json!("x")];
+    match v {
+        serde_json::Value::Number(_) => {
+            out.extend([json!(1e308), json!(-1e308), json!(0), json!(-1), json!(u64::MAX), json!(i64::MIN), json!(1e-308)])
+        }
+        serde_json::Value::String(_) => out.extend([json!("a".repeat(10_000)), json!("")]),
+        serde_json::Value::Array(_) => out.extend([json!([]), json!(7), json!([[], {}, 1e308])]),
+        serde_json::Value::Object(_) => out.extend([json!(7), json!({})]),
+        serde_json::Value::Bool(_) => out.extend([json!(true), json!(false)]),
+        serde_json::Value::Null => out.extend([json!(1e308), json!({}), json!([])]),
+    }
+    out
+}
+
+/// A layout document with a map frame, a group of two, a text with a dynamic tag, a picture, a
+/// legend, a scale bar and a north arrow.
+fn hostile_base() -> serde_json::Value {
+    let text = text_element(
+        "CIMTextGraphic",
+        "SCALE TEXT",
+        json!({"x": 2.0, "y": 10.0}),
+        r#"Scale <dyn type="mapFrame" name="MAIN MAP" property="scale" preStr="1:"/>"#,
+        text_symbol(json!({})),
+    );
+    let character = json!({"type": "CIMCharacterMarker", "enable": true, "size": 24.0, "characterIndex": 178, "fontFamilyName": "ESRI North",
+        "fontStyleName": "Regular", "symbol": polygon_symbol(vec![solid_fill(rgb(10, 0, 0))])});
+    let elements = vec![
+        map_frame_element(
+            "MAIN MAP",
+            (1.0, 1.0, 9.0, 8.0),
+            json!({"mapURI": "CIMPATH=map/m.json", "graphicFrame": {"type": "CIMGraphicFrame", "borderGapX": 3}}),
+        ),
+        group_element(
+            "LOGO AND LINK",
+            vec![picture_element("LOGO"), rectangle_element("RULE", corner_ring(1.0, 9.0, 3.0, 9.1))],
+            json!({}),
+        ),
+        text,
+        picture_element("PICTURE"),
+        surround_element(
+            "CIMLegend",
+            "LEGEND",
+            "MAIN MAP",
+            json!({"title": "Legend", "columns": 2, "fittingStrategy": "AdjustColumnsAndSize", "excludedLayers": ["CIMPATH=map/roads.json"],
+                "defaultLegendItem": {"type": "CIMLegendItem", "showLayerName": true, "showHeading": true},
+                "items": [{"type": "CIMLegendItem", "layerURI": "CIMPATH=map/roads.json", "showHeading": false}]}),
+        ),
+        surround_element(
+            "CIMDoubleFillScaleBar",
+            "SCALE BAR",
+            "MAIN MAP",
+            json!({"units": {"uwkid": 9035}, "divisions": 2, "subdivisions": 1, "labelPosition": "AboveBar", "numberFormat": {"type": "CIMNumericFormat", "roundingValue": 0}}),
+        ),
+        surround_element(
+            "CIMMarkerNorthArrow",
+            "NORTH ARROW",
+            "MAIN MAP",
+            json!({"northType": "TrueNorth", "calibrationAngle": 0,
+                "pointSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPointSymbol", "symbolLayers": [character]}}}),
+        ),
+    ];
+    json!({"type": "CIMLayoutDocument", "version": "3.7.0",
+        "binaryReferences": [{"type": "CIMBinaryReference", "uRI": "CIMPATH=Pictures/logo.png", "data": "iVBORw0KGgo="}],
+        "mapDefinitions": [embedded_map("CIMPATH=map/m.json", 3857, camera(-9_000_000.0, 4_000_000.0, 24_000.0))],
+        "layerDefinitions": [layer_def("Roads", "CIMPATH=map/roads.json")],
+        "layoutDefinition": {"type": "CIMLayout", "name": "P",
+            "page": {"type": "CIMPage", "width": 17, "height": 11, "units": {"uwkid": 109008}, "guides": [{"type": "CIMGuide", "position": 16.5, "orientation": "Vertical"}]},
+            "elements": elements}})
+}
+
+/// Reads `doc`; when that works, the layout must clamp and serialise (which refuses NaN and infinities).
+fn read_and_check(doc: &serde_json::Value) {
+    let Ok(doc) = Document::from_json(&doc.to_string()) else { return };
+    let mut report = Report::default();
+    if let Ok(mut imp) = read_layout(&doc, &mut report) {
+        imp.layout.clamp();
+        let text = serde_json::to_string(&imp.layout);
+        assert!(text.is_ok(), "{:?}", text.err());
+        let back = serde_json::from_str::<crate::layout::Layout>(&text.unwrap_or_default());
+        assert!(back.is_ok(), "{:?}", back.err());
+    }
+}
+
+#[test]
+fn hostile_layouts_never_panic() {
+    let base = hostile_base();
+    // The fixture itself reads whole.
+    let mut report = Report::default();
+    let imp = read_layout(&Document::from_json(&base.to_string()).unwrap(), &mut report).unwrap();
+    let has = |f: fn(&ElementKind) -> bool| imp.layout.elements.iter().any(|e| f(&e.kind));
+    assert!(has(|k| matches!(k, ElementKind::MapFrame { .. })));
+    assert!(has(|k| matches!(k, ElementKind::Group { .. })));
+    assert!(has(|k| matches!(k, ElementKind::Text { .. })));
+    assert!(has(|k| matches!(k, ElementKind::Picture { .. })));
+    assert!(has(|k| matches!(k, ElementKind::Legend { .. })));
+    assert!(has(|k| matches!(k, ElementKind::ScaleBar { .. })));
+    assert!(has(|k| matches!(k, ElementKind::NorthArrow { .. })));
+    read_and_check(&base);
+
+    // Every node of the fixture, replaced one at a time by each junk value suited to it.
+    let mut paths = Vec::new();
+    json_paths(&base, &mut Vec::new(), &mut paths);
+    let mut runs = 0;
+    for path in &paths {
+        let mut probe = base.clone();
+        let Some(here) = node_at(&mut probe, path) else { continue };
+        for junk in replacements(here) {
+            let mut doc = base.clone();
+            if let Some(node) = node_at(&mut doc, path) {
+                *node = junk;
+            }
+            read_and_check(&doc);
+            runs += 1;
+        }
+    }
+    assert!(runs >= 200, "{runs} mutations");
+
+    // Then pairs of mutations picked by a fixed-seed generator.
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |n: usize| {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 33) as usize) % n.max(1)
+    };
+    for _ in 0..300 {
+        let mut doc = base.clone();
+        for _ in 0..2 {
+            let Some(path) = paths.get(next(paths.len())) else { continue };
+            let Some(here) = node_at(&mut doc, path) else { continue };
+            let options = replacements(here);
+            if let Some(junk) = options.get(next(options.len())) {
+                *here = junk.clone();
+            }
+        }
+        read_and_check(&doc);
+    }
+}

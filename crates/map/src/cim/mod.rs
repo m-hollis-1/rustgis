@@ -9,6 +9,9 @@
 //! own nesting limit, a zip is read within the same budget, and every lookup is by key, so a
 //! document missing what a reader looks for gives `None`, never a panic.
 
+pub(crate) mod color;
+pub(crate) mod units;
+
 #[cfg(test)]
 mod tests;
 

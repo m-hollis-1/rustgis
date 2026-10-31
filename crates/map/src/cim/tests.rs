@@ -1,6 +1,9 @@
 //! Small CIM documents, written by hand in the shapes ArcGIS Pro writes them.
 
+use serde_json::json;
+
 use super::*;
+use crate::Rgba;
 
 #[test]
 fn a_layout_document_resolves_its_embedded_maps_layers_and_binaries() {
@@ -82,4 +85,72 @@ fn the_readers_take_only_what_is_there() {
     assert!(typed(&v, "CIMPointSymbol").is_some());
     assert!(typed(&v, "CIMLineSymbol").is_none());
     assert!(typed(&Value::Null, "CIMPointSymbol").is_none());
+}
+
+#[test]
+fn cim_colours_become_rgba() {
+    let rgb = json!({"type":"CIMRGBColor","values":[255, 128, 0, 50]});
+    assert_eq!(color::color(&rgb), Some(Rgba::new(255, 128, 0, 128)));
+    let cmyk = json!({"type":"CIMCMYKColor","values":[0, 100, 100, 0, 100]});
+    assert_eq!(color::color(&cmyk), Some(Rgba::new(255, 0, 0, 255)));
+    let gray = json!({"type":"CIMGrayColor","values":[50, 100]});
+    assert_eq!(color::color(&gray).map(|c| c.r()), Some(128));
+    assert_eq!(color::color(&json!({"type":"CIMRGBColor","values":[1]})), None);
+    assert_eq!(color::color(&json!({"type":"CIMRGBColor","values":["a","b","c"]})), None);
+}
+
+#[test]
+fn page_units_and_point_sizes_convert() {
+    assert_eq!(units::page_unit_mm(&json!({"units":{"uwkid":109008}})), Some(25.4));
+    assert_eq!(units::page_unit_mm(&json!({"units":{"uwkid":1}})), None);
+    assert!((units::pt96(1.0) - 96.0 / 72.0).abs() < 1e-6);
+    assert_eq!(units::pt96(f64::NAN), 0.0);
+    assert_eq!(units::text_pt(1000.0), 400.0);
+}
+
+#[test]
+fn hue_and_lab_colours_and_symbol_references() {
+    let c = |ty: &str, values: Value| color::color(&json!({"type": ty, "values": values}));
+    assert_eq!(c("CIMHSVColor", json!([120, 100, 100])), Some(Rgba::new(0, 255, 0, 255)));
+    assert_eq!(c("CIMHSVColor", json!([-120, 100, 50, 0])), Some(Rgba::new(0, 0, 128, 0)));
+    assert_eq!(c("CIMHSLColor", json!([240, 100, 50])), Some(Rgba::new(0, 0, 255, 255)));
+    assert_eq!(c("CIMHSLColor", json!([0, 0, 100])), Some(Rgba::new(255, 255, 255, 255)));
+    assert_eq!(c("CIMLABColor", json!([100, 0, 0])), Some(Rgba::new(255, 255, 255, 255)));
+    assert_eq!(c("CIMLABColor", json!([0, 0, 0])), Some(Rgba::new(0, 0, 0, 255)));
+    // sRGB red in Lab (D65), to within a step.
+    let red = c("CIMLABColor", json!([53.24, 80.09, 67.2])).map(|c| c.0);
+    assert!(red.is_some_and(|[r, g, b, _]| r >= 254 && g <= 2 && b <= 2), "{red:?}");
+    // Out of range values are clamped; unreadable ones, an unknown kind and a missing type are not colours.
+    assert_eq!(c("CIMRGBColor", json!([300, -5, 0, 500])), Some(Rgba::new(255, 0, 0, 255)));
+    assert_eq!(c("CIMRGBColor", json!([0, 0, 0])), Some(Rgba::new(0, 0, 0, 255)));
+    assert_eq!(c("CIMCMYKColor", json!([0, 0, 0])), None);
+    assert_eq!(c("CIMPatternColor", json!([0, 0, 0])), None);
+    assert_eq!(color::color(&json!({"values": [0, 0, 0]})), None);
+    assert_eq!(color::color(&json!({"type": "CIMRGBColor"})), None);
+
+    let layers = json!({"type": "CIMPointSymbol", "symbolLayers": []});
+    let reference = json!({"type": "CIMSymbolReference", "symbol": layers});
+    assert_eq!(color::symbol_of(&reference), Some(&layers));
+    assert_eq!(color::symbol_of(&layers), Some(&layers));
+    assert_eq!(color::symbol_of(&json!({"type": "CIMSymbolReference"})), None);
+    assert_eq!(color::symbol_of(&json!({"type": "CIMRGBColor"})), None);
+}
+
+#[test]
+fn page_units_come_from_esris_linear_unit_table() {
+    let mm = |wkid: i64| units::page_unit_mm(&json!({"units": {"uwkid": wkid}}));
+    assert_eq!(mm(9001), Some(1000.0));
+    assert_eq!(mm(109006), Some(10.0));
+    assert_eq!(mm(109007), Some(1.0));
+    assert_eq!(mm(109008), Some(25.4));
+    assert!(mm(109016).is_some_and(|p| (p - 25.4 / 72.0).abs() < 1e-9));
+    assert_eq!(mm(109001), None);
+    assert_eq!(units::page_unit_mm(&json!({})), None);
+    assert_eq!(units::page_unit_mm(&json!({"units": {"uwkid": "x"}})), None);
+    assert_eq!(units::pt96(-3.0), 0.0);
+    assert_eq!(units::pt96(1e9), 1000.0);
+    assert_eq!(units::pt96(f64::INFINITY), 0.0);
+    assert_eq!(units::text_pt(0.5), 2.0);
+    assert_eq!(units::text_pt(f64::NAN), 2.0);
+    assert_eq!(units::text_pt(12.0), 12.0);
 }

@@ -22,8 +22,6 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 /// How far into a layout's text its type is looked for.
 const TYPE_WITHIN: usize = 200;
-/// The widest and tallest a GIF or BMP picture may be to be converted to PNG.
-const MAX_SIDE: u32 = 4096;
 const NOT_A_LAYOUT: &str = "not an ArcGIS Pro layout: the document isn't a CIMLayoutDocument";
 /// The most of a name or path a note quotes.
 const SHOWN: usize = 64;
@@ -107,7 +105,7 @@ fn inspect(_: &mut Session, p: &Value) -> CmdResult {
 
 /// The project maps `maps` names for frames (by frame name, in lower case): an object of map
 /// names, each a map of the project.
-fn chosen_maps(s: &Session, p: &Value) -> Result<HashMap<String, String>, String> {
+fn chosen_maps(s: &Session, p: &Value) -> Result<HashMap<String, (String, String)>, String> {
     let mut chosen = HashMap::new();
     let given = match p.get("maps") {
         None | Some(Value::Null) => return Ok(chosen),
@@ -122,7 +120,7 @@ fn chosen_maps(s: &Session, p: &Value) -> Result<HashMap<String, String>, String
             .iter()
             .find(|m| m.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| format!("maps: no map named {}", shown(name)))?;
-        chosen.insert(frame.trim().to_lowercase(), m.name.clone());
+        chosen.insert(frame.trim().to_lowercase(), (frame.clone(), m.name.clone()));
     }
     Ok(chosen)
 }
@@ -150,6 +148,11 @@ pub(crate) fn import_layout(s: &mut Session, text: &str, dir: Option<&str>, p: &
     let mut imp = cim::read_layout(&doc, &mut report)?;
     let maps = embedded_maps(&doc, &imp, &mut report);
     let chosen = chosen_maps(s, p)?;
+    for (key, (frame, _)) in &chosen {
+        if !imp.frames.iter().any(|b| b.name.trim().to_lowercase() == *key) {
+            report.skipped("", format!("maps: no frame named {}", shown(frame)));
+        }
+    }
     read_pictures(&mut imp, dir, &mut report);
     convert_markers(&mut imp, &mut report);
 
@@ -187,27 +190,29 @@ pub(crate) fn import_layout(s: &mut Session, text: &str, dir: Option<&str>, p: &
 
 /// Gives each map frame its project map: the embedded map it shows, else the one `maps` names
 /// for it, else the active map (noted when the template doesn't name one). A frame that takes
-/// its map's view (scale 0) takes that map's current centre and scale.
+/// its map's view (scale 0) takes that map's current centre, scale, bearing and pitch.
 fn bind_frames(
     s: &Session,
     imp: &mut LayoutImport,
     bound: &HashMap<String, String>,
-    chosen: &HashMap<String, String>,
+    chosen: &HashMap<String, (String, String)>,
     report: &mut Report,
 ) {
     let active = s.map().name.clone();
     for b in &imp.frames {
         let embedded = b.map_uri.as_deref().and_then(|u| bound.get(&uri_key(u)));
-        let named = chosen.get(&b.name.trim().to_lowercase());
+        let named = chosen.get(&b.name.trim().to_lowercase()).map(|(_, m)| m);
         let map = embedded.or(named).unwrap_or(&active).clone();
         let Some(el) = imp.layout.element_mut(b.element) else { continue };
         let w = el.w;
-        let ElementKind::MapFrame { map: shows, center, scale, .. } = &mut el.kind else { continue };
+        let ElementKind::MapFrame { map: shows, center, scale, bearing, pitch, .. } = &mut el.kind else { continue };
         let mut current = false;
         if *scale == 0.0
             && let Some(m) = s.project.maps.iter().find(|m| m.name == map)
         {
+            // As `layout.frameZoom` takes a view: its centre, scale, bearing and pitch.
             (*center, *scale) = current_view(s, m, w);
+            (*bearing, *pitch) = (m.camera.bearing, m.camera.pitch);
             current = true;
         }
         *shows = map;
@@ -225,24 +230,44 @@ fn current_view(s: &Session, m: &rustgis_map::Map, w_mm: f64) -> (Coord, f64) {
     (m.center_lonlat(), if scale.is_finite() { scale.clamp(MIN_FRAME_SCALE, MAX_FRAME_SCALE) } else { MIN_FRAME_SCALE })
 }
 
-/// A path as compared with the one a layer was opened from: absolute where it can be made so.
+/// A path as compared with the one a layer was opened from: absolute where it can be made so,
+/// and in lower case on Windows, whose file names are compared regardless of case.
 fn absolute(path: &str) -> String {
-    std::path::absolute(path).map_or_else(|_| path.to_string(), |a| a.display().to_string())
+    let p = std::path::absolute(path).map_or_else(|_| path.to_string(), |a| a.display().to_string());
+    if cfg!(windows) { p.to_lowercase() } else { p }
 }
 
-/// The files of `m`'s layers, top first, as they are opened: a path and a table.
+/// The files of `m`'s layers that are there to open, top first: a path and a table. (A file that
+/// isn't there is left out of the map, so it is left out of the comparison too.)
 fn layer_files(m: &MapImport, dir: Option<&str>) -> Vec<(String, Option<String>)> {
-    m.layers.iter().filter_map(|l| Some((absolute(&resolve(l.path.as_deref()?, dir)), l.table.clone()))).collect()
+    m.layers
+        .iter()
+        .filter_map(|l| {
+            let path = resolve(l.path.as_deref()?, dir);
+            std::path::Path::new(&path).exists().then(|| (absolute(&path), l.table.clone()))
+        })
+        .collect()
 }
 
-/// A project map an earlier import added for `m`: of its name, with its layers' files in order.
+/// Whether a project map's name is `base`, or `base` numbered as `map.new` numbers a name that
+/// is taken (`base2`, `base3`…): the map an earlier import added when another had the name.
+fn named_as(name: &str, base: &str) -> bool {
+    if name.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    let (Some(head), Some(tail)) = (name.get(..base.len()), name.get(base.len()..)) else { return false };
+    head.eq_ignore_ascii_case(base) && tail.parse::<u32>().is_ok_and(|n| n >= 2) && tail.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A project map an earlier import added for `m`: of its name (or that name numbered), with its
+/// layers' files in order.
 fn reusable(s: &Session, m: &MapImport, dir: Option<&str>) -> Option<String> {
     let want = layer_files(m, dir);
     s.project
         .maps
         .iter()
         .find(|pm| {
-            if !pm.name.eq_ignore_ascii_case(&m.name) {
+            if !named_as(&pm.name, &m.name) {
                 return false;
             }
             let have: Vec<_> = pm.layers.iter().filter(|l| !l.graphics).collect();
@@ -376,7 +401,12 @@ fn as_png_or_jpeg(bytes: &[u8]) -> Result<String, String> {
         return Ok(b64);
     }
     if bytes.starts_with(b"GIF8") || bytes.starts_with(b"BM") {
-        return to_png(bytes).map(|png| base64::engine::general_purpose::STANDARD.encode(png));
+        let png = to_png(bytes)?;
+        let limit = super::graphics::MAX_PICTURE;
+        if png.len() > limit {
+            return Err(format!("larger than {} MB once converted to PNG", limit >> 20));
+        }
+        return Ok(base64::engine::general_purpose::STANDARD.encode(png));
     }
     Err("not a PNG, JPEG, GIF or BMP picture".into())
 }
@@ -399,10 +429,12 @@ fn read_file(_: &str) -> Result<Vec<u8>, String> {
     Err("the browser can't read files beside a layout; relink the picture".into())
 }
 
-/// A GIF or BMP picture as PNG: at most [`MAX_SIDE`] pixels each way.
+/// A GIF or BMP picture as PNG: at most 4096 pixels each way.
 #[cfg(not(target_arch = "wasm32"))]
 fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Cursor;
+    /// The widest and tallest a GIF or BMP picture may be to be converted.
+    const MAX_SIDE: u32 = 4096;
     let format = match image::guess_format(bytes) {
         Ok(f @ (image::ImageFormat::Gif | image::ImageFormat::Bmp)) => f,
         _ => return Err("not a GIF or BMP picture".into()),

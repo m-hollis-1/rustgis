@@ -22963,7 +22963,7 @@ fn pagx_with(logo: Value, arrow_url: &str) -> String {
         "renderer": {"type": "CIMSimpleRenderer", "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPointSymbol",
             "symbolLayers": [{"type": "CIMVectorMarker", "enable": true, "size": 6.0}]}}}});
     // Pro writes the document's type first, which is how `layout.import` tells a .pagx's text.
-    let doc = json!({"version": "3.7.0",
+    let doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0",
         "binaryReferences": [{"type": "CIMBinaryReference", "uRI": "CIMPATH=Pictures/logo.png", "data": b64(&picture_bytes(4, 2, image::ImageFormat::Png))}],
         "mapDefinitions": [{"type": "CIMMap", "name": "NEW DETAIL MAP", "uRI": "CIMPATH=map/new_detail_map.json",
             "layers": ["CIMPATH=new_detail_map/detail_points.json"], "spatialReference": {"wkid": 4326, "latestWkid": 4326},
@@ -22972,13 +22972,19 @@ fn pagx_with(logo: Value, arrow_url: &str) -> String {
         "layoutDefinition": {"type": "CIMLayout", "name": "11x17 LANDSCAPE",
             "page": {"type": "CIMPage", "width": 17, "height": 11, "units": {"uwkid": 109008}, "guides": []},
             "elements": elements}});
-    format!(r#"{{"type":"CIMLayoutDocument",{}"#, &doc.to_string()[1..])
+    type_first(doc)
+}
+
+/// A CIM document's text with its `type` first, as Pro writes it (serde_json sorts the keys).
+fn type_first(mut doc: Value) -> String {
+    let ty = doc.as_object_mut().unwrap().remove("type").unwrap();
+    format!(r#"{{"type":{ty},{}"#, &doc.to_string()[1..])
 }
 
 /// The fixture with its logo from the document's binaries and a PNG north arrow.
 fn pagx() -> String {
     let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
-    pagx_with(json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Holland LR Logo.png"}), &arrow)
+    pagx_with(json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": "logos/logo.png"}), &arrow)
 }
 
 #[test]
@@ -23044,11 +23050,14 @@ fn importing_the_same_pagx_twice_reuses_the_embedded_map() {
 fn an_unbound_frame_takes_the_active_maps_view_and_says_so() {
     use rustgis_map::layout::ElementKind;
     let mut s = world();
+    s.map_mut().camera.bearing = 30.0;
     let r = s.run("layout.import", &json!({"text": pagx()})).unwrap();
     let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
     let main = l.elements.iter().find(|e| e.name == "MAIN MAP").unwrap();
-    let ElementKind::MapFrame { map, center, scale, .. } = &main.kind else { panic!("{:?}", main.kind) };
+    let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &main.kind else { panic!("{:?}", main.kind) };
     assert_eq!(map, "World");
+    assert_eq!((*bearing, *pitch), (s.map().camera.bearing, s.map().camera.pitch));
+    assert_eq!(*bearing, 30.0);
     let m = s.map();
     let expected = s.view_size.0 * m.ground_res() / (main.w / 1000.0);
     assert!(*scale > 0.0 && (scale - expected).abs() <= 1e-6 * expected, "{scale} vs {expected}");
@@ -23065,6 +23074,39 @@ fn an_unbound_frame_takes_the_active_maps_view_and_says_so() {
     assert!(s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": 7}})).is_err());
     assert!(s.run("layout.import", &json!({"text": pagx(), "maps": ["World"]})).is_err());
     assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+    // A frame the layout hasn't is said, not silently ignored.
+    let r = s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": "World", "INSET": "World"}})).unwrap();
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n["text"] == "maps: no frame named INSET"), "{}", r["notes"]);
+}
+
+#[test]
+fn a_pagx_whose_data_is_missing_still_reuses_its_map() {
+    // The embedded map has a second layer whose shapefile isn't there.
+    let mut doc: Value = serde_json::from_str(&pagx()).unwrap();
+    let mut missing = doc["layerDefinitions"][0].clone();
+    missing["name"] = json!("Gone");
+    missing["uRI"] = json!("CIMPATH=new_detail_map/gone.json");
+    missing["featureTable"]["dataConnection"]["dataset"] = json!("rustgis-no-such-file.shp");
+    doc["layerDefinitions"].as_array_mut().unwrap().push(missing);
+    doc["mapDefinitions"][0]["layers"].as_array_mut().unwrap().push(json!("CIMPATH=new_detail_map/gone.json"));
+    let text = type_first(doc);
+    let mut s = world();
+    let maps = s.project.maps.len();
+    let params = json!({"text": text, "maps": {"MAIN MAP": "World"}});
+    let first = s.run("layout.import", &params).unwrap();
+    assert!(first["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "Gone" && n["kind"] == "skipped"), "{}", first["notes"]);
+    s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 1);
+    // Another map of the embedded map's name: the import's own map, numbered, is still found.
+    let mut s = world();
+    s.run("map.new", &json!({"name": "NEW DETAIL MAP"})).unwrap();
+    s.run("map.activate", &json!({"name": "World"})).unwrap();
+    let maps = s.project.maps.len();
+    let first = s.run("layout.import", &params).unwrap();
+    let second = s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!(first["maps"], second["maps"]);
+    assert_eq!(first["maps"], json!(["NEW DETAIL MAP2"]));
 }
 
 #[test]

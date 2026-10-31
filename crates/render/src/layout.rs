@@ -3,6 +3,7 @@
 
 use rustgis_data::GeometryType;
 use rustgis_geom::{Coord, Extent};
+use rustgis_map::graphics::decimal;
 use rustgis_map::layout::{
     ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, Layout, LineHead, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits,
     TextAlign, TickSide, frame_camera,
@@ -21,6 +22,8 @@ pub struct PageInfo {
     pub pages: usize,
     /// The map series page's name.
     pub page_name: String,
+    /// The project's name.
+    pub project: String,
 }
 
 /// Largest page drawn, in pixels per side and in all (less in the browser, where memory is
@@ -380,41 +383,41 @@ fn finish_frame_map(mut img: crate::Rendered, ppp: f64) -> Pixmap {
     img.pixmap
 }
 
-/// Expands layout text tokens: the page ones here, the map ones from the first frame.
+/// Expands layout text tokens: the page values from `info` and `layout`, the map ones from the
+/// first frame, all through the one expander (`rustgis_map::graphics::expand`).
 pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, rustgis_map::Camera)>) -> String {
-    // The frame's scale, worked out once for both its forms below.
-    let scale = frame.map(|(m, cam)| m.ground_res_at(&cam) / rustgis_map::layout::PAPER_M_PER_PT);
-    // A layout with a decimal comma prints its scale with points between thousands: put in first,
-    // so a page or layout name holding "{scale}" isn't read as the token.
-    let t = match scale {
-        Some(scale) if layout.decimal_comma => t.replace("{scale}", &decimal(rustgis_map::graphics::scale_ratio(scale), true)),
-        _ => t.to_string(),
-    };
-    let t = t
-        .replace("{page}", &info.page.max(1).to_string())
-        .replace("{pages}", &info.pages.max(1).to_string())
-        .replace("{pageName}", &info.page_name)
-        .replace("{layout}", &layout.name);
     let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let v = match frame {
-        Some((m, cam)) => rustgis_map::graphics::TokenValues {
-            map: m.name.clone(),
-            scale: scale.unwrap_or(0.0),
-            crs: m.projection.label(),
-            layers: m.layers.iter().filter(|l| !l.graphics).count(),
-            center: m.to_lonlat(cam.center).unwrap_or_default(),
-            now,
-        },
-        None => rustgis_map::graphics::TokenValues {
-            map: String::new(),
-            scale: 0.0,
-            crs: String::new(),
-            layers: 0,
-            center: Coord::default(),
-            now,
-        },
+    let mut v = rustgis_map::graphics::TokenValues {
+        page: info.page.max(1),
+        pages: info.pages.max(1),
+        page_name: info.page_name.clone(),
+        layout: layout.name.clone(),
+        decimal_comma: layout.decimal_comma,
+        project: info.project.clone(),
+        now,
+        ..Default::default()
     };
-    rustgis_map::graphics::expand(&t, &v)
+    if let Some((m, cam)) = frame {
+        v.map = m.name.clone();
+        v.scale = m.ground_res_at(&cam) / rustgis_map::layout::PAPER_M_PER_PT;
+        v.crs = m.projection.label();
+        v.layers = m.layers.iter().filter(|l| !l.graphics).count();
+        v.center = m.to_lonlat(cam.center).unwrap_or_default();
+        v.credits = credits(m);
+    }
+    rustgis_map::graphics::expand(t, &v)
+}
+
+/// The attributions of a map's web layers that draw, each once, joined with commas.
+fn credits(map: &Map) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for t in map.tiles.iter().filter(|t| t.draws()) {
+        let a = t.attribution.trim();
+        if !a.is_empty() && !seen.contains(&a) {
+            seen.push(a);
+        }
+    }
+    seen.join(", ")
 }
 
 /// A rectangle with its corners rounded by `rad` pixels (at most half its shorter side), each a
@@ -439,21 +442,6 @@ pub(crate) fn rounded_rect(r: tiny_skia::Rect, rad: f32) -> Option<tiny_skia::Pa
     pb.cubic_to(l, t + rad - c, l + rad - c, t, l + rad, t);
     pb.close();
     pb.finish()
-}
-
-/// A number as printed with a decimal comma when `comma` (`0.05` to `0,05`, `6,300,000` to
-/// `6.300.000`): its points and commas swapped.
-fn decimal(s: String, comma: bool) -> String {
-    if !comma {
-        return s;
-    }
-    s.chars()
-        .map(|c| match c {
-            '.' => ',',
-            ',' => '.',
-            c => c,
-        })
-        .collect()
 }
 
 fn shape_path(shape: &FrameShape, r: Rect) -> Option<tiny_skia::Path> {
@@ -550,7 +538,7 @@ fn graticule_lines(g: &Grid, ext: Extent, comma: bool, lines: &mut Vec<(Vec<Coor
     let mut lon = (ext.min_x / step).floor() * step;
     while lon <= ext.max_x + step * 1e-9 && n < 200 {
         let pts = (0..=48).map(|i| Coord::new(lon, lat0 + (lat1 - lat0) * i as f64 / 48.0)).collect();
-        lines.push((pts, decimal(grid_label(g, lon, true, step), comma), true));
+        lines.push((pts, decimal(&grid_label(g, lon, true, step), comma), true));
         lon += step;
         n += 1;
     }
@@ -558,7 +546,7 @@ fn graticule_lines(g: &Grid, ext: Extent, comma: bool, lines: &mut Vec<(Vec<Coor
     while lat <= ext.max_y + step * 1e-9 && n < 400 {
         if lat.abs() <= 90.0 {
             let pts = (0..=48).map(|i| Coord::new(lon0 + (lon1 - lon0) * i as f64 / 48.0, lat)).collect();
-            lines.push((pts, decimal(grid_label(g, lat, false, step), comma), false));
+            lines.push((pts, decimal(&grid_label(g, lat, false, step), comma), false));
         }
         lat += step;
         n += 1;
@@ -610,7 +598,7 @@ fn measured_lines(
         }
         // (A point that doesn't convert is left out.)
         let pts: Vec<Coord> = (0..=48).filter_map(|i| back(x, y0 + (y1 - y0) * f64::from(i) / 48.0)).collect();
-        lines.push((pts, decimal(g.measured_label(x, step), comma), true));
+        lines.push((pts, decimal(&g.measured_label(x, step), comma), true));
     }
     for (i, y) in
         std::iter::successors(Some(first(ext.min_y)), |y| Some(y + step)).take_while(|y| *y <= ext.max_y + step * 1e-9).enumerate()
@@ -619,7 +607,7 @@ fn measured_lines(
             break;
         }
         let pts: Vec<Coord> = (0..=48).filter_map(|i| back(x0 + (x1 - x0) * f64::from(i) / 48.0, y)).collect();
-        lines.push((pts, decimal(g.measured_label(y, step), comma), false));
+        lines.push((pts, decimal(&g.measured_label(y, step), comma), false));
     }
 }
 
@@ -1034,7 +1022,7 @@ fn scale_bar(pm: &mut Pixmap, r: Rect, ground_per_pt: f64, bar: (ScaleUnits, usi
     let gap = 3.0 * ppp as f32;
     let labels: Vec<(f32, String)> = (0..=divisions)
         .map(|i| {
-            let v = decimal(scale_number(total * i as f64 / divisions as f64, total / divisions as f64), comma);
+            let v = decimal(&scale_number(total * i as f64 / divisions as f64, total / divisions as f64), comma);
             (x0 + seg * i as f32, if i == divisions { format!("{v} {abbr}") } else { v })
         })
         .collect();
@@ -1592,7 +1580,7 @@ fn colorbar(pm: &mut Pixmap, r: Rect, scale: &ColorScale, bar: &Bar, ppp: f64) {
     if blocks.is_empty() || r.width() < 2.0 || bottom - top < 2.0 {
         return;
     }
-    let labels: Vec<(f32, String)> = labels.into_iter().map(|(at, s)| (at, decimal(s, bar.comma))).collect();
+    let labels: Vec<(f32, String)> = labels.into_iter().map(|(at, s)| (at, decimal(&s, bar.comma))).collect();
     let tick = 2.5 * ppp;
     let gap = 1.5 * ppp;
     let vertical = bar.orientation == Orientation::Vertical;
@@ -1846,7 +1834,7 @@ mod tests {
     #[test]
     fn the_tokens_offered_are_the_ones_expanded() {
         let layout = Layout::new("Atlas", 100.0, 100.0);
-        let info = PageInfo { page: 2, pages: 5, page_name: "North".into() };
+        let info = PageInfo { page: 2, pages: 5, page_name: "North".into(), ..Default::default() };
         let tokens = rustgis_map::layout::PAGE_TOKENS.iter().chain(rustgis_map::graphics::TOKENS);
         for (token, _) in tokens {
             assert!(!expand(token, &layout, &info, None).contains('{'), "{token}");
@@ -2740,16 +2728,45 @@ mod tests {
         assert_eq!(kept, ["6°S", "42°W", "34°W"]);
     }
 
+    /// `{project}` is the page's project name and `{credits}` the frame map's web layers'
+    /// attributions, each once, those that draw only.
+    #[test]
+    fn project_and_credits_fill_from_the_page_and_the_frame() {
+        let mut map = Map::new("m");
+        let tile = |name: &str, attribution: &str, visible: bool| {
+            let mut t = rustgis_map::TileLayer::new(name, rustgis_map::TileKind::Raster, "https://example.test/{z}/{x}/{y}.png");
+            t.attribution = attribution.into();
+            t.visible = visible;
+            t
+        };
+        map.tiles = vec![
+            tile("a", "© One", true),
+            tile("b", " © Two ", true),
+            tile("c", "© One", true),
+            tile("d", "© Hidden", false),
+            tile("e", "", true),
+        ];
+        let cam = frame_camera(&map, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
+        let layout = Layout::new("L", 100.0, 100.0);
+        let info = PageInfo { project: "Parcels".into(), ..Default::default() };
+        assert_eq!(
+            expand("{project|Project: |\\n}{credits|Data: }", &layout, &info, Some((&map, cam))),
+            "Project: Parcels\nData: © One, © Two"
+        );
+        // Without a frame there are no credits.
+        assert_eq!(expand("{project}|{credits|Data: }", &layout, &info, None), "Parcels|");
+    }
+
     /// A layout with a decimal comma swaps the marks of the numbers it prints, `{scale}` included,
     /// and leaves other text alone.
     #[test]
     fn a_decimal_comma_swaps_the_marks() {
-        assert_eq!(decimal("0.05".into(), true), "0,05");
-        assert_eq!(decimal("6,300,000".into(), true), "6.300.000");
-        assert_eq!(decimal("0.05".into(), false), "0.05");
+        assert_eq!(decimal("0.05", true), "0,05");
+        assert_eq!(decimal("6,300,000", true), "6.300.000");
+        assert_eq!(decimal("0.05", false), "0.05");
         let map = Map::new("m");
         let cam = frame_camera(&map, Coord::new(0.0, 0.0), 6_300_000.0, 0.0, 0.0);
-        let info = PageInfo { page: 1, pages: 1, page_name: String::new() };
+        let info = PageInfo { page: 1, pages: 1, ..Default::default() };
         let mut layout = Layout::new("L", 100.0, 100.0);
         let point = expand("Scale {scale}, page {page}.", &layout, &info, Some((&map, cam)));
         layout.decimal_comma = true;

@@ -816,7 +816,8 @@ fn series_label(app: &mut RustGisApp, li: usize) -> Option<(usize, String)> {
 pub fn page_info(app: &mut RustGisApp, li: usize) -> rustgis_engine::render::layout::PageInfo {
     let page = app.session.project.layouts.get(li).and_then(|l| l.series.as_ref()).map_or(0, |s| s.page);
     let (pages, page_name) = series_label(app, li).unwrap_or((1, String::new()));
-    rustgis_engine::render::layout::PageInfo { page: page + 1, pages, page_name }
+    let project = app.session.project.name.clone();
+    rustgis_engine::render::layout::PageInfo { page: page + 1, pages, page_name, project }
 }
 
 /// The map frame under a screen point, when map frames are being navigated.

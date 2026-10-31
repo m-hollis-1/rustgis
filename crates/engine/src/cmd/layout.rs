@@ -3196,6 +3196,7 @@ pub fn layout_bytes(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool) 
                     Some(n) => n.get(*page).cloned().unwrap_or_default(),
                     None => info.as_ref().map(|i| i.1.clone()).unwrap_or_default(),
                 },
+                project: s.project.name.clone(),
             };
             let img = rustgis_render::layout::render(layout, &mut s.project.maps, dpi, &info).ok_or("the page is too large to draw")?;
             // Each page is compressed as soon as it's drawn, within a memory budget.
@@ -3253,6 +3254,7 @@ fn layout_svg(s: &mut Session, li: usize, dpi: f64) -> Result<String, String> {
         page: current + 1,
         pages: series.as_ref().map_or(1, |i| i.0),
         page_name: series.map(|i| i.1).unwrap_or_default(),
+        project: s.project.name.clone(),
     };
     // Rendering borrows the current layout; it does not step or modify the series page.
     let layout = s.project.layouts.get(li).ok_or("no layout")?;

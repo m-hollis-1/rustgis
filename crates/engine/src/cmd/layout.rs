@@ -2925,7 +2925,7 @@ fn has_legend_layout(p: &Value, bar: bool) -> bool {
     ["columns", "fit", "showLayerNames"].iter().filter(|k| !(bar && **k == "fit")).any(|k| p.get(*k).is_some_and(|v| !v.is_null()))
 }
 
-const ONLY_BAR_DETAILS: &str = "only scale bars have subdivisions, divisionsBeforeZero, labelPosition, unitLabel, unitLabelPosition, decimals or labelSize (and a fit of divisions)";
+const ONLY_BAR_DETAILS: &str = "subdivisions, divisionsBeforeZero, labelPosition, unitLabel, unitLabelPosition, decimals and labelSize are for scale bars only (a scale bar's fit is adjustDivisionValue, adjustDivision or adjustWidth; legends have their own)";
 
 /// The options a scale bar takes besides its style, units and divisions.
 const BAR_DETAILS: [&str; 7] =

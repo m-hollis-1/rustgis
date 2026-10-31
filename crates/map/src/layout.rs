@@ -991,7 +991,7 @@ impl BarLabels {
     }
 
     pub fn from_name(s: &str) -> Option<BarLabels> {
-        BarLabels::ALL.into_iter().find(|v| v.code() == s)
+        BarLabels::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
     }
 }
 
@@ -1031,7 +1031,7 @@ impl UnitLabel {
     }
 
     pub fn from_name(s: &str) -> Option<UnitLabel> {
-        UnitLabel::ALL.into_iter().find(|v| v.code() == s)
+        UnitLabel::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
     }
 }
 
@@ -1069,7 +1069,7 @@ impl ScaleFit {
     }
 
     pub fn from_name(s: &str) -> Option<ScaleFit> {
-        ScaleFit::ALL.into_iter().find(|v| v.code() == s)
+        ScaleFit::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
     }
 }
 
@@ -1105,8 +1105,11 @@ fn is_default_value<T: Default + PartialEq>(v: &T) -> bool {
 /// The most divisions a scale bar has.
 pub const MAX_SCALE_DIVISIONS: usize = 10;
 
+/// The divisions a scale bar has unless set.
+pub const DEFAULT_SCALE_DIVISIONS: usize = 4;
+
 fn divisions() -> usize {
-    4
+    DEFAULT_SCALE_DIVISIONS
 }
 
 fn ink() -> Rgba {

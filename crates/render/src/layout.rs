@@ -1154,11 +1154,12 @@ struct BarOptions {
     fit: ScaleFit,
 }
 
+#[cfg(test)]
 impl Default for BarOptions {
     fn default() -> Self {
         BarOptions {
             units: ScaleUnits::default(),
-            divisions: 4,
+            divisions: rustgis_map::layout::DEFAULT_SCALE_DIVISIONS,
             style: ScaleBarStyle::default(),
             subdivisions: 0,
             divisions_before_zero: 0,
@@ -1169,6 +1170,25 @@ impl Default for BarOptions {
             label_size: DEFAULT_SCALE_LABEL_SIZE,
             fit: ScaleFit::default(),
         }
+    }
+}
+
+/// The lines of text over and under a scale bar: how many of each, and which line (0 is the
+/// nearest the bar) a unit label on a line of its own takes.
+struct BarRows {
+    up: usize,
+    down: usize,
+    unit_row: usize,
+}
+
+fn bar_rows(labels: BarLabels, unit: UnitLabel, has_unit: bool) -> BarRows {
+    let unit_above = has_unit && unit == UnitLabel::Above;
+    let unit_below = has_unit && unit == UnitLabel::Below;
+    BarRows {
+        up: usize::from(labels == BarLabels::Above) + usize::from(unit_above),
+        down: usize::from(labels == BarLabels::Below) + usize::from(unit_below),
+        // The labels have the nearest line on their side.
+        unit_row: usize::from((unit_above && labels == BarLabels::Above) || (unit_below && labels == BarLabels::Below)),
     }
 }
 
@@ -1199,15 +1219,16 @@ fn scale_bar(pm: &mut Pixmap, r: Rect, ground_per_pt: f64, bar: &BarOptions, ppp
     };
     let gap = 3.0 * ppp as f32;
     // The width the unit takes right of the bar.
+    // The bar keeps at least half the box: a wider label overflows it to the right.
     let beside = if bar.unit_label_position == UnitLabel::AfterBar && !unit_text.is_empty() {
-        2.0 * half(&unit_text) + gap + ppp as f32
+        (2.0 * half(&unit_text) + gap + ppp as f32).min(room_px * 0.5)
     } else {
         0.0
     };
     // The division value (in the unit) and the divisions after zero, for the width left once
     // `taken` px of the box are spoken for.
     let plan = |taken: f32| -> Option<(f64, usize)> {
-        let room = (room_px - taken) as f64 * ground_per_px / unit_m;
+        let room = (room_px - taken.min(room_px * 0.5)) as f64 * ground_per_px / unit_m;
         let count = (before + after) as f64;
         match bar.fit {
             ScaleFit::AdjustDivisionValue => {
@@ -1247,10 +1268,8 @@ fn scale_bar(pm: &mut Pixmap, r: Rect, ground_per_pt: f64, bar: &BarOptions, ppp
     let seg = len / divs as f32;
     let bar_h = (r.height() * 0.28).min(6.0 * ppp as f32);
     // The bar sits low when the labels are over it, high when they're under it.
-    let unit_row = |p: UnitLabel| usize::from(bar.unit_label_position == p && !unit_text.is_empty());
-    let up = usize::from(bar.label_position == BarLabels::Above) + unit_row(UnitLabel::Above);
-    let down = usize::from(bar.label_position == BarLabels::Below) + unit_row(UnitLabel::Below);
-    let centre = r.y() + r.height() * (0.5 + 0.12 * (up as f32 - down as f32));
+    let rows = bar_rows(bar.label_position, bar.unit_label_position, !unit_text.is_empty());
+    let centre = r.y() + r.height() * (0.5 + 0.12 * (rows.up as f32 - rows.down as f32));
     let (x0, y0) = (r.x() + 2.0 + pad, centre - bar_h / 2.0);
     let zero_x = x0 + seg * before as f32;
     let dark = Rgba::rgb(0x22, 0x22, 0x22);
@@ -1352,13 +1371,9 @@ fn scale_bar(pm: &mut Pixmap, r: Rect, ground_per_pt: f64, bar: &BarOptions, ppp
         UnitLabel::AfterBar => {
             text::text_at(pm, &unit_text, x0 + len + gap + ppp as f32, y0 + bar_h / 2.0, px, dark, false, text::Align::Left, false)
         }
-        UnitLabel::Above => {
-            let n = usize::from(bar.label_position == BarLabels::Above);
-            text::text_at(pm, &unit_text, middle, y0 - row(n), px, dark, false, text::Align::Center, false)
-        }
+        UnitLabel::Above => text::text_at(pm, &unit_text, middle, y0 - row(rows.unit_row), px, dark, false, text::Align::Center, false),
         UnitLabel::Below => {
-            let n = usize::from(bar.label_position == BarLabels::Below);
-            text::text_at(pm, &unit_text, middle, y0 + bar_h + row(n), px, dark, false, text::Align::Center, false)
+            text::text_at(pm, &unit_text, middle, y0 + bar_h + row(rows.unit_row), px, dark, false, text::Align::Center, false)
         }
     }
 }
@@ -3995,6 +4010,23 @@ pub(crate) mod tests {
         assert!(bottom(&under) > bottom(&blank), "{} against {}", bottom(&under), bottom(&blank));
         // The unit text is verbatim.
         assert_ne!(after_bar(Some("FEET"), UnitLabel::AfterBar).data(), feet.data());
+    }
+
+    #[test]
+    fn a_wide_unit_label_after_the_bar_keeps_the_bar() {
+        let long = "Kilometers of ground distance, as measured on the map ".repeat(2);
+        for width in [40u32, 93, 300] {
+            let bar = BarOptions {
+                unit_label: Some(long.clone()),
+                unit_label_position: UnitLabel::AfterBar,
+                units: ScaleUnits::Kilometers,
+                ..BarOptions::default()
+            };
+            let pm = draw_bar(&bar, width);
+            let (a, b) = marked_span(&pm, 37).unwrap_or((0, 0));
+            assert!(b > a + width / 4, "width {width}: bar from {a} to {b}");
+            assert!(bar_ink_rows(&pm).len() > 6, "width {width}: labels drawn");
+        }
     }
 
     #[test]

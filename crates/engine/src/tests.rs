@@ -4494,12 +4494,11 @@ fn layout_scale_bars_take_their_details() {
         json!({"unitLabel": 7}),
         json!({"unitLabel": ["ft"]}),
         json!({"unitLabelPosition": "beside"}),
-        json!({"unitLabelPosition": "above "}),
         json!({"decimals": {}}),
         json!({"labelSize": "big"}),
         json!({"fit": "manual"}),
         json!({"fit": 3}),
-        json!({"fit": "AdjustWidth"}),
+        json!({"unitLabelPosition": "beside "}),
     ] {
         let mut p = bad.clone();
         p["element"] = json!(bar);
@@ -4509,6 +4508,11 @@ fn layout_scale_bars_take_their_details() {
         assert_eq!(details(&s, bar), before, "{bad}");
         assert!(matches!(find(&s, "scaleBar").kind, ElementKind::ScaleBar { style: rustgis_map::layout::ScaleBarStyle::Alternating, .. }));
     }
+    // Names ignore case and surrounding spaces, as the style and units do.
+    s.run("layout.update", &json!({"element": bar, "labelPosition": " ABOVE ", "unitLabelPosition": "AfterBar ", "fit": "AdjustWidth"}))
+        .unwrap();
+    let d = details(&s, bar);
+    assert_eq!((d.2, d.4, d.7), (BarLabels::Above, UnitLabel::AfterBar, ScaleFit::AdjustWidth));
     // Added with them.
     let added = s
         .run(

@@ -12,7 +12,7 @@ use super::{b, f, ps, uint};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 /// Largest picture accepted (16 MiB).
-const MAX_PICTURE: usize = 16 << 20;
+pub(crate) const MAX_PICTURE: usize = 16 << 20;
 /// Most vertices in one graphic.
 const MAX_POINTS: usize = 100_000;
 

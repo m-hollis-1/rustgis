@@ -139,25 +139,16 @@ pub fn commands() -> Vec<C> {
         .view()
         .params(r#"{"layout"?, "path": "*.rgislayout"}"#),
         C::new("layout.import", "Import Layout", "Home › Project", |s, p| {
-            let text = match (ps(p, "text"), ps(p, "path")) {
-                (Some(t), _) => t.to_string(),
-                (None, Some(path)) => {
-                    use std::io::Read;
-                    // Read at most one byte past the limit, so a file growing meanwhile is still refused.
-                    let mut text = String::new();
-                    std::fs::File::open(path)
-                        .and_then(|f| f.take(MAX_LAYOUT + 1).read_to_string(&mut text))
-                        .map_err(|e| format!("{path}: {e}"))?;
-                    if text.len() as u64 > MAX_LAYOUT {
-                        return Err("the layout file is too large".into());
-                    }
-                    text
-                }
-                (None, None) => return Err("path or text is required".into()),
-            };
+            let text = layout_text(p)?;
+            // An ArcGIS Pro layout: by its extension, or by its text, whose type Pro writes first.
+            let path = ps(p, "text").is_none().then(|| ps(p, "path")).flatten();
+            if super::arcgis_pro::is_pagx(&text, path) {
+                let dir = super::arcgis_pro::folder(p);
+                return super::arcgis_pro::import_layout(s, &text, dir.as_deref(), p);
+            }
             import(s, &text)
         })
-        .params(r#"{"path"?: "*.rgislayout", "text"?: layout JSON}"#),
+        .params(r#"{"path"?: "*.rgislayout|*.pagx", "text"?: layout JSON or a .pagx file's text, "maps"?: {frame name: map name} (.pagx: the project map a frame shows when the layout doesn't say; default: the active map), "dir"?: "the folder a .pagx's relative picture and data paths start from (default: the file's)"} → {"layout", "name"} (.pagx: and "maps" added or reused, "notes" on what wasn't carried over)"#),
     ]
 }
 
@@ -230,7 +221,7 @@ fn unlocked(l: &Layout, id: u32) -> Result<(), String> {
     }
 }
 
-fn unique_name(s: &Session, base: &str) -> String {
+pub(crate) fn unique_name(s: &Session, base: &str) -> String {
     let base = base.trim();
     let base = if base.is_empty() { "Layout" } else { base };
     numbered(base, |n| s.project.layouts.iter().any(|l| l.name.eq_ignore_ascii_case(n)))
@@ -3901,6 +3892,24 @@ fn layout_svg(s: &mut Session, li: usize, dpi: f64) -> Result<String, String> {
     let layout = s.project.layouts.get(li).ok_or("no layout")?;
     rustgis_render::svg::layout_svg(layout, &mut s.project.maps, dpi, &info)
         .ok_or_else(|| "could not draw the page; check its map sources and export size".into())
+}
+
+/// A layout file's text: `text`, else the file at `path`, read up to [`MAX_LAYOUT`] bytes.
+pub(crate) fn layout_text(p: &Value) -> Result<String, String> {
+    match (ps(p, "text"), ps(p, "path")) {
+        (Some(t), _) => Ok(t.to_string()),
+        (None, Some(path)) => {
+            use std::io::Read;
+            // Read at most one byte past the limit, so a file growing meanwhile is still refused.
+            let mut text = String::new();
+            std::fs::File::open(path).and_then(|f| f.take(MAX_LAYOUT + 1).read_to_string(&mut text)).map_err(|e| format!("{path}: {e}"))?;
+            if text.len() as u64 > MAX_LAYOUT {
+                return Err("the layout file is too large".into());
+            }
+            Ok(text)
+        }
+        (None, None) => Err("path or text is required".into()),
+    }
 }
 
 pub(crate) fn import(s: &mut Session, text: &str) -> CmdResult {

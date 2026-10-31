@@ -2131,6 +2131,11 @@ fn hostile_params_never_panic() {
         json!({"source": 7, "id": ["c1"]}),
         // A plugin browser: a junk node and query.
         json!({"id": "hostile-browser", "node": 1e300, "query": {}}),
+        // An ArcGIS Pro layout: frame bindings of the wrong type, a document with no layout.
+        json!({"maps": 1}),
+        json!({"maps": {"a": null}}),
+        json!({"text": "{\"type\":\"CIMLayoutDocument\"}"}),
+        json!({"text": "{\"type\":\"CIMLayoutDocument\",\"layoutDefinition\":{\"page\":{\"width\":1e308,\"height\":-1},\"elements\":[{\"type\":\"CIMMapFrame\",\"uRI\":7}]}}", "path": "x.pagx", "dir": 7}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);
@@ -22848,5 +22853,297 @@ fn merge_distinguishes_case_sensitive_file_paths() {
         })
         .collect();
     assert_eq!(coordinates, [1.0, 2.0]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ---- ArcGIS Pro layouts (.pagx) ----
+
+/// The shapefile the fixture's embedded map reads, written once for every test that uses it.
+fn pagx_shapefile() -> std::path::PathBuf {
+    static SHP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    SHP.get_or_init(|| line_of_points_shp("pagx-detail", 5)).clone()
+}
+
+/// A `w`×`h` black picture in `format`.
+fn picture_bytes(w: u32, h: u32, format: image::ImageFormat) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255])))
+        .write_to(&mut std::io::Cursor::new(&mut out), format)
+        .unwrap();
+    out
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The 11x17 template reduced by hand: two frames (the small one linked to the main one, with its
+/// extent indicator, and showing an embedded map of one shapefile layer), background boxes, text
+/// with dynamic tags, a legend, a scale bar, a north arrow, a logo, and two groups. `logo` is the
+/// HLR LOGO's picture keys (`referenceURI`, `sourceURL`); `arrow_url` the north arrow marker's
+/// data URL.
+fn pagx_with(logo: Value, arrow_url: &str) -> String {
+    let shp = pagx_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    let ring = |x0: f64, y0: f64, x1: f64, y1: f64| json!({"rings": [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]]});
+    let rgb = |r: u8, g: u8, b: u8| json!({"type": "CIMRGBColor", "values": [r, g, b, 100]});
+    let fill = |c: Value| json!({"type": "CIMSolidFill", "enable": true, "color": c});
+    let stroke = |c: Value| json!({"type": "CIMSolidStroke", "enable": true, "width": 1.0, "color": c});
+    let polygon =
+        |layers: Vec<Value>| json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMPolygonSymbol", "symbolLayers": layers}});
+    let rectangle = |name: &str, r: Value, c: Value| {
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "BottomLeftCorner", "visible": true,
+            "graphic": {"type": "CIMPolygonGraphic", "polygon": r, "symbol": polygon(vec![fill(c)])}})
+    };
+    let text = |name: &str, x: f64, y: f64, t: &str| {
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "TopLeftCorner", "visible": true,
+            "graphic": {"type": "CIMTextGraphic", "shape": {"x": x, "y": y}, "text": t,
+                "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "fontFamilyName": "Arial", "fontStyleName": "Regular",
+                    "height": 12, "symbol": {"type": "CIMPolygonSymbol", "symbolLayers": [fill(rgb(0, 0, 0))]}}}}})
+    };
+    let frame =
+        |name: &str, r: Value| json!({"type": "CIMMapFrame", "name": name, "anchor": "BottomLeftCorner", "visible": true, "frame": r});
+    let main = frame("MAIN MAP", ring(0.5, 0.5, 11.5, 10.0));
+    let mut detail = frame("SMALL DETAIL MAP", ring(12.0, 6.0, 16.5, 10.0));
+    detail["uRI"] = json!("CIMPATH=map/new_detail_map.json");
+    detail["view"] =
+        json!({"type": "CIMMapView", "camera": {"type": "CIMViewCamera", "x": -97.0, "y": 38.0, "scale": 25_000_000.0, "heading": 0}});
+    detail["autoCamera"] =
+        json!({"type": "CIMAutoCamera", "source": "MapFrameLink", "mapFrameLinkName": "MAIN MAP", "autoCameraType": "Center"});
+    detail["extentIndicators"] = json!([{"type": "CIMExtentIndicator", "sourceMapFrame": "MAIN MAP",
+        "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMLineSymbol", "symbolLayers": [stroke(rgb(255, 0, 0))]}}}]);
+    let surround = |ty: &str, name: &str, r: Value, extra: Value| {
+        let mut e = json!({"type": ty, "name": name, "anchor": "BottomLeftCorner", "visible": true, "mapFrame": "MAIN MAP", "frame": r});
+        e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        e
+    };
+    let legend = surround("CIMLegend", "LEGEND", ring(12.0, 2.5, 16.5, 5.5), json!({"title": "Legend", "showTitle": false, "columns": 1}));
+    let label = json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 9.0, "fontStyleName": "Regular"}});
+    let bar = surround(
+        "CIMDoubleFillScaleBar",
+        "SCALE BAR",
+        ring(12.0, 1.5, 15.0, 2.0),
+        json!({"units": {"uwkid": 9002}, "divisions": 4, "subdivisions": 2, "divisionsBeforeZero": 0, "labelPosition": "Bottom",
+            "unitLabel": "Feet", "unitLabelPosition": "AfterBar", "labelSymbol": label, "fittingStrategy": "AdjustDivision"}),
+    );
+    let arrow = surround(
+        "CIMMarkerNorthArrow",
+        "NORTH ARROW",
+        ring(15.5, 1.0, 16.5, 2.5),
+        json!({"northType": "TrueNorth", "pointSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPointSymbol",
+            "symbolLayers": [{"type": "CIMPictureMarker", "enable": true, "size": 36.0, "url": arrow_url}]}}}),
+    );
+    let mut logo_graphic = json!({"type": "CIMPictureGraphic", "box": {"xmin": 0.76, "ymin": 10.3, "xmax": 1.83, "ymax": 10.9}});
+    logo_graphic.as_object_mut().unwrap().extend(logo.as_object().unwrap().clone());
+    let logo = json!({"type": "CIMGraphicElement", "name": "HLR LOGO", "anchor": "CenterPoint", "visible": true, "graphic": logo_graphic});
+    let group = |name: &str, children: Vec<Value>| json!({"type": "CIMGroupElement", "name": name, "visible": true, "elements": children});
+    let elements = vec![
+        group(
+            "HEADER",
+            vec![
+                rectangle("TOP BACKGROUND", ring(0.0, 10.25, 17.0, 11.0), rgb(230, 230, 230)),
+                rectangle("LOGO RIBBON", ring(0.0, 10.25, 3.0, 11.0), rgb(20, 60, 120)),
+            ],
+        ),
+        group("TITLE BLOCK", vec![logo, text("TITLE", 3.5, 10.9, "PROJECT TITLE")]),
+        text("SCALE TEXT", 12.0, 1.4, r#"<dyn type="mapFrame" name="MAIN MAP" property="scale" preStr="1:"/>"#),
+        text("SPATIAL REF DATA", 12.0, 1.2, r#"<dyn type="mapFrame" name="MAIN MAP" property="sr" srProperty="name"/>"#),
+        text("DATE AUTO", 12.0, 1.0, r#"<dyn type="date"/>"#),
+        main,
+        detail,
+        legend,
+        bar,
+        arrow,
+    ];
+    let layer = json!({"type": "CIMFeatureLayer", "name": "Detail Points", "uRI": "CIMPATH=new_detail_map/detail_points.json", "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": format!("DATABASE={folder}"), "workspaceFactory": "Shapefile", "dataset": file, "datasetType": "esriDTFeatureClass"}},
+        "renderer": {"type": "CIMSimpleRenderer", "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPointSymbol",
+            "symbolLayers": [{"type": "CIMVectorMarker", "enable": true, "size": 6.0}]}}}});
+    // Pro writes the document's type first, which is how `layout.import` tells a .pagx's text.
+    let doc = json!({"version": "3.7.0",
+        "binaryReferences": [{"type": "CIMBinaryReference", "uRI": "CIMPATH=Pictures/logo.png", "data": b64(&picture_bytes(4, 2, image::ImageFormat::Png))}],
+        "mapDefinitions": [{"type": "CIMMap", "name": "NEW DETAIL MAP", "uRI": "CIMPATH=map/new_detail_map.json",
+            "layers": ["CIMPATH=new_detail_map/detail_points.json"], "spatialReference": {"wkid": 4326, "latestWkid": 4326},
+            "defaultExtent": {"xmin": -125.0, "ymin": 24.0, "xmax": -66.0, "ymax": 50.0, "spatialReference": {"wkid": 4326}}}],
+        "layerDefinitions": [layer],
+        "layoutDefinition": {"type": "CIMLayout", "name": "11x17 LANDSCAPE",
+            "page": {"type": "CIMPage", "width": 17, "height": 11, "units": {"uwkid": 109008}, "guides": []},
+            "elements": elements}});
+    format!(r#"{{"type":"CIMLayoutDocument",{}"#, &doc.to_string()[1..])
+}
+
+/// The fixture with its logo from the document's binaries and a PNG north arrow.
+fn pagx() -> String {
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    pagx_with(json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Holland LR Logo.png"}), &arrow)
+}
+
+#[test]
+fn a_pagx_imports_with_its_frames_bound_and_its_embedded_map_added() {
+    use rustgis_map::layout::{ElementKind, FrameLink};
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": "World"}})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    // (17 × 25.4 isn't 431.8 exactly in floating point.)
+    assert!((l.width - 431.8).abs() < 1e-9 && (l.height - 279.4).abs() < 1e-9, "{} × {}", l.width, l.height);
+    let main = l.elements.iter().find(|e| e.name == "MAIN MAP").unwrap();
+    let detail = l.elements.iter().find(|e| e.name == "SMALL DETAIL MAP").unwrap();
+    assert!(matches!(&main.kind, ElementKind::MapFrame { map, scale, .. } if map == "World" && *scale > 0.0), "{:?}", main.kind);
+    assert!(
+        matches!(&detail.kind, ElementKind::MapFrame { map, link: Some(FrameLink { frame, .. }), extent_of: Some(of), .. } if map == "NEW DETAIL MAP" && *frame == main.id && *of == main.id),
+        "{:?}",
+        detail.kind
+    );
+    assert!(s.project.maps.iter().any(|m| m.name == "NEW DETAIL MAP"));
+    let scale_text = l.elements.iter().find(|e| e.name == "SCALE TEXT").unwrap();
+    assert!(
+        matches!(&scale_text.kind, ElementKind::Text { text, frame: Some(f), .. } if text == "{scale}" && *f == main.id),
+        "{:?}",
+        scale_text.kind
+    );
+    assert!(l.elements.iter().any(|e| matches!(&e.kind, ElementKind::Group { children } if children.len() == 2)));
+    assert!(r["notes"].as_array().unwrap().iter().all(|n| n["kind"] != "skipped"), "{}", r["notes"]);
+    // The embedded map holds its shapefile layer, and the map that was active still is.
+    let added = s.project.maps.iter().find(|m| m.name == "NEW DETAIL MAP").unwrap();
+    assert_eq!(added.layers.iter().filter(|l| !l.graphics).count(), 1);
+    assert_eq!(added.basemap, rustgis_map::Basemap::Blank);
+    assert!(!added.graticule);
+    assert_eq!(s.map().name, "World");
+    assert_eq!(r["maps"], json!(["NEW DETAIL MAP"]));
+    assert_eq!(s.active_layout, Some(r["layout"].as_u64().unwrap() as usize));
+    // The logo comes from the document.
+    let logo = l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap();
+    assert!(matches!(&logo.kind, ElementKind::Picture { image, .. } if !image.is_empty()));
+}
+
+#[test]
+fn importing_the_same_pagx_twice_reuses_the_embedded_map() {
+    let mut s = world();
+    let maps = s.project.maps.len();
+    let layouts = s.project.layouts.len();
+    let text = pagx();
+    let params = json!({"text": text, "maps": {"MAIN MAP": "World"}});
+    let first = s.run("layout.import", &params).unwrap();
+    let second = s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!((&first["maps"], &second["maps"]), (&json!(["NEW DETAIL MAP"]), &json!(["NEW DETAIL MAP"])));
+    assert_eq!(s.project.layouts.len(), layouts + 2);
+    assert_ne!(first["name"], second["name"]);
+    // A map of that name with other layers isn't the template's: a new one is added.
+    let detail = s.project.maps.iter().position(|m| m.name == "NEW DETAIL MAP").unwrap();
+    s.project.maps[detail].layers.retain(|l| l.graphics);
+    let third = s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 2);
+    assert_ne!(third["maps"], json!(["NEW DETAIL MAP"]));
+}
+
+#[test]
+fn an_unbound_frame_takes_the_active_maps_view_and_says_so() {
+    use rustgis_map::layout::ElementKind;
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"text": pagx()})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let main = l.elements.iter().find(|e| e.name == "MAIN MAP").unwrap();
+    let ElementKind::MapFrame { map, center, scale, .. } = &main.kind else { panic!("{:?}", main.kind) };
+    assert_eq!(map, "World");
+    let m = s.map();
+    let expected = s.view_size.0 * m.ground_res() / (main.w / 1000.0);
+    assert!(*scale > 0.0 && (scale - expected).abs() <= 1e-6 * expected, "{scale} vs {expected}");
+    let c = m.center_lonlat();
+    assert!((center.x - c.x).abs() < 1e-9 && (center.y - c.y).abs() < 1e-9, "{center:?} vs {c:?}");
+    let notes = r["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n["layer"] == "MAIN MAP" && n["text"].as_str().unwrap().contains("template")), "{notes:?}");
+    // The frame the template binds says nothing of the kind.
+    assert!(!notes.iter().any(|n| n["layer"] == "SMALL DETAIL MAP" && n["text"].as_str().unwrap().contains("template")), "{notes:?}");
+    // A map the project hasn't is refused before anything changes.
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let e = s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": "Nowhere"}})).unwrap_err();
+    assert!(e.contains("maps: no map named Nowhere"), "{e}");
+    assert!(s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": 7}})).is_err());
+    assert!(s.run("layout.import", &json!({"text": pagx(), "maps": ["World"]})).is_err());
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+}
+
+#[test]
+fn layout_inspect_lists_frames_without_importing() {
+    let mut s = world();
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let r = s.run("layout.inspect", &json!({"text": pagx()})).unwrap();
+    assert_eq!(
+        r,
+        json!({"frames": [{"name": "MAIN MAP", "map": null}, {"name": "SMALL DETAIL MAP", "map": "NEW DETAIL MAP"}], "maps": ["NEW DETAIL MAP"]})
+    );
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+    // By path too; a document that isn't a layout is refused.
+    let dir = std::env::temp_dir().join(format!("rustgis-layout-inspect-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.pagx");
+    std::fs::write(&file, pagx()).unwrap();
+    assert_eq!(s.run("layout.inspect", &json!({"path": file.display().to_string()})).unwrap(), r);
+    assert!(s.run("layout.inspect", &json!({"text": "{\"type\":\"CIMMapDocument\"}"})).is_err());
+    assert!(s.run("layout.inspect", &json!({})).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_pagx_by_path_resolves_pictures_beside_it() {
+    use rustgis_map::layout::ElementKind;
+    use rustgis_map::symbology::Marker;
+    let dir = std::env::temp_dir().join(format!("rustgis-pagx-pictures-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("logo.png");
+    std::fs::write(&png, picture_bytes(3, 2, image::ImageFormat::Png)).unwrap();
+    std::fs::write(dir.join("logo.bmp"), picture_bytes(3, 2, image::ImageFormat::Bmp)).unwrap();
+    let gif_arrow = format!("data:image/gif;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Gif)));
+    let kind = |s: &Session, r: &Value, name: &str| {
+        let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+        l.elements.iter().find(|e| e.name == name).unwrap().kind.clone()
+    };
+    // An absolute path, and a north arrow whose GIF marker becomes a PNG.
+    let file = dir.join("abs.pagx");
+    std::fs::write(&file, pagx_with(json!({"sourceURL": png.display().to_string()}), &gif_arrow)).unwrap();
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"path": file.display().to_string(), "maps": {"MAIN MAP": "World"}})).unwrap();
+    let ElementKind::Picture { image, source } = kind(&s, &r, "HLR LOGO") else { panic!() };
+    assert_eq!(rustgis_render::picture_size(&image), Some((3, 2)));
+    assert_eq!(source.as_deref(), Some(png.display().to_string().as_str()));
+    let ElementKind::NorthArrow { symbol, .. } = kind(&s, &r, "NORTH ARROW") else { panic!() };
+    assert!(matches!(&symbol[0].marker, Marker::Image(i) if rustgis_render::picture_size(i.as_str()) == Some((2, 2))), "{symbol:?}");
+    // A relative path, beside the .pagx: a BMP, converted to PNG.
+    let file = dir.join("rel.pagx");
+    std::fs::write(&file, pagx_with(json!({"sourceURL": "logo.bmp"}), &gif_arrow)).unwrap();
+    let r = s.run("layout.import", &json!({"path": file.display().to_string()})).unwrap();
+    let ElementKind::Picture { image, source } = kind(&s, &r, "HLR LOGO") else { panic!() };
+    assert_eq!(rustgis_render::picture_size(&image), Some((3, 2)));
+    assert_eq!(source.as_deref(), Some("logo.bmp"));
+    // A picture that isn't there: noted, the element empty with its source.
+    let text = pagx_with(json!({"sourceURL": "missing.png"}), &gif_arrow);
+    let r = s.run("layout.import", &json!({"text": text, "dir": dir.display().to_string()})).unwrap();
+    let ElementKind::Picture { image, source } = kind(&s, &r, "HLR LOGO") else { panic!() };
+    assert!(image.is_empty() && source.as_deref() == Some("missing.png"));
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "HLR LOGO"), "{}", r["notes"]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rgislayout_files_still_import() {
+    let mut s = world();
+    let layouts = s.project.layouts.len();
+    s.run("layout.new", &json!({"name": "CIMLayoutDocument"})).unwrap();
+    let text = serde_json::to_string(s.project.layouts.last().unwrap()).unwrap();
+    // A RustGIS layout named like a CIM type is still a RustGIS layout.
+    let r = s.run("layout.import", &json!({"text": text})).unwrap();
+    assert_eq!(s.project.layouts.len(), layouts + 2);
+    assert_eq!(r["name"], "CIMLayoutDocument 2");
+    let dir = std::env::temp_dir().join(format!("rustgis-rgislayout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rgislayout");
+    std::fs::write(&file, &text).unwrap();
+    s.run("layout.import", &json!({"path": file.display().to_string()})).unwrap();
+    assert_eq!(s.project.layouts.len(), layouts + 3);
+    assert!(s.run("layout.import", &json!({"text": "{}"})).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }

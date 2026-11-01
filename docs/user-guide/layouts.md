@@ -144,7 +144,22 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   and **Outline** colours (`"style":"compass","fill":"#B91C1C"`). A scale bar's pick its
   **Style** (alternating bar, stepped line or single line), its **Units** (metres or kilometres
   to suit the scale, or kilometres, metres, miles or feet) and its **Divisions** (1 to 10), each
-  labelled where there is room (`"style":"line","units":"miles","divisions":2`). A legend shows what
+  labelled where there is room (`"style":"line","units":"miles","divisions":2`). A scale bar also
+  sets **Subdivisions** (0 to 10: parts the first division is cut into, not labelled),
+  **Divisions before zero** (0 to 2: whole divisions left of zero, labelled with negatives),
+  **Decimals** (0 to 3 for the division labels; 0 gives each the decimals it needs), **Label
+  size** (4 to 24 pt, 8 to begin with), **Label position** (above or below the bar), **Unit
+  label** (the unit's name as printed, its abbreviation to begin with, empty for none) and
+  **Unit label position** (after the last label, after the bar, above or below). **Fit** says how
+  the bar fills its width: **Adjust division value** (the default) stretches the divisions to
+  it, so a value may not be round, **Adjust divisions** keeps the value round and adds or drops
+  divisions, and **Adjust width** keeps both and draws the bar as wide as they need. Scripts use
+  `subdivisions`, `divisionsBeforeZero`, `decimals`, `labelSize`, `labelPosition` (`above`,
+  `below`), `unitLabel` (`null` on `layout.update` gives the abbreviation again),
+  `unitLabelPosition` (`afterBar`, `afterLabels`, `above`, `below`) and `fit`
+  (`adjustDivisionValue`, `adjustDivision`, `adjustWidth`). A north arrow imported from an ArcGIS
+  Pro point symbol keeps that symbol: its pane shows **Custom symbol (from import)** in place of
+  the style and colours, and **Clear** (`"symbol": null`) draws it in a style again. A legend shows what
   its frame draws: only layers with a feature at the frame's scale (through their definition
   query, display filters and scale range) and, for Unique Values, only the classes those features
   have, with `<all other values>` only when some feature falls in it and its symbol is not fully
@@ -203,7 +218,15 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.update={"element":7,"angle":-90}` to turn one.
 - **Text** and **Dynamic Text**: `{date}`, `{time}`, `{scale}`, `{map}`, `{crs}`, `{page}`,
   `{pages}`, `{pageName}` and `{layout}` fill in when the page is drawn; the Format pane's
-  **Insert Dynamic Text** menu, under the text, lists each with what it shows. The text, its
+  **Insert Dynamic Text** menu, under the text, lists each with what it shows. It also lists
+  `{project}` (the project's name), `{credits}` (the attributions of the frame's web layers),
+  `{crsName}`, `{crsProjection}`, `{crsUnits}` and `{crsWkid}` (the frame's coordinate system by
+  name, projection, linear units and code) and `{extent}` (the frame's extent in degrees: west,
+  south, east, north). A name is spelt as the EPSG dataset spells it (`NAD83 / Texas Central
+  (ftUS)`), a code from Esri's own series as Esri does. A token with no value prints nothing, and
+  `{token|prefix|suffix}` prints the prefix and suffix round a value only when there is one
+  (`{credits|Data: }`; `\n` in either is a line
+  break), so a line that may be empty leaves no stray label. The text, its
   size (2 to 400 points, as text graphics on the map), colour, bold, **Italic** (slanted, as water
   and ocean names are; the built-in fonts have no italic face, so the letters are slanted 12°),
   **Alignment** (left, center or right within the element) and **Letter spacing** in points
@@ -241,7 +264,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   lines, and **Case** shows the text in upper or lower case after the tokens have filled in.
   Scripts set them with `frame` (a map frame's id, or `null` for the first frame), `wrap`, `valign`
   (`top`, `middle`, `bottom`), `lineSpacing` and `case` (`none`, `upper`, `lower`) on
-  `layout.addElement` and `layout.update`. **Picture** places a PNG or JPEG.
+  `layout.addElement` and `layout.update`. **Picture** places a PNG or JPEG. One given a file by
+  a script (`path`) or imported from a layout file remembers it, so a file that has gone missing
+  can be found again: the pane says the picture is missing, and **Relink…** (desktop) picks the
+  file again (`layout.update` with `path`; a file that is missing or not a PNG or JPEG is
+  refused, and the picture stays as it was).
 - **Map Series**: one page per feature of an index layer, with the frame zoomed to each feature;
   step through pages, refresh, and export every page into one PDF.
 - Any element can have a border and a background. The Format pane's **Frame** section sets each as a colour
@@ -262,6 +289,16 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   element over or under every other, and **Bring Forward** and **Send Backward** move it one
   place, to put a legend over a map frame, say. A locked element keeps its place. From a command:
   `layout.arrange={"element":4,"to":"front"}` (`front`, `forward`, `backward` or `back`).
+- **Groups**: Shift-click elements to select more than one, or Shift-drag a box round them
+  (it picks the elements wholly inside it), then **Group** in the Publish tab's **Arrange** group
+  (or in the Format pane) makes them one group. A group moves, is copied (with everything in it,
+  into a group of its own), reordered and deleted as one, and groups can hold groups, up to 8
+  deep. A click or a drag on one of its elements moves the group; the Format pane's **Select
+  Group** picks the group itself, to name it, hide or lock it (which hides or locks everything in
+  it) or give it a border and background round its box. A group is moved, not sized. **Ungroup**
+  takes the group away and leaves its elements where they are. From a command:
+  `layout.group={"elements":[3,4,5],"name":"Title block"}` (it answers with the group's id) and
+  `layout.ungroup={"element":8}`.
 - **Locked**, at the top of the Format pane, keeps a finished element from being changed by
   mistake: it can still be selected (a lock marks its corner, and it has no handles), but not
   moved, resized, deleted or edited, and a locked map frame's map isn't panned or zoomed. A map
@@ -285,6 +322,21 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.export` accepts `dpi` and `"allPages": false` for just the current PDF
   page. **Print** opens the PDF in the system viewer on desktop; **Save Layout File** and
   **Import Layout** move layouts between projects (`.rgislayout`).
+- **Home › New Layout › Import Layout** also opens an ArcGIS Pro layout (`.pagx`), from the picker
+  or by double-clicking it in the Browser pane: `layout.import={"path": "…/Site plan.pagx"}`. The page
+  comes in at its size, with its map frames (their shape, view and rotation, extent
+  indicators and the frames that follow another), its text and dynamic text, rectangles, lines,
+  pictures, groups, borders and backgrounds, legends, scale bars, north arrows, table frames and
+  map series. Each map the frames show is added to the project as a new map, with its layers
+  (shapefiles and file geodatabase feature classes, from the file's folder or `dir`), their
+  symbols, labels and visibility; running the import again reuses a map it added before. A frame
+  that doesn't say which map it shows, when the project has more than one map, makes a dialog ask
+  which, frame by frame, before anything is imported (`maps={"Main Map": "Overview"}` from a
+  command); with one map, or in the browser, such a frame shows the active map at its current
+  view. A notice counts what was drawn differently and what was left out, and the command's
+  `notes` list each by element; [ArcGIS Pro layouts](workspace.md#arcgis-pro-layouts) lists the
+  differences. `layout.inspect` answers, for a file, which map each frame shows, without
+  importing it.
 
 ## Reports
 

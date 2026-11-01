@@ -49,6 +49,16 @@ draws a circle, so the point still shows. By command:
 layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
 ```
 
+A marker can also be a **picture**: a PNG or JPEG drawn in its own colours with its longer side
+the **Size**, as the picture markers of ArcGIS Pro symbols are, and as they come in from a
+`.pagx` layout (GIF and BMP markers are converted to PNG). By command, `layer.marker` takes
+`image` (the picture as base64, at most 512 KB) or `imagePath` (a file, read by the app, not in
+the browser) in place of a shape or a character:
+
+```text
+layer.marker={"layer":"Peaks","imagePath":"C:/symbols/summit.png","size":18}
+```
+
 **Rotation** turns each point's marker by the angle in a number field, in degrees clockwise
 (**Counterclockwise** for angles as mathematics counts them), as wind arrows or the signs of a
 topographic map turn. **Marks** stack several markers at a point, bottom first, in place of the

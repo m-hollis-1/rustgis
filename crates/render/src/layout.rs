@@ -1853,12 +1853,26 @@ fn legend_layout(rows: &[LegendRow], widths: &LegendWidths, r: Rect, title: &str
         }
         last
     };
-    let more_columns = || (n..=MAX).map(|c| plan(c, 1.0)).find(|p| p.fits);
+    // The most columns (from `n`, up to `MAX`) whose widest rows fit across the box at the size
+    // factor `k`: a column is never narrower than its rows, so columns never draw over each other.
+    let across = |k: f32| {
+        (n..=MAX)
+            .take_while(|&c| c == n || c as f32 * widths.widest_fixed * k + LEGEND_COLUMN_GAP * (c - 1) as f32 <= size.0 + LEGEND_SLACK)
+            .last()
+            .unwrap_or(n)
+    };
+    // The fewest columns, from `n`, that hold the rows at `k`.
+    let more_columns = |k: f32| (n..=across(k)).map(|c| plan(c, k)).find(|p| p.fits);
     match opts.fit {
         LegendFit::Manual => plan(n, 1.0),
         LegendFit::AdjustSize => shrink(n),
-        LegendFit::AdjustColumns => more_columns().unwrap_or_else(|| plan(MAX, 1.0)),
-        LegendFit::AdjustColumnsAndSize => more_columns().unwrap_or_else(|| shrink(MAX)),
+        LegendFit::AdjustColumns => more_columns(1.0).unwrap_or_else(|| plan(across(1.0), 1.0)),
+        // More columns at the natural size, then at each smaller size; past the smallest, as many
+        // columns as fit across at it (the tail is cut).
+        LegendFit::AdjustColumnsAndSize => sizes().find_map(more_columns).unwrap_or_else(|| {
+            let k = sizes().next_back().unwrap_or(1.0);
+            plan(across(k), k)
+        }),
         LegendFit::AdjustFrame => {
             // The natural size from the box's corner: the box is not changed, the legend runs over
             // its edges.
@@ -1931,7 +1945,7 @@ fn legend(
                     swatch(pm, cr.x(), y, sw, line, l.geometry_type(), &l.renderer.symbol_for(&l.dataset, 0), ppp_k);
                     text::text_at(
                         pm,
-                        &l.name,
+                        cut_to(&l.name, cr.width() - sw - 6.0 * ppp_k, 9.0 * ppp_k, false),
                         cr.x() + sw + 6.0 * ppp_k,
                         y + line / 2.0,
                         9.0 * 1.33 * ppp_k,
@@ -1943,14 +1957,15 @@ fn legend(
                     shown.push((l.name.clone(), 9.0 * k));
                 }
                 LegendRow::Head(name) => {
-                    text::text_at(pm, name, cr.x(), y + line / 2.0, 9.0 * 1.33 * ppp_k, dark, true, text::Align::Left, false);
+                    let drawn = cut_to(name, cr.width(), 9.0 * ppp_k, true);
+                    text::text_at(pm, drawn, cr.x(), y + line / 2.0, 9.0 * 1.33 * ppp_k, dark, true, text::Align::Left, false);
                     shown.push((name.to_string(), 9.0 * k));
                 }
                 LegendRow::Class(gt, en) => {
                     swatch(pm, cr.x() + 6.0 * ppp_k, y, sw, line, *gt, &en.symbol, ppp_k);
                     text::text_at(
                         pm,
-                        &en.label,
+                        cut_to(&en.label, cr.width() - sw - 12.0 * ppp_k, 8.5 * ppp_k, false),
                         cr.x() + sw + 12.0 * ppp_k,
                         y + line / 2.0,
                         8.5 * 1.33 * ppp_k,
@@ -1967,6 +1982,31 @@ fn legend(
         }
     }
     shown
+}
+
+/// The longest start of `text` that measures at most `room` pixels at `size` (as [`text::measure`]
+/// takes it): a legend row wider than its column is cut at the column's edge rather than drawn
+/// over the next one.
+fn cut_to(text: &str, room: f32, size: f32, bold: bool) -> &str {
+    if text::measure(text, size, bold) <= room {
+        return text;
+    }
+    // The character boundaries, searched by halves: the start up to `ends[i]` fits for `i < lo`.
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).skip(1).chain(std::iter::once(text.len())).collect();
+    let (mut lo, mut hi) = (0usize, ends.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let end = ends.get(mid).copied().unwrap_or(text.len());
+        if text::measure(text.get(..end).unwrap_or(""), size, bold) <= room {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    match lo.checked_sub(1).and_then(|i| ends.get(i)) {
+        Some(&end) => text.get(..end).unwrap_or(""),
+        None => "",
+    }
 }
 
 /// The pixels a legend picture's pixel takes in the legend `r`: a pixel a point, narrowed to fit
@@ -2845,10 +2885,25 @@ pub(crate) mod tests {
         assert_eq!(rows.len(), 12, "{rows:?}");
         assert!(rows.iter().all(|(_, size)| (*size - 9.0).abs() < 1e-4));
         assert!(inked(&pm, 200, 300), "the third column is drawn");
-        // More rows than six columns hold: six are used, the tail is cut.
+        // More rows than the columns that fit across hold: as many columns as fit are used (five:
+        // six of these rows are wider than 400 points), the tail is cut.
         let map = plain_layers_map(28);
+        let widest = LegendWidths::of(&legend_rows(
+            &map,
+            None,
+            &LegendOptions {
+                hide_other: false,
+                exclude: &[],
+                scale: 1e6,
+                columns: 1,
+                fit: LegendFit::AdjustColumns,
+                show_layer_names: true,
+            },
+        ))
+        .widest_fixed;
+        assert!(5.0 * widest + 4.0 * LEGEND_COLUMN_GAP <= 400.0 && 6.0 * widest + 5.0 * LEGEND_COLUMN_GAP > 400.0, "{widest}");
         let (_, rows) = drawn_legend(&map, (400.0, 60.0), (1, LegendFit::AdjustColumns, true));
-        assert_eq!(rows.len(), 24, "six columns of four");
+        assert_eq!(rows.len(), 20, "five columns of four");
         // Columns and size: past six columns the text shrinks (and the rows fit).
         let (_, rows) = drawn_legend(&map, (400.0, 60.0), (1, LegendFit::AdjustColumnsAndSize, true));
         assert_eq!(rows.len(), 28, "{}", rows.len());
@@ -2981,6 +3036,56 @@ pub(crate) mod tests {
             show_layer_names: true,
         };
         assert!(legend_layout(&rows, &widths, r, "", &opts, 1.0).fits);
+    }
+
+    /// A map of `n` layers drawn in one symbol, named `name 1` … `name n`.
+    fn named_layers_map(n: usize, name: &str) -> Map {
+        use rustgis_data::Dataset;
+        let mut map = Map::new("m");
+        for i in 1..=n {
+            map.add_dataset(Dataset::new(format!("{name} {i}"), GeometryType::Point, vec![]));
+        }
+        map
+    }
+
+    /// The legend plan `drawn_legend` draws for `map` in a `w` × `h` box.
+    fn legend_plan_of(map: &Map, (w, h): (f32, f32), columns: usize, fit: LegendFit) -> (LegendPlan, LegendWidths) {
+        let opts = LegendOptions { hide_other: false, exclude: &[], scale: 1e6, columns, fit, show_layer_names: true };
+        let rows = legend_rows(map, None, &opts);
+        let widths = LegendWidths::of(&rows);
+        (legend_layout(&rows, &widths, Rect::from_xywh(0.0, 0.0, w, h).unwrap(), "", &opts, 1.0), widths)
+    }
+
+    #[test]
+    fn legend_columns_never_draw_over_each_other() {
+        // Rows wider than half the box (as a template's narrow legend of a map's many classes):
+        // more columns at the natural size would overlap, so the text shrinks until two fit.
+        let map = named_layers_map(10, "Countries 23.6M – 9.6M");
+        let (w, h) = (260.0, 60.0);
+        let (plan, widths) = legend_plan_of(&map, (w, h), 1, LegendFit::AdjustColumnsAndSize);
+        assert!(widths.widest_fixed > w / 2.0, "{}", widths.widest_fixed);
+        let used = plan.columns.len();
+        assert!(plan.column_w + LEGEND_SLACK >= widths.widest_fixed * plan.k, "{} < {} × {}", plan.column_w, widths.widest_fixed, plan.k);
+        assert!(used as f32 * plan.column_w + LEGEND_COLUMN_GAP * (used - 1) as f32 <= w + LEGEND_SLACK);
+        assert!(plan.fits && used == 2 && plan.k < 1.0, "{used} columns at {}", plan.k);
+        let (pm, rows) = drawn_legend(&map, (w, h), (1, LegendFit::AdjustColumnsAndSize, true));
+        assert_eq!(rows.len(), 10, "{rows:?}");
+        // The gap between the columns stays blank.
+        let gap = plan.column_w.ceil() as u32 + 1;
+        assert!(!inked(&pm, gap, (plan.column_w + LEGEND_COLUMN_GAP).floor() as u32), "ink between the columns");
+        assert!(inked(&pm, (plan.column_w + LEGEND_COLUMN_GAP).ceil() as u32, w as u32), "the second column is drawn");
+        // Rows wider than a column even at the smallest size are cut at its edge, not drawn
+        // over the next column (nor past the box).
+        let map = named_layers_map(12, "A layer with a name far too long for its narrow column");
+        for fit in [LegendFit::Manual, LegendFit::AdjustColumns, LegendFit::AdjustSize, LegendFit::AdjustColumnsAndSize] {
+            let (plan, _) = legend_plan_of(&map, (w, h), 2, fit);
+            let (pm, rows) = drawn_legend(&map, (w, h), (2, fit, true));
+            assert!(!rows.is_empty(), "{fit:?}");
+            assert_eq!(plan.columns.len(), 2, "{fit:?}");
+            let edge = plan.column_w.ceil() as u32 + 1;
+            assert!(!inked(&pm, edge, (plan.column_w + LEGEND_COLUMN_GAP).floor() as u32), "{fit:?}: ink between the columns");
+            assert!(!inked(&pm, w as u32 + 1, 400), "{fit:?}: ink past the box");
+        }
     }
 
     #[test]

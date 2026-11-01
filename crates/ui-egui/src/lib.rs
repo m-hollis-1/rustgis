@@ -3897,11 +3897,18 @@ impl RustGisApp {
                     held += 1;
                     continue;
                 }
-                if p.to_ascii_lowercase().ends_with(".rgplugin") {
+                let lower = p.to_ascii_lowercase();
+                if lower.ends_with(".rgplugin") {
                     match std::fs::read(f.path()) {
                         Ok(bytes) => pluginsui::received(self, bytes, None),
                         Err(e) => self.session.notify(format!("{p}: {e}"), true),
                     }
+                    continue;
+                }
+                // A layout (ArcGIS Pro's or RustGIS's own) imports as a layout, not as data. A
+                // failure is told by the command.
+                if lower.ends_with(".pagx") || lower.ends_with(".rgislayout") {
+                    let _ = self.import_layout_file(&p);
                     continue;
                 }
                 let _ = layerchooser::add_file(self, &p);
@@ -4495,6 +4502,51 @@ mod pagx_tests {
             assert_eq!(h.state().session.project.layouts.len(), layouts + usize::from(import));
         }
     }
+    /// A file dropped on the desktop window, as eframe passes it: by its path.
+    #[derive(Debug)]
+    struct Dropped(std::path::PathBuf);
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A `.pagx` (any case) or `.rgislayout` dropped on the window imports as a layout; it never
+    /// goes to `layer.addData`.
+    #[test]
+    fn a_dropped_pagx_or_rgislayout_imports_a_layout_not_a_layer() {
+        let (dir, pagx) = written("drop");
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Mine"})).unwrap();
+        let saved = dir.0.join("mine.RGISLAYOUT");
+        app.run("layout.save", json!({"path": saved.display().to_string()})).unwrap();
+        app.start(&Default::default()).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.step();
+        let layers = h.state().session.map().layers.len();
+        let layouts = h.state().session.project.layouts.len();
+        for f in [std::path::PathBuf::from(&pagx), saved] {
+            h.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(f)));
+        }
+        h.step();
+        h.step();
+        let app = h.state();
+        assert_eq!(app.session.project.layouts.len(), layouts + 2);
+        assert!(app.session.project.layouts.iter().any(|l| l.name == "Two frames"));
+        assert_eq!(app.session.map().layers.len(), layers, "a dropped layout must not become a layer");
+        assert!(!app.session.notices.iter().any(|n| n.text.contains("t.PAGX") || n.text.contains("mine.RGISLAYOUT")));
+    }
+
     #[test]
     fn a_rgislayout_file_never_asks_which_map() {
         let mut app = RustGisApp::with_sample();

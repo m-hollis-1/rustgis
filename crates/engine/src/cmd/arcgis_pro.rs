@@ -383,14 +383,14 @@ fn convert_markers(imp: &mut LayoutImport, report: &mut Report) {
     }
 }
 
-/// The bytes of a `data:…;base64,…` URL.
+/// The bytes of a `data:…;base64,…` URL (whitespace in its base64, as Pro writes it, is dropped).
 fn data_bytes(url: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
     let (head, payload) = url.split_once(',').ok_or("not a data URL")?;
     if !head.to_ascii_lowercase().contains(";base64") {
         return Err("not base64".into());
     }
-    base64::engine::general_purpose::STANDARD.decode(payload.trim()).map_err(|_| "not base64".to_string())
+    base64::engine::general_purpose::STANDARD.decode(cim::base64_text(payload)).map_err(|_| "not base64".to_string())
 }
 
 /// A picture file's bytes as base64 PNG or JPEG: a PNG or JPEG as it is, a GIF or BMP converted.
@@ -452,4 +452,26 @@ fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(target_arch = "wasm32")]
 fn to_png(_: &[u8]) -> Result<Vec<u8>, String> {
     Err("the browser can't convert GIF and BMP pictures".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 1×1 GIF.
+    const GIF: &str = "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
+
+    #[test]
+    fn data_urls_decode_base64_wrapped_by_newlines() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(GIF).unwrap();
+        let (a, b) = GIF.split_at(20);
+        // Pro wraps its base64 with newlines; a URL the reader didn't clean is still read.
+        let url = format!("data:image/gif;base64,{a}\n{b}\r\n");
+        assert_eq!(data_bytes(&url).unwrap(), bytes);
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(to_png(&data_bytes(&url).unwrap()).is_ok());
+        assert!(data_bytes("data:image/gif;base64,R0l GOD!").is_err());
+        assert!(data_bytes("data:image/gif,R0lGOD").is_err());
+    }
 }

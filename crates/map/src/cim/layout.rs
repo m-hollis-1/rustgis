@@ -17,7 +17,7 @@ use super::color::symbol_of;
 use super::dyntext;
 use super::frame::{self, Frames};
 use super::surround;
-use super::symbol::{self, data_url};
+use super::symbol::{self, base64_text, data_url};
 use super::units::page_unit_mm;
 use super::{Document, Report, flag, num, str_of};
 use crate::Rgba;
@@ -646,8 +646,10 @@ impl Reader<'_> {
             self.report.skipped(name, "a data: URL that isn't base64, left out");
         }
         let path = url.filter(|_| !is_data);
-        let embedded = str_of(g, "referenceURI").and_then(|u| self.doc.binary(u)).map(|d| data_url(d).map_or(d, |(_, payload)| payload));
-        let image = embedded.or(inline).unwrap_or_default().to_string();
+        let embedded = str_of(g, "referenceURI")
+            .and_then(|u| self.doc.binary(u))
+            .map(|d| data_url(d).map_or_else(|| base64_text(d), |(_, payload)| payload));
+        let image = embedded.or(inline).unwrap_or_default();
         if image.is_empty() && path.is_none() {
             self.report.skipped(name, "a picture with no image or file, left empty");
         }

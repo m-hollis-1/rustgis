@@ -817,7 +817,8 @@ fn dyn_tags_become_tokens_with_prefix_suffix_and_newline() {
         &mut Report::default(),
         "T",
     );
-    assert_eq!(t, "Spatial Reference{crsName|Name: |\\n}{scale}");
+    // newLine starts a line before the text: a heading, then "Name: …" under it.
+    assert_eq!(t, "Spatial Reference{crsName|\\nName: }{scale}");
     assert_eq!(frame.as_deref(), Some("MAIN MAP"));
 }
 
@@ -2360,4 +2361,77 @@ fn unreadable_symbols_empty_renderers_and_odd_datasets_are_noted() {
     }
     assert!(n.iter().any(|t| t.starts_with("Up: ") && t.contains("secret")), "{n:?}");
     assert!(n.iter().any(|t| t.starts_with("Deep: ")), "{n:?}");
+}
+
+/// `text` with a newline after every `every` characters, as Pro wraps the base64 it writes.
+fn wrapped(text: &str, every: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars.chunks(every).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn picture_markers_read_base64_wrapped_by_newlines() {
+    use crate::symbology::Marker;
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let gif = "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [
+        {"type": "CIMPictureMarker", "enable": true, "size": 36.0, "url": format!("data:image/png;base64,{}", wrapped(png, 76))},
+        {"type": "CIMPictureMarker", "enable": true, "size": 36.0, "url": format!("data:image/gif;base64,{}\r\n", wrapped(gif, 20))},
+    ]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "North arrow", &mut report);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    match p.symbols[0].marker {
+        Marker::Image(image) => assert_eq!(image.as_str(), png),
+        other => panic!("{other:?}"),
+    }
+    // The GIF is handed on as a clean data: URL.
+    assert_eq!(p.pending_pictures, vec![(1, format!("data:image/gif;base64,{gif}"))]);
+}
+
+#[test]
+fn layout_pictures_read_base64_wrapped_by_newlines() {
+    use crate::layout::ElementKind::Picture;
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let picture = |name: &str, extra: serde_json::Value| {
+        let mut g = extra;
+        g["type"] = json!("CIMPictureGraphic");
+        g["box"] = json!({"xmin": 0.76, "ymin": 9.0, "xmax": 1.83, "ymax": 9.41});
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint", "graphic": g})
+    };
+    let doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0",
+    "binaryReferences": [
+        {"type": "CIMBinaryReference", "uRI": "CIMPATH=Pictures/a.png", "data": wrapped(png, 76)},
+        {"type": "CIMBinaryReference", "uRI": "CIMPATH=Pictures/b.png", "data": format!("data:image/png;base64,{}", wrapped(png, 76))},
+    ],
+    "layoutDefinition": {"type": "CIMLayout", "name": "P",
+        "page": {"type": "CIMPage", "width": 17, "height": 11, "units": {"uwkid": 109008}, "guides": []},
+        "elements": [
+            picture("INLINE", json!({"sourceURL": format!("data:image/png;base64,{}", wrapped(png, 76))})),
+            picture("EMBEDDED", json!({"referenceURI": "CIMPATH=Pictures/a.png"})),
+            picture("EMBEDDED URL", json!({"referenceURI": "CIMPATH=Pictures/b.png"})),
+        ]}});
+    let mut report = Report::default();
+    let imp = read_layout(&Document::from_json(&doc.to_string()).unwrap(), &mut report).unwrap();
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    assert_eq!(imp.layout.elements.len(), 3);
+    for e in &imp.layout.elements {
+        assert!(matches!(&e.kind, Picture { image, .. } if image == png), "{}: {:?}", e.name, e.kind);
+    }
+}
+
+#[test]
+fn an_extent_indicator_drawn_with_a_polygon_symbol_takes_its_outline_without_a_note() {
+    // Pro's indicators are polygon symbols: an outline and a fill. RustGIS draws the outline.
+    let sym =
+        json!({"type": "CIMSymbolReference", "symbol": polygon_symbol(vec![solid_stroke(rgb(255, 0, 0), 1.5), solid_fill(rgb(0, 0, 0))])});
+    let main = map_frame_element("MAIN MAP", (1.0, 1.0, 9.0, 8.0), json!({}));
+    let mut small = map_frame_element("SMALL DETAIL MAP", (10.0, 1.0, 16.0, 4.0), json!({}));
+    small["extentIndicators"] = json!([{"type": "CIMExtentIndicator", "sourceMapFrame": "MAIN MAP", "symbol": sym}]);
+    let (imp, report) = read_with_maps(&[], &[main, small]);
+    let main_id = frame_of(&imp, "MAIN MAP").0;
+    let (_, ElementKind::MapFrame { extent_of, extent_color, extent_width, .. }) = frame_of(&imp, "SMALL DETAIL MAP") else { panic!() };
+    assert_eq!((extent_of, extent_color), (Some(main_id), Rgba::rgb(255, 0, 0)));
+    assert!(near(extent_width, 1.5 * 96.0 / 72.0, 1e-6), "{extent_width}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
 }

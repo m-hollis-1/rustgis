@@ -380,6 +380,12 @@ mod tests {
         v.scale = 24_000.0;
         assert_eq!(expand("{scale|Scale }", &v), "Scale 1:24,000");
         assert_eq!(expand("{nothing|x|y}", &v), "{nothing|x|y}");
+        // A prefix that starts with a line break (Pro's newLine), only when there is a value.
+        let v = TokenValues { map: "World".into(), crs_name: "WGS 1984".into(), ..Default::default() };
+        assert_eq!(
+            expand("Spatial Reference{map|\\nName: }{crsWkid|\\nWKID: }{crsName|\\n}", &v),
+            "Spatial Reference\nName: World\nWGS 1984"
+        );
     }
 
     #[test]

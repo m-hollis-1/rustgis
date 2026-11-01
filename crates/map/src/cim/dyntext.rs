@@ -135,10 +135,13 @@ impl State<'_> {
         {
             pre = p.to_string();
         }
-        let mut post = self.affix_of(get("postStr").unwrap_or_default());
+        // `newLine` starts the text on a line of its own: the break comes before it, inside the
+        // prefix, so an empty value leaves no blank line ("Spatial Reference<dyn … preStr="Name: "
+        // newLine="true"/>" is a heading with "Name: …" under it).
         if get("newLine").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
-            post.push_str("\\n");
+            pre.insert_str(0, "\\n");
         }
+        let post = self.affix_of(get("postStr").unwrap_or_default());
         out.push('{');
         out.push_str(token);
         if !pre.is_empty() || !post.is_empty() {
@@ -320,7 +323,10 @@ mod tests {
     #[test]
     fn prefix_and_suffix_keep_line_breaks_and_lose_what_the_token_syntax_cant_hold() {
         let (t, _, n) = run("<dyn type=\"project\" property=\"name\" preStr=\"a|b}c\nd\" postStr=\"\" newLine=\"true\"/>");
-        assert_eq!(t, "{project|abc\\nd|\\n}");
+        assert_eq!(t, "{project|\\nabc\\nd}");
+        // A line break with no prefix is the whole prefix; one with a suffix keeps it.
+        let (t, _, _) = run("<dyn type=\"project\" property=\"name\" postStr=\" ft\" newLine=\"true\"/>");
+        assert_eq!(t, "{project|\\n| ft}");
         assert_eq!(n, ["T: a '|' or '}' in a prefix or suffix, left out"]);
         let long = "x".repeat(200);
         let (t, _, n) = run(&format!("<dyn type=\"project\" property=\"name\" preStr=\"{long}\"/>"));

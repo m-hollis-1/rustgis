@@ -23171,6 +23171,24 @@ fn a_pagx_by_path_resolves_pictures_beside_it() {
 }
 
 #[test]
+fn a_north_arrow_gif_wrapped_by_newlines_becomes_a_png() {
+    use rustgis_map::layout::ElementKind;
+    use rustgis_map::symbology::Marker;
+    // Pro wraps the base64 of its data: URLs with newlines (every 76 characters; this GIF is short).
+    let text = b64(&picture_bytes(2, 2, image::ImageFormat::Gif));
+    let chars: Vec<char> = text.chars().collect();
+    let wrapped = chars.chunks(16).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(wrapped.contains('\n'));
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"text": pagx_with(json!({}), &format!("data:image/gif;base64,{wrapped}"))})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let arrow = l.elements.iter().find(|e| e.name == "NORTH ARROW").unwrap();
+    let ElementKind::NorthArrow { symbol, .. } = &arrow.kind else { panic!() };
+    assert!(matches!(&symbol[0].marker, Marker::Image(i) if rustgis_render::picture_size(i.as_str()) == Some((2, 2))), "{symbol:?}");
+    assert!(!r["notes"].to_string().contains("couldn't be converted"), "{}", r["notes"]);
+}
+
+#[test]
 fn rgislayout_files_still_import() {
     let mut s = world();
     let layouts = s.project.layouts.len();

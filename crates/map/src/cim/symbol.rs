@@ -370,9 +370,9 @@ fn picture_marker(
     };
     let none = Paint { fill: None, stroke: None, strokes: Vec::new(), fills: Vec::new() };
     let kept = match media.as_str() {
-        "image/png" | "image/jpeg" | "image/jpg" => ImageRef::new(payload).map(Marker::Image),
+        "image/png" | "image/jpeg" | "image/jpg" => ImageRef::new(&payload).map(Marker::Image),
         "image/gif" | "image/bmp" if payload.len() <= ImageRef::MAX_BYTES => {
-            pending.push((index, url.to_string()));
+            pending.push((index, format!("data:{media};base64,{payload}")));
             return Some(marker_symbol(Marker::Circle, size, &none));
         }
         _ => None,
@@ -384,12 +384,19 @@ fn picture_marker(
     Some(marker_symbol(marker, size, &none))
 }
 
-/// The media type (lower case) and base64 text of a `data:<type>;base64,<text>` URL.
-pub(crate) fn data_url(url: &str) -> Option<(String, &str)> {
+/// The media type (lower case) and base64 text (see [`base64_text`]) of a
+/// `data:<type>;base64,<text>` URL.
+pub(crate) fn data_url(url: &str) -> Option<(String, String)> {
     let (head, payload) = url.get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).and_then(|_| url.get(5..))?.split_once(',')?;
     let mut parts = head.split(';');
     let media = parts.next()?.trim().to_ascii_lowercase();
-    parts.any(|p| p.trim().eq_ignore_ascii_case("base64")).then_some((media, payload))
+    parts.any(|p| p.trim().eq_ignore_ascii_case("base64")).then(|| (media, base64_text(payload)))
+}
+
+/// Base64 text without the whitespace it may carry: Pro wraps the base64 it writes with
+/// newlines, which decoders reject.
+pub fn base64_text(payload: &str) -> String {
+    payload.chars().filter(|c| !c.is_ascii_whitespace()).collect()
 }
 
 /// A `CIMCharacterMarker`: a character of a font, in the colours of its symbol (black without one).

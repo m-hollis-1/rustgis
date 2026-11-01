@@ -379,15 +379,16 @@ fn link(e: &Value, name: &str, report: &mut Report) -> Option<(String, LinkMode,
     Some((target.to_string(), mode, super::flag(auto, "syncRotation", false)))
 }
 
-/// The first extent indicator: its colour and width (the defaults when its symbol draws no
-/// stroke) and the name of the frame it outlines. Further ones are noted.
+/// The first extent indicator: its outline's colour and width (the defaults when its symbol draws no
+/// stroke; its fill is not drawn, and not noted) and the name of the frame it outlines. Further
+/// ones are noted.
 fn indicators(e: &Value, name: &str, report: &mut Report) -> (Rgba, f64, Option<String>) {
     let list = e.get("extentIndicators").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     let Some(first) = list.first() else { return (INDICATOR_COLOR, INDICATOR_WIDTH, None) };
     if list.len() > 1 {
         report.skipped(name, format!("{} more extent indicators, left out", list.len() - 1));
     }
-    let (color, width) = match first.get("symbol").and_then(|s| symbol::line(s, name, report).stroke) {
+    let (color, width) = match first.get("symbol").and_then(|s| symbol::polygon(s, name, report).stroke) {
         Some((c, w)) => (c, f64::from(w)),
         None => (INDICATOR_COLOR, INDICATOR_WIDTH),
     };

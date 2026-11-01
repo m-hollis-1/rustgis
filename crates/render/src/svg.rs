@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use base64::Engine;
 use rustgis_map::Map;
-use rustgis_map::layout::{ElementKind, FontFamily, FrameStyle, GroupFrame, Layout, LineHead, PT_PER_MM, TextAlign};
+use rustgis_map::layout::{ElementKind, FontFamily, FrameStyle, GroupFrame, Layout, LineHead, PT_PER_MM, TextAlign, VAlign};
 
 use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, render_element};
 
@@ -89,7 +89,8 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                 // As the page draws it: the size in points, lines 1.25 (times the line spacing)
                 // apart, the first baseline 0.6 of the size below the top of the block, which
                 // sits at the top, middle or bottom of the box; the lines broken at the box's
-                // width when wrapped (by the same measure), lines past the frame left out.
+                // width when wrapped (by the same measure), a top block's lines past the frame
+                // left out.
                 let em = size.clamp(2.0, 400.0) * 1.33 / PT_PER_MM;
                 let spacing = if line_spacing.is_finite() { line_spacing.clamp(0.5, 3.0) } else { 1.0 };
                 let face = crate::layout::text_face(*bold, *italic, *font, font_name.as_deref());
@@ -110,7 +111,9 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                     .iter()
                     .enumerate()
                     .map(|(i, l)| (top + em * (0.6 + 1.25 * spacing * i as f64), l.as_str()))
-                    .take_while(|(ly, _)| *ly <= y + h + em)
+                    // A top block's lines more than an em past the box are left out, as the page
+                    // leaves them; a middle or bottom block's all draw.
+                    .take_while(|(ly, _)| *valign != VAlign::Top || *ly <= y + h + em)
                     .collect();
                 // A named family first (#762), quoted as CSS has it (its own backslashes and
                 // quotes escaped), then the generic one, for a viewer without it.
@@ -381,7 +384,7 @@ mod tests {
     /// reads the tokens of the frame it is bound to.
     #[test]
     fn text_is_wrapped_aligned_spaced_and_cased_and_reads_its_frame() {
-        use rustgis_map::layout::{TextCase, VAlign};
+        use rustgis_map::layout::TextCase;
         let mut layout = Layout::new("SVG", 100.0, 80.0);
         let frame = |scale: f64| {
             serde_json::from_value(serde_json::json!({"MapFrame": {"map": "Map", "center": {"x": 0, "y": 0}, "scale": scale}})).unwrap()
@@ -428,6 +431,25 @@ mod tests {
         };
         assert!(unbound.contains("1:10,000") && !unbound.contains("1:50,000"));
         assert!(unbound.contains(&format!("y=\"{}\"", num(10.0 + em * 0.6))), "top: {unbound}");
+    }
+
+    /// A middle-aligned block taller than its box overflows both ways in SVG as on the page:
+    /// every line is written, centred on the box.
+    #[test]
+    fn a_middle_block_taller_than_its_box_keeps_its_lower_half() {
+        let em = 10.0 * 1.33 / PT_PER_MM;
+        let mut layout = Layout::new("SVG", 100.0, 80.0);
+        let mut kind = ElementKind::text("1\n2\n3\n4\n5\n6\n7\n8\n9", 10.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+        if let ElementKind::Text { valign, .. } = &mut kind {
+            *valign = VAlign::Middle;
+        }
+        layout.add("Text", (10.0, 30.0, 60.0, em * 1.25), kind);
+        let svg = layout_svg(&layout, &mut [], 72.0, &PageInfo::default()).unwrap();
+        let ys: Vec<f64> = svg.split("<tspan ").skip(1).filter_map(|t| t.split("y=\"").nth(1)?.split('"').next()?.parse().ok()).collect();
+        assert_eq!(ys.len(), 9, "{svg}");
+        // The fifth line is the box's: its baseline 0.6 em below the box's top.
+        assert!((ys[4] - (30.0 + em * 0.6)).abs() < 0.01, "{ys:?}");
+        assert!(((ys[4] - ys[0]) - (ys[8] - ys[4])).abs() < 0.01, "{ys:?}");
     }
 
     /// A group is vector and draws nothing of its own; its frame is rects round its children,

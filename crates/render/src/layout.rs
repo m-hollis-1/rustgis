@@ -1096,6 +1096,14 @@ fn symbol_arrow(pm: &mut Pixmap, r: Rect, symbol: &[Symbol], colours: (Rgba, Rgb
                 }
                 continue;
             }
+            // An Esri symbol font not yet known to be missing (the families still being indexed)
+            // draws nothing for now, not the circle a map's point would.
+            if let rustgis_map::Marker::Char(g) = s.marker
+                && crate::glyphs::symbol_family(g.font.as_str())
+                && crate::glyphs::shape(g).is_none()
+            {
+                continue;
+            }
             crate::draw_marker(pm, x, y, &scaled, 1.0, None, 1.0);
         }
     };
@@ -1965,7 +1973,7 @@ fn legend(
                     swatch(pm, cr.x(), y, sw, line, l.geometry_type(), &l.renderer.symbol_for(&l.dataset, 0), ppp_k);
                     text::text_at(
                         pm,
-                        cut_to(&l.name, cr.width() - sw - 6.0 * ppp_k, 9.0 * ppp_k, false),
+                        &cut_to(&l.name, cr.width() - sw - 6.0 * ppp_k, 9.0 * ppp_k, false),
                         cr.x() + sw + 6.0 * ppp_k,
                         y + line / 2.0,
                         9.0 * 1.33 * ppp_k,
@@ -1978,14 +1986,14 @@ fn legend(
                 }
                 LegendRow::Head(name) => {
                     let drawn = cut_to(name, cr.width(), 9.0 * ppp_k, true);
-                    text::text_at(pm, drawn, cr.x(), y + line / 2.0, 9.0 * 1.33 * ppp_k, dark, true, text::Align::Left, false);
+                    text::text_at(pm, &drawn, cr.x(), y + line / 2.0, 9.0 * 1.33 * ppp_k, dark, true, text::Align::Left, false);
                     shown.push((name.to_string(), 9.0 * k));
                 }
                 LegendRow::Class(gt, en) => {
                     swatch(pm, cr.x() + 6.0 * ppp_k, y, sw, line, *gt, &en.symbol, ppp_k);
                     text::text_at(
                         pm,
-                        cut_to(&en.label, cr.width() - sw - 12.0 * ppp_k, 8.5 * ppp_k, false),
+                        &cut_to(&en.label, cr.width() - sw - 12.0 * ppp_k, 8.5 * ppp_k, false),
                         cr.x() + sw + 12.0 * ppp_k,
                         y + line / 2.0,
                         8.5 * 1.33 * ppp_k,
@@ -2004,28 +2012,33 @@ fn legend(
     shown
 }
 
-/// The longest start of `text` that measures at most `room` pixels at `size` (as [`text::measure`]
-/// takes it): a legend row wider than its column is cut at the column's edge rather than drawn
-/// over the next one.
-fn cut_to(text: &str, room: f32, size: f32, bold: bool) -> &str {
+/// `text` as it fits `room` pixels at `size` (as [`text::measure`] takes it): whole when it fits,
+/// else its longest start followed by "…" that does, so a legend row wider than its column is cut
+/// at the column's edge, visibly, rather than drawn over the next one. Empty when not even the
+/// ellipsis fits.
+fn cut_to(text: &str, room: f32, size: f32, bold: bool) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    const ELLIPSIS: &str = "…";
     if text::measure(text, size, bold) <= room {
-        return text;
+        return Cow::Borrowed(text);
     }
-    // The character boundaries, searched by halves: the start up to `ends[i]` fits for `i < lo`.
-    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).skip(1).chain(std::iter::once(text.len())).collect();
+    let with = |end: usize| format!("{}{ELLIPSIS}", text.get(..end).unwrap_or("").trim_end());
+    // The character boundaries, searched by halves: the start up to `ends[i]` and the ellipsis
+    // fit for `i < lo`.
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
     let (mut lo, mut hi) = (0usize, ends.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let end = ends.get(mid).copied().unwrap_or(text.len());
-        if text::measure(text.get(..end).unwrap_or(""), size, bold) <= room {
+        if text::measure(&with(end), size, bold) <= room {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
     match lo.checked_sub(1).and_then(|i| ends.get(i)) {
-        Some(&end) => text.get(..end).unwrap_or(""),
-        None => "",
+        Some(&end) => Cow::Owned(with(end)),
+        None => Cow::Borrowed(""),
     }
 }
 
@@ -2431,7 +2444,10 @@ fn text_block(pm: &mut Pixmap, r: Rect, s: &str, size: f32, color: Rgba, style: 
     let shift = block_shift(style.valign, f64::from(r.height()), f64::from(px), lines.len(), f64::from(ls)) as f32;
     let mut y = r.y() + shift + px * 0.6;
     for line in &lines {
-        if y > r.y() + r.height() + px {
+        // A top block runs on down the page: lines more than an em past the box are left out. A
+        // middle block overflows both ways, symmetrically, and a bottom one upwards: theirs all
+        // draw (bounded by `text_lines`).
+        if style.valign == VAlign::Top && y > r.y() + r.height() + px {
             break;
         }
         // Centred and right-aligned lines are placed by the ink they draw (italic overhang and a
@@ -3110,6 +3126,35 @@ pub(crate) mod tests {
         }
     }
 
+    /// A one-column `Manual` legend (a layout from before columns) with a name wider than its box:
+    /// the name is cut at the box's edge with an ellipsis that fits inside it, so the cut shows;
+    /// the rows drawn still report the whole name.
+    #[test]
+    fn a_name_wider_than_its_legend_ends_in_an_ellipsis_inside_the_box() {
+        use rustgis_data::Dataset;
+        let one = |name: &str| {
+            let mut map = Map::new("m");
+            map.add_dataset(Dataset::new(name, GeometryType::Point, vec![]));
+            map
+        };
+        let long = "A layer with a name far too long for its narrow legend box";
+        let (w, h) = (120.0, 40.0);
+        let (pm, rows) = drawn_legend(&one(long), (w, h), (1, LegendFit::Manual, true));
+        assert_eq!(rows.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), [long], "the whole name is reported");
+        assert!(inked(&pm, 0, w as u32) && !inked(&pm, w as u32 + 1, 400), "no ink past the box");
+        // What is drawn is the name cut to the room after the swatch, ending in "…", which fits.
+        let (plan, _) = legend_plan_of(&one(long), (w, h), 1, LegendFit::Manual);
+        let room = plan.column_w - LEGEND_SWATCH - 6.0;
+        let cut = cut_to(long, room, 9.0, false);
+        assert!(cut.ends_with('…') && cut.len() < long.len(), "{cut}");
+        assert!(text::measure(&cut, 9.0, false) <= room);
+        let (as_cut, _) = drawn_legend(&one(&cut), (w, h), (1, LegendFit::Manual, true));
+        assert_eq!(pm.data(), as_cut.data(), "the row draws the cut name with its ellipsis");
+        // A name that fits is drawn whole; no room even for the ellipsis draws nothing.
+        assert_eq!(cut_to("Roads", room, 9.0, false), "Roads");
+        assert_eq!(cut_to(long, 0.5, 9.0, false), "");
+    }
+
     #[test]
     fn legends_with_nothing_to_list_or_no_room_draw_safely() {
         for fit in LegendFit::ALL {
@@ -3516,14 +3561,15 @@ pub(crate) mod tests {
         let (top_first, top_last) = page(VAlign::Top);
         assert!(top_first >= y0 && top_last > y0 + h, "top: from the box's top down ({top_first}..{top_last})");
         let (first, last) = page(VAlign::Bottom);
+        let bottom_last = last;
         assert!(last <= y0 + h && last > y0 + h - 5.0, "bottom: the last line on the box's bottom ({last})");
         assert!(first < y0 - 40.0, "bottom: the first line above the box's top ({first})");
         assert!((top_first - first - (block - h)).abs() < 1.5, "the same block, moved up by its overflow");
-        // Middle: centred, half the overflow above the box (lines more than an em below the box
-        // are left out, as a top block's are).
+        // Middle: centred, half the overflow above the box and half below it, every line drawn.
         let (first, last) = page(VAlign::Middle);
         assert!((top_first - first - (block - h) / 2.0).abs() < 1.5, "middle: centred ({first})");
-        assert!(last > y0 + h, "middle: runs on below the box too ({last})");
+        assert!((last - bottom_last - (block - h) / 2.0).abs() < 1.5, "middle: the lower half drawn too ({last} vs {bottom_last})");
+        assert!(((y0 - first) - (last - (y0 + h))).abs() < 3.0, "middle: as far over the top as past the bottom ({first}..{last})");
         // The shift the page and the SVG export share goes negative.
         assert!((block_shift(VAlign::Bottom, 10.0, 10.0, 5, 1.0) - (10.0 - 62.5)).abs() < 1e-9);
         assert!((block_shift(VAlign::Middle, 10.0, 10.0, 5, 1.0) - (10.0 - 62.5) / 2.0).abs() < 1e-9);

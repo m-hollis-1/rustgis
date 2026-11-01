@@ -2,7 +2,8 @@
 //! family as a marker's outline, placed as QGIS places a font marker: the em is the marker's size,
 //! the character's advance is centred on the point and its baseline is half the font's ascent
 //! below it. A family the machine lacks, or one without the character, draws it in the label font,
-//! except an Esri symbol font's (ESRI North), whose characters are pictures: those draw nothing.
+//! except an Esri symbol font's (ESRI North), whose characters are pictures: those have no shape
+//! here, so a map's point draws the circle of its size and a north arrow its Classic arrow.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -51,8 +52,8 @@ pub(crate) fn symbol_family(family: &str) -> bool {
 }
 
 /// Whether `g` is a character of an Esri symbol font (see [`symbol_family`]) this machine lacks,
-/// once the installed families are indexed: it draws nothing, and a north arrow draws its Classic
-/// arrow in its place (see `layout::symbol_arrow`).
+/// once the installed families are indexed: a map's point draws the circle of its size, and a
+/// north arrow draws its Classic arrow in its place (see `layout::symbol_arrow`).
 pub(crate) fn symbol_font_missing(g: Glyph) -> bool {
     symbol_family(g.font.as_str()) && matches!(crate::text::marker_font(g.font.as_str()), (None, true))
 }
@@ -148,22 +149,31 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_esri_symbol_font_draws_nothing_rather_than_a_text_glyph() {
+    fn a_missing_esri_symbol_font_draws_a_circle_rather_than_a_text_glyph() {
         // Char 178 of ESRI North is an arrow; in a text font it is "²". A symbol font the machine
-        // lacks draws nothing (not the label font's character, not a stand-in circle).
+        // lacks never draws the label font's character: a map layer's point draws the circle of
+        // its size, so it still shows (a north arrow draws its Classic arrow instead, see
+        // `layout::symbol_arrow`).
         let missing = Glyph::new('\u{B2}', "ESRI No Such Symbols");
         assert!(symbol_font_missing(missing));
         assert!(shape(missing).is_none());
-        let mut pm = tiny_skia::Pixmap::new(60, 60).unwrap();
-        let s = rustgis_map::Symbol {
-            fill: rustgis_map::Rgba::rgb(0, 0, 0),
-            stroke: rustgis_map::Rgba::rgb(0, 0, 0),
-            stroke_width: 1.0,
-            size: 40.0,
-            marker: rustgis_map::Marker::Char(missing),
+        let draw = |marker| {
+            let mut pm = tiny_skia::Pixmap::new(60, 60).unwrap();
+            let s = rustgis_map::Symbol {
+                fill: rustgis_map::Rgba::rgb(0, 0, 0),
+                stroke: rustgis_map::Rgba::rgb(0, 0, 0),
+                stroke_width: 1.0,
+                size: 40.0,
+                marker,
+            };
+            crate::draw_marker(&mut pm, 30.0, 30.0, &s, 1.0, None, 1.0);
+            pm
         };
-        crate::draw_marker(&mut pm, 30.0, 30.0, &s, 1.0, None, 1.0);
-        assert!(pm.pixels().iter().all(|p| p.alpha() == 0), "nothing drawn");
+        let drawn = draw(rustgis_map::Marker::Char(missing));
+        assert!(drawn.pixels().iter().any(|p| p.alpha() > 0), "the point still shows");
+        assert_eq!(drawn.data(), draw(rustgis_map::Marker::Circle).data(), "the circle of its size");
+        let superscript = draw(rustgis_map::Marker::Char(Glyph::new('\u{B2}', "")));
+        assert_ne!(drawn.data(), superscript.data(), "not the label font's ²");
         // In any case; a text family, or none, still falls back to the label font.
         assert!(symbol_font_missing(Glyph::new('A', "esri no such symbols")));
         assert!(!symbol_font_missing(Glyph::new('\u{B2}', "No Such Family Anywhere")));

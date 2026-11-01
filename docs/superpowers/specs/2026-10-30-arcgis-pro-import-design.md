@@ -1,37 +1,37 @@
 # ArcGIS Pro import: layouts (.pagx) and maps (.aprx)
 
-Design, 2026-10-30. Brainstormed with Mike Hollis (Holland-LR); decisions marked **(Mike)** are
+Design, 2026-10-30. Brainstormed with the user who asked for it; decisions marked **(user)** are
 his, decisions marked **(call)** were made by the designer and can be overruled.
 
 ## Intent
 
-Holland-LR produces its maps in ArcGIS Pro today and wants to produce them in RustGIS. Two things
+The user's company produces its maps in ArcGIS Pro today and wants to produce them in RustGIS. Two things
 stand in the way: the layout templates (six `.pagx` files, one per page size) exist only in Pro,
 and the project maps (`.aprx`), with years of symbology and labelling, exist only in Pro. This
 design adds two import tools:
 
 1. **Layout import**: RustGIS's existing Import Layout tool reads `.pagx` as well as
    `.rgislayout`, and the result is as close to the Pro layout as possible, including dynamic text
-   that stays linked to the right map frame. **(Mike)** "Any differences would be not good."
+   that stays linked to the right map frame. **(user)** "Any differences would be not good."
 2. **Map import**: opening an `.aprx` shows a picker of its maps and layouts; each map ticked
    becomes a RustGIS map with every layer of Pro's Contents pane, its symbology and its labels.
 
 Both read the same format, Esri's Cartographic Information Model (CIM): a `.pagx` is one JSON
 document, an `.aprx` is a zip of such documents. A shared reader serves both tools.
 
-**Order of delivery (Mike):** layouts first, then maps. The layout templates are ready to use
+**Order of delivery (user):** layouts first, then maps. The layout templates are ready to use
 the day they import; a map import pays off only once its data sources open.
 
 ## Goals
 
-- The six Holland-LR templates (`11x17 LANDSCAPE`, `11x17 PORTRAIT`, `8x11 LANDSCAPE`,
+- The six company templates (`11x17 LANDSCAPE`, `11x17 PORTRAIT`, `8x11 LANDSCAPE`,
   `8x11 LANDSCAPE - MH FIX`, `8x11 PORTRAIT`, `ARCH D`) import and print as they do from Pro.
 - Dynamic text keeps reading from the frame Pro linked it to (scale and spatial reference of
   `MAIN MAP`), the project name, the date and the service layer credits.
 - Every layer in a Pro map's Contents pane appears in RustGIS's Layers pane, in the same group
   tree, with the same name, visibility, scale range, symbology, labels and definition query.
 - A layer whose data RustGIS can't reach still appears, as a broken layer that keeps its style
-  and can be repaired later. **(Mike)**
+  and can be repaired later. **(user)**
 - What can't be carried over is said, layer by layer and element by element, as the QGIS project
   importer does with its notes (`rustgis_map::qgis::Report`). Nothing is dropped silently.
 
@@ -40,7 +40,7 @@ the day they import; a map import pays off only once its data sources open.
 - Writing `.aprx`, `.pagx` or `.stylx` files (export to Pro).
 - Importing Pro's favourites and styles (`.stylx`). A follow-on project; see the end.
 - Matching Maplex label placement pixel for pixel. The placement engines differ; the import maps
-  each Pro placement choice to the nearest RustGIS one and stops there. Mike wants a new, simpler
+  each Pro placement choice to the nearest RustGIS one and stops there. The user wants a new, simpler
   label engine for RustGIS eventually; that is a later project, not this one.
 - Pro's 3D scenes, animations, charts, pop-ups, metadata, geoprocessing history, toolboxes,
   styles and folder connections in a project.
@@ -53,7 +53,7 @@ the day they import; a map import pays off only once its data sources open.
   looks right but has lost the link between its scale text and its frame is a failure.
 - Putting the importer in the ArcGIS Online plugin. The plugin can only issue commands; the
   symbology mapping needs the map crate's own types. **(call)** The importer lives in core
-  RustGIS, in the `hlr` fork, written to the repo's conventions so it can be offered upstream.
+  RustGIS, in this fork, written to the repo's conventions so it can be offered upstream.
 - Crashing on a hostile or odd file. CIM documents are user data: bounded recursion, bounded
   lists, `get()` over indexing, sizes clamped, as `AGENTS.md` requires.
 
@@ -69,7 +69,7 @@ the day they import; a map import pays off only once its data sources open.
   holds the ArcGIS sign-in commands and stays as it is).
 - Existing `.rgislayout` and project files keep reading: every new field on a layout element or
   a layer has a serde default and is left out when unset.
-- Test files: the six templates and the Ovintiv project are Mike's working files on `G:` and are
+- Test files: the six templates and the test project are the user's working files on a network drive and are
   not committed. Tests use small synthetic CIM fixtures that exercise each mapping; the real files
   are used for manual verification (below).
 
@@ -84,7 +84,7 @@ A module `rustgis_map::cim` that turns CIM JSON into map and layout types.
 (`projectItems` of `itemType` `Map` and `Layout`, each with a `catalogPath` of the form
 `CIMPATH=folder/file.json`), one JSON per map (`CIMMap` with a `layers` list of `CIMPATH=` URIs),
 one per layer, one per layout. The reader resolves `CIMPATH=` URIs against the zip's entries
-(case-insensitively: the Ovintiv project has both `MAIN_MAP1/` and `main_map/`) or against the
+(case-insensitively: the test project has both `MAIN_MAP1/` and `main_map/`) or against the
 embedded definition lists of a `.pagx`/`.mapx`. An `.aprx` can hold a thousand entries and three
 megabytes; the reader reads only the entries it is pointed at.
 
@@ -116,7 +116,7 @@ name, counted, bounded, returned by the commands and summarised in a notice.
   when given `text`. The Import Layout button's file filter, the Browser pane's open action and
   dropping a file on the window all take `.pagx` beside `.rgislayout`.
 - A `.pagx` carries no project, so the command takes an optional `maps` parameter mapping frame
-  names to RustGIS map names (`{"MAIN MAP": "Ovintiv"}`). On the desktop, when a frame isn't
+  names to RustGIS map names (`{"MAIN MAP": "Project"}`). On the desktop, when a frame isn't
   bound (see Map frames below), a small dialog asks which map each unbound frame shows, defaulting
   to the active map. On the command line and in the assistant the default is used silently and a
   note says so.
@@ -190,11 +190,11 @@ Element `name`, `visible` and `locked` carry over.
   converts to a longitude/latitude centre and keeps the scale. `autoCamera` of type `Extent`
   fits the `extent` instead. An unbound frame (a template's `MAIN MAP`) carries the camera of
   whatever project it was last saved from and no spatial reference for it, so its saved camera
-  is ignored: the frame shows what the bound map is showing at import **(Mike)**, centre and
+  is ignored: the frame shows what the bound map is showing at import **(user)**, centre and
   scale from the map's view. The saved camera is kept only as a note.
 - **Linked frames (new).** `autoCamera.source = MapFrameLink` with `mapFrameLinkName` and
   `autoCameraType` of `Center`, `Extent` or `Scale`, plus `syncRotation`, means the frame follows
-  another at draw time. **(Mike)** This must keep working after import, not just be resolved
+  another at draw time. **(user)** This must keep working after import, not just be resolved
   once. `MapFrame` gains `link: Option<FrameLink { frame: u32, mode: Center | Extent | Scale,
   rotation: bool }>`; the renderer works a linked frame's camera out from its source frame's
   before drawing; the layout view shows the link in the frame's properties and lets it be set
@@ -204,7 +204,7 @@ Element `name`, `visible` and `locked` carry over.
   RustGIS keeps one indicator per frame (`extent_of`, `extent_color`, `extent_width`): the first
   is taken, with its stroke colour and width; further ones are noted.
 - **Border and background (new).** `graphicFrame.borderSymbol` (a line symbol), `backgroundSymbol`
-  (a fill) and `shadowSymbol` are Pro's per-element frame styling. **(Mike)** Border and
+  (a fill) and `shadowSymbol` are Pro's per-element frame styling. **(user)** Border and
   background must come across. Since legends, scale bars, pictures and groups have the same
   `graphicFrame`, this goes on `Element`, not on `MapFrame`: `frame_style: Option<FrameStyle {
   border: Option<(Rgba, f64)>, background: Option<Rgba>, gap: f64 }>`, drawn behind and around
@@ -221,7 +221,7 @@ Element `name`, `visible` and `locked` carry over.
 ` and draws from the top. The
   templates depend on both (the disclaimer is a 330-character paragraph in a 4 × 0.5 in box;
   the spatial reference and project name sit at the bottom of theirs), so `Text` gains
-  **(call, from Mike's bar)** `wrap: bool` (lines broken at the box's width when drawn, so text
+  **(call, from the user's bar)** `wrap: bool` (lines broken at the box's width when drawn, so text
   whose tokens vary in length, like `{credits}`, still fits), `valign: Top | Middle | Bottom`,
   and `line_spacing: f64` (Pro's `lineSpacing`, a multiple). Import sets `wrap` for paragraph
   text and leaves it off for point text.
@@ -251,12 +251,12 @@ first map frame. The template needs:
 | `project property="name"` | `{project}` (new): the project's name, or its file name without extension |
 | `layout … property="serviceLayerCredits"` | `{credits}` (new): the attribution of the web layers the layout's frames draw, as RustGIS already draws on the map |
 | `layout property="name"` | `{layout}` |
-| `date format="short|long|…"` | `{date}`; the format is noted and ignored **(Mike, accepted)** |
+| `date format="short|long|…"` | `{date}`; the format is noted and ignored **(user, accepted)** |
 | `time` | `{time}` |
 | `page property="number"`, `pageName`, `pageCount` | `{page}`, `{pageName}`, `{pages}` |
 | `user`, `computer`, `project path`, metadata properties | noted and dropped |
 
-Three behaviours are new and **required (Mike)**:
+Three behaviours are new and **required (user)**:
 
 1. **Text bound to a named frame.** `Text` gains `frame: Option<u32>`; tokens in a text element
    read from that frame's map and camera, and from the first frame only when unset (today's
@@ -272,7 +272,7 @@ Three behaviours are new and **required (Mike)**:
 3. **The new tokens above**, with `crsName` the coordinate system's full name (`NAD 1983
    StatePlane Texas Central FIPS 4203 (US Feet)`), `crsProjection` its method, `crsUnits` its
    linear or angular unit, `crsWkid` its EPSG code when it has one. RustGIS labels a projection
-   by its code today, so **(Mike)** it gains a table of EPSG codes to names (and to method and
+   by its code today, so **(user)** it gains a table of EPSG codes to names (and to method and
    unit where the PROJ string doesn't say), shipped as a data file under `crates/data` with its
    row in `ATTRIBUTION.md` (the EPSG dataset's terms allow this with attribution), used by the
    tokens, the projection dialog and the status bar. Codes outside the table fall back to
@@ -281,7 +281,7 @@ Three behaviours are new and **required (Mike)**:
 A `dyn type="layout"` tag reads from the layout it sits in, whatever its `name` attribute says
 **(call)**: the templates' credits tags name layouts that no longer exist (`8x11 LANDSCAPE`,
 `NEW STYLE LETTER LANDSCAPE`, `8 1/2 x 11 Portrait`) because they were copied from one another,
-and what Mike means by them is "this layout's credits". A `mapFrame` tag naming a frame that
+and what the user means by them is "this layout's credits". A `mapFrame` tag naming a frame that
 isn't on the page expands to nothing, with a note.
 
 ### Pictures
@@ -295,7 +295,7 @@ a note. On the web a path can't be read and is noted.
 
 ### Groups (new)
 
-**(Mike)** Groups make moving things easier and are wanted. `ElementKind::Group { children:
+**(user)** Groups make moving things easier and are wanted. `ElementKind::Group { children:
 Vec<u32> }` **(call)**, an element whose box is the union of its children's; children also get
 `group: Option<u32>` so either direction is cheap. Selecting a group selects its children; moving,
 resizing, deleting, duplicating, locking and hiding act on all; a Group and Ungroup command pair
@@ -307,7 +307,7 @@ groups and nesting.
 
 `CIMLegend` carries `title`/`showTitle`, `autoAdd`, `autoVisibility`, `autoReorder`, `columns`,
 `fittingStrategy` and `items` (one `CIMLegendItem` per layer: `showLayerName`, `showHeading`,
-label overrides, patch sizes, `keepTogether`). `Legend` gains **(Mike)**: `columns: usize` and
+label overrides, patch sizes, `keepTogether`). `Legend` gains **(user)**: `columns: usize` and
 `fit: LegendFit { AdjustSize | AdjustColumns | AdjustColumnsAndSize | AdjustFrame | Manual }`
 honoured by the renderer, plus `show_layer_names: bool`. Per-item patch sizes and label
 overrides are noted. `autoAdd=false` with an explicit item list becomes `exclude` for the layers
@@ -315,7 +315,7 @@ not listed.
 
 ### Scale bar
 
-**(Mike)** Subdivisions, label placement, the unit label and the number format must come across.
+**(user)** Subdivisions, label placement, the unit label and the number format must come across.
 `ScaleBar` gains `subdivisions: usize`, `divisions_before_zero: usize`, `label_position: Above |
 Below`, `unit_label: Option<String>` with `unit_label_position: AfterBar | AfterLabels | Above |
 Below`, `decimals: usize`, `thousands_separator: bool`, and a label `size`/`font`. The CIM style
@@ -328,7 +328,7 @@ Mark heights and frequencies are noted.
 
 ### North arrow
 
-**(Mike)** The arrow must look as it does in Pro. `CIMMarkerNorthArrow.pointSymbol` is a point
+**(user)** The arrow must look as it does in Pro. `CIMMarkerNorthArrow.pointSymbol` is a point
 symbol (the template's is a picture marker under a character marker). `NorthArrow` gains
 `symbol: Option<Symbol>` drawn at the element's size and turned to the frame's bearing plus
 `calibrationAngle`; this reuses Part 3's point symbol mapping, including the new image and path
@@ -341,7 +341,7 @@ remain. `northType` other than true north (magnetic, grid) is noted.
   anchor, for point-anchored text at each anchor, for every `dyn` tag, for a `.pagx` with an
   embedded map, and for a hostile file (deep nesting, huge counts, bad numbers, missing fields);
   `hostile_params_never_panic` stays green.
-- Manual: Mike exports each of the six templates from Pro as PDF at the same page size, imports
+- Manual: the user exports each of the six templates from Pro as PDF at the same page size, imports
   the `.pagx` into a project holding a map named for `MAIN MAP`, exports a PDF from RustGIS, and
   compares the two side by side. Fonts Roboto, Roboto Condensed, Arial and Ebrima are installed on
   the machine. The acceptance bar: every element at the same place (within half a millimetre),
@@ -357,7 +357,7 @@ remain. `northType` other than true north (magnetic, grid) is noted.
   `layouts: [names]`, `dir`. Without `maps`/`layouts` on the desktop, the picker opens; on the
   command line, nothing is imported and the result lists what the file holds (so a script can
   choose).
-- **The picker (Mike).** A dialog listing the project's maps and layouts with a tick box each,
+- **The picker (user).** A dialog listing the project's maps and layouts with a tick box each,
   the map Pro had open last ticked (from `GISProject.json`'s `views`) and nothing else; an "All"
   and a "None" link; ticking a layout ticks the maps its frames show. Dropping an `.aprx` on the
   window opens the picker; the Browser pane opens it too.
@@ -391,7 +391,7 @@ Relative paths resolve against `dir`, else the `.aprx`'s folder (`defaultFolder`
 
 ### Broken layers (new)
 
-**(Mike)** A layer whose source can't be opened is still added: same name, place in the tree,
+**(user)** A layer whose source can't be opened is still added: same name, place in the tree,
 visibility, scale range, symbology, labels and definition query, with a new `origin:
 Option<String>` on `SourceLayer` holding a readable description of where Pro read it from, and no
 open handle. It draws nothing. The Layers pane shows a warning glyph with the origin in its
@@ -406,7 +406,7 @@ not dropped.
 |---|---|
 | `CIMSimpleRenderer` | `Single` |
 | `CIMUniqueValueRenderer`, one field | `Unique` with `classes` from `groups[].classes[]` (`values[].fieldValues[0]` → `label`), `other` from `defaultSymbol` when `useDefaultSymbol`, `other_label` from `defaultLabel`, headings from `groups[].heading` into `class_labels` |
-| … several fields | `Unique` on the first field; the others noted. (Mike may want a combined virtual field later; not in this design.) |
+| … several fields | `Unique` on the first field; the others noted. (The user may want a combined virtual field later; not in this design.) |
 | `CIMClassBreaksRenderer` (graduated) | `Graduated` with `breaks`, `method` from `classificationMethod`, `min` from `minimumBreak` |
 | … `classBreakType = UnclassedColor` | `Graduated` over the colour ramp with many classes, noted |
 | `CIMProportionalRenderer` | `Proportional` |
@@ -434,11 +434,11 @@ Point symbol layers:
 - `CIMVectorMarker` whose `markerGraphics` draw one of the shapes RustGIS has (a circle from
   curve rings, a square or diamond from a four-corner ring and the marker's rotation, a triangle,
   a star, a cross or line from a two-point path) → that `Marker` with `size`, fill and outline.
-  In the Ovintiv project this covers about nine in ten.
+  In the test project this covers about nine in ten.
 - Any other vector marker → **`Marker::Path` (new, call)**: the marker's graphics as normalised
   paths with per-path fill and stroke, scaled to `size`. Drawn by the renderer on the CPU and
   GPU paths, used in legends and the symbol dialog ("Custom").
-- `CIMPictureMarker` (`url` a `data:` PNG/GIF/JPEG) → **`Marker::Image` (new, Mike)**: PNG
+- `CIMPictureMarker` (`url` a `data:` PNG/GIF/JPEG) → **`Marker::Image` (new, user)**: PNG
   bytes (GIF/JPEG converted), `size`, drawn at the point, in legends, and in the symbol dialog
   (choose a file; the import fills it). Tinting (`tintColor`) noted.
 - `CIMCharacterMarker` → `Marker::Char` with the font and character index.
@@ -458,7 +458,7 @@ the stylx follow-on both want the same thing).
 `CIMBackgroundCallout` → `LabelBackground`; `CIMSimpleLineCallout` and composite callouts → a
 plain label, noted).
 
-**Label expressions (new, Mike).** `expression` with `expressionEngine` Arcade, VBScript, Python
+**Label expressions (new, user).** `expression` with `expressionEngine` Arcade, VBScript, Python
 or JScript. `LabelClass.field` becomes a template: literal text with `{Field}` placeholders and
 `\n` line breaks, evaluated per feature (a template that is just `{Field}` is today's field
 label, so existing projects read unchanged). The import translates: field references
@@ -497,7 +497,7 @@ standalone tables when their source opens.
 
 - Unit tests per table row on synthetic fixtures; a synthetic `.aprx` zip with two maps, a
   layout and an ArcMap XML item; hostile input tests.
-- Manual: import the Ovintiv project's `Ovintiv` map on Mike's machine with `G:` mounted and
+- Manual: import the test project's main map on the user's machine with its drive mounted and
   ArcGIS Online signed in. Acceptance: the Layers pane lists every layer of Pro's Contents in the
   same tree; each file-backed layer draws with the same colours, widths, markers and labels at
   the same zoom (compared by screenshot against Pro); service layers draw or are broken with the
@@ -520,6 +520,6 @@ standalone tables when their source opens.
 1. **Favourites and styles (`.stylx`).** A SQLite database of CIM symbols. Reuses Part 3's symbol
    mapping and the new marker kinds; each row becomes an `.rgisstyle` item. Small once this
    design ships.
-2. **A new label engine** for RustGIS, simpler than Maplex. Mike's wish; this design only maps
+2. **A new label engine** for RustGIS, simpler than Maplex. The user's wish; this design only maps
    placements to what RustGIS has.
 3. **`.lyrx` layer files** beyond a single layer; multi-field unique values as a combined field.

@@ -22879,7 +22879,7 @@ fn b64(bytes: &[u8]) -> String {
 /// The 11x17 template reduced by hand: two frames (the small one linked to the main one, with its
 /// extent indicator, and showing an embedded map of one shapefile layer), background boxes, text
 /// with dynamic tags, a legend, a scale bar, a north arrow, a logo, and two groups. `logo` is the
-/// HLR LOGO's picture keys (`referenceURI`, `sourceURL`); `arrow_url` the north arrow marker's
+/// COMPANY LOGO's picture keys (`referenceURI`, `sourceURL`); `arrow_url` the north arrow marker's
 /// data URL.
 fn pagx_with(logo: Value, arrow_url: &str) -> String {
     let shp = pagx_shapefile();
@@ -22935,7 +22935,8 @@ fn pagx_with(logo: Value, arrow_url: &str) -> String {
     );
     let mut logo_graphic = json!({"type": "CIMPictureGraphic", "box": {"xmin": 0.76, "ymin": 10.3, "xmax": 1.83, "ymax": 10.9}});
     logo_graphic.as_object_mut().unwrap().extend(logo.as_object().unwrap().clone());
-    let logo = json!({"type": "CIMGraphicElement", "name": "HLR LOGO", "anchor": "CenterPoint", "visible": true, "graphic": logo_graphic});
+    let logo =
+        json!({"type": "CIMGraphicElement", "name": "COMPANY LOGO", "anchor": "CenterPoint", "visible": true, "graphic": logo_graphic});
     let group = |name: &str, children: Vec<Value>| json!({"type": "CIMGroupElement", "name": name, "visible": true, "elements": children});
     let elements = vec![
         group(
@@ -23019,7 +23020,7 @@ fn a_pagx_imports_with_its_frames_bound_and_its_embedded_map_added() {
     assert_eq!(r["maps"], json!(["NEW DETAIL MAP"]));
     assert_eq!(s.active_layout, Some(r["layout"].as_u64().unwrap() as usize));
     // The logo comes from the document.
-    let logo = l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap();
+    let logo = l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap();
     assert!(matches!(&logo.kind, ElementKind::Picture { image, .. } if !image.is_empty()));
 }
 
@@ -23147,7 +23148,7 @@ fn a_pagx_by_path_resolves_pictures_beside_it() {
     std::fs::write(&file, pagx_with(json!({"sourceURL": png.display().to_string()}), &gif_arrow)).unwrap();
     let mut s = world();
     let r = s.run("layout.import", &json!({"path": file.display().to_string(), "maps": {"MAIN MAP": "World"}})).unwrap();
-    let ElementKind::Picture { image, source } = kind(&s, &r, "HLR LOGO") else { panic!() };
+    let ElementKind::Picture { image, source } = kind(&s, &r, "COMPANY LOGO") else { panic!() };
     assert_eq!(rustgis_render::picture_size(&image), Some((3, 2)));
     assert_eq!(source.as_deref(), Some(png.display().to_string().as_str()));
     let ElementKind::NorthArrow { symbol, .. } = kind(&s, &r, "NORTH ARROW") else { panic!() };
@@ -23156,15 +23157,15 @@ fn a_pagx_by_path_resolves_pictures_beside_it() {
     let file = dir.join("rel.pagx");
     std::fs::write(&file, pagx_with(json!({"sourceURL": "logo.bmp"}), &gif_arrow)).unwrap();
     let r = s.run("layout.import", &json!({"path": file.display().to_string()})).unwrap();
-    let ElementKind::Picture { image, source } = kind(&s, &r, "HLR LOGO") else { panic!() };
+    let ElementKind::Picture { image, source } = kind(&s, &r, "COMPANY LOGO") else { panic!() };
     assert_eq!(rustgis_render::picture_size(&image), Some((3, 2)));
     assert_eq!(source.as_deref(), Some("logo.bmp"));
     // A picture that isn't there: noted, the element empty with its source.
     let text = pagx_with(json!({"sourceURL": "missing.png"}), &gif_arrow);
     let r = s.run("layout.import", &json!({"text": text, "dir": dir.display().to_string()})).unwrap();
-    let ElementKind::Picture { image, source } = kind(&s, &r, "HLR LOGO") else { panic!() };
+    let ElementKind::Picture { image, source } = kind(&s, &r, "COMPANY LOGO") else { panic!() };
     assert!(image.is_empty() && source.as_deref() == Some("missing.png"));
-    assert!(r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "HLR LOGO"), "{}", r["notes"]);
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "COMPANY LOGO"), "{}", r["notes"]);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -23181,10 +23182,10 @@ fn an_embedded_gif_picture_imports_as_a_png() {
     let logo = json!({"sourceURL": format!("data:image/gif;base64,{wrapped}")});
     let r = s.run("layout.import", &json!({"text": pagx_with(logo, &arrow)})).unwrap();
     let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
-    let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap().kind else { panic!() };
+    let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap().kind else { panic!() };
     assert!(image.starts_with("iVBORw0KGgo"), "a PNG: {}", image.get(..16).unwrap_or(image));
     assert_eq!(rustgis_render::picture_size(image), Some((3, 2)));
-    assert!(!r["notes"].to_string().contains("HLR LOGO"), "{}", r["notes"]);
+    assert!(!r["notes"].to_string().contains("COMPANY LOGO"), "{}", r["notes"]);
 }
 
 /// An embedded picture larger than `layout.addElement` takes, or that isn't a picture, is noted
@@ -23202,10 +23203,10 @@ fn an_oversize_or_unreadable_embedded_picture_is_noted_and_left_empty() {
         let mut s = world();
         let r = s.run("layout.import", &json!({"text": pagx_with(logo, &arrow)})).unwrap();
         let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
-        let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap().kind else { panic!() };
+        let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap().kind else { panic!() };
         assert!(image.is_empty(), "{why}: {}", image.len());
         let notes = r["notes"].as_array().unwrap();
-        assert!(notes.iter().any(|n| n["layer"] == "HLR LOGO" && n["text"].as_str().unwrap().contains(why)), "{why}: {}", r["notes"]);
+        assert!(notes.iter().any(|n| n["layer"] == "COMPANY LOGO" && n["text"].as_str().unwrap().contains(why)), "{why}: {}", r["notes"]);
     }
 }
 
@@ -23223,10 +23224,10 @@ fn a_relative_picture_with_no_folder_is_noted_not_read_from_the_working_director
     let _ = std::fs::remove_file(&name);
     let r = r.unwrap();
     let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
-    let ElementKind::Picture { image, source } = &l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap().kind else { panic!() };
+    let ElementKind::Picture { image, source } = &l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap().kind else { panic!() };
     assert!(image.is_empty() && source.as_deref() == Some(name.as_str()));
     assert!(
-        r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "HLR LOGO" && n["text"].as_str().unwrap().contains("no folder")),
+        r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "COMPANY LOGO" && n["text"].as_str().unwrap().contains("no folder")),
         "{}",
         r["notes"]
     );

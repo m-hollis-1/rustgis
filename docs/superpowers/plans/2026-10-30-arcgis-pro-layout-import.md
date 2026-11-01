@@ -19,7 +19,7 @@
 - Page coordinates: CIM is page units from the bottom-left; RustGIS is millimetres from the top-left: `y_mm = (page_h - (y + h)) * unit_mm`.
 - Interface text through `tl!("…")` and `i18n::fmt`; command ids and parameters never translated.
 - `cargo` is at `~/.cargo/bin`: run tool shells with `PATH="$HOME/.cargo/bin:$PATH"`.
-- Test fixtures are small synthetic CIM JSON strings in the test modules, never Mike's files from `G:`.
+- Test fixtures are small synthetic CIM JSON strings in the test modules, never the user's own files.
 - Commit after every task with a conventional message (`feat(layout): …`, `feat(cim): …`, `docs: …`) ending in `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 
 ## Review Focus
@@ -721,7 +721,7 @@ Note: Pro prints Esri's spelling (`NAD 1983 StatePlane Texas Central FIPS 4203 (
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-10-30-arcgis-pro-layout-import-checklist.md` (the results of this task, not committed until filled)
-- Use: `G:\1- NEW LAYOUT FILES\*.pagx`, Mike's PDF exports of the same six from Pro (ask Mike for them: File › Share › Export Layout, PDF, 300 dpi), a project with a map named `MAIN MAP`-worthy (any map with a few layers and a web basemap, so `{credits}` has something to say)
+- Use: the template folder's `*.pagx` files, the user's PDF exports of the same six from Pro (ask for them: File › Share › Export Layout, PDF, 300 dpi), a project with a map named `MAIN MAP`-worthy (any map with a few layers and a web basemap, so `{credits}` has something to say)
 
 - [ ] **Step 1: Import each template** with the desktop app (`PATH="$HOME/.cargo/bin:$PATH" cargo run --release -p rustgis`): Home › Project › Import Layout, pick the `.pagx`, bind MAIN MAP in the dialog. Note every notice.
 - [ ] **Step 2: Export each** (Publish › Export Layout, PDF, 300 dpi) and put it beside Pro's PDF.

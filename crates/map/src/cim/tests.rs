@@ -623,7 +623,7 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
         json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint", "graphic": g})
     };
     let (imp, report) = read(&[
-        picture("HLR LOGO", json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Holland LR Logo.png"})),
+        picture("COMPANY LOGO", json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Company Logo.png"})),
         picture("FILE", json!({"sourceURL": r"G:\LOGOS\Other.png"})),
         picture("INLINE", json!({"sourceURL": "data:image/png;base64,AAAA"})),
     ]);
@@ -638,7 +638,7 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
     // Every picture is left for the engine to check and convert, embedded ones included: the
     // elements are empty until it does.
     assert!(
-        matches!(&els[0].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Holland LR Logo.png"))
+        matches!(&els[0].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Company Logo.png"))
     );
     assert!(matches!(&els[1].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Other.png")));
     assert!(matches!(&els[2].kind, Picture { image, source } if image.is_empty() && source.is_none()));

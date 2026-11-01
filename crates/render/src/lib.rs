@@ -1488,9 +1488,10 @@ pub(crate) fn marker_path(x: f32, y: f32, r: f32, marker: Marker) -> Option<tiny
                 let em = 2.0 * r;
                 return s.path.clone().transform(Transform::from_row(em, 0.0, 0.0, em, x, y));
             }
-            // A space draws nothing; a character no font here has, a circle of its size, so the
-            // point still shows.
-            None if g.ch.is_whitespace() => return None,
+            // A space draws nothing, and so does an Esri symbol font's picture this machine
+            // can't draw (see `glyphs::symbol_family`); a character no font here has, a circle of
+            // its size, so the point still shows.
+            None if g.ch.is_whitespace() || glyphs::symbol_family(g.font.as_str()) => return None,
             None => pb.push_circle(x, y, r),
         },
     }

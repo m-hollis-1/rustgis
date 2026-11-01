@@ -186,11 +186,7 @@ fn font_dirs() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut dirs: Vec<PathBuf> = Vec::new();
     if cfg!(target_os = "windows") {
-        let windir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from("C:\\Windows"), PathBuf::from);
-        dirs.push(windir.join("Fonts"));
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            dirs.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
-        }
+        dirs = windows_font_dirs(|k| std::env::var_os(k));
     } else if cfg!(target_os = "macos") {
         dirs.extend(["/System/Library/Fonts", "/Library/Fonts"].map(PathBuf::from));
         dirs.extend(home.iter().map(|h| h.join("Library").join("Fonts")));
@@ -201,6 +197,26 @@ fn font_dirs() -> Vec<PathBuf> {
             None => dirs.extend(home.iter().map(|h| h.join(".local").join("share").join("fonts"))),
         }
         dirs.extend(home.iter().map(|h| h.join(".fonts")));
+    }
+    dirs
+}
+
+/// The font folders of a Windows system whose environment is `env`: the system's, the user's,
+/// and ArcGIS Pro's where it is installed (under `%ProgramFiles%`, else `C:\Program Files`, and
+/// `%ProgramW6432%`), whose Esri symbol fonts (ESRI North, ESRI Default Marker, …) Pro's maps and
+/// layouts draw their markers and north arrows in.
+fn windows_font_dirs(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let windir = env("WINDIR").map_or_else(|| PathBuf::from("C:\\Windows"), PathBuf::from);
+    let mut dirs = vec![windir.join("Fonts")];
+    if let Some(local) = env("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
+    }
+    let programs = env("ProgramFiles").map_or_else(|| PathBuf::from("C:\\Program Files"), PathBuf::from);
+    for p in std::iter::once(programs).chain(env("ProgramW6432").map(PathBuf::from)) {
+        let pro = p.join("ArcGIS").join("Pro").join("Resources").join("Fonts");
+        if !dirs.contains(&pro) && pro.is_dir() {
+            dirs.push(pro);
+        }
     }
     dirs
 }
@@ -458,6 +474,35 @@ mod tests {
         let mut seen = HashSet::new();
         walk(dir.path(), 0, &mut files, &mut seen);
         assert_eq!((files.len(), seen.len()), (1, 1), "{files:?}");
+    }
+
+    #[test]
+    fn arcgis_pros_font_folder_is_scanned_where_it_is_installed() {
+        // Esri's symbol fonts (ESRI North, ESRI Default Marker) live in ArcGIS Pro's own folder.
+        let pf = tempfile::tempdir().unwrap();
+        let w64 = tempfile::tempdir().unwrap();
+        let pro = |d: &Path| d.join("ArcGIS").join("Pro").join("Resources").join("Fonts");
+        std::fs::create_dir_all(pro(pf.path())).unwrap();
+        std::fs::create_dir_all(pro(w64.path())).unwrap();
+        let env = |pf: Option<&Path>, w64: Option<&Path>| {
+            let (pf, w64) = (pf.map(Path::to_path_buf), w64.map(Path::to_path_buf));
+            move |k: &str| match k {
+                "WINDIR" => Some(std::ffi::OsString::from("W:/Windows")),
+                "ProgramFiles" => pf.clone().map(PathBuf::into_os_string),
+                "ProgramW6432" => w64.clone().map(PathBuf::into_os_string),
+                _ => None,
+            }
+        };
+        let dirs = windows_font_dirs(env(Some(pf.path()), Some(w64.path())));
+        assert_eq!(dirs.first(), Some(&PathBuf::from("W:/Windows").join("Fonts")));
+        assert!(dirs.contains(&pro(pf.path())), "{dirs:?}");
+        assert!(dirs.contains(&pro(w64.path())), "{dirs:?}");
+        // The same folder twice is listed once; a machine without Pro lists no Pro folder.
+        let once = windows_font_dirs(env(Some(pf.path()), Some(pf.path())));
+        assert_eq!(once.iter().filter(|d| **d == pro(pf.path())).count(), 1, "{once:?}");
+        let none = tempfile::tempdir().unwrap();
+        let without = windows_font_dirs(env(Some(none.path()), None));
+        assert!(without.iter().all(|d| !d.ends_with(Path::new("Resources").join("Fonts"))), "{without:?}");
     }
 
     #[test]

@@ -1066,8 +1066,11 @@ const MAX_ARROW_SCRATCH: f32 = 4096.0;
 /// A north arrow's point `symbol` (bottom layer first) centred in `r`, the largest layer's size
 /// filling `r`'s shorter side and the others keeping their ratio to it, turned about the middle of
 /// `r` as a north arrow is (see [`north_arrow`]). `false` when there is nothing to size it by (no
-/// layer has a size), so the caller draws the style instead.
-fn symbol_arrow(pm: &mut Pixmap, r: Rect, symbol: &[Symbol], bearing: f64) -> bool {
+/// layer has a size), so the caller draws the style instead. A layer in an Esri symbol font this
+/// machine lacks (ESRI North's arrow, without ArcGIS Pro's fonts) draws as the [`ArrowStyle::Classic`]
+/// arrow in the element's `fill` and `outline`, in the square the glyph's em would fill, so the
+/// arrow is still an arrow.
+fn symbol_arrow(pm: &mut Pixmap, r: Rect, symbol: &[Symbol], colours: (Rgba, Rgba), ppp: f64, bearing: f64) -> bool {
     let largest = symbol.iter().map(|s| s.size).filter(|z| z.is_finite()).fold(0.0f32, f32::max);
     let side = r.width().min(r.height());
     if largest <= 0.0 || !(side.is_finite() && side > 0.0) {
@@ -1082,6 +1085,17 @@ fn symbol_arrow(pm: &mut Pixmap, r: Rect, symbol: &[Symbol], bearing: f64) -> bo
         for s in symbol.iter().filter(|s| s.size.is_finite() && s.size > 0.0) {
             // Sized in pixels, so one pixel to the point.
             let scaled = Symbol { size: s.size * k, stroke_width: s.stroke_width * k, ..*s };
+            if let rustgis_map::Marker::Char(g) = s.marker
+                && crate::glyphs::symbol_font_missing(g)
+            {
+                // The scratch pixmap draws `k` smaller than the page; its outline too.
+                let (half, shrink) = (scaled.size / 2.0, k * largest / side);
+                if let Some(at) = Rect::from_xywh(x - half, y - half, scaled.size, scaled.size) {
+                    // Drawn upright: a turned map turns the scratch pixmap it is drawn on.
+                    style_arrow(pm, at, ArrowStyle::Classic, colours.0, colours.1, ppp * f64::from(shrink), 0.0);
+                }
+                continue;
+            }
             crate::draw_marker(pm, x, y, &scaled, 1.0, None, 1.0);
         }
     };
@@ -1105,12 +1119,18 @@ fn symbol_arrow(pm: &mut Pixmap, r: Rect, symbol: &[Symbol], bearing: f64) -> bo
 
 /// A north arrow in `style`, with an `N` above it, pointing north on a map turned to `bearing`
 /// (degrees clockwise from north): turned about the middle of `r`, the `N` kept upright. A point
-/// `symbol` (an imported arrow's own) draws instead, when it has a size, and no `N`.
+/// `symbol` (an imported arrow's own) draws instead, when it has a size, and no `N` (but for a
+/// layer in a missing Esri symbol font, which draws the Classic arrow, `N` and all: see
+/// [`symbol_arrow`]).
 #[allow(clippy::too_many_arguments)]
 fn north_arrow(pm: &mut Pixmap, r: Rect, style: ArrowStyle, fill: Rgba, outline: Rgba, symbol: &[Symbol], ppp: f64, bearing: f64) {
-    if symbol_arrow(pm, r, symbol, bearing) {
-        return;
+    if !symbol_arrow(pm, r, symbol, (fill, outline), ppp, bearing) {
+        style_arrow(pm, r, style, fill, outline, ppp, bearing);
     }
+}
+
+/// [`north_arrow`]'s built-in arrow in `style`, with its `N`.
+fn style_arrow(pm: &mut Pixmap, r: Rect, style: ArrowStyle, fill: Rgba, outline: Rgba, ppp: f64, bearing: f64) {
     let white = Rgba::rgb(0xFF, 0xFF, 0xFF);
     let sw = 0.8 * ppp as f32;
     let (cx, top) = (r.x() + r.width() / 2.0, r.y());
@@ -2379,10 +2399,12 @@ pub(crate) fn text_lines(s: &str, size: f32, face: text::Face, spacing: f32, wra
 
 /// How far down a box `box_h` tall a block of `lines` lines starts for `valign`, in the units of
 /// `px` (a line's font size): the block is a line's 1.25 `px` and a pitch (`line_spacing` times
-/// that) for each line more. A block taller than the box starts at its top.
+/// that) for each line more. A block taller than the box overflows it as ArcGIS Pro's does, away
+/// from its alignment: a bottom one keeps its last line on the box's bottom and starts above its
+/// top (a negative shift), a middle one stays centred, a top one runs on below.
 pub(crate) fn block_shift(valign: VAlign, box_h: f64, px: f64, lines: usize, line_spacing: f64) -> f64 {
     let block = px * 1.25 * (1.0 + lines.saturating_sub(1) as f64 * line_spacing);
-    let free = (box_h - block).max(0.0);
+    let free = box_h - block;
     match valign {
         VAlign::Top => 0.0,
         VAlign::Middle => free / 2.0,
@@ -3477,6 +3499,38 @@ pub(crate) mod tests {
         assert!(text_lines(&"a\n".repeat(900), 10.0, face, 0.0, None).len() <= 200);
     }
 
+    #[test]
+    fn a_block_taller_than_its_box_overflows_away_from_its_alignment() {
+        // As Pro places it: five lines in a box one line tall. Bottom keeps the last line on the
+        // box's bottom and grows up past its top; middle grows both ways; top grows down.
+        let (y0, h) = (150.0f32, 10.0 * 1.33 * 1.25);
+        let page = |valign| {
+            let mut pm = Pixmap::new(120, 300).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            let r = Rect::from_xywh(0.0, y0, 120.0, h).unwrap();
+            text_block(&mut pm, r, "HHH\nHHH\nHHH\nHHH\nHHH", 10.0, Rgba::rgb(0, 0, 0), TextStyle { valign, ..TextStyle::default() }, 1.0);
+            let rows = ink_rows(&pm);
+            (rows[0] as f32, rows[rows.len() - 1] as f32)
+        };
+        let block = 10.0 * 1.33 * 1.25 * 5.0;
+        let (top_first, top_last) = page(VAlign::Top);
+        assert!(top_first >= y0 && top_last > y0 + h, "top: from the box's top down ({top_first}..{top_last})");
+        let (first, last) = page(VAlign::Bottom);
+        assert!(last <= y0 + h && last > y0 + h - 5.0, "bottom: the last line on the box's bottom ({last})");
+        assert!(first < y0 - 40.0, "bottom: the first line above the box's top ({first})");
+        assert!((top_first - first - (block - h)).abs() < 1.5, "the same block, moved up by its overflow");
+        // Middle: centred, half the overflow above the box (lines more than an em below the box
+        // are left out, as a top block's are).
+        let (first, last) = page(VAlign::Middle);
+        assert!((top_first - first - (block - h) / 2.0).abs() < 1.5, "middle: centred ({first})");
+        assert!(last > y0 + h, "middle: runs on below the box too ({last})");
+        // The shift the page and the SVG export share goes negative.
+        assert!((block_shift(VAlign::Bottom, 10.0, 10.0, 5, 1.0) - (10.0 - 62.5)).abs() < 1e-9);
+        assert!((block_shift(VAlign::Middle, 10.0, 10.0, 5, 1.0) - (10.0 - 62.5) / 2.0).abs() < 1e-9);
+        assert_eq!(block_shift(VAlign::Top, 10.0, 10.0, 5, 1.0), 0.0);
+        assert!((block_shift(VAlign::Bottom, 100.0, 10.0, 1, 1.0) - 87.5).abs() < 1e-9, "a block that fits is unchanged");
+    }
+
     /// Two frames of one map at 1:10,000 and 1:50,000 on a page, with `text` (bound to
     /// `frame`) under them, drawn at 96 dpi.
     fn two_frame_page(text: &str, frame: Option<usize>, case: rustgis_map::layout::TextCase) -> Pixmap {
@@ -4013,6 +4067,42 @@ pub(crate) mod tests {
                 assert_ne!(a.data(), b.data(), "each style draws differently");
             }
         }
+    }
+
+    #[test]
+    fn a_north_arrow_in_a_missing_esri_font_draws_the_classic_arrow() {
+        // An imported Pro arrow: char 178 of ESRI North (40.8 pt). Where the family is missing it
+        // draws as RustGIS's Classic arrow in the glyph's place (here the whole square), never as
+        // the label font's "²".
+        let (fill, outline) = (Rgba::rgb(0xFF, 0, 0), Rgba::rgb(0x22, 0x22, 0x22));
+        let r = Rect::from_xywh(0.0, 0.0, 80.0, 80.0).unwrap();
+        let draw = |symbol: &[Symbol]| {
+            let mut pm = Pixmap::new(80, 80).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            north_arrow(&mut pm, r, ArrowStyle::Triangle, fill, outline, symbol, 1.5, 0.0);
+            pm
+        };
+        let classic = {
+            let mut pm = Pixmap::new(80, 80).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            north_arrow(&mut pm, r, ArrowStyle::Classic, fill, outline, &[], 1.5, 0.0);
+            pm
+        };
+        let char_symbol = |font: &str| symbol(rustgis_map::Marker::Char(rustgis_map::Glyph::new('\u{B2}', font)), 40.8, outline);
+        let missing = draw(&[char_symbol("ESRI No Such Symbols")]);
+        assert_eq!(missing.data(), classic.data(), "the Classic arrow, its size and centre the glyph's");
+        let superscript = draw(&[char_symbol("")]);
+        assert_ne!(missing.data(), superscript.data(), "not the label font's ²");
+        if crate::families::find("ESRI North").is_none() {
+            assert_eq!(draw(&[char_symbol("ESRI North")]).data(), classic.data());
+        }
+        // A smaller layer beside it (the logo mark of the template) keeps its place; the Classic
+        // arrow still takes the missing glyph's.
+        let logo = symbol(rustgis_map::Marker::Square, 8.7, Rgba::rgb(0, 0, 0xFF));
+        let both = draw(&[logo, char_symbol("ESRI No Such Symbols")]);
+        let blue = |p: tiny_skia::PremultipliedColorU8| p.blue() > 200 && p.red() < 50;
+        assert!(both.pixels().iter().any(|p| blue(*p)), "the logo layer draws");
+        assert!(both.pixels().iter().filter(|p| red(**p)).count() > 50, "the Classic arrow draws");
     }
 
     #[test]

@@ -3147,16 +3147,7 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             add(app, json!({"kind": "text"}));
         }
         big_menu(ui, app, "dynamic_text", "Dynamic\nText", "Add text that updates: page, date, scale, map and more.", |ui, app| {
-            for (token, what) in [
-                ("{date}", "Current date"),
-                ("{time}", "Current time"),
-                ("{scale}", "Map scale"),
-                ("{map}", "Map name"),
-                ("{crs}", "Coordinate system"),
-                ("{page} / {pages}", "Page number"),
-                ("{pageName}", "Map series page name"),
-                ("{layout}", "Layout name"),
-            ] {
+            for (token, what) in layout_tokens() {
                 if ui.button(format!("{}  {token}", tl!(what))).clicked() {
                     add(app, json!({"kind": "dynamicText", "text": token}));
                     ui.close();
@@ -3175,6 +3166,14 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             small(ui, app, "map", "Show Map", "Close the layout and show the map.", "layout.close", Value::Null, false);
         });
     });
+}
+
+/// The values a layout's Dynamic Text menu offers, each with what it shows: the map's
+/// (`graphics::TOKENS`), then the page's (`{page}` and `{pages}` share one entry).
+pub(crate) fn layout_tokens() -> Vec<(&'static str, &'static str)> {
+    let mut tokens = rustgis_engine::map::graphics::TOKENS.to_vec();
+    tokens.extend([("{page} / {pages}", "Page number"), ("{pageName}", "Map series page name"), ("{layout}", "Layout name")]);
+    tokens
 }
 
 fn plugins_tab(app: &mut RustGisApp, ui: &mut Ui) {

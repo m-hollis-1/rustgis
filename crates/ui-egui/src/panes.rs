@@ -2589,6 +2589,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "rgismpk",
                         "rgislyr",
                         "rgislayout",
+                        "pagx",
                     ]
                     .iter()
                     .any(|x| n.to_lowercase().ends_with(&format!(".{x}"))))
@@ -2617,8 +2618,8 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 } else if name.ends_with(".rgismap") || name.ends_with(".rgismpk") {
                     let _ = app.run("map.import", json!({"path": path.display().to_string()}));
                     app.map.invalidate();
-                } else if name.ends_with(".rgislayout") {
-                    let _ = app.run("layout.import", json!({"path": path.display().to_string()}));
+                } else if name.ends_with(".rgislayout") || name.to_ascii_lowercase().ends_with(".pagx") {
+                    let _ = app.import_layout_file(&path.display().to_string());
                 } else {
                     let _ = crate::layerchooser::add_file(app, &path.display().to_string());
                 }

@@ -158,8 +158,9 @@ fn parse(text: &str) -> Result<Value, String> {
 /// A path as it is compared: without `CIMPATH=` or a leading slash, with `/` for `\`, lower-cased.
 /// (A `uRI` and the zip entry it names can differ in case.)
 fn path_key(path: &str) -> String {
-    let p = path.strip_prefix(PATH_PREFIX).unwrap_or(path).replace('\\', "/");
-    p.trim_start_matches('/').to_lowercase()
+    // Lower-cased first, so `cimpath=` comes off in any case (as the engine's `uri_key`).
+    let lower = path.trim().replace('\\', "/").to_lowercase();
+    lower.strip_prefix(&PATH_PREFIX.to_lowercase()).unwrap_or(&lower).trim_start_matches('/').to_string()
 }
 
 // What the symbol, layout and map readers share: a key that is missing or of another type gives

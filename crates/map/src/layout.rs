@@ -634,8 +634,9 @@ impl LegendFit {
         }
     }
 
+    /// A fit's code (`adjustColumns`), trimmed, in any case.
     pub fn from_name(s: &str) -> Option<LegendFit> {
-        LegendFit::ALL.into_iter().find(|f| f.code() == s)
+        LegendFit::ALL.into_iter().find(|f| f.code().eq_ignore_ascii_case(s.trim()))
     }
 }
 
@@ -1193,8 +1194,9 @@ impl LinkMode {
         }
     }
 
+    /// A mode's code (`extent`), trimmed, in any case.
     pub fn from_name(s: &str) -> Option<LinkMode> {
-        LinkMode::ALL.into_iter().find(|m| m.code() == s)
+        LinkMode::ALL.into_iter().find(|m| m.code().eq_ignore_ascii_case(s.trim()))
     }
 }
 
@@ -2121,12 +2123,20 @@ impl Layout {
         }
         self.clamp_links(&frames);
         self.clamp_groups();
+        self.drop_empty_groups();
         if let Some(s) = &mut self.series {
             if !frames.contains(&s.frame) {
                 self.series = None;
             } else {
                 s.margin = finite_or(s.margin, 0.1).clamp(0.0, 5.0);
             }
+        }
+        // The series' frame follows the pages, never another frame (`layout.series` refuses a
+        // linked one): its link goes.
+        if let Some(frame) = self.series.as_ref().map(|s| s.frame)
+            && let Some(ElementKind::MapFrame { link, .. }) = self.element_mut(frame).map(|e| &mut e.kind)
+        {
+            *link = None;
         }
     }
 }
@@ -2206,6 +2216,28 @@ impl Layout {
                 children.retain(|c| !dissolved.contains(c));
                 children.extend(moved.iter().filter(|(_, p)| *p == gid).map(|(c, _)| *c));
                 children.truncate(MAX_GROUP_CHILDREN);
+            }
+        }
+    }
+
+    /// Drops the groups left with no children, as removing a group's last child removes the
+    /// group; a group holding only such groups goes with them, level by level.
+    fn drop_empty_groups(&mut self) {
+        for _ in 0..=MAX_GROUP_DEPTH {
+            let empty: std::collections::HashSet<u32> = self
+                .elements
+                .iter()
+                .filter(|e| matches!(&e.kind, ElementKind::Group { children } if children.is_empty()))
+                .map(|e| e.id)
+                .collect();
+            if empty.is_empty() {
+                return;
+            }
+            self.elements.retain(|e| !empty.contains(&e.id));
+            for e in &mut self.elements {
+                if let ElementKind::Group { children } = &mut e.kind {
+                    children.retain(|c| !empty.contains(c));
+                }
             }
         }
     }
@@ -2983,6 +3015,32 @@ mod tests {
         assert_eq!(l, before);
     }
 
+    /// The map series' frame follows the pages, not another frame: `clamp` drops its link, as
+    /// `layout.series` refuses a linked frame.
+    #[test]
+    fn the_series_frame_loses_its_link_in_clamp() {
+        let to = |frame| Some(FrameLink { frame, mode: LinkMode::Center, rotation: false });
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        let c = linked_frame(&mut l, "C", (0.0, 0.0), 1e6, None);
+        set_link(&mut l, b, to(a));
+        set_link(&mut l, c, to(b));
+        l.series = Some(MapSeries::new(b, "Pages", ""));
+        l.clamp();
+        assert_eq!((link_of(&l, b), link_of(&l, c)), (None, to(b)), "a frame following the series frame keeps its link");
+        assert_eq!(l.series.as_ref().map(|s| s.frame), Some(b));
+    }
+
+    #[test]
+    fn link_and_fit_names_are_trimmed_and_any_case() {
+        assert_eq!(LinkMode::from_name(" EXTENT "), Some(LinkMode::Extent));
+        assert_eq!(LinkMode::from_name("center"), Some(LinkMode::Center));
+        assert_eq!(LegendFit::from_name("AdjustColumns"), Some(LegendFit::AdjustColumns));
+        assert_eq!(LegendFit::from_name(" adjustcolumnsandsize "), Some(LegendFit::AdjustColumnsAndSize));
+        assert_eq!((LinkMode::from_name("near"), LegendFit::from_name("")), (None, None));
+    }
+
     #[test]
     fn a_long_chain_of_links_resolves() {
         let maps = [Map::new("Map")];
@@ -3049,7 +3107,7 @@ mod tests {
             FrameLink { frame: 3, mode: LinkMode::Center, rotation: false }
         );
         assert_eq!(LinkMode::from_name("scale"), Some(LinkMode::Scale));
-        assert_eq!(LinkMode::from_name("Scale"), None);
+        assert_eq!(LinkMode::from_name("Scale"), Some(LinkMode::Scale));
     }
 
     #[test]
@@ -3380,7 +3438,8 @@ mod tests {
             {"id":2,"name":"b","x":20,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}},
             {"id":3,"name":"g","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,99,3,2,1]}}},
             {"id":4,"name":"h","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,5]}}},
-            {"id":5,"name":"loop","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[4]}}}]}"#;
+            {"id":5,"name":"loop","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[4,6]}}},
+            {"id":6,"name":"c","x":40,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}}]}"#;
         let mut l: Layout = serde_json::from_str(text).unwrap();
         l.clamp();
         // The missing child, the group itself and the repeat are gone; 1 stays with the first
@@ -3388,7 +3447,7 @@ mod tests {
         assert_eq!(children(&l, 3), vec![1, 2]);
         // 4 and 5 hold each other: the first in element order keeps its child.
         assert_eq!(children(&l, 4), vec![5]);
-        assert_eq!(children(&l, 5), Vec::<u32>::new());
+        assert_eq!(children(&l, 5), vec![6]);
         assert_eq!((l.group_of(1), l.group_of(2), l.group_of(5), l.group_of(4)), (Some(3), Some(3), Some(4), None));
         // A group reads back as it was saved.
         let s = serde_json::to_string(&l).unwrap();
@@ -3400,6 +3459,24 @@ mod tests {
         let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":""}}}"#;
         assert_eq!(serde_json::to_string(&serde_json::from_str::<Element>(j).unwrap()).unwrap(), j);
         assert_eq!(serde_json::from_str::<ElementKind>(r#"{"Group":{}}"#).unwrap(), g);
+    }
+
+    /// A group whose children were all dropped goes too, as removing its last child removes it,
+    /// and so does a group left holding only that one.
+    #[test]
+    fn clamp_drops_a_group_left_with_no_children() {
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}},
+            {"id":2,"name":"gone","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[98,99]}}},
+            {"id":3,"name":"outer","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[2]}}},
+            {"id":4,"name":"kept","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,2]}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        assert!(l.element(2).is_none() && l.element(3).is_none(), "{:?}", l.elements);
+        assert_eq!(children(&l, 4), vec![1]);
+        let before = l.clone();
+        l.clamp();
+        assert_eq!(l, before);
     }
 
     #[test]

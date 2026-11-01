@@ -190,11 +190,42 @@ impl Frames {
             match find(&s.frame) {
                 Some(frame) => {
                     layout.series = Some(MapSeries::new(frame, s.layer.clone(), s.name_field.clone()));
+                    // The series' frame follows the pages, never another frame.
+                    if let Some(el) = layout.element_mut(frame)
+                        && let ElementKind::MapFrame { link, .. } = &mut el.kind
+                        && link.take().is_some()
+                    {
+                        report.skipped(&el.name, "drives the map series; its link is left out");
+                    }
                 }
                 None if s.frame.is_empty() => report.skipped(&s.what, "the map series names no frame; left out"),
                 None => {
                     report.skipped(&s.what, format!("the map series reads frame {}, which isn't on the page; left out", shown(&s.frame)))
                 }
+            }
+        }
+    }
+
+    /// Each map frame's link target, to compare across `Layout::clamp` with [`Frames::note_cut_links`].
+    pub fn links_of(layout: &Layout) -> Vec<(u32, u32)> {
+        layout
+            .elements
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ElementKind::MapFrame { link: Some(l), .. } => Some((e.id, l.frame)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Notes the links `Layout::clamp` cut (`before` is [`Frames::links_of`] taken before it):
+    /// after `resolve`, every link names a map frame on the page, so a cut one closed a loop.
+    pub fn note_cut_links(before: &[(u32, u32)], layout: &Layout, report: &mut Report) {
+        for (id, target) in before {
+            let Some(el) = layout.element(*id) else { continue };
+            if matches!(&el.kind, ElementKind::MapFrame { link: None, .. }) {
+                let other = layout.element(*target).map(|t| t.name.clone()).unwrap_or_default();
+                report.skipped(&el.name, format!("follows {}, which follows it back; the link is left out", shown(&other)));
             }
         }
     }
@@ -231,6 +262,10 @@ pub(crate) fn read(doc: &Document, e: &Value, name: &str, report: &mut Report) -
     // An unbound frame's camera belongs to some other project: its rotation is not believed either.
     let bearing = def.and_then(|_| num(cam, "heading")).unwrap_or(0.0);
     let (extent_color, extent_width, indicator) = indicators(e, name, report);
+    // Graticules and measured grids aren't read yet: noted, so the frame's missing grid is told.
+    if e.get("grids").and_then(Value::as_array).is_some_and(|g| !g.is_empty()) {
+        report.skipped(name, "map grids, left out");
+    }
     let kind = ElementKind::MapFrame {
         map: name.to_string(),
         center,

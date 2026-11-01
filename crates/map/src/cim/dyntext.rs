@@ -131,7 +131,7 @@ impl State<'_> {
         let mut pre = self.affix_of(get("preStr").unwrap_or_default());
         // Pro's scale is the bare number and the template supplies "1:"; RustGIS's `{scale}` has it.
         if token == "scale"
-            && let Some(p) = pre.trim_end().strip_suffix("1:")
+            && let Some(p) = pre.trim_end().strip_suffix("1:").filter(|p| !p.ends_with(|c: char| c.is_ascii_digit()))
         {
             pre = p.to_string();
         }
@@ -290,6 +290,9 @@ mod tests {
         assert_eq!(scale("Scale 1:"), "{scale|Scale }");
         assert_eq!(scale("Scale 1: "), "{scale|Scale }");
         assert_eq!(scale("Scale: "), "{scale|Scale: }");
+        // A "1:" that ends a longer number isn't the ratio's.
+        assert_eq!(scale("Plan 11:"), "{scale|Plan 11:}");
+        assert_eq!(scale("21: "), "{scale|21: }");
         // Another token keeps a "1:".
         assert_eq!(run(r#"<dyn type="page" property="number" preStr="1:"/>"#).0, "{page|1:}");
     }

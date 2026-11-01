@@ -49,7 +49,9 @@ pub struct LayoutImport {
     pub layout: Layout,
     /// One per map frame element.
     pub frames: Vec<FrameBinding>,
-    /// Picture elements whose bytes aren't in the document.
+    /// Picture elements and where their bytes are, for the engine to check (size, format) and
+    /// convert (GIF and BMP to PNG) before they are set: every picture element is left empty
+    /// until then, embedded ones included.
     pub pictures: Vec<(u32, PictureSource)>,
     /// Map URIs the frames refer to, in order of first use.
     pub embedded_maps: Vec<String>,
@@ -71,11 +73,14 @@ pub struct FrameBinding {
     pub saved_camera: Option<(f64, f64, f64)>,
 }
 
-/// Where a picture's bytes are to be found when the document doesn't hold them.
+/// Where a picture's bytes are to be found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PictureSource {
-    /// A file path, as Pro saved it.
+    /// A file path, as Pro saved it: the document doesn't hold the bytes.
     Path(String),
+    /// Base64 the document holds (a `data:` URL or a `binaryReferences` entry), whitespace
+    /// removed; not yet checked to be a picture RustGIS draws.
+    Embedded(String),
 }
 
 /// A box on the page in page units, measured from the bottom-left corner as CIM does.
@@ -354,7 +359,9 @@ pub fn read_layout(doc: &Document, report: &mut Report) -> Result<LayoutImport, 
     let Reader { mut layout, pictures, text_frames, mut frames, mut pending_pictures, name, .. } = reader;
     frames.set_series(surround::series(doc, def, &name, report));
     frames.resolve(&mut layout, &text_frames, report);
+    let links = Frames::links_of(&layout);
     layout.clamp();
+    Frames::note_cut_links(&links, &layout, report);
     frames.restore_unset_scales(&mut layout);
     // A north arrow dropped for want of a frame takes its pictures with it.
     pending_pictures.retain(|(id, _, _)| layout.element(*id).is_some());
@@ -653,9 +660,11 @@ impl Reader<'_> {
         if image.is_empty() && path.is_none() {
             self.report.skipped(name, "a picture with no image or file, left empty");
         }
-        let id = self.add(e, b, name, ElementKind::Picture { image: image.clone(), source: path.map(str::to_string) })?;
-        if let (true, Some(p)) = (image.is_empty(), path) {
-            self.pictures.push((id, PictureSource::Path(p.to_string())));
+        let id = self.add(e, b, name, ElementKind::Picture { image: String::new(), source: path.map(str::to_string) })?;
+        match path {
+            _ if !image.is_empty() => self.pictures.push((id, PictureSource::Embedded(image))),
+            Some(p) => self.pictures.push((id, PictureSource::Path(p.to_string()))),
+            None => {}
         }
         Some(id)
     }

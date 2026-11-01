@@ -635,12 +635,21 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
     use crate::layout::ElementKind::Picture;
     let els = &imp.layout.elements;
     assert_eq!(els.len(), 3);
+    // Every picture is left for the engine to check and convert, embedded ones included: the
+    // elements are empty until it does.
     assert!(
-        matches!(&els[0].kind, Picture { image, source } if image == "iVBORw0KGgo=" && source.as_deref() == Some(r"G:\LOGOS\Holland LR Logo.png"))
+        matches!(&els[0].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Holland LR Logo.png"))
     );
     assert!(matches!(&els[1].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Other.png")));
-    assert!(matches!(&els[2].kind, Picture { image, source } if image == "AAAA" && source.is_none()));
-    assert_eq!(imp.pictures, vec![(els[1].id, PictureSource::Path(r"G:\LOGOS\Other.png".into()))]);
+    assert!(matches!(&els[2].kind, Picture { image, source } if image.is_empty() && source.is_none()));
+    assert_eq!(
+        imp.pictures,
+        vec![
+            (els[0].id, PictureSource::Embedded("iVBORw0KGgo=".into())),
+            (els[1].id, PictureSource::Path(r"G:\LOGOS\Other.png".into())),
+            (els[2].id, PictureSource::Embedded("AAAA".into())),
+        ]
+    );
     let e = &els[0];
     assert!(near(e.x, 0.76 * 25.4, 1e-9) && near(e.y, (11.0 - 9.41) * 25.4, 1e-9) && near(e.w, 1.07 * 25.4, 1e-9));
     assert!(report.notes.is_empty(), "{:?}", notes(&report));
@@ -2415,8 +2424,10 @@ fn layout_pictures_read_base64_wrapped_by_newlines() {
     let imp = read_layout(&Document::from_json(&doc.to_string()).unwrap(), &mut report).unwrap();
     assert!(report.notes.is_empty(), "{:?}", notes(&report));
     assert_eq!(imp.layout.elements.len(), 3);
+    // Handed to the engine to check, the whitespace gone; the elements wait empty.
     for e in &imp.layout.elements {
-        assert!(matches!(&e.kind, Picture { image, .. } if image == png), "{}: {:?}", e.name, e.kind);
+        assert!(matches!(&e.kind, Picture { image, .. } if image.is_empty()), "{}: {:?}", e.name, e.kind);
+        assert!(imp.pictures.contains(&(e.id, PictureSource::Embedded(png.to_string()))), "{}: {:?}", e.name, imp.pictures);
     }
 }
 
@@ -2434,4 +2445,57 @@ fn an_extent_indicator_drawn_with_a_polygon_symbol_takes_its_outline_without_a_n
     assert_eq!((extent_of, extent_color), (Some(main_id), Rgba::rgb(255, 0, 0)));
     assert!(near(extent_width, 1.5 * 96.0 / 72.0, 1e-6), "{extent_width}");
     assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn a_frames_map_grids_are_noted_as_left_out() {
+    let graticule = json!({"grids": [{"type": "CIMGraticule", "name": "Graticule", "visible": true}]});
+    let (imp, report) = read_with_maps(&[], &[map_frame_element("GRID", (1.0, 1.0, 9.0, 8.0), graticule), main_frame()]);
+    assert!(matches!(frame_of(&imp, "GRID").1, ElementKind::MapFrame { grid: None, .. }));
+    assert_eq!(notes(&report), ["GRID: map grids, left out"]);
+    // An empty list says nothing.
+    let (_, report) = read_with_maps(&[], &[map_frame_element("NONE", (1.0, 1.0, 9.0, 8.0), json!({"grids": []}))]);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn the_series_frame_drops_its_link_with_a_note() {
+    let layers = [layer_def("Index", "CIMPATH=map/index.json")];
+    let mut linked = main_frame();
+    linked["autoCamera"] = json!({"source": "MapFrameLink", "mapFrame": "OVERVIEW", "autoCameraType": "Center"});
+    let overview = map_frame_element("OVERVIEW", (10.0, 6.0, 16.0, 10.0), json!({}));
+    let series = json!({"type": "CIMSpatialMapSeries", "indexLayerURI": "CIMPATH=map/index.json", "mapFrameName": "MAIN MAP"});
+    let (imp, report) = read_surrounds(&layers, series, &[linked, overview]);
+    let (main, kind) = frame_of(&imp, "MAIN MAP");
+    assert!(matches!(kind, ElementKind::MapFrame { link: None, .. }), "{kind:?}");
+    assert_eq!(imp.layout.series.as_ref().map(|s| s.frame), Some(main));
+    let n = notes(&report);
+    assert!(n.iter().any(|s| s == "MAIN MAP: drives the map series; its link is left out"), "{n:?}");
+}
+
+#[test]
+fn a_link_cut_from_a_cycle_is_noted() {
+    let linking = |name: &str, target: &str, at: f64| {
+        let mut f = map_frame_element(name, (at, 1.0, at + 3.0, 5.0), json!({}));
+        f["autoCamera"] = json!({"source": "MapFrameLink", "mapFrame": target, "autoCameraType": "Center"});
+        f
+    };
+    let (imp, report) = read_with_maps(&[], &[linking("A", "B", 1.0), linking("B", "A", 5.0)]);
+    let link = |n: &str| match frame_of(&imp, n).1 {
+        ElementKind::MapFrame { link, .. } => link.map(|l| l.frame),
+        _ => panic!(),
+    };
+    assert_eq!((link("A"), link("B")), (Some(frame_of(&imp, "B").0), None));
+    assert_eq!(notes(&report), ["B: follows A, which follows it back; the link is left out"]);
+}
+
+#[test]
+fn path_keys_ignore_the_case_of_the_cimpath_prefix() {
+    assert_eq!(path_key("cimpath=Map/M.json"), "map/m.json");
+    assert_eq!(path_key("CIMPATH=Map/M.json"), "map/m.json");
+    assert_eq!(path_key(r" CimPath=\Map\M.json"), "map/m.json");
+    let d =
+        Document::from_json(r#"{"type":"CIMLayoutDocument","mapDefinitions":[{"type":"CIMMap","name":"M","uRI":"cimpath=map/m.json"}]}"#)
+            .unwrap();
+    assert_eq!(d.resolve("CIMPATH=Map/M.json").unwrap()["name"], "M");
 }

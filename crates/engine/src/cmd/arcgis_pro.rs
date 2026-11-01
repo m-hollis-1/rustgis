@@ -133,6 +133,16 @@ fn resolve(path: &str, dir: Option<&str>) -> String {
     }
 }
 
+/// `path` as a file to read: started from `dir` when it is relative. A relative path with no
+/// folder to start from (text given without `dir`) is refused rather than read against the
+/// working directory, which has nothing to do with the layout.
+fn local_path(path: &str, dir: Option<&str>) -> Result<String, String> {
+    if dir.is_none() && rustgis_map::qgis::is_relative(path) {
+        return Err("a relative path, and no folder to find it from".into());
+    }
+    Ok(resolve(path, dir))
+}
+
 pub(crate) fn import_layout(s: &mut Session, text: &str, dir: Option<&str>, p: &Value) -> CmdResult {
     let doc = Document::from_json(text)?;
     if doc.kind() != DocKind::Layout {
@@ -243,7 +253,7 @@ fn layer_files(m: &MapImport, dir: Option<&str>) -> Vec<(String, Option<String>)
     m.layers
         .iter()
         .filter_map(|l| {
-            let path = resolve(l.path.as_deref()?, dir);
+            let path = local_path(l.path.as_deref()?, dir).ok()?;
             std::path::Path::new(&path).exists().then(|| (absolute(&path), l.table.clone()))
         })
         .collect()
@@ -305,7 +315,14 @@ fn add_map(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Repor
     // Bottom first, so each is added on top of the ones below it.
     for layer in m.layers.iter().rev() {
         let Some(path) = layer.path.as_deref() else { continue };
-        let mut q = json!({"path": resolve(path, dir), "name": layer.name});
+        let path = match local_path(path, dir) {
+            Ok(p) => p,
+            Err(e) => {
+                report.skipped(&layer.name, format!("its data couldn't be opened ({e}), left out"));
+                continue;
+            }
+        };
+        let mut q = json!({"path": path, "name": layer.name});
         if let Some(t) = &layer.table {
             q["layer"] = json!(t);
         }
@@ -350,18 +367,36 @@ fn go_to_extent(s: &mut Session, m: &MapImport) {
 
 // ---- pictures ----------------------------------------------------------------------------------
 
-/// Reads the pictures the layout keeps beside it into their elements; one that can't be read is
-/// noted and left empty with its `source`, to be relinked.
+/// Reads the pictures into their elements, those the layout keeps beside it and those it embeds,
+/// each checked and converted as `layout.addElement` would take it (a PNG or JPEG of at most
+/// [`MAX_PICTURE`](super::graphics::MAX_PICTURE), a GIF or BMP converted to PNG); one that can't
+/// be is noted and left empty with its `source`, to be relinked.
 fn read_pictures(imp: &mut LayoutImport, dir: Option<&str>, report: &mut Report) {
-    for (id, PictureSource::Path(src)) in &imp.pictures {
+    for (id, src) in &imp.pictures {
         let Some(el) = imp.layout.element_mut(*id) else { continue };
         let what = el.name.clone();
         let ElementKind::Picture { image, .. } = &mut el.kind else { continue };
-        match read_file(&resolve(src, dir)).and_then(|bytes| as_png_or_jpeg(&bytes)) {
-            Ok(b64) => *image = b64,
-            Err(e) => report.skipped(&what, format!("its picture {} couldn't be read ({e}); relink it", shown(src))),
+        match src {
+            PictureSource::Path(src) => match local_path(src, dir).and_then(|path| read_file(&path)).and_then(|b| as_png_or_jpeg(&b)) {
+                Ok(b64) => *image = b64,
+                Err(e) => report.skipped(&what, format!("its picture {} couldn't be read ({e}); relink it", shown(src))),
+            },
+            PictureSource::Embedded(b64) => match embedded_bytes(b64).and_then(|b| as_png_or_jpeg(&b)) {
+                Ok(b64) => *image = b64,
+                Err(e) => report.skipped(&what, format!("its embedded picture couldn't be used ({e}); relink it")),
+            },
         }
     }
+}
+
+/// The bytes of embedded base64 `b64`, refused past [`MAX_PICTURE`](super::graphics::MAX_PICTURE).
+fn embedded_bytes(b64: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let limit = super::graphics::MAX_PICTURE;
+    if b64.len() > limit / 3 * 4 + 4 {
+        return Err(format!("larger than {} MB", limit >> 20));
+    }
+    base64::engine::general_purpose::STANDARD.decode(b64).map_err(|_| "not base64".to_string())
 }
 
 /// Converts the GIF and BMP markers of north arrows to PNG; one that can't be is noted and drawn
@@ -396,8 +431,11 @@ fn data_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// A picture file's bytes as base64 PNG or JPEG: a PNG or JPEG as it is, a GIF or BMP converted.
 fn as_png_or_jpeg(bytes: &[u8]) -> Result<String, String> {
     use base64::Engine;
+    // Kept as it is only when it is a PNG or JPEG: the renderer may read other formats where the
+    // `image` crate has them (natively), but a layout must draw the same everywhere.
+    let png_or_jpeg = bytes.starts_with(b"\x89PNG") || bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    if rustgis_render::picture_size(&b64).is_some() {
+    if png_or_jpeg && rustgis_render::picture_size(&b64).is_some() {
         return Ok(b64);
     }
     if bytes.starts_with(b"GIF8") || bytes.starts_with(b"BM") {

@@ -4212,7 +4212,6 @@ fn layout_update_sets_legend_columns_fit_and_layer_names() {
         (json!({"element": legend, "columns": [2]}), "columns as an array"),
         (json!({"element": legend, "columns": true}), "columns as a bool"),
         (json!({"element": legend, "fit": "shrink"}), "an unknown fit"),
-        (json!({"element": legend, "fit": "AdjustSize"}), "fits are lowerCamel"),
         (json!({"element": legend, "fit": 2}), "a fit that isn't text"),
         (json!({"element": legend, "showLayerNames": "no"}), "layer names that isn't a bool"),
         (json!({"element": legend, "title": "x", "columns": 2, "fit": "zoom"}), "other changes in the call"),
@@ -4303,7 +4302,6 @@ fn layout_update_links_and_unlinks_frames_and_refuses_cycles() {
         (json!({"element": inset, "link": {"frame": 1.5}}), "a fractional frame"),
         (json!({"element": inset, "link": {"frame": 4294967297u64}}), "a frame past u32"),
         (json!({"element": inset, "link": {"frame": main, "mode": "zoom"}}), "an unknown mode"),
-        (json!({"element": inset, "link": {"frame": main, "mode": "Center"}}), "modes are lowercase"),
         (json!({"element": inset, "link": {"frame": main, "mode": 7}}), "a mode that isn't text"),
         (json!({"element": inset, "link": {"frame": main, "mode": null}}), "a null mode"),
         (json!({"element": inset, "link": {"frame": main, "rotation": "yes"}}), "a rotation that isn't a bool"),
@@ -23168,6 +23166,70 @@ fn a_pagx_by_path_resolves_pictures_beside_it() {
     assert!(image.is_empty() && source.as_deref() == Some("missing.png"));
     assert!(r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "HLR LOGO"), "{}", r["notes"]);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// An embedded picture goes through the checks a file beside the layout does: a GIF in a data:
+/// URL (wrapped by newlines, as Pro writes it) becomes a PNG.
+#[test]
+fn an_embedded_gif_picture_imports_as_a_png() {
+    use rustgis_map::layout::ElementKind;
+    let text = b64(&picture_bytes(3, 2, image::ImageFormat::Gif));
+    let chars: Vec<char> = text.chars().collect();
+    let wrapped = chars.chunks(16).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    let mut s = world();
+    let logo = json!({"sourceURL": format!("data:image/gif;base64,{wrapped}")});
+    let r = s.run("layout.import", &json!({"text": pagx_with(logo, &arrow)})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap().kind else { panic!() };
+    assert!(image.starts_with("iVBORw0KGgo"), "a PNG: {}", image.get(..16).unwrap_or(image));
+    assert_eq!(rustgis_render::picture_size(image), Some((3, 2)));
+    assert!(!r["notes"].to_string().contains("HLR LOGO"), "{}", r["notes"]);
+}
+
+/// An embedded picture larger than `layout.addElement` takes, or that isn't a picture, is noted
+/// and left empty, with its source to relink.
+#[test]
+fn an_oversize_or_unreadable_embedded_picture_is_noted_and_left_empty() {
+    use rustgis_map::layout::ElementKind;
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    let mut png = picture_bytes(2, 2, image::ImageFormat::Png);
+    png.resize(17 << 20, 0);
+    for (logo, why) in [
+        (json!({"sourceURL": format!("data:image/png;base64,{}", b64(&png))}), "larger than 16 MB"),
+        (json!({"sourceURL": "data:image/png;base64,AAAA", "referenceURI": "CIMPATH=none"}), "not a PNG, JPEG, GIF or BMP"),
+    ] {
+        let mut s = world();
+        let r = s.run("layout.import", &json!({"text": pagx_with(logo, &arrow)})).unwrap();
+        let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+        let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap().kind else { panic!() };
+        assert!(image.is_empty(), "{why}: {}", image.len());
+        let notes = r["notes"].as_array().unwrap();
+        assert!(notes.iter().any(|n| n["layer"] == "HLR LOGO" && n["text"].as_str().unwrap().contains(why)), "{why}: {}", r["notes"]);
+    }
+}
+
+/// A relative picture path in text given without a folder isn't read against the working
+/// directory: it is noted, and the picture left to relink.
+#[test]
+fn a_relative_picture_with_no_folder_is_noted_not_read_from_the_working_directory() {
+    use rustgis_map::layout::ElementKind;
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    // A picture in the working directory that a CWD-relative read would find.
+    let name = format!("rustgis-cwd-picture-{}.png", std::process::id());
+    std::fs::write(&name, picture_bytes(3, 2, image::ImageFormat::Png)).unwrap();
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"text": pagx_with(json!({"sourceURL": name}), &arrow)}));
+    let _ = std::fs::remove_file(&name);
+    let r = r.unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let ElementKind::Picture { image, source } = &l.elements.iter().find(|e| e.name == "HLR LOGO").unwrap().kind else { panic!() };
+    assert!(image.is_empty() && source.as_deref() == Some(name.as_str()));
+    assert!(
+        r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "HLR LOGO" && n["text"].as_str().unwrap().contains("no folder")),
+        "{}",
+        r["notes"]
+    );
 }
 
 #[test]

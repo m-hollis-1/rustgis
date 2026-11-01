@@ -1012,7 +1012,7 @@ RustGIS saves pieces of a project as files you can share and reuse:
 | Results package (geoprocessing history and outputs) | `.rgisgpk` | Publish › Package › Results | any zip tool |
 | Task (guided command steps) | `.rgistask` | Analyze › Task, Publish › Save As › Task Item | Analyze › Task › Import Task |
 | Bookmarks (as longitude, latitude and scale) | `.rgisbookmarks` | Home › Navigate › Bookmarks › Export Bookmarks | Home › Navigate › Bookmarks › Import Bookmarks |
-| Layout | `.rgislayout` | Publish › Save Layout File | Home › New Layout › Import Layout |
+| Layout | `.rgislayout` (Import Layout also reads ArcGIS Pro `.pagx`) | Publish › Save Layout File | Home › New Layout › Import Layout |
 
 Packages are zip files. Project and map packages can newly embed a combined 512 MiB of linked
 raster files on the desktop (128 MiB in the web app); a raster that doesn't fit stays linked.

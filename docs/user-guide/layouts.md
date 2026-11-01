@@ -188,7 +188,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `adjustColumns` adds columns up to six, `adjustColumnsAndSize` adds columns and then shrinks the
   text if six are not enough, and `adjustFrame` draws at the natural size over the edges of the
   box (the box is not resized). A legend that still doesn't fit at the smallest size or six
-  columns is cut as `manual` cuts it. Untick **Layer names** (`"showLayerNames": false`) to list
+  columns is cut as `manual` cuts it. A row wider than its column is cut at the column's edge, never
+  drawn over the next, and the fits that add columns add only as many as fit across the box.
+  Untick **Layer names** (`"showLayerNames": false`) to list
   only the classes: a layer drawn in a single symbol keeps its name, which labels its swatch.
 - **Colorbar**: the colour scale of a raster layer in the frame's map, as the map draws it (its
   stretch, colour ramp and enhancement): a gradient bar for a stretch or a tinted hillshade,
@@ -217,7 +219,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.addElement={"kind":"arrow","angle":30,"length":60}`, or
   `layout.update={"element":7,"angle":-90}` to turn one.
 - **Text** and **Dynamic Text**: `{date}`, `{time}`, `{scale}`, `{map}`, `{crs}`, `{page}`,
-  `{pages}`, `{pageName}` and `{layout}` fill in when the page is drawn; the Format pane's
+  `{pages}`, `{pageName}`, `{layers}` (the number of layers), `{center}` (the map's centre) and
+  `{layout}` fill in when the page is drawn; the Format pane's
   **Insert Dynamic Text** menu, under the text, lists each with what it shows. It also lists
   `{project}` (the project's name), `{credits}` (the attributions of the frame's web layers),
   `{crsName}`, `{crsProjection}`, `{crsUnits}` and `{crsWkid}` (the frame's coordinate system by
@@ -290,7 +293,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   place, to put a legend over a map frame, say. A locked element keeps its place. From a command:
   `layout.arrange={"element":4,"to":"front"}` (`front`, `forward`, `backward` or `back`).
 - **Groups**: Shift-click elements to select more than one, or Shift-drag a box round them
-  (it picks the elements wholly inside it), then **Group** in the Publish tab's **Arrange** group
+  (start it on empty page: Shift-dragging a map frame pans it; the box picks the elements wholly
+  inside it), then **Group** in the Publish tab's **Arrange** group
   (or in the Format pane) makes them one group. A group moves, is copied (with everything in it,
   into a group of its own), reordered and deleted as one, and groups can hold groups, up to 8
   deep. A click or a drag on one of its elements moves the group; the Format pane's **Select

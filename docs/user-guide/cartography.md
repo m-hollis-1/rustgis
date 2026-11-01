@@ -50,8 +50,9 @@ layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
 ```
 
 A marker can also be a **picture**: a PNG or JPEG drawn in its own colours with its longer side
-the **Size**, as the picture markers of ArcGIS Pro symbols are, and as they come in from a
-`.pagx` layout (GIF and BMP markers are converted to PNG). By command, `layer.marker` takes
+the **Size**, as the picture markers of ArcGIS Pro symbols are, and PNG and JPEG
+ones come in from a `.pagx` layout's maps (a GIF or BMP marker in a layer's symbol is drawn as
+a circle, and noted). By command, `layer.marker` takes
 `image` (the picture as base64, at most 512 KB) or `imagePath` (a file, read by the app, not in
 the browser) in place of a shape or a character:
 

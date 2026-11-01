@@ -200,6 +200,12 @@ what was left out; the command's `notes` name each, element by element. Pro proj
 and map files (`.mapx`) are not imported yet: that is a later part. A layer in a layout's map
 that RustGIS can't open is left out, and said.
 
+The layers of a layout's embedded maps come in with their symbols, renderers and labels
+approximated where RustGIS has no equivalent, each noted: a definition query is dropped, dashed
+polygon outlines are drawn solid, several marker layers are reduced to the first, a renderer
+RustGIS lacks is drawn with a default symbol, a label expression is drawn as the field it names (or
+its class left out), and label halos and justified text are simplified.
+
 What RustGIS draws differently from Pro:
 
 - **Text**: Pro's formatting tags (bold, italic and colour runs inside a text) are stripped, a
@@ -215,6 +221,9 @@ What RustGIS draws differently from Pro:
   RustGIS has no match for as Manual.
 - **Scale bars**: the heights and frequency of the marks are drawn as RustGIS draws them, and a
   hollow or single-fill bar is drawn as an alternating bar.
+- **Layer symbols**: a GIF or BMP picture marker in a layer's point symbol is drawn as a circle
+  (PNG and JPEG markers come in as image markers, see
+  [Symbology](cartography.md#symbology)).
 - **Pictures**: a GIF or BMP is converted to PNG (up to 4096 pixels each way). A picture file
   is read from the layout's folder (or `dir`) when the layout is imported; one that can't be
   read (the browser can't read files beside a layout, nor convert a GIF or BMP) keeps its place,

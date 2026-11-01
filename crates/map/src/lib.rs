@@ -3,6 +3,7 @@
 
 pub mod antimeridian;
 pub mod camera;
+pub mod cim;
 pub mod color;
 pub mod design;
 pub mod effects;
@@ -34,8 +35,8 @@ pub use color::{Ramp, RampGroup, Rgba};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
-    ClassMethod, FontName, Glyph, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin,
-    LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
+    ClassMethod, FontName, Glyph, ImageRef, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap,
+    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 

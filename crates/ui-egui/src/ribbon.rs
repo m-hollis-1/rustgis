@@ -3122,21 +3122,32 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             }
         });
     });
+    group(ui, "Arrange", |ui| {
+        col(ui, |ui| {
+            // Group the elements picked with Shift-click or a Shift-drag round them.
+            let picked = app.layout.selection.clone();
+            let desc = "Group the selected elements, so they move, copy and delete together (Shift-click to select more than one).";
+            let r = ui.add_enabled_ui(picked.len() >= 2, |ui| small(ui, app, "layout_group", "Group", desc, "ui.menu", Value::Null, false));
+            if r.inner.clicked() {
+                crate::layoutview::group_selection(app, li);
+            }
+            let grouped = app.layout.selected.filter(|id| layout.element(*id).is_some_and(|e| e.is_group()));
+            let desc = "Ungroup the selected group: its elements stay where they are.";
+            let r =
+                ui.add_enabled_ui(grouped.is_some(), |ui| small(ui, app, "layout_ungroup", "Ungroup", desc, "ui.menu", Value::Null, false));
+            if r.inner.clicked()
+                && let Some(g) = grouped
+            {
+                crate::layoutview::ungroup(app, li, g);
+            }
+        });
+    });
     group(ui, "Text", |ui| {
         if big(ui, app, "g_text", "Text", "Add a text element.", "ui.menu", Value::Null, false, false).clicked() {
             add(app, json!({"kind": "text"}));
         }
         big_menu(ui, app, "dynamic_text", "Dynamic\nText", "Add text that updates: page, date, scale, map and more.", |ui, app| {
-            for (token, what) in [
-                ("{date}", "Current date"),
-                ("{time}", "Current time"),
-                ("{scale}", "Map scale"),
-                ("{map}", "Map name"),
-                ("{crs}", "Coordinate system"),
-                ("{page} / {pages}", "Page number"),
-                ("{pageName}", "Map series page name"),
-                ("{layout}", "Layout name"),
-            ] {
+            for (token, what) in layout_tokens() {
                 if ui.button(format!("{}  {token}", tl!(what))).clicked() {
                     add(app, json!({"kind": "dynamicText", "text": token}));
                     ui.close();
@@ -3155,6 +3166,14 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             small(ui, app, "map", "Show Map", "Close the layout and show the map.", "layout.close", Value::Null, false);
         });
     });
+}
+
+/// The values a layout's Dynamic Text menu offers, each with what it shows: the map's
+/// (`graphics::TOKENS`), then the page's (`{page}` and `{pages}` share one entry).
+pub(crate) fn layout_tokens() -> Vec<(&'static str, &'static str)> {
+    let mut tokens = rustgis_engine::map::graphics::TOKENS.to_vec();
+    tokens.extend([("{page} / {pages}", "Page number"), ("{pageName}", "Map series page name"), ("{layout}", "Layout name")]);
+    tokens
 }
 
 fn plugins_tab(app: &mut RustGisApp, ui: &mut Ui) {

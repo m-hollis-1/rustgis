@@ -43,10 +43,23 @@ character of an installed font, picked under **Font**, as map signs often are (a
 church, tree or mine). Its **Size** is the font's size, and the character sits as QGIS draws a
 font marker: centred across the point, its baseline half the font's ascent below it. A font the
 machine lacks draws the character in the label font, and a character no font here has
-draws a circle, so the point still shows. By command:
+draws a circle, so the point still shows. An Esri symbol font ("ESRI Default Marker", "ESRI
+North" and the others named "ESRI …") the machine lacks draws a circle too, never the label
+font's character of the same code, which would be a different mark. By command:
 
 ```text
 layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
+```
+
+A marker can also be a **picture**: a PNG or JPEG drawn in its own colours with its longer side
+the **Size**, as the picture markers of ArcGIS Pro symbols are, and PNG and JPEG
+ones come in from a `.pagx` layout's maps (a GIF or BMP marker in a layer's symbol is drawn as
+a circle, and noted). By command, `layer.marker` takes
+`image` (the picture as base64, at most 512 KB) or `imagePath` (a file, read by the app, not in
+the browser) in place of a shape or a character:
+
+```text
+layer.marker={"layer":"Peaks","imagePath":"C:/symbols/summit.png","size":18}
 ```
 
 **Rotation** turns each point's marker by the angle in a number field, in degrees clockwise

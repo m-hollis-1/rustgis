@@ -39,6 +39,13 @@ pub const TOKENS: &[(&str, &str)] = &[
     ("{crs}", "Coordinate system"),
     ("{layers}", "Number of layers"),
     ("{center}", "Map centre"),
+    ("{project}", "Project name"),
+    ("{credits}", "Map sources' credits"),
+    ("{crsName}", "Coordinate system name"),
+    ("{crsProjection}", "Coordinate system projection"),
+    ("{crsUnits}", "Coordinate system units"),
+    ("{crsWkid}", "Coordinate system code"),
+    ("{extent}", "Map extent"),
 ];
 
 /// An empty graphics dataset.
@@ -126,7 +133,7 @@ pub fn symbol(ds: &Dataset, row: usize) -> Symbol {
     }
 }
 
-/// What dynamic text tokens stand for when a map is drawn.
+/// What dynamic text tokens stand for when a map or a layout page is drawn.
 pub struct TokenValues {
     pub map: String,
     pub scale: f64,
@@ -135,23 +142,77 @@ pub struct TokenValues {
     pub center: rustgis_geom::Coord,
     /// Seconds since the Unix epoch.
     pub now: u64,
+    /// A layout page's 1-based number and count, its name (a map series has many) and its
+    /// layout's name; 0 pages and empty names stand for nothing.
+    pub page: usize,
+    pub pages: usize,
+    pub page_name: String,
+    pub layout: String,
+    /// Whether numbers print with a decimal comma (the scale's points and commas swap).
+    pub decimal_comma: bool,
+    pub project: String,
+    /// The map's web layers' attributions.
+    pub credits: String,
+    /// The coordinate system's name, projection, linear units and code.
+    pub crs_name: String,
+    pub crs_projection: String,
+    pub crs_units: String,
+    pub crs_wkid: String,
+    /// The map's extent in degrees.
+    pub extent: Option<rustgis_geom::Extent>,
+}
+
+impl Default for TokenValues {
+    fn default() -> Self {
+        TokenValues {
+            map: String::new(),
+            scale: 0.0,
+            crs: String::new(),
+            layers: 0,
+            center: rustgis_geom::Coord::default(),
+            now: 0,
+            page: 0,
+            pages: 0,
+            page_name: String::new(),
+            layout: String::new(),
+            decimal_comma: false,
+            project: String::new(),
+            credits: String::new(),
+            crs_name: String::new(),
+            crs_projection: String::new(),
+            crs_units: String::new(),
+            crs_wkid: String::new(),
+            extent: None,
+        }
+    }
 }
 
 impl TokenValues {
     /// The values a map's dynamic text shows at `scale`, now.
     pub fn of(map: &crate::Map, scale: f64) -> Self {
+        let crs = map.projection.info();
         TokenValues {
             map: map.name.clone(),
             scale,
             crs: map.projection.label(),
+            crs_name: crs.name,
+            crs_projection: crs.method,
+            crs_units: crs.units,
+            crs_wkid: crs.wkid,
             layers: map.layers.iter().filter(|l| !l.graphics).count(),
             center: map.center_lonlat(),
             now: web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            ..Default::default()
         }
     }
 }
 
-/// Expands dynamic text tokens.
+/// The longest token body (between the braces) read; a longer one is plain text.
+const MAX_TOKEN: usize = 200;
+
+/// Expands dynamic text tokens: `{name}`, `{name|prefix}` and `{name|prefix|suffix}`, where the
+/// prefix and suffix are text (a backslash and `n` for a line break) printed only when the token
+/// has a value. Unknown names are left as they are, braces and all.
 pub fn expand(text: &str, v: &TokenValues) -> String {
     if !text.contains('{') {
         return text.to_string();
@@ -163,23 +224,21 @@ pub fn expand(text: &str, v: &TokenValues) -> String {
     while let Some(i) = rest.find('{') {
         out.push_str(rest.get(..i).unwrap_or(""));
         let tail = rest.get(i..).unwrap_or("");
-        let token = tail.find('}').and_then(|j| tail.get(..=j)).unwrap_or("");
-        let value = match token {
-            "{map}" => Some(v.map.clone()),
-            "{scale}" => Some(scale_ratio(v.scale)),
-            "{date}" => Some(date.clone()),
-            "{time}" => Some(time.clone()),
-            "{crs}" => Some(v.crs.clone()),
-            "{layers}" => Some(v.layers.to_string()),
-            "{center}" => Some(rustgis_geom::format_lonlat(v.center)),
-            _ => None,
-        };
-        match value {
-            Some(val) => {
-                out.push_str(&val);
-                rest = tail.get(token.len()..).unwrap_or("");
+        // The closing brace within the longest body, so a stray "{" doesn't scan the whole text.
+        let close = tail.char_indices().skip(1).take(MAX_TOKEN + 1).find(|(_, c)| *c == '}').map(|(j, _)| j);
+        let body = close.and_then(|j| tail.get(1..j));
+        let mut parts = body.unwrap_or("").split('|');
+        let name = parts.next().unwrap_or("");
+        match (body.and_then(|_| token_value(name, v, &date, &time)), close) {
+            (Some(val), Some(j)) => {
+                if !val.is_empty() {
+                    push_literal(&mut out, parts.next().unwrap_or(""));
+                    out.push_str(&val);
+                    push_literal(&mut out, parts.next().unwrap_or(""));
+                }
+                rest = tail.get(j + 1..).unwrap_or("");
             }
-            None => {
+            _ => {
                 out.push('{');
                 rest = tail.get(1..).unwrap_or("");
             }
@@ -187,6 +246,66 @@ pub fn expand(text: &str, v: &TokenValues) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// What the token `name` stands for; empty when it has no value, `None` for no such token.
+fn token_value(name: &str, v: &TokenValues, date: &str, time: &str) -> Option<String> {
+    let number = |n: usize| if n == 0 { String::new() } else { n.to_string() };
+    Some(match name {
+        "map" => v.map.clone(),
+        "scale" if v.scale > 0.0 => decimal(&scale_ratio(v.scale), v.decimal_comma),
+        "scale" => String::new(),
+        "date" => date.to_string(),
+        "time" => time.to_string(),
+        "crs" => v.crs.clone(),
+        "layers" => number(v.layers),
+        "center" => rustgis_geom::format_lonlat(v.center),
+        "page" => number(v.page),
+        "pages" => number(v.pages),
+        "pageName" => v.page_name.clone(),
+        "layout" => v.layout.clone(),
+        "project" => v.project.clone(),
+        "credits" => v.credits.clone(),
+        "crsName" => v.crs_name.clone(),
+        "crsProjection" => v.crs_projection.clone(),
+        "crsUnits" => v.crs_units.clone(),
+        "crsWkid" => v.crs_wkid.clone(),
+        "extent" => match v.extent {
+            Some(e) if !e.is_empty() && [e.min_x, e.min_y, e.max_x, e.max_y].iter().all(|c| c.is_finite()) => {
+                format!("{:.4}, {:.4}, {:.4}, {:.4}", e.min_x, e.min_y, e.max_x, e.max_y)
+            }
+            _ => String::new(),
+        },
+        _ => return None,
+    })
+}
+
+/// Adds a token's prefix or suffix, a backslash and `n` in it a line break.
+fn push_literal(out: &mut String, text: &str) {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x5c' && chars.peek() == Some(&'n') {
+            chars.next();
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// A number as printed with a decimal comma when `comma` (`0.05` to `0,05`, `6,300,000` to
+/// `6.300.000`): its points and commas swapped.
+pub fn decimal(s: &str, comma: bool) -> String {
+    if !comma {
+        return s.to_string();
+    }
+    s.chars()
+        .map(|c| match c {
+            '.' => ',',
+            ',' => '.',
+            c => c,
+        })
+        .collect()
 }
 
 /// A scale denominator as a ratio: `1:12,345`, or `2:1` and `2.5:1` once the map is larger than
@@ -244,12 +363,71 @@ mod tests {
             layers: 4,
             center: rustgis_geom::Coord::new(0.0, 0.0),
             now: 1_760_140_800, // 2025-10-11 00:00 UTC
+            ..Default::default()
         };
         assert_eq!(expand("{map} at {scale}", &v), "World at 1:25,000,000");
         assert_eq!(expand("{date} {time} · {layers}", &v), "2025-10-11 00:00 · 4");
         assert_eq!(expand("plain", &v), "plain");
         let named = TokenValues { map: "{date}".into(), ..v };
         assert_eq!(expand("{map} {nope} {", &named), "{date} {nope} {");
+    }
+
+    #[test]
+    fn tokens_take_prefix_and_suffix_dropped_when_empty() {
+        let mut v = TokenValues { crs_name: "NAD 1983 StatePlane Texas Central FIPS 4203 (US Feet)".into(), ..Default::default() };
+        assert_eq!(expand("{crsName|Name: |\\n}{crsWkid|WKID: |\\n}", &v), "Name: NAD 1983 StatePlane Texas Central FIPS 4203 (US Feet)\n");
+        assert_eq!(expand("{scale|Scale }", &v), "");
+        v.scale = 24_000.0;
+        assert_eq!(expand("{scale|Scale }", &v), "Scale 1:24,000");
+        assert_eq!(expand("{nothing|x|y}", &v), "{nothing|x|y}");
+        // A prefix that starts with a line break (Pro's newLine), only when there is a value.
+        let v = TokenValues { map: "World".into(), crs_name: "WGS 1984".into(), ..Default::default() };
+        assert_eq!(
+            expand("Spatial Reference{map|\\nName: }{crsWkid|\\nWKID: }{crsName|\\n}", &v),
+            "Spatial Reference\nName: World\nWGS 1984"
+        );
+    }
+
+    #[test]
+    fn page_tokens_expand_here_now() {
+        let v = TokenValues { page: 2, pages: 5, page_name: "North".into(), layout: "Atlas".into(), ..Default::default() };
+        assert_eq!(expand("{page} of {pages}, {pageName} · {layout}", &v), "2 of 5, North · Atlas");
+    }
+
+    #[test]
+    fn empty_values_leave_nothing_and_odd_tokens_stay_as_written() {
+        let v = TokenValues { layers: 0, project: "Parcels".into(), ..Default::default() };
+        // Counts of 0, an empty string and an unset extent print nothing, prefix and suffix included.
+        assert_eq!(expand("[{layers|n=}{map|m=|;}{extent|e=}{page|p=}]", &v), "[]");
+        assert_eq!(expand("{project|<|>}", &v), "<Parcels>");
+        // The prefix alone; a third `|` ends the suffix.
+        assert_eq!(expand("{project|by }", &v), "by Parcels");
+        assert_eq!(expand("{project||!|ignored}", &v), "Parcels!");
+        // No closing brace, or a body over 200 characters: plain text.
+        assert_eq!(expand("{project", &v), "{project");
+        let pad = "x".repeat(200 - "project|".len());
+        assert_eq!(expand(&format!("{{project|{pad}}}"), &v), format!("{pad}Parcels"));
+        let long = format!("{{project|{pad}x}}");
+        assert_eq!(expand(&long, &v), long);
+        // A stray brace before a token doesn't hide it.
+        assert_eq!(expand("{ {project}", &v), "{ Parcels");
+    }
+
+    #[test]
+    fn the_extent_prints_in_degrees_and_the_scale_honours_the_decimal_comma() {
+        let v = TokenValues {
+            extent: Some(rustgis_geom::Extent::new(-97.5, 30.25, -97.0, 30.75)),
+            scale: 6_300_000.0,
+            decimal_comma: true,
+            ..Default::default()
+        };
+        assert_eq!(expand("{extent}", &v), "-97.5000, 30.2500, -97.0000, 30.7500");
+        assert_eq!(expand("{scale} {extent|x}", &v), "1:6.300.000 x-97.5000, 30.2500, -97.0000, 30.7500");
+        let empty = TokenValues { extent: Some(rustgis_geom::Extent::EMPTY), ..Default::default() };
+        assert_eq!(expand("{extent|e}", &empty), "");
+        assert_eq!(decimal("0.05", true), "0,05");
+        assert_eq!(decimal("6,300,000", true), "6.300.000");
+        assert_eq!(decimal("0.05", false), "0.05");
     }
 
     #[test]
@@ -266,5 +444,17 @@ mod tests {
             assert_eq!(scale_ratio(nothing), "1:0", "{nothing}");
         }
         assert_eq!(scale_ratio(f64::INFINITY), "1:1,000,000,000,000,000");
+    }
+
+    /// A map's own dynamic text names its coordinate system too.
+    #[test]
+    fn a_maps_text_names_its_coordinate_system() {
+        let mut map = crate::Map::new("m");
+        map.projection = crate::Projection::from_code("EPSG:2277").unwrap();
+        let v = TokenValues::of(&map, 1000.0);
+        assert_eq!(
+            expand("{crsName} / {crsProjection} / {crsUnits} / {crsWkid}", &v),
+            "NAD83 / Texas Central (ftUS) / Lambert Conformal Conic / US survey foot / 2277"
+        );
     }
 }

@@ -1338,6 +1338,33 @@ impl RustGisApp {
         }
     }
 
+    /// Imports the layout file at `path`. A `.pagx` (ArcGIS Pro) may not say which map some of
+    /// its frames show: when the project has several maps, Import Layout asks which, frame by
+    /// frame (and nothing is imported until it is answered); otherwise the file is imported as
+    /// it is, its unbound frames showing the active map.
+    pub(crate) fn import_layout_file(&mut self, path: &str) -> Result<Value, String> {
+        if path.to_ascii_lowercase().ends_with(".pagx") && self.session.project.maps.len() > 1 {
+            let seen = self.run("layout.inspect", json!({"path": path}))?;
+            let mut unbound: Vec<String> = Vec::new();
+            for frame in seen.get("frames").and_then(Value::as_array).into_iter().flatten() {
+                let name = frame.get("name").and_then(Value::as_str);
+                if let Some(name) = name.filter(|_| frame.get("map").is_none_or(Value::is_null))
+                    && !unbound.iter().any(|u| u.eq_ignore_ascii_case(name))
+                {
+                    unbound.push(name.to_string());
+                }
+            }
+            if !unbound.is_empty() {
+                self.dialogs.open("importLayoutFrames", &self.session)?;
+                let active = self.session.map().name.clone();
+                self.dialogs.layout_path = path.to_string();
+                self.dialogs.layout_frames = unbound.into_iter().map(|frame| (frame, active.clone())).collect();
+                return Ok(Value::Null);
+            }
+        }
+        self.run("layout.import", json!({"path": path}))
+    }
+
     /// Opens file bytes with picker options, forwarding source CRS overrides before ZIP parsing.
     fn open_bytes_with(&mut self, name: &str, bytes: &[u8], csv: Option<Value>) -> Result<Value, String> {
         let lower = name.to_ascii_lowercase();
@@ -1401,6 +1428,12 @@ impl RustGisApp {
         }
         if lower.ends_with(".rgislayout") {
             let text = std::str::from_utf8(bytes).map_err(|_| "not a RustGIS layout".to_string())?;
+            return self.run("layout.import", json!({"text": text}));
+        }
+        // An ArcGIS Pro layout: the browser has no maps dialog, so frames the file leaves
+        // unbound show the active map.
+        if lower.ends_with(".pagx") {
+            let text = std::str::from_utf8(bytes).map_err(|_| tl!("not an ArcGIS Pro layout").to_string())?;
             return self.run("layout.import", json!({"text": text}));
         }
         // A layout picture needs the layout still open.
@@ -2793,8 +2826,8 @@ impl RustGisApp {
                     self.ui.pending_picture = None;
                     self.ui.pending_open = None;
                     open("layout");
-                } else if let Some(path) = dialogs::pick_open(&["rgislayout"], tl!("RustGIS layout")) {
-                    return self.run("layout.import", json!({"path": path}));
+                } else if let Some(path) = dialogs::pick_open(&["rgislayout", "pagx"], tl!("Layout file")) {
+                    return self.import_layout_file(&path);
                 }
             }
             "ui.layoutPicture" => {
@@ -3864,11 +3897,18 @@ impl RustGisApp {
                     held += 1;
                     continue;
                 }
-                if p.to_ascii_lowercase().ends_with(".rgplugin") {
+                let lower = p.to_ascii_lowercase();
+                if lower.ends_with(".rgplugin") {
                     match std::fs::read(f.path()) {
                         Ok(bytes) => pluginsui::received(self, bytes, None),
                         Err(e) => self.session.notify(format!("{p}: {e}"), true),
                     }
+                    continue;
+                }
+                // A layout (ArcGIS Pro's or RustGIS's own) imports as a layout, not as data. A
+                // failure is told by the command.
+                if lower.ends_with(".pagx") || lower.ends_with(".rgislayout") {
+                    let _ = self.import_layout_file(&p);
                     continue;
                 }
                 let _ = layerchooser::add_file(self, &p);
@@ -4328,5 +4368,211 @@ mod download_service_tests {
         let mut app = RustGisApp::with_sample();
         assert_eq!(app.run("gp.fileDelivered", json!({"id": u64::MAX})), Err("no pending file with that id".into()));
         assert_eq!(app.session.notices.iter().filter(|n| n.error && n.text == "no pending file with that id").count(), 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod pagx_tests {
+    use super::RustGisApp;
+    use egui::vec2;
+    use rustgis_engine::map::layout::ElementKind;
+    use serde_json::{Value, json};
+
+    /// A layout from ArcGIS Pro with two map frames, neither saying which map it shows.
+    const PAGX: &str = r#"{"type":"CIMLayoutDocument","version":"3.7.0","layoutDefinition":{"type":"CIMLayout","name":"Two frames",
+        "page":{"type":"CIMPage","width":17,"height":11,"units":{"uwkid":109008},"guides":[]},
+        "elements":[
+          {"type":"CIMMapFrame","name":"MAIN MAP","anchor":"BottomLeftCorner","visible":true,
+           "frame":{"rings":[[[0.5,0.5],[0.5,10.0],[11.5,10.0],[11.5,0.5],[0.5,0.5]]]}},
+          {"type":"CIMMapFrame","name":"INSET","anchor":"BottomLeftCorner","visible":true,
+           "frame":{"rings":[[[12.0,6.0],[12.0,10.0],[16.5,10.0],[16.5,6.0],[12.0,6.0]]]}}]}}"#;
+
+    /// Removes the folder when the test ends, a failed assertion included.
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The `.pagx` in a folder of its own: (the folder, the file's path).
+    fn written(tag: &str) -> (TempDir, String) {
+        let dir = std::env::temp_dir().join(format!("rustgis-pagx-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.PAGX");
+        std::fs::write(&file, PAGX).unwrap();
+        (TempDir(dir), file.display().to_string())
+    }
+
+    /// The map each map frame of the layout `li` shows, by frame name.
+    fn frame_maps(app: &RustGisApp, li: usize) -> Vec<(String, String)> {
+        app.session.project.layouts[li]
+            .elements
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ElementKind::MapFrame { map, .. } => Some((e.name.clone(), map.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pagx_opened_from_bytes_becomes_a_layout() {
+        let mut app = RustGisApp::with_sample();
+        let before = app.session.project.layouts.len();
+        let r = app.open_bytes_with("t.pagx", PAGX.as_bytes(), None).unwrap();
+        assert_eq!(app.session.project.layouts.len(), before + 1);
+        let li = r["layout"].as_u64().unwrap() as usize;
+        assert_eq!(app.session.project.layouts[li].name, "Two frames");
+        assert_eq!(app.session.active_layout, Some(li));
+        // The browser has no maps dialog: the frames take the active map.
+        let active = app.session.map().name.clone();
+        assert_eq!(frame_maps(&app, li), vec![("MAIN MAP".to_string(), active.clone()), ("INSET".to_string(), active)]);
+        assert!(app.dialogs.open.is_none());
+        // Not text: refused, not a panic.
+        assert!(app.open_bytes_with("bad.pagx", &[0xff, 0xfe, 0x00], None).is_err());
+    }
+
+    #[test]
+    fn a_pagx_file_imports_straight_away_when_the_project_has_one_map() {
+        let mut app = RustGisApp::with_sample();
+        assert_eq!(app.session.project.maps.len(), 1);
+        let (_dir, path) = written("one");
+        let r = app.import_layout_file(&path).unwrap();
+        assert!(app.dialogs.open.is_none());
+        let li = r["layout"].as_u64().unwrap() as usize;
+        assert_eq!(app.session.project.layouts[li].name, "Two frames");
+    }
+
+    #[test]
+    fn a_pagx_file_with_unbound_frames_asks_which_map_when_the_project_has_several() {
+        let mut app = RustGisApp::with_sample();
+        let first = app.session.map().name.clone();
+        app.run("map.new", json!({"name": "Second"})).unwrap();
+        let active = app.session.map().name.clone();
+        assert_ne!(active, first);
+        let layouts = app.session.project.layouts.len();
+        let (_dir, path) = written("two");
+        let r = app.import_layout_file(&path).unwrap();
+        assert_eq!(r, Value::Null);
+        assert_eq!(app.dialogs.open, Some("importLayoutFrames"));
+        assert_eq!(app.dialogs.layout_path, path);
+        assert_eq!(app.dialogs.layout_frames, vec![("MAIN MAP".to_string(), active.clone()), ("INSET".to_string(), active.clone())]);
+        // Nothing is imported until Import is pressed.
+        assert_eq!(app.session.project.layouts.len(), layouts);
+        // Choose the first map for one frame, then press Import.
+        app.dialogs.layout_frames[0].1 = first.clone();
+        crate::dialogs::finish_layout_import(&mut app).unwrap();
+        assert_eq!(app.session.project.layouts.len(), layouts + 1);
+        let li = app.session.active_layout.unwrap();
+        assert_eq!(frame_maps(&app, li), vec![("MAIN MAP".to_string(), first), ("INSET".to_string(), active)]);
+    }
+
+    /// The Import Layout dialog lists the unbound frames; Import brings the layout in, Cancel
+    /// closes it without one.
+    #[test]
+    fn the_pagx_dialog_imports_with_its_button_and_cancels_without_a_layout() {
+        use egui_kittest::kittest::Queryable;
+        for import in [true, false] {
+            let mut app = RustGisApp::with_sample();
+            app.run("map.new", json!({"name": "Second"})).unwrap();
+            let layouts = app.session.project.layouts.len();
+            let (_dir, path) = written(if import { "button" } else { "cancel" });
+            app.import_layout_file(&path).unwrap();
+            let mut fonts = false;
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    if !fonts {
+                        crate::theme::install_fonts(ui.ctx(), &[], None);
+                        fonts = true;
+                        return;
+                    }
+                    let ctx = ui.ctx().clone();
+                    crate::dialogs::show(app, &ctx);
+                },
+                app,
+            );
+            h.run_steps(3);
+            h.get_by_label("MAIN MAP");
+            h.get_by_label("INSET");
+            h.get_by_label(if import { "Import" } else { "Cancel" }).click();
+            h.run_steps(3);
+            assert!(h.state().dialogs.open.is_none());
+            assert_eq!(h.state().session.project.layouts.len(), layouts + usize::from(import));
+        }
+    }
+    /// A file dropped on the desktop window, as eframe passes it: by its path.
+    #[derive(Debug)]
+    struct Dropped(std::path::PathBuf);
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A `.pagx` (any case) or `.rgislayout` dropped on the window imports as a layout; it never
+    /// goes to `layer.addData`.
+    #[test]
+    fn a_dropped_pagx_or_rgislayout_imports_a_layout_not_a_layer() {
+        let (dir, pagx) = written("drop");
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Mine"})).unwrap();
+        let saved = dir.0.join("mine.RGISLAYOUT");
+        app.run("layout.save", json!({"path": saved.display().to_string()})).unwrap();
+        app.start(&Default::default()).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.step();
+        let layers = h.state().session.map().layers.len();
+        let layouts = h.state().session.project.layouts.len();
+        for f in [std::path::PathBuf::from(&pagx), saved] {
+            h.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(f)));
+        }
+        h.step();
+        h.step();
+        let app = h.state();
+        assert_eq!(app.session.project.layouts.len(), layouts + 2);
+        assert!(app.session.project.layouts.iter().any(|l| l.name == "Two frames"));
+        assert_eq!(app.session.map().layers.len(), layers, "a dropped layout must not become a layer");
+        assert!(!app.session.notices.iter().any(|n| n.text.contains("t.PAGX") || n.text.contains("mine.RGISLAYOUT")));
+    }
+
+    #[test]
+    fn a_rgislayout_file_never_asks_which_map() {
+        let mut app = RustGisApp::with_sample();
+        app.run("map.new", json!({"name": "Second"})).unwrap();
+        app.run("layout.new", json!({"name": "Mine"})).unwrap();
+        let (dir, _) = written("rgislayout");
+        let file = dir.0.join("mine.rgislayout");
+        app.run("layout.save", json!({"path": file.display().to_string()})).unwrap();
+        let layouts = app.session.project.layouts.len();
+        app.import_layout_file(&file.display().to_string()).unwrap();
+        assert!(app.dialogs.open.is_none());
+        assert_eq!(app.session.project.layouts.len(), layouts + 1);
+    }
+
+    #[test]
+    fn the_dynamic_text_menu_lists_every_map_token_and_the_page_tokens() {
+        let tokens: Vec<&str> = crate::ribbon::layout_tokens().iter().map(|(t, _)| *t).collect();
+        for token in rustgis_engine::map::graphics::TOKENS {
+            assert!(tokens.contains(&token.0), "{} is missing", token.0);
+        }
+        for token in ["{crsName}", "{crsProjection}", "{crsUnits}", "{crsWkid}", "{extent}", "{project}", "{credits}"] {
+            assert!(tokens.contains(&token), "{token} is missing");
+        }
+        for token in ["{page} / {pages}", "{pageName}", "{layout}"] {
+            assert!(tokens.contains(&token), "{token} is missing");
+        }
+        assert_eq!(tokens.len(), rustgis_engine::map::graphics::TOKENS.len() + 3);
     }
 }

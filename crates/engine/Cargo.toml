@@ -36,9 +36,10 @@ rusqlite = { workspace = true }
 rustgis-plugins = { workspace = true, features = ["testing"] }
 tiny-skia = { workspace = true }
 
-# Time slider animations as GIFs (exported by the desktop app only).
+# Time slider animations as GIFs (exported by the desktop app only); GIF and BMP pictures of an
+# ArcGIS Pro layout, converted to PNG.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-image = { workspace = true, features = ["gif"] }
+image = { workspace = true, features = ["gif", "bmp"] }
 
 # The live PostGIS tests make their own tables, and change rows as someone else would.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

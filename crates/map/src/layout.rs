@@ -8,6 +8,7 @@ use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 
 use crate::raster::{Colorizer, Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle};
+use crate::symbology::Symbol;
 use crate::{Camera, Layer, Map, Rgba};
 
 /// Logical points per millimetre (96 points per inch).
@@ -447,6 +448,117 @@ fn is_sans(f: &FontFamily) -> bool {
     *f == FontFamily::Sans
 }
 
+/// Where a text element's block of lines sits down its box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VAlign {
+    /// From the top edge, as text always started.
+    #[default]
+    Top,
+    Middle,
+    /// The last line on the bottom edge.
+    Bottom,
+}
+
+impl VAlign {
+    pub const ALL: [VAlign; 3] = [VAlign::Top, VAlign::Middle, VAlign::Bottom];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            VAlign::Top => "top",
+            VAlign::Middle => "middle",
+            VAlign::Bottom => "bottom",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VAlign::Top => "Top",
+            VAlign::Middle => "Middle",
+            VAlign::Bottom => "Bottom",
+        }
+    }
+
+    /// `top`, `middle` or `bottom` (`center` and `centre` for the middle), in any case.
+    pub fn from_name(s: &str) -> Option<VAlign> {
+        let s = s.trim();
+        VAlign::ALL
+            .into_iter()
+            .find(|v| v.code().eq_ignore_ascii_case(s))
+            .or((s.eq_ignore_ascii_case("center") || s.eq_ignore_ascii_case("centre")).then_some(VAlign::Middle))
+    }
+}
+
+/// The case a text element's words are drawn in, whatever was typed (applied after its tokens
+/// expand).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextCase {
+    /// As typed.
+    #[default]
+    None,
+    Upper,
+    Lower,
+}
+
+impl TextCase {
+    pub const ALL: [TextCase; 3] = [TextCase::None, TextCase::Upper, TextCase::Lower];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            TextCase::None => "none",
+            TextCase::Upper => "upper",
+            TextCase::Lower => "lower",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextCase::None => "As typed",
+            TextCase::Upper => "Upper case",
+            TextCase::Lower => "Lower case",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<TextCase> {
+        let s = s.trim();
+        TextCase::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s))
+    }
+
+    /// `s` in this case.
+    pub fn apply(self, s: String) -> String {
+        match self {
+            TextCase::None => s,
+            TextCase::Upper => s.to_uppercase(),
+            TextCase::Lower => s.to_lowercase(),
+        }
+    }
+}
+
+fn is_top(v: &VAlign) -> bool {
+    *v == VAlign::Top
+}
+
+fn is_no_case(v: &TextCase) -> bool {
+    *v == TextCase::None
+}
+
+/// A text element's line spacing, a multiple of the usual pitch, until it is set.
+pub const LINE_SPACING: f64 = 1.0;
+/// The least and most a text element's line spacing may be.
+pub const MIN_LINE_SPACING: f64 = 0.5;
+pub const MAX_LINE_SPACING: f64 = 3.0;
+
+fn line_spacing() -> f64 {
+    LINE_SPACING
+}
+
+fn is_line_spacing(v: &f64) -> bool {
+    *v == LINE_SPACING
+}
+
+fn is_none_frame(v: &Option<u32>) -> bool {
+    v.is_none()
+}
+
 /// The most letter spacing a text element takes, either way (points).
 pub const MAX_LETTER_SPACING: f64 = 50.0;
 pub const MIN_LETTER_SPACING: f64 = -5.0;
@@ -461,6 +573,72 @@ fn is_left(a: &TextAlign) -> bool {
 
 /// The most layers a legend leaves out.
 pub const MAX_LEGEND_EXCLUDED: usize = 1000;
+
+/// The most columns a legend has.
+pub const MAX_LEGEND_COLUMNS: usize = 6;
+
+fn one_column() -> usize {
+    1
+}
+
+fn is_one_column(v: &usize) -> bool {
+    *v == 1
+}
+
+fn is_manual_fit(v: &LegendFit) -> bool {
+    *v == LegendFit::Manual
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+/// What a legend does when its rows don't fit its box (ArcGIS Pro's fitting strategy).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegendFit {
+    /// Draw as many rows as fit; the rest are cut off.
+    #[default]
+    Manual,
+    /// Shrink the text together, down to 6 pt, until the rows fit.
+    AdjustSize,
+    /// Add columns, up to [`MAX_LEGEND_COLUMNS`], until the rows fit.
+    AdjustColumns,
+    /// Add columns first, then shrink the text if six are not enough.
+    AdjustColumnsAndSize,
+    /// Draw at the natural size, over the box's edges.
+    AdjustFrame,
+}
+
+impl LegendFit {
+    pub const ALL: [LegendFit; 5] =
+        [LegendFit::Manual, LegendFit::AdjustSize, LegendFit::AdjustColumns, LegendFit::AdjustColumnsAndSize, LegendFit::AdjustFrame];
+
+    /// The name `layout.update` takes (a saved layout holds the variant's own name).
+    pub fn code(self) -> &'static str {
+        match self {
+            LegendFit::Manual => "manual",
+            LegendFit::AdjustSize => "adjustSize",
+            LegendFit::AdjustColumns => "adjustColumns",
+            LegendFit::AdjustColumnsAndSize => "adjustColumnsAndSize",
+            LegendFit::AdjustFrame => "adjustFrame",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LegendFit::Manual => "Manual",
+            LegendFit::AdjustSize => "Adjust size",
+            LegendFit::AdjustColumns => "Adjust columns",
+            LegendFit::AdjustColumnsAndSize => "Adjust columns and size",
+            LegendFit::AdjustFrame => "Adjust frame",
+        }
+    }
+
+    /// A fit's code (`adjustColumns`), trimmed, in any case.
+    pub fn from_name(s: &str) -> Option<LegendFit> {
+        LegendFit::ALL.into_iter().find(|f| f.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
 
 /// Which way a line element runs across its box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,11 +964,158 @@ impl ScaleBarStyle {
     }
 }
 
+/// Where a scale bar's division labels sit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BarLabels {
+    /// Over the bar (where scale bars have always put them).
+    #[default]
+    Above,
+    /// Under the bar.
+    Below,
+}
+
+impl BarLabels {
+    pub const ALL: [BarLabels; 2] = [BarLabels::Above, BarLabels::Below];
+
+    /// The name `layout.update` takes (a saved layout holds the variant's own name).
+    pub fn code(self) -> &'static str {
+        match self {
+            BarLabels::Above => "above",
+            BarLabels::Below => "below",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BarLabels::Above => "Above the bar",
+            BarLabels::Below => "Below the bar",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<BarLabels> {
+        BarLabels::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// Where a scale bar's unit label (the unit's abbreviation, or the text given) sits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitLabel {
+    /// To the right of the bar, level with it.
+    AfterBar,
+    /// After the last division label, on the labels' line.
+    #[default]
+    AfterLabels,
+    /// Centred over the bar, on a line of its own.
+    Above,
+    /// Centred under the bar, on a line of its own.
+    Below,
+}
+
+impl UnitLabel {
+    pub const ALL: [UnitLabel; 4] = [UnitLabel::AfterBar, UnitLabel::AfterLabels, UnitLabel::Above, UnitLabel::Below];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            UnitLabel::AfterBar => "afterBar",
+            UnitLabel::AfterLabels => "afterLabels",
+            UnitLabel::Above => "above",
+            UnitLabel::Below => "below",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UnitLabel::AfterBar => "After the bar",
+            UnitLabel::AfterLabels => "After the labels",
+            UnitLabel::Above => "Above the bar",
+            UnitLabel::Below => "Below the bar",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<UnitLabel> {
+        UnitLabel::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// What a scale bar does when its divisions don't come out round across its box (ArcGIS Pro's
+/// fitting strategy).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScaleFit {
+    /// Stretch the divisions to the box's width: their value may not be a round number.
+    #[default]
+    AdjustDivisionValue,
+    /// Keep the division value round and add or drop divisions to fill the width.
+    AdjustDivision,
+    /// Keep the divisions and their round value and draw the bar as wide as they need: not the
+    /// box's width.
+    AdjustWidth,
+}
+
+impl ScaleFit {
+    pub const ALL: [ScaleFit; 3] = [ScaleFit::AdjustDivisionValue, ScaleFit::AdjustDivision, ScaleFit::AdjustWidth];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            ScaleFit::AdjustDivisionValue => "adjustDivisionValue",
+            ScaleFit::AdjustDivision => "adjustDivision",
+            ScaleFit::AdjustWidth => "adjustWidth",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleFit::AdjustDivisionValue => "Adjust division value",
+            ScaleFit::AdjustDivision => "Adjust divisions",
+            ScaleFit::AdjustWidth => "Adjust width",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<ScaleFit> {
+        ScaleFit::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// The most parts a scale bar's first division is split into.
+pub const MAX_SCALE_SUBDIVISIONS: usize = 10;
+/// The most divisions a scale bar has left of zero.
+pub const MAX_SCALE_BEFORE_ZERO: usize = 2;
+/// The most decimals a scale bar's labels have.
+pub const MAX_SCALE_DECIMALS: usize = 3;
+/// A scale bar's label size, in points.
+pub const SCALE_LABEL_SIZE: std::ops::RangeInclusive<f64> = 4.0..=24.0;
+/// The longest unit label text, in characters.
+pub const MAX_UNIT_LABEL_CHARS: usize = 100;
+/// The label size scale bars have unless set (points).
+pub const DEFAULT_SCALE_LABEL_SIZE: f64 = 8.0;
+
+fn scale_label_size() -> f64 {
+    DEFAULT_SCALE_LABEL_SIZE
+}
+
+fn is_scale_label_size(v: &f64) -> bool {
+    *v == DEFAULT_SCALE_LABEL_SIZE
+}
+
+fn is_zero_count(v: &usize) -> bool {
+    *v == 0
+}
+
+fn is_default_value<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
 /// The most divisions a scale bar has.
 pub const MAX_SCALE_DIVISIONS: usize = 10;
+/// Most symbols (layers) a north arrow's point symbol keeps.
+pub const MAX_NORTH_ARROW_SYMBOLS: usize = 8;
+/// Largest marker size in a north arrow's symbol, in points.
+pub const MAX_NORTH_ARROW_SYMBOL_SIZE: f32 = 1000.0;
+
+/// The divisions a scale bar has unless set.
+pub const DEFAULT_SCALE_DIVISIONS: usize = 4;
 
 fn divisions() -> usize {
-    4
+    DEFAULT_SCALE_DIVISIONS
 }
 
 fn ink() -> Rgba {
@@ -837,6 +1162,56 @@ fn ticks() -> usize {
     5
 }
 
+/// What a linked map frame takes from the frame it follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkMode {
+    /// The source's centre; the frame keeps its own scale.
+    #[default]
+    Center,
+    /// The scale that fits what the source shows into this frame.
+    Extent,
+    /// The source's scale; the frame keeps its own centre.
+    Scale,
+}
+
+impl LinkMode {
+    pub const ALL: [LinkMode; 3] = [LinkMode::Center, LinkMode::Extent, LinkMode::Scale];
+
+    /// The name `layout.update` takes (a saved layout holds the variant's own name, `Extent`).
+    pub fn code(self) -> &'static str {
+        match self {
+            LinkMode::Center => "center",
+            LinkMode::Extent => "extent",
+            LinkMode::Scale => "scale",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LinkMode::Center => "Same centre",
+            LinkMode::Extent => "Same extent",
+            LinkMode::Scale => "Same scale",
+        }
+    }
+
+    /// A mode's code (`extent`), trimmed, in any case.
+    pub fn from_name(s: &str) -> Option<LinkMode> {
+        LinkMode::ALL.into_iter().find(|m| m.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// A map frame that follows another frame's view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameLink {
+    /// The map frame followed.
+    pub frame: u32,
+    #[serde(default)]
+    pub mode: LinkMode,
+    /// Also take the source's bearing.
+    #[serde(default)]
+    pub rotation: bool,
+}
+
 /// What an element is.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ElementKind {
@@ -864,6 +1239,10 @@ pub enum ElementKind {
         bearing: f64,
         #[serde(default, skip_serializing_if = "is_zero")]
         pitch: f64,
+        /// Another frame this one follows: it takes that frame's centre, extent or scale (see
+        /// [`Layout::resolved_cameras`]), and its own are kept for when the link is removed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<FrameLink>,
     },
     NorthArrow {
         frame: u32,
@@ -875,6 +1254,11 @@ pub enum ElementKind {
         /// The outline and the `N`.
         #[serde(default = "ink")]
         outline: Rgba,
+        /// A point symbol the arrow is drawn from instead of its style (an imported north arrow
+        /// keeps its own picture or vector symbol), bottom layer first, at most
+        /// [`MAX_NORTH_ARROW_SYMBOLS`]. Empty: the style draws.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        symbol: Vec<Symbol>,
     },
     ScaleBar {
         frame: u32,
@@ -885,6 +1269,31 @@ pub enum ElementKind {
         divisions: usize,
         #[serde(default)]
         style: ScaleBarStyle,
+        /// Parts the first division (the one after zero) is split into, 0 to
+        /// [`MAX_SCALE_SUBDIVISIONS`]; 0 and 1 leave it whole. They are not labelled.
+        #[serde(default, skip_serializing_if = "is_zero_count")]
+        subdivisions: usize,
+        /// Whole divisions left of zero, 0 to [`MAX_SCALE_BEFORE_ZERO`], labelled with negatives.
+        #[serde(default, skip_serializing_if = "is_zero_count")]
+        divisions_before_zero: usize,
+        /// Where the division labels sit.
+        #[serde(default, skip_serializing_if = "is_default_value")]
+        label_position: BarLabels,
+        /// The text of the unit label; `None` is the unit's abbreviation and an empty text prints
+        /// nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit_label: Option<String>,
+        #[serde(default, skip_serializing_if = "is_default_value")]
+        unit_label_position: UnitLabel,
+        /// Decimals of every division label, 0 to [`MAX_SCALE_DECIMALS`]; 0 gives each label
+        /// the decimals its division needs.
+        #[serde(default, skip_serializing_if = "is_zero_count")]
+        decimals: usize,
+        /// The labels' size in points, within [`SCALE_LABEL_SIZE`].
+        #[serde(default = "scale_label_size", skip_serializing_if = "is_scale_label_size")]
+        label_size: f64,
+        #[serde(default, skip_serializing_if = "is_default_value")]
+        fit: ScaleFit,
     },
     Legend {
         frame: u32,
@@ -902,6 +1311,17 @@ pub enum ElementKind {
         /// highlight, a basemap-like layer. Empty, it lists every layer it would otherwise.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<String>,
+        /// Columns the rows run down and across, 1 to [`MAX_LEGEND_COLUMNS`], shared out so the
+        /// columns are about equally tall.
+        #[serde(default = "one_column", skip_serializing_if = "is_one_column")]
+        columns: usize,
+        /// What the legend does when its rows don't fit the box.
+        #[serde(default, skip_serializing_if = "is_manual_fit")]
+        fit: LegendFit,
+        /// List each layer's name. Off, a layer with classes keeps its classes and loses its head;
+        /// a layer drawn in one symbol keeps its name, which labels the swatch.
+        #[serde(default = "yes", skip_serializing_if = "is_true")]
+        show_layer_names: bool,
     },
     /// The colour scale of a raster layer in a frame's map: a gradient bar for a stretch, steps
     /// for classes, a block per value for unique values and colour tables (#326).
@@ -951,10 +1371,30 @@ pub enum ElementKind {
         /// (trimmed, bounded, none when not a name).
         #[serde(default, deserialize_with = "crate::symbology::de_font", skip_serializing_if = "Option::is_none")]
         font_name: Option<String>,
+        /// The map frame its map tokens (`{scale}`, `{map}`, `{extent}`…) read; `None` is the
+        /// page's first frame. Unlike a surround's, it isn't removed with its frame.
+        #[serde(default, skip_serializing_if = "is_none_frame")]
+        frame: Option<u32>,
+        /// Break each line at the element's width, at spaces and after dashes; a word wider
+        /// than it stays whole on a line of its own.
+        #[serde(default, skip_serializing_if = "is_false")]
+        wrap: bool,
+        /// Where the block of lines sits down the element.
+        #[serde(default, skip_serializing_if = "is_top")]
+        valign: VAlign,
+        /// The distance between lines as a multiple of the usual one (0.5 to 3).
+        #[serde(default = "line_spacing", skip_serializing_if = "is_line_spacing")]
+        line_spacing: f64,
+        /// Upper or lower case applied once the tokens have expanded.
+        #[serde(default, skip_serializing_if = "is_no_case")]
+        case: TextCase,
     },
     Picture {
-        /// Base64 PNG or JPEG.
+        /// Base64 PNG or JPEG. Empty when the file is missing (the picture shows a placeholder).
         image: String,
+        /// The file the picture was read from, kept so a missing one can be relinked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// The attribute table of a layer in a frame's map.
     Table {
@@ -994,7 +1434,22 @@ pub enum ElementKind {
         #[serde(default)]
         head: LineHead,
     },
+    /// Elements that move, delete and copy together, by id. A group draws nothing of its own
+    /// (its frame style goes round [`Layout::group_box`]), its own box means nothing, and a click
+    /// picks the child under it. An element is in one group at most; groups nest
+    /// [`MAX_GROUP_DEPTH`] deep.
+    Group {
+        #[serde(default)]
+        children: Vec<u32>,
+    },
 }
+
+/// How deep groups nest: a group of groups is 2 deep.
+pub const MAX_GROUP_DEPTH: usize = 8;
+/// Most elements one group holds (a layout holds at most [`MAX_ELEMENTS`]).
+pub const MAX_GROUP_CHILDREN: usize = 500;
+/// Most elements a layout holds.
+pub const MAX_ELEMENTS: usize = 500;
 
 fn rows() -> usize {
     12
@@ -1013,17 +1468,35 @@ impl ElementKind {
             letter_spacing: 0.0,
             font: FontFamily::Sans,
             font_name: None,
+            frame: None,
+            wrap: false,
+            valign: VAlign::Top,
+            line_spacing: LINE_SPACING,
+            case: TextCase::None,
         }
     }
 
     /// A north arrow for `frame`, in the default style.
     pub fn north_arrow(frame: u32) -> ElementKind {
-        ElementKind::NorthArrow { frame, style: ArrowStyle::default(), fill: ink(), outline: ink() }
+        ElementKind::NorthArrow { frame, style: ArrowStyle::default(), fill: ink(), outline: ink(), symbol: Vec::new() }
     }
 
     /// A scale bar for `frame`, in the default style.
     pub fn scale_bar(frame: u32) -> ElementKind {
-        ElementKind::ScaleBar { frame, units: ScaleUnits::default(), divisions: divisions(), style: ScaleBarStyle::default() }
+        ElementKind::ScaleBar {
+            frame,
+            units: ScaleUnits::default(),
+            divisions: divisions(),
+            style: ScaleBarStyle::default(),
+            subdivisions: 0,
+            divisions_before_zero: 0,
+            label_position: BarLabels::default(),
+            unit_label: None,
+            unit_label_position: UnitLabel::default(),
+            decimals: 0,
+            label_size: DEFAULT_SCALE_LABEL_SIZE,
+            fit: ScaleFit::default(),
+        }
     }
 
     pub fn code(&self) -> &'static str {
@@ -1040,6 +1513,7 @@ impl ElementKind {
             ElementKind::Rectangle { .. } => "rectangle",
             ElementKind::Ellipse { .. } => "ellipse",
             ElementKind::Line { .. } => "line",
+            ElementKind::Group { .. } => "group",
         }
     }
     pub fn label(&self) -> &'static str {
@@ -1056,8 +1530,34 @@ impl ElementKind {
             ElementKind::Rectangle { .. } => "Rectangle",
             ElementKind::Ellipse { .. } => "Ellipse",
             ElementKind::Line { .. } => "Line",
+            ElementKind::Group { .. } => "Group",
         }
     }
+    /// Points each reference to another element (a surround's or a text's frame, an extent
+    /// indicator, a link, a group's children) at `to(id)`, where that gives one.
+    pub fn remap(&mut self, to: impl Fn(u32) -> Option<u32>) {
+        let swap = |id: &mut u32| {
+            if let Some(n) = to(*id) {
+                *id = n;
+            }
+        };
+        match self {
+            ElementKind::NorthArrow { frame, .. }
+            | ElementKind::ScaleBar { frame, .. }
+            | ElementKind::Legend { frame, .. }
+            | ElementKind::Colorbar { frame, .. }
+            | ElementKind::Table { frame, .. }
+            | ElementKind::Chart { frame, .. } => swap(frame),
+            ElementKind::Text { frame, .. } => frame.iter_mut().for_each(swap),
+            ElementKind::MapFrame { extent_of, link, .. } => {
+                extent_of.iter_mut().for_each(swap);
+                link.iter_mut().for_each(|l| swap(&mut l.frame));
+            }
+            ElementKind::Group { children } => children.iter_mut().for_each(swap),
+            _ => {}
+        }
+    }
+
     /// The map frame this element belongs to.
     pub fn frame(&self) -> Option<u32> {
         match self {
@@ -1087,12 +1587,78 @@ pub struct Element {
     /// Locked, it can be selected but not moved, resized, deleted or edited until unlocked.
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
+    /// A border and background drawn around the element, whatever it is; none when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_style: Option<FrameStyle>,
     pub kind: ElementKind,
+}
+
+/// The widest a frame border may be (points) and the largest gap between it and the element (mm).
+pub const MAX_FRAME_WIDTH: f64 = 50.0;
+pub const MAX_FRAME_GAP: f64 = 50.0;
+
+/// An optional border and background drawn around an element, `gap` millimetres outside its box.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FrameStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<Rgba>,
+    /// The border's width in points (1/96 inch).
+    #[serde(skip_serializing_if = "is_frame_width")]
+    pub border_width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<Rgba>,
+    /// Millimetres between the element's box and the border and background.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gap: f64,
+}
+
+impl Default for FrameStyle {
+    fn default() -> Self {
+        FrameStyle { border: None, border_width: 1.0, background: None, gap: 0.0 }
+    }
+}
+
+fn is_frame_width(w: &f64) -> bool {
+    *w == 1.0
+}
+
+impl FrameStyle {
+    /// Keeps the width and gap finite and within their limits (a bad value takes its default).
+    pub fn clamp(&mut self) {
+        self.border_width = finite_or(self.border_width, 1.0).clamp(0.0, MAX_FRAME_WIDTH);
+        self.gap = finite_or(self.gap, 0.0).clamp(0.0, MAX_FRAME_GAP);
+    }
+
+    /// How far outside the element's box the frame reaches, in millimetres: the gap, and half the
+    /// border centred on the grown box's edge.
+    pub fn outset(&self) -> f64 {
+        let half = if self.border.is_some() { self.border_width / 2.0 / PT_PER_MM } else { 0.0 };
+        self.gap + half
+    }
+
+    /// The element's box `(x, y, w, h)` grown by the gap on every side: where the background
+    /// is drawn and the border centred.
+    pub fn grown(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+        (x - self.gap, y - self.gap, w + 2.0 * self.gap, h + 2.0 * self.gap)
+    }
 }
 
 impl Element {
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+
+    pub fn is_group(&self) -> bool {
+        matches!(self.kind, ElementKind::Group { .. })
+    }
+
+    /// A group's children (none for any other element).
+    pub fn children(&self) -> &[u32] {
+        match &self.kind {
+            ElementKind::Group { children } => children,
+            _ => &[],
+        }
     }
 }
 
@@ -1117,6 +1683,16 @@ pub struct MapSeries {
 fn margin() -> f64 {
     0.1
 }
+
+impl MapSeries {
+    /// A series over `layer` in `frame`, on its first page, with the usual margin.
+    pub fn new(frame: u32, layer: impl Into<String>, name_field: impl Into<String>) -> MapSeries {
+        MapSeries { frame, layer: layer.into(), name_field: name_field.into(), margin: margin(), page: 0 }
+    }
+}
+
+/// Longest path a picture remembers as its source (characters).
+pub const MAX_PICTURE_SOURCE: usize = 1000;
 
 /// Most guides a layout keeps in each direction.
 pub const MAX_GUIDES: usize = 64;
@@ -1177,7 +1753,7 @@ impl Layout {
         self.next_id = id.saturating_add(1);
         // Templates on tiny pages can compute sizes near zero.
         let (w, h) = (finite_or(w, 1.0).clamp(MIN_ELEMENT_MM, 5000.0), finite_or(h, 1.0).clamp(MIN_ELEMENT_MM, 5000.0));
-        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, kind });
+        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, frame_style: None, kind });
         id
     }
 
@@ -1195,7 +1771,7 @@ impl Layout {
 
     /// The topmost element at a page point (mm).
     pub fn hit(&self, x: f64, y: f64) -> Option<u32> {
-        self.elements.iter().rev().find(|e| e.visible && e.contains(x, y)).map(|e| e.id)
+        self.elements.iter().rev().find(|e| e.visible && !e.is_group() && e.contains(x, y)).map(|e| e.id)
     }
 
     /// Where element `id` is drawn among the others, and how many there are: 0 is drawn first,
@@ -1208,6 +1784,9 @@ impl Layout {
     /// under every other. Its new place, or None when there's no such element.
     pub fn arrange(&mut self, id: u32, to: Arrange) -> Option<usize> {
         let (i, n) = self.draw_order(id)?;
+        if self.element(id).is_some_and(Element::is_group) {
+            return self.arrange_group(id, to);
+        }
         let last = n - 1;
         let j = match to {
             Arrange::Front => last,
@@ -1220,27 +1799,202 @@ impl Layout {
         Some(j)
     }
 
+    /// Moves group `id` in the drawing order with everything in it, as one block in the order
+    /// they were: over every other element, over the one above its top, under the one below its
+    /// bottom, or under every other. The group's new place.
+    fn arrange_group(&mut self, id: u32, to: Arrange) -> Option<usize> {
+        let members: std::collections::HashSet<u32> = std::iter::once(id).chain(self.descendants(id)).collect();
+        let places: Vec<usize> = self.elements.iter().enumerate().filter(|(_, e)| members.contains(&e.id)).map(|(i, _)| i).collect();
+        let (first, last) = (*places.first()?, *places.last()?);
+        let others_below = |at: usize| self.elements.iter().take(at).filter(|e| !members.contains(&e.id)).count();
+        let (below_first, below_last) = (others_below(first), others_below(last));
+        let (block, others): (Vec<Element>, Vec<Element>) =
+            std::mem::take(&mut self.elements).into_iter().partition(|e| members.contains(&e.id));
+        let at = match to {
+            Arrange::Front => others.len(),
+            Arrange::Forward => (below_last + 1).min(others.len()),
+            Arrange::Backward => below_first.saturating_sub(1),
+            Arrange::Back => 0,
+        };
+        let mut others = others;
+        let above = others.split_off(at.min(others.len()));
+        self.elements = others.into_iter().chain(block).chain(above).collect();
+        self.elements.iter().position(|e| e.id == id)
+    }
+
     /// The locked element that removing `id` would take with it: the element itself, or one of
     /// the surrounds that belong to it.
     pub fn locked_in_removal(&self, id: u32) -> Option<&Element> {
-        self.elements.iter().find(|e| e.locked && (e.id == id || e.kind.frame() == Some(id)))
+        let gone = self.removal(id);
+        // The groups they're in change too (and may go, emptied).
+        let around: std::collections::HashSet<u32> = gone.iter().flat_map(|g| self.groups_of(*g)).collect();
+        self.elements.iter().find(|e| e.locked && (gone.contains(&e.id) || around.contains(&e.id)))
     }
 
-    /// Removes an element and the surrounds that belong to it.
+    /// What removing `id` removes: the element, everything in it when it's a group, and the
+    /// surrounds of the map frames among them.
+    fn removal(&self, id: u32) -> std::collections::HashSet<u32> {
+        let mut gone: std::collections::HashSet<u32> = std::iter::once(id).chain(self.descendants(id)).collect();
+        let surrounds: Vec<u32> =
+            self.elements.iter().filter(|e| e.kind.frame().is_some_and(|f| gone.contains(&f))).map(|e| e.id).collect();
+        gone.extend(surrounds);
+        gone
+    }
+
+    /// Removes an element, the surrounds that belong to it, and, for a group, everything in it.
+    /// An element removed leaves its group; a group left with nothing in it goes too.
     pub fn remove(&mut self, id: u32) -> bool {
-        let before = self.elements.len();
-        self.elements.retain(|e| e.id != id && e.kind.frame() != Some(id));
+        if self.element(id).is_none() {
+            return false;
+        }
+        let mut gone = self.removal(id);
+        // Groups emptied by the removal, then the groups those empty, up to the top.
+        for _ in 0..=MAX_GROUP_DEPTH {
+            let emptied: Vec<u32> = self
+                .elements
+                .iter()
+                .filter(|e| !gone.contains(&e.id) && !e.children().is_empty() && e.children().iter().all(|c| gone.contains(c)))
+                .map(|e| e.id)
+                .collect();
+            if emptied.is_empty() {
+                break;
+            }
+            gone.extend(emptied);
+        }
+        self.elements.retain(|e| !gone.contains(&e.id));
         for e in &mut self.elements {
-            if let ElementKind::MapFrame { extent_of, .. } = &mut e.kind
-                && *extent_of == Some(id)
-            {
-                *extent_of = None;
+            match &mut e.kind {
+                ElementKind::MapFrame { extent_of, link, .. } => {
+                    if extent_of.is_some_and(|o| gone.contains(&o)) {
+                        *extent_of = None;
+                    }
+                    if link.is_some_and(|l| gone.contains(&l.frame)) {
+                        *link = None;
+                    }
+                }
+                ElementKind::Text { frame, .. } if frame.is_some_and(|f| gone.contains(&f)) => *frame = None,
+                ElementKind::Group { children } => children.retain(|c| !gone.contains(c)),
+                _ => {}
             }
         }
-        if self.series.as_ref().is_some_and(|s| s.frame == id) {
+        if self.series.as_ref().is_some_and(|s| gone.contains(&s.frame)) {
             self.series = None;
         }
-        self.elements.len() != before
+        true
+    }
+
+    /// The group element `id` is in.
+    pub fn group_of(&self, id: u32) -> Option<u32> {
+        self.elements.iter().find(|e| e.children().contains(&id)).map(|e| e.id)
+    }
+
+    /// The groups element `id` is in, the innermost first (none when it's in none). The walk is
+    /// bounded, so a loop in a hand-edited layout (which `clamp` cuts) can't hang it.
+    pub fn groups_of(&self, id: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut at = id;
+        while let Some(g) = self.group_of(at) {
+            if g == id || out.contains(&g) || out.len() > MAX_ELEMENTS {
+                break;
+            }
+            out.push(g);
+            at = g;
+        }
+        out
+    }
+
+    /// The outermost group element `id` is in, or itself when it's in none.
+    pub fn top_group(&self, id: u32) -> u32 {
+        self.groups_of(id).last().copied().unwrap_or(id)
+    }
+
+    /// Everything in group `id`, its own groups' contents too: the children first, in the order
+    /// the group lists them, then theirs (empty for any other element). Each comes once, and the
+    /// walk stops [`MAX_GROUP_DEPTH`] down.
+    pub fn descendants(&self, id: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        let mut level = vec![id];
+        for _ in 0..MAX_GROUP_DEPTH {
+            let mut next = Vec::new();
+            for g in &level {
+                for c in self.element(*g).map(Element::children).unwrap_or(&[]) {
+                    if *c != id && !out.contains(c) {
+                        out.push(*c);
+                        next.push(*c);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            level = next;
+        }
+        out
+    }
+
+    /// How deep group `id` goes: 1 for a group of plain elements, 2 for a group holding one, and
+    /// so on (0 for an element that isn't a group).
+    pub fn group_depth(&self, id: u32) -> usize {
+        self.depth_below(id, 0)
+    }
+
+    fn depth_below(&self, id: u32, steps: usize) -> usize {
+        match self.element(id) {
+            Some(e) if e.is_group() && steps < MAX_GROUP_DEPTH => {
+                1 + e.children().iter().map(|c| self.depth_below(*c, steps + 1)).max().unwrap_or(0)
+            }
+            Some(e) if e.is_group() => 1,
+            _ => 0,
+        }
+    }
+
+    /// Group `id`'s box: the union of its children's boxes, a group child's its own union
+    /// (x, y, width, height in mm). None for an empty group or an element that isn't a group.
+    pub fn group_box(&self, id: u32) -> Option<(f64, f64, f64, f64)> {
+        self.element(id).filter(|e| e.is_group())?;
+        self.union_box(id, 0)
+    }
+
+    fn union_box(&self, id: u32, steps: usize) -> Option<(f64, f64, f64, f64)> {
+        let e = self.element(id)?;
+        if !e.is_group() {
+            return Some((e.x, e.y, e.w, e.h));
+        }
+        if steps >= MAX_GROUP_DEPTH {
+            return None;
+        }
+        let boxes = e.children().iter().filter(|c| **c != id).filter_map(|c| self.union_box(*c, steps + 1));
+        boxes.fold(None, |acc: Option<(f64, f64, f64, f64)>, (x, y, w, h)| {
+            Some(match acc {
+                None => (x, y, w, h),
+                Some((ax, ay, aw, ah)) => {
+                    let (x0, y0) = (ax.min(x), ay.min(y));
+                    (x0, y0, (ax + aw).max(x + w) - x0, (ay + ah).max(y + h) - y0)
+                }
+            })
+        })
+    }
+
+    /// Where element `id` is on the page: its box, or a group's [`Layout::group_box`].
+    pub fn element_box(&self, id: u32) -> Option<(f64, f64, f64, f64)> {
+        let e = self.element(id)?;
+        if e.is_group() { self.group_box(id) } else { Some((e.x, e.y, e.w, e.h)) }
+    }
+
+    /// The visible groups with a frame style: where in the drawing order its background goes
+    /// (under the lowest of the group and the elements in it) and its border (over the highest),
+    /// and the box the frame goes round.
+    pub fn group_frames(&self) -> Vec<GroupFrame<'_>> {
+        self.elements
+            .iter()
+            .filter(|e| e.visible && e.is_group() && e.frame_style.is_some())
+            .filter_map(|g| {
+                let at = |id: u32| self.elements.iter().position(|e| e.id == id);
+                let places: Vec<usize> = std::iter::once(g.id).chain(self.descendants(g.id)).filter_map(at).collect();
+                let (first, last) = (places.iter().min().copied()?, places.iter().max().copied()?);
+                Some(GroupFrame { group: g, first, last, rect: self.group_box(g.id)? })
+            })
+            .collect()
     }
 
     /// Keeps the page and elements sane after loading or editing (layout files are untrusted):
@@ -1253,7 +2007,7 @@ impl Layout {
             list.retain(|v| v.is_finite() && v.abs() <= 5000.0);
             list.truncate(MAX_GUIDES);
         }
-        self.elements.truncate(500);
+        self.elements.truncate(MAX_ELEMENTS);
         let mut seen = std::collections::HashSet::new();
         let mut next = self.elements.iter().map(|e| e.id).filter(|id| *id <= MAX_ID).max().unwrap_or(0).saturating_add(1);
         for e in &mut self.elements {
@@ -1270,6 +2024,9 @@ impl Layout {
             e.x = finite_or(e.x, 0.0).clamp(-5000.0, 5000.0);
             e.y = finite_or(e.y, 0.0).clamp(-5000.0, 5000.0);
             e.name = e.name.chars().take(200).collect();
+            if let Some(f) = &mut e.frame_style {
+                f.clamp();
+            }
             match &mut e.kind {
                 ElementKind::MapFrame { center, scale, shape, grid, bearing, pitch, extent_width, .. } => {
                     *scale = finite_or(*scale, 50_000_000.0).clamp(MIN_FRAME_SCALE, MAX_FRAME_SCALE);
@@ -1301,22 +2058,50 @@ impl Layout {
                         g.width = finite_or(g.width, grid_width()).clamp(0.0, MAX_GRID_WIDTH);
                     }
                 }
-                ElementKind::Legend { exclude, .. } => {
+                ElementKind::Legend { exclude, columns, .. } => {
+                    *columns = (*columns).clamp(1, MAX_LEGEND_COLUMNS);
                     // Names stay whole: a layer's own name isn't cut, and a cut one would no
                     // longer match it.
                     exclude.truncate(MAX_LEGEND_EXCLUDED);
                 }
-                ElementKind::Text { text, size, letter_spacing, .. } => {
+                ElementKind::Text { text, size, letter_spacing, line_spacing, .. } => {
+                    *line_spacing = finite_or(*line_spacing, LINE_SPACING).clamp(MIN_LINE_SPACING, MAX_LINE_SPACING);
                     *size = finite_or(*size, 12.0).clamp(*crate::graphics::FONT_SIZE.start(), *crate::graphics::FONT_SIZE.end());
                     *letter_spacing = finite_or(*letter_spacing, 0.0).clamp(MIN_LETTER_SPACING, MAX_LETTER_SPACING);
                     text.truncate(text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i));
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
-                ElementKind::ScaleBar { divisions, .. } => *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS),
+                ElementKind::NorthArrow { symbol, .. } => {
+                    symbol.truncate(MAX_NORTH_ARROW_SYMBOLS);
+                    for s in symbol.iter_mut() {
+                        s.size = if s.size.is_finite() { s.size.clamp(0.0, MAX_NORTH_ARROW_SYMBOL_SIZE) } else { 0.0 };
+                        s.stroke_width =
+                            if s.stroke_width.is_finite() { s.stroke_width.clamp(0.0, MAX_NORTH_ARROW_SYMBOL_SIZE) } else { 0.0 };
+                    }
+                }
+                ElementKind::ScaleBar { divisions, subdivisions, divisions_before_zero, unit_label, decimals, label_size, .. } => {
+                    *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS);
+                    *subdivisions = (*subdivisions).min(MAX_SCALE_SUBDIVISIONS);
+                    *divisions_before_zero = (*divisions_before_zero).min(MAX_SCALE_BEFORE_ZERO);
+                    *decimals = (*decimals).min(MAX_SCALE_DECIMALS);
+                    *label_size =
+                        finite_or(*label_size, DEFAULT_SCALE_LABEL_SIZE).clamp(*SCALE_LABEL_SIZE.start(), *SCALE_LABEL_SIZE.end());
+                    if let Some(t) = unit_label {
+                        t.truncate(t.char_indices().nth(MAX_UNIT_LABEL_CHARS).map_or(t.len(), |(i, _)| i));
+                    }
+                }
                 ElementKind::Rectangle { width, .. } | ElementKind::Ellipse { width, .. } => {
                     *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
                 }
                 ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
+                ElementKind::Picture { source, .. } => {
+                    if let Some(s) = source {
+                        s.truncate(s.char_indices().nth(MAX_PICTURE_SOURCE).map_or(s.len(), |(i, _)| i));
+                    }
+                    if source.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                        *source = None;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1326,12 +2111,19 @@ impl Layout {
             self.elements.iter().filter(|e| matches!(e.kind, ElementKind::MapFrame { .. })).map(|e| e.id).collect();
         self.elements.retain(|e| e.kind.frame().is_none_or(|f| frames.contains(&f)));
         for e in &mut self.elements {
-            if let ElementKind::MapFrame { extent_of, .. } = &mut e.kind
-                && extent_of.is_some_and(|o| !frames.contains(&o) || o == e.id)
-            {
-                *extent_of = None;
+            match &mut e.kind {
+                ElementKind::MapFrame { extent_of, .. } if extent_of.is_some_and(|o| !frames.contains(&o) || o == e.id) => {
+                    *extent_of = None;
+                }
+                // A text bound to something that isn't a map frame reads the first one, as an
+                // unbound one does.
+                ElementKind::Text { frame, .. } if frame.is_some_and(|f| !frames.contains(&f)) => *frame = None,
+                _ => {}
             }
         }
+        self.clamp_links(&frames);
+        self.clamp_groups();
+        self.drop_empty_groups();
         if let Some(s) = &mut self.series {
             if !frames.contains(&s.frame) {
                 self.series = None;
@@ -1339,7 +2131,264 @@ impl Layout {
                 s.margin = finite_or(s.margin, 0.1).clamp(0.0, 5.0);
             }
         }
+        // The series' frame follows the pages, never another frame (`layout.series` refuses a
+        // linked one): its link goes.
+        if let Some(frame) = self.series.as_ref().map(|s| s.frame)
+            && let Some(ElementKind::MapFrame { link, .. }) = self.element_mut(frame).map(|e| &mut e.kind)
+        {
+            *link = None;
+        }
     }
+}
+
+impl Layout {
+    /// Keeps groups sane: a group lists only elements that exist, never itself, each once, and
+    /// an element is in the first group (in element order) that lists it. A group that would hold
+    /// itself through others loses that child, and groups deeper than [`MAX_GROUP_DEPTH`] are
+    /// dissolved, what they held going to the deepest group kept above them.
+    fn clamp_groups(&mut self) {
+        use std::collections::{HashMap, HashSet};
+        let ids: HashSet<u32> = self.elements.iter().map(|e| e.id).collect();
+        let mut claimed: HashSet<u32> = HashSet::new();
+        for e in &mut self.elements {
+            let gid = e.id;
+            let ElementKind::Group { children } = &mut e.kind else { continue };
+            children.retain(|c| *c != gid && ids.contains(c) && claimed.insert(*c));
+            children.truncate(MAX_GROUP_CHILDREN);
+        }
+        // Rebuilt from what the groups kept (a child cut by `truncate` belongs to none).
+        let mut parent: HashMap<u32, u32> = self.elements.iter().flat_map(|e| e.children().iter().map(move |c| (*c, e.id))).collect();
+        // Loops: walking up from a group back to itself, it leaves its parent.
+        let groups: Vec<u32> = self.elements.iter().filter(|e| e.is_group()).map(|e| e.id).collect();
+        for g in &groups {
+            let mut at = *g;
+            for _ in 0..=self.elements.len() {
+                match parent.get(&at).copied() {
+                    Some(p) if p == *g => {
+                        if let Some(up) = parent.remove(g)
+                            && let Some(ElementKind::Group { children }) = self.element_mut(up).map(|e| &mut e.kind)
+                        {
+                            children.retain(|c| c != g);
+                        }
+                        break;
+                    }
+                    Some(p) => at = p,
+                    None => break,
+                }
+            }
+        }
+        // Each element's groups, the innermost first; the loops are gone, so this ends.
+        let limit = self.elements.len();
+        let chain = |id: u32| {
+            let mut out = Vec::new();
+            let mut at = id;
+            while let Some(&p) = parent.get(&at) {
+                if out.len() > limit {
+                    break;
+                }
+                out.push(p);
+                at = p;
+            }
+            out
+        };
+        // A group with MAX_GROUP_DEPTH groups round it is too deep, and dissolved.
+        let dissolved: HashSet<u32> = groups.iter().copied().filter(|g| chain(*g).len() >= MAX_GROUP_DEPTH).collect();
+        if dissolved.is_empty() {
+            return;
+        }
+        // What a dissolved group held, at whatever depth, goes to the deepest group kept.
+        let moved: Vec<(u32, u32)> = self
+            .elements
+            .iter()
+            .filter(|e| !dissolved.contains(&e.id))
+            .filter_map(|e| {
+                let up = chain(e.id);
+                if up.first().is_none_or(|p| !dissolved.contains(p)) {
+                    return None;
+                }
+                up.iter().find(|p| !dissolved.contains(p)).map(|p| (e.id, *p))
+            })
+            .collect();
+        self.elements.retain(|e| !dissolved.contains(&e.id));
+        for e in &mut self.elements {
+            let gid = e.id;
+            if let ElementKind::Group { children } = &mut e.kind {
+                children.retain(|c| !dissolved.contains(c));
+                children.extend(moved.iter().filter(|(_, p)| *p == gid).map(|(c, _)| *c));
+                children.truncate(MAX_GROUP_CHILDREN);
+            }
+        }
+    }
+
+    /// Drops the groups left with no children, as removing a group's last child removes the
+    /// group; a group holding only such groups goes with them, level by level.
+    fn drop_empty_groups(&mut self) {
+        for _ in 0..=MAX_GROUP_DEPTH {
+            let empty: std::collections::HashSet<u32> = self
+                .elements
+                .iter()
+                .filter(|e| matches!(&e.kind, ElementKind::Group { children } if children.is_empty()))
+                .map(|e| e.id)
+                .collect();
+            if empty.is_empty() {
+                return;
+            }
+            self.elements.retain(|e| !empty.contains(&e.id));
+            for e in &mut self.elements {
+                if let ElementKind::Group { children } = &mut e.kind {
+                    children.retain(|c| !empty.contains(c));
+                }
+            }
+        }
+    }
+
+    /// Drops the links that point at something that isn't a map frame, at the frame itself, or
+    /// that close a loop. Frames are taken in element order and a link stays unless it would
+    /// close a loop with those kept before it, so of a pair that follow each other the first
+    /// keeps its link.
+    fn clamp_links(&mut self, frames: &std::collections::HashSet<u32>) {
+        let mut kept: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for e in &mut self.elements {
+            let ElementKind::MapFrame { link, .. } = &mut e.kind else { continue };
+            let Some(target) = link.map(|l| l.frame) else { continue };
+            // Walk the kept links from the target: back at this frame, the link would close a loop.
+            let mut at = target;
+            let mut steps = 0;
+            let closes = loop {
+                if at == e.id {
+                    break true;
+                }
+                steps += 1;
+                match kept.get(&at) {
+                    Some(&next) if steps <= MAX_LINK_STEPS => at = next,
+                    Some(_) => break true,
+                    None => break false,
+                }
+            };
+            if !frames.contains(&target) || closes {
+                *link = None;
+            } else {
+                kept.insert(e.id, target);
+            }
+        }
+    }
+
+    /// Every map frame's camera, with the links between frames applied (frames whose map is
+    /// missing from `maps` are left out). A linked frame follows its source's resolved camera,
+    /// so a chain of links works; a frame whose source can't be resolved (a missing map, or a
+    /// loop `clamp` would have cut) keeps its own saved camera.
+    pub fn resolved_cameras(&self, maps: &[Map]) -> Vec<(u32, Camera)> {
+        /// What a frame shows, before it is turned into a camera.
+        #[derive(Clone, Copy)]
+        struct Shown {
+            center: Coord,
+            scale: f64,
+            bearing: f64,
+            pitch: f64,
+        }
+        struct Frame<'a> {
+            id: u32,
+            map: &'a Map,
+            w: f64,
+            h: f64,
+            own: Shown,
+            link: Option<FrameLink>,
+        }
+        let mut frames: Vec<Frame> = Vec::new();
+        for e in &self.elements {
+            let ElementKind::MapFrame { map, center, scale, bearing, pitch, link, .. } = &e.kind else { continue };
+            let Some(m) = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { continue };
+            let own = Shown { center: *center, scale: *scale, bearing: *bearing, pitch: *pitch };
+            frames.push(Frame { id: e.id, map: m, w: e.w, h: e.h, own, link: *link });
+        }
+        // A repeated id means its first element, as references to it do.
+        let index: std::collections::HashMap<u32, usize> = frames.iter().enumerate().rev().map(|(i, f)| (f.id, i)).collect();
+        let camera = |f: &Frame, v: Shown| frame_camera(f.map, v.center, v.scale, v.bearing, v.pitch);
+        let mut done: Vec<Option<Shown>> = frames.iter().map(|f| f.link.is_none().then_some(f.own)).collect();
+        for _ in 0..MAX_LINK_STEPS {
+            let mut progress = false;
+            for (i, f) in frames.iter().enumerate() {
+                let Some(link) = f.link else { continue };
+                if done.get(i).copied().flatten().is_some() {
+                    continue;
+                }
+                let Some(&si) = index.get(&link.frame) else { continue };
+                let (Some(src), Some(Some(sv))) = (frames.get(si), done.get(si).copied()) else { continue };
+                let bearing = if link.rotation { sv.bearing } else { f.own.bearing };
+                let v = match link.mode {
+                    LinkMode::Center => Shown { center: map_center(src.map, &camera(src, sv)).unwrap_or(f.own.center), bearing, ..f.own },
+                    LinkMode::Scale => Shown { scale: sv.scale, bearing, ..f.own },
+                    LinkMode::Extent => {
+                        let seen = camera_lonlat(src.map, &camera(src, sv), src.w * PT_PER_MM, src.h * PT_PER_MM);
+                        match fit_scale(f.map, &seen, f.w, f.h) {
+                            Some((center, scale)) => Shown { center, scale, bearing, ..f.own },
+                            None => Shown { bearing, ..f.own },
+                        }
+                    }
+                };
+                if let Some(slot) = done.get_mut(i) {
+                    *slot = Some(v);
+                }
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        frames.iter().zip(&done).map(|(f, v)| (f.id, camera(f, v.unwrap_or(f.own)))).collect()
+    }
+}
+
+/// A group's frame style, as [`Layout::group_frames`] gives it.
+pub struct GroupFrame<'a> {
+    pub group: &'a Element,
+    /// The background is drawn before element `first` of the drawing order, the border after
+    /// element `last`.
+    pub first: usize,
+    pub last: usize,
+    /// The group's box (mm).
+    pub rect: (f64, f64, f64, f64),
+}
+
+/// The most links followed in a row, and the most passes resolving them.
+pub const MAX_LINK_STEPS: usize = 500;
+
+/// The longitude/latitude under a camera's centre.
+fn map_center(map: &Map, cam: &Camera) -> Option<Coord> {
+    map.to_lonlat(cam.center).filter(|c| c.is_finite())
+}
+
+/// The longitude/latitude extent a camera shows in a `w`×`h` view (the whole world on the
+/// globe, or when the projection can't say).
+pub fn camera_lonlat(map: &Map, cam: &Camera, w: f64, h: f64) -> rustgis_geom::Extent {
+    use rustgis_geom::Extent;
+    if map.projection.is_globe() {
+        return Extent::WORLD_LONLAT;
+    }
+    let flat = map.flat();
+    let e = cam.extent(w, h);
+    let mut out = Extent::EMPTY;
+    const N: usize = 8;
+    for i in 0..=N {
+        let t = i as f64 / N as f64;
+        let (x, y) = (e.min_x + t * e.width(), e.min_y + t * e.height());
+        for c in [Coord::new(x, e.min_y), Coord::new(x, e.max_y), Coord::new(e.min_x, y), Coord::new(e.max_x, y)] {
+            match flat.inverse(c) {
+                Some(p) if p.is_finite() => out.expand(p),
+                _ => return Extent::WORLD_LONLAT,
+            }
+        }
+    }
+    // A pole inside the view lies beyond every edge sample (a polar projection): reach it.
+    for pole in [Coord::new(0.0, 90.0), Coord::new(0.0, -90.0)] {
+        if let Some(p) = flat.forward(pole)
+            && p.is_finite()
+            && e.contains(p)
+        {
+            out = Extent::new(-180.0, out.min_y.min(pole.y), 180.0, out.max_y.max(pole.y));
+        }
+    }
+    if out.is_empty() { Extent::WORLD_LONLAT } else { out }
 }
 
 fn finite_or(v: f64, d: f64) -> f64 {
@@ -1387,6 +2436,11 @@ pub fn frame_camera(map: &Map, center: Coord, scale: f64, bearing: f64, pitch: f
     cam.res = scale * PAPER_M_PER_PT / per;
     cam.clamp();
     cam
+}
+
+/// The paper scale (the denominator) a frame camera shows: the inverse of [`frame_camera`].
+pub fn camera_scale(map: &Map, cam: &Camera) -> f64 {
+    map.ground_res_at(cam) / PAPER_M_PER_PT
 }
 
 /// The scale that fits a lon/lat extent into a frame `w_mm`×`h_mm` with a margin, and its centre.
@@ -1507,6 +2561,278 @@ mod tests {
     use super::*;
 
     #[test]
+    fn elements_without_frame_style_save_as_before() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":""}}}"#;
+        let e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(e.frame_style, None);
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        // A frame style at its defaults writes only what is set, and reads back.
+        let set = Element { frame_style: Some(FrameStyle { border: Some(Rgba::rgb(255, 0, 0)), ..FrameStyle::default() }), ..e };
+        let s = serde_json::to_string(&set).unwrap();
+        assert!(s.contains(r#""frame_style":{"border":[255,0,0,255]}"#), "{s}");
+        assert_eq!(serde_json::from_str::<Element>(&s).unwrap(), set);
+        let full = FrameStyle { border: None, border_width: 2.5, background: Some(Rgba::rgb(1, 2, 3)), gap: 4.0 };
+        assert_eq!(serde_json::from_str::<FrameStyle>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
+        assert_eq!(serde_json::from_str::<FrameStyle>("{}").unwrap(), FrameStyle::default());
+        assert_eq!(FrameStyle::default().border_width, 1.0);
+    }
+
+    #[test]
+    fn pictures_remember_their_source_and_old_files_save_the_same() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":"abc"}}}"#;
+        let e: Element = serde_json::from_str(j).unwrap();
+        assert!(matches!(&e.kind, ElementKind::Picture { source: None, .. }));
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        let with = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":"","source":"C:/logos/a.png"}}}"#;
+        let e: Element = serde_json::from_str(with).unwrap();
+        assert!(matches!(&e.kind, ElementKind::Picture { source: Some(s), .. } if s == "C:/logos/a.png"));
+        assert_eq!(serde_json::to_string(&e).unwrap(), with);
+    }
+
+    #[test]
+    fn loaded_picture_sources_are_limited() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let long = l.add("long", (0.0, 0.0, 10.0, 10.0), ElementKind::Picture { image: String::new(), source: Some("é".repeat(1500)) });
+        let blank = l.add("blank", (0.0, 0.0, 10.0, 10.0), ElementKind::Picture { image: String::new(), source: Some("  ".into()) });
+        l.clamp();
+        let source = |id| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Picture { source, .. }) => source.clone(),
+            _ => panic!("not a picture"),
+        };
+        assert_eq!(source(long).map(|s| s.chars().count()), Some(MAX_PICTURE_SOURCE));
+        assert_eq!(source(blank), None);
+    }
+
+    #[test]
+    fn legends_without_columns_or_fit_save_as_before() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Legend":{"frame":2,"title":"L","all_classes":false,"hide_other":false}}}"#;
+        let mut e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        let ElementKind::Legend { columns, fit, show_layer_names, .. } = &mut e.kind else { panic!("not a legend") };
+        assert_eq!((*columns, *fit, *show_layer_names), (1, LegendFit::Manual, true));
+        *columns = 3;
+        *fit = LegendFit::AdjustColumnsAndSize;
+        *show_layer_names = false;
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""columns":3,"fit":"AdjustColumnsAndSize","show_layer_names":false"#), "{s}");
+        assert_eq!(serde_json::from_str::<Element>(&s).unwrap(), e);
+        // A loaded layout's columns are limited.
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"MapFrame":{"map":"m","center":{"x":0,"y":0},"scale":1000}}},
+            {"id":2,"name":"b","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":1,"title":"","columns":0}}},
+            {"id":3,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":1,"title":"","columns":99}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        let cols = |id| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Legend { columns, .. }) => *columns,
+            _ => 0,
+        };
+        assert_eq!((cols(2), cols(3)), (1, MAX_LEGEND_COLUMNS));
+        for f in LegendFit::ALL {
+            assert_eq!(LegendFit::from_name(f.code()), Some(f));
+        }
+    }
+
+    #[test]
+    fn scale_bars_without_details_save_as_before() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"ScaleBar":{"frame":2,"units":"Auto","divisions":4,"style":"Alternating"}}}"#;
+        let mut e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), j);
+        let ElementKind::ScaleBar {
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            label_size,
+            fit,
+            ..
+        } = &mut e.kind
+        else {
+            panic!("not a scale bar")
+        };
+        assert_eq!((*subdivisions, *divisions_before_zero, *decimals, *label_size), (0, 0, 0, 8.0));
+        assert_eq!(
+            (*label_position, *unit_label_position, *fit),
+            (BarLabels::Above, UnitLabel::AfterLabels, ScaleFit::AdjustDivisionValue)
+        );
+        assert_eq!(*unit_label, None);
+        *subdivisions = 2;
+        *divisions_before_zero = 1;
+        *label_position = BarLabels::Below;
+        *unit_label = Some("Feet".into());
+        *unit_label_position = UnitLabel::AfterBar;
+        *decimals = 2;
+        *label_size = 10.0;
+        *fit = ScaleFit::AdjustWidth;
+        let s = serde_json::to_string(&e).unwrap();
+        for part in [
+            r#""subdivisions":2"#,
+            r#""divisions_before_zero":1"#,
+            r#""label_position":"Below""#,
+            r#""unit_label":"Feet""#,
+            r#""unit_label_position":"AfterBar""#,
+            r#""decimals":2"#,
+            r#""label_size":10.0"#,
+            r#""fit":"AdjustWidth""#,
+        ] {
+            assert!(s.contains(part), "{part} in {s}");
+        }
+        assert_eq!(serde_json::from_str::<Element>(&s).unwrap(), e);
+        // A loaded layout's details are limited.
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"MapFrame":{"map":"m","center":{"x":0,"y":0},"scale":1000}}},
+            {"id":2,"name":"b","x":0,"y":0,"w":10,"h":10,"kind":{"ScaleBar":{"frame":1,"subdivisions":99,"divisions_before_zero":9,"decimals":9,"label_size":1e9}}},
+            {"id":3,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"ScaleBar":{"frame":1,"label_size":-4}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        let get = |id| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::ScaleBar { subdivisions, divisions_before_zero, decimals, label_size, .. }) => {
+                (*subdivisions, *divisions_before_zero, *decimals, *label_size)
+            }
+            _ => (0, 0, 0, 0.0),
+        };
+        assert_eq!(get(2), (MAX_SCALE_SUBDIVISIONS, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS, 24.0));
+        assert_eq!(get(3).3, 4.0);
+        for v in BarLabels::ALL {
+            assert_eq!(BarLabels::from_name(v.code()), Some(v));
+        }
+        for v in UnitLabel::ALL {
+            assert_eq!(UnitLabel::from_name(v.code()), Some(v));
+        }
+        for v in ScaleFit::ALL {
+            assert_eq!(ScaleFit::from_name(v.code()), Some(v));
+        }
+    }
+
+    #[test]
+    fn loaded_frame_styles_are_limited() {
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}},
+             "frame_style":{"border":[0,0,0,255],"border_width":1e9,"gap":-3}},
+            {"id":2,"name":"b","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}},
+             "frame_style":{"border_width":-1,"gap":1e9}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        let f = |id| l.element(id).and_then(|e| e.frame_style.clone()).unwrap();
+        assert_eq!((f(1).border_width, f(1).gap), (MAX_FRAME_WIDTH, 0.0));
+        assert_eq!((f(2).border_width, f(2).gap), (0.0, MAX_FRAME_GAP));
+        let mut fs = FrameStyle { border_width: f64::NAN, gap: f64::INFINITY, ..FrameStyle::default() };
+        fs.clamp();
+        assert_eq!((fs.border_width, fs.gap), (1.0, 0.0));
+    }
+
+    #[test]
+    fn a_frame_style_grows_the_box_by_its_gap_and_half_its_border() {
+        let fs = FrameStyle { border: Some(Rgba::rgb(0, 0, 0)), border_width: PT_PER_MM, gap: 2.0, ..FrameStyle::default() };
+        assert_eq!(fs.grown(10.0, 20.0, 30.0, 40.0), (8.0, 18.0, 34.0, 44.0));
+        assert!((fs.outset() - 2.5).abs() < 1e-9);
+        // Without a border the box grows by the gap alone.
+        assert_eq!(FrameStyle { border: None, background: Some(Rgba::rgb(0, 0, 0)), ..fs }.outset(), 2.0);
+    }
+
+    #[test]
+    fn text_elements_saved_before_read_and_save_the_same() {
+        // `bold` has always been written; every later field is left out at its default.
+        let j = r#"{"Text":{"text":"a","size":10.0,"color":[0,0,0,255],"bold":false}}"#;
+        let k: ElementKind = serde_json::from_str(j).unwrap();
+        assert!(matches!(
+            &k,
+            ElementKind::Text { frame: None, wrap: false, valign: VAlign::Top, case: TextCase::None, line_spacing, .. } if *line_spacing == 1.0
+        ));
+        assert_eq!(serde_json::to_string(&k).unwrap(), j);
+        // Set, they are written and read back.
+        let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, .. } = k else { panic!() };
+        let set = ElementKind::Text {
+            text,
+            size,
+            color,
+            bold,
+            italic,
+            align,
+            letter_spacing,
+            font,
+            font_name,
+            frame: Some(3),
+            wrap: true,
+            valign: VAlign::Bottom,
+            line_spacing: 1.5,
+            case: TextCase::Upper,
+        };
+        let s = serde_json::to_string(&set).unwrap();
+        assert!(s.contains(r#""frame":3,"wrap":true,"valign":"Bottom","line_spacing":1.5,"case":"Upper""#), "{s}");
+        assert_eq!(serde_json::from_str::<ElementKind>(&s).unwrap(), set);
+        assert_eq!(VAlign::from_name(" MIDDLE "), Some(VAlign::Middle));
+        assert_eq!(VAlign::from_name("centre"), Some(VAlign::Middle));
+        assert_eq!(TextCase::from_name("Upper"), Some(TextCase::Upper));
+        assert_eq!(TextCase::Upper.apply("Straße 9".into()), "STRASSE 9");
+        assert_eq!(TextCase::from_name("title"), None);
+    }
+
+    #[test]
+    fn a_text_bound_to_a_frame_keeps_it_until_the_frame_goes() {
+        let mut l = Layout::new("L", 200.0, 200.0);
+        let frame = |l: &mut Layout, name: &str| {
+            l.add(
+                name,
+                (10.0, 10.0, 80.0, 80.0),
+                ElementKind::MapFrame {
+                    map: "Map".into(),
+                    center: Coord::new(0.0, 0.0),
+                    scale: 50_000.0,
+                    shape: FrameShape::Rectangle,
+                    grid: None,
+                    bearing: 0.0,
+                    pitch: 0.0,
+                    link: None,
+                    extent_of: None,
+                    extent_color: INDICATOR_COLOR,
+                    extent_width: INDICATOR_WIDTH,
+                },
+            )
+        };
+        let (a, b) = (frame(&mut l, "A"), frame(&mut l, "B"));
+        let rect = l.add(
+            "R",
+            (0.0, 0.0, 5.0, 5.0),
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 },
+        );
+        let t = l.add("T", (0.0, 100.0, 50.0, 10.0), ElementKind::text("{scale}", 10.0, Rgba::rgb(0, 0, 0), false));
+        let bind = |l: &mut Layout, f: Option<u32>| {
+            if let Some(ElementKind::Text { frame, .. }) = l.element_mut(t).map(|e| &mut e.kind) {
+                *frame = f;
+            }
+        };
+        let bound = |l: &Layout| match l.element(t).map(|e| &e.kind) {
+            Some(ElementKind::Text { frame, .. }) => *frame,
+            _ => Some(u32::MAX),
+        };
+        // A text isn't a surround: its frame doesn't carry it away, and removing a frame it
+        // isn't bound to leaves it bound.
+        assert_eq!(l.element(t).map(|e| e.kind.frame()), Some(None));
+        bind(&mut l, Some(b));
+        assert!(l.remove(a));
+        assert_eq!(bound(&l), Some(b));
+        assert!(l.remove(b));
+        assert!(l.element(t).is_some(), "the text stays");
+        assert_eq!(bound(&l), None, "and reads the first frame again");
+        // Loading drops a binding to something that isn't a map frame, and keeps line spacing in range.
+        bind(&mut l, Some(rect));
+        if let Some(ElementKind::Text { line_spacing, .. }) = l.element_mut(t).map(|e| &mut e.kind) {
+            *line_spacing = 99.0;
+        }
+        l.clamp();
+        assert_eq!(bound(&l), None);
+        assert!(matches!(l.element(t).map(|e| &e.kind), Some(ElementKind::Text { line_spacing, .. }) if *line_spacing == 3.0));
+        if let Some(ElementKind::Text { line_spacing, .. }) = l.element_mut(t).map(|e| &mut e.kind) {
+            *line_spacing = f64::NAN;
+        }
+        l.clamp();
+        assert!(matches!(l.element(t).map(|e| &e.kind), Some(ElementKind::Text { line_spacing, .. }) if *line_spacing == 1.0));
+    }
+
+    #[test]
     fn elements_are_arranged_in_the_drawing_order() {
         let mut l = Layout::new("L", 100.0, 100.0);
         let rect = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
@@ -1558,6 +2884,232 @@ mod tests {
         assert!(r.2.is_finite() && r.3.is_finite() && r.2 > 0.0);
     }
 
+    /// A map frame at `at` (lon/lat) and 1:`scale`, 100×80 mm, linked as `link`.
+    fn linked_frame(l: &mut Layout, name: &str, at: (f64, f64), scale: f64, link: Option<FrameLink>) -> u32 {
+        l.add(
+            name,
+            (0.0, 0.0, 100.0, 80.0),
+            ElementKind::MapFrame {
+                map: "Map".into(),
+                center: Coord::new(at.0, at.1),
+                scale,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: INDICATOR_COLOR,
+                extent_width: INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+                link,
+            },
+        )
+    }
+
+    fn set_link(l: &mut Layout, id: u32, new: Option<FrameLink>) {
+        if let Some(ElementKind::MapFrame { link, .. }) = l.element_mut(id).map(|e| &mut e.kind) {
+            *link = new;
+        }
+    }
+
+    fn link_of(l: &Layout, id: u32) -> Option<FrameLink> {
+        match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { link, .. }) => *link,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_linked_frame_follows_its_sources_centre_scale_or_extent() {
+        let maps = [Map::new("Map")];
+        let map = &maps[0];
+        let camera = |l: &Layout, id: u32| l.resolved_cameras(&maps).into_iter().find(|(i, _)| *i == id).map(|(_, c)| c).unwrap();
+        let centre_of = |c: &Camera| map.to_lonlat(c.center).unwrap();
+        let go = |mode, rotation, turn: f64| {
+            let mut l = Layout::new("L", 297.0, 210.0);
+            let src = linked_frame(&mut l, "Main", (10.0, 20.0), 1_000_000.0, None);
+            let own = linked_frame(&mut l, "Inset", (-30.0, 5.0), 5_000_000.0, Some(FrameLink { frame: src, mode, rotation }));
+            if let Some(ElementKind::MapFrame { bearing, .. }) = l.element_mut(src).map(|e| &mut e.kind) {
+                *bearing = turn;
+            }
+            (camera(&l, src), camera(&l, own))
+        };
+        let near = |a: Coord, b: (f64, f64)| (a.x - b.0).abs() < 1e-6 && (a.y - b.1).abs() < 1e-6;
+        let res = |at: (f64, f64), scale| frame_camera(map, Coord::new(at.0, at.1), scale, 0.0, 0.0).res;
+
+        // Centre: the source's centre at the frame's own scale, its own bearing.
+        let (src, cam) = go(LinkMode::Center, false, 30.0);
+        assert!(near(centre_of(&cam), (10.0, 20.0)), "{:?}", centre_of(&cam));
+        assert!((cam.res / res((10.0, 20.0), 5_000_000.0) - 1.0).abs() < 1e-9);
+        assert_eq!((src.bearing, cam.bearing), (30.0, 0.0));
+        // Scale: the source's scale around the frame's own centre.
+        let (_, cam) = go(LinkMode::Scale, false, 0.0);
+        assert!(near(centre_of(&cam), (-30.0, 5.0)), "{:?}", centre_of(&cam));
+        assert!((cam.res / res((-30.0, 5.0), 1_000_000.0) - 1.0).abs() < 1e-9);
+        // Extent: the frame's box holds what the source shows, a margin around it.
+        let (src, cam) = go(LinkMode::Extent, false, 0.0);
+        assert!(near(centre_of(&cam), (10.0, 20.0)), "{:?}", centre_of(&cam));
+        let wider = cam.res / src.res;
+        assert!(wider > 1.05 && wider < 1.2, "{wider}");
+        assert_eq!(cam.bearing, 0.0);
+        let (_, cam) = go(LinkMode::Extent, true, 30.0);
+        assert_eq!(cam.bearing, 30.0, "rotation takes the bearing, whatever the mode");
+
+        // A chain follows the resolved camera of the frame before it.
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 9_000_000.0, None);
+        let b = linked_frame(&mut l, "B", (1.0, 1.0), 2_000_000.0, None);
+        let c = linked_frame(&mut l, "C", (2.0, 2.0), 3_000_000.0, None);
+        set_link(&mut l, c, Some(FrameLink { frame: b, mode: LinkMode::Center, rotation: false }));
+        set_link(&mut l, b, Some(FrameLink { frame: a, mode: LinkMode::Scale, rotation: false }));
+        let (cb, cc) = (camera(&l, b), camera(&l, c));
+        assert!((cb.res / res((1.0, 1.0), 9_000_000.0) - 1.0).abs() < 1e-9);
+        assert!(near(centre_of(&cc), (1.0, 1.0)), "{:?}", centre_of(&cc));
+        assert!((cc.res / res((1.0, 1.0), 3_000_000.0) - 1.0).abs() < 1e-9, "C keeps its own scale");
+
+        // Without its source (a loop, a dangling id, a source of a missing map) a frame keeps its own view.
+        set_link(&mut l, a, Some(FrameLink { frame: c, mode: LinkMode::Center, rotation: true }));
+        assert!((camera(&l, a).res / res((0.0, 0.0), 9_000_000.0) - 1.0).abs() < 1e-9);
+        assert!((camera(&l, c).res / res((2.0, 2.0), 3_000_000.0) - 1.0).abs() < 1e-9);
+        set_link(&mut l, a, Some(FrameLink { frame: 999, mode: LinkMode::Center, rotation: false }));
+        assert!(near(centre_of(&camera(&l, a)), (0.0, 0.0)));
+        assert!(l.resolved_cameras(&[]).is_empty(), "frames of a missing map have no camera");
+    }
+
+    #[test]
+    fn link_cycles_and_self_links_are_dropped_by_clamp() {
+        let to = |frame| Some(FrameLink { frame, mode: LinkMode::Extent, rotation: true });
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        set_link(&mut l, a, to(b));
+        set_link(&mut l, b, to(a));
+        l.clamp();
+        assert_eq!((link_of(&l, a), link_of(&l, b)), (to(b), None), "the first frame keeps its link");
+
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        set_link(&mut l, a, to(a));
+        l.clamp();
+        assert_eq!(link_of(&l, a), None);
+
+        // A longer loop loses its last link; a link to a rectangle or to nothing goes.
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        let c = linked_frame(&mut l, "C", (0.0, 0.0), 1e6, None);
+        let d = linked_frame(&mut l, "D", (0.0, 0.0), 1e6, None);
+        let e = linked_frame(&mut l, "E", (0.0, 0.0), 1e6, None);
+        let r = l.add(
+            "R",
+            (0.0, 0.0, 5.0, 5.0),
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 },
+        );
+        for (from, target) in [(a, b), (b, c), (c, a), (d, r), (e, 999)] {
+            set_link(&mut l, from, to(target));
+        }
+        l.clamp();
+        assert_eq!([a, b, c, d, e].map(|f| link_of(&l, f)), [to(b), to(c), None, None, None]);
+        // Clamping again changes nothing.
+        let before = l.clone();
+        l.clamp();
+        assert_eq!(l, before);
+    }
+
+    /// The map series' frame follows the pages, not another frame: `clamp` drops its link, as
+    /// `layout.series` refuses a linked frame.
+    #[test]
+    fn the_series_frame_loses_its_link_in_clamp() {
+        let to = |frame| Some(FrameLink { frame, mode: LinkMode::Center, rotation: false });
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        let c = linked_frame(&mut l, "C", (0.0, 0.0), 1e6, None);
+        set_link(&mut l, b, to(a));
+        set_link(&mut l, c, to(b));
+        l.series = Some(MapSeries::new(b, "Pages", ""));
+        l.clamp();
+        assert_eq!((link_of(&l, b), link_of(&l, c)), (None, to(b)), "a frame following the series frame keeps its link");
+        assert_eq!(l.series.as_ref().map(|s| s.frame), Some(b));
+    }
+
+    #[test]
+    fn link_and_fit_names_are_trimmed_and_any_case() {
+        assert_eq!(LinkMode::from_name(" EXTENT "), Some(LinkMode::Extent));
+        assert_eq!(LinkMode::from_name("center"), Some(LinkMode::Center));
+        assert_eq!(LegendFit::from_name("AdjustColumns"), Some(LegendFit::AdjustColumns));
+        assert_eq!(LegendFit::from_name(" adjustcolumnsandsize "), Some(LegendFit::AdjustColumnsAndSize));
+        assert_eq!((LinkMode::from_name("near"), LegendFit::from_name("")), (None, None));
+    }
+
+    #[test]
+    fn a_long_chain_of_links_resolves() {
+        let maps = [Map::new("Map")];
+        let mut l = Layout::new("L", 297.0, 210.0);
+        // 300 frames, each following the one after it, the last one the source.
+        let ids: Vec<u32> = (0..300).map(|i| linked_frame(&mut l, "F", (f64::from(i % 50), 0.0), 1e6, None)).collect();
+        for w in ids.windows(2) {
+            set_link(&mut l, w[0], Some(FrameLink { frame: w[1], mode: LinkMode::Center, rotation: false }));
+        }
+        l.clamp();
+        let cams = l.resolved_cameras(&maps);
+        assert_eq!(cams.len(), 300);
+        let lonlat = |c: Option<&(u32, Camera)>| maps[0].to_lonlat(c.map(|(_, c)| c.center).unwrap()).unwrap();
+        let (first, last) = (lonlat(cams.first()), lonlat(cams.last()));
+        assert!((first.x - last.x).abs() < 1e-6 && (first.x - 49.0).abs() < 1e-6, "{first:?} {last:?}");
+    }
+
+    #[test]
+    fn removing_a_frame_clears_links_to_it() {
+        let mut l = Layout::new("L", 297.0, 210.0);
+        let a = linked_frame(&mut l, "A", (0.0, 0.0), 1e6, None);
+        let b = linked_frame(&mut l, "B", (0.0, 0.0), 1e6, None);
+        let c = linked_frame(&mut l, "C", (0.0, 0.0), 1e6, None);
+        let to = |frame| Some(FrameLink { frame, mode: LinkMode::Scale, rotation: false });
+        set_link(&mut l, a, to(b));
+        set_link(&mut l, c, to(a));
+        assert!(l.remove(b));
+        assert_eq!((link_of(&l, a), link_of(&l, c)), (None, to(a)), "only links to the frame removed go");
+    }
+
+    #[test]
+    fn frames_without_a_link_save_as_before() {
+        let j = r#"{"MapFrame":{"map":"Map","center":{"x":1.0,"y":2.0},"scale":50000.0,"shape":"Rectangle","grid":null,"extent_of":null}}"#;
+        let kind: ElementKind = serde_json::from_str(j).unwrap();
+        assert!(matches!(&kind, ElementKind::MapFrame { link: None, .. }));
+        let ElementKind::MapFrame { map, center, scale, shape, grid, extent_of, extent_color, extent_width, bearing, pitch, .. } = kind
+        else {
+            panic!()
+        };
+        let link = Some(FrameLink { frame: 7, mode: LinkMode::Extent, rotation: true });
+        let none = ElementKind::MapFrame {
+            map: map.clone(),
+            center,
+            scale,
+            shape: shape.clone(),
+            grid: grid.clone(),
+            extent_of,
+            extent_color,
+            extent_width,
+            bearing,
+            pitch,
+            link: None,
+        };
+        let plain = serde_json::to_string(&none).unwrap();
+        assert!(!plain.contains("link"), "{plain}");
+        assert_eq!(serde_json::from_str::<ElementKind>(&plain).unwrap(), none);
+        let set = ElementKind::MapFrame { map, center, scale, shape, grid, extent_of, extent_color, extent_width, bearing, pitch, link };
+        let s = serde_json::to_string(&set).unwrap();
+        assert!(s.ends_with(r#""link":{"frame":7,"mode":"Extent","rotation":true}}}"#), "{s}");
+        assert_eq!(serde_json::from_str::<ElementKind>(&s).unwrap(), set);
+        // A link names only its frame: it follows the centre, without turning.
+        assert_eq!(
+            serde_json::from_str::<FrameLink>(r#"{"frame":3}"#).unwrap(),
+            FrameLink { frame: 3, mode: LinkMode::Center, rotation: false }
+        );
+        assert_eq!(LinkMode::from_name("scale"), Some(LinkMode::Scale));
+        assert_eq!(LinkMode::from_name("Scale"), Some(LinkMode::Scale));
+    }
+
     #[test]
     fn elements_add_hit_and_remove_with_surrounds() {
         let mut l = Layout::new("Layout", 297.0, 210.0);
@@ -1575,6 +3127,7 @@ mod tests {
                 extent_width: INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
         let n = l.add("North Arrow", (215.0, 10.0, 15.0, 20.0), ElementKind::north_arrow(f));
@@ -1649,6 +3202,7 @@ mod tests {
         let cam = frame_camera(&map, Coord::new(0.0, 0.0), 1_000_000.0, 0.0, 0.0);
         // At the equator one logical point of paper (0.2646 mm) covers 264.6 m at 1:1,000,000.
         assert!((cam.res - 264.583).abs() < 0.5, "{}", cam.res);
+        assert!((camera_scale(&map, &cam) / 1_000_000.0 - 1.0).abs() < 1e-9, "the scale back from the camera");
         let (c, s) = fit_scale(&map, &rustgis_geom::Extent::new(-10.0, -10.0, 10.0, 10.0), 200.0, 200.0).unwrap_or_default();
         assert!(c.x.abs() < 1e-6 && s > 1e7 && s < 2e7, "{c:?} {s}");
         // A finds drawing at 2:1 on the equator, where a frame's camera is closest (#902).
@@ -1805,6 +3359,35 @@ mod tests {
     }
 
     #[test]
+    fn north_arrows_without_a_symbol_save_as_before_and_a_loaded_symbol_is_limited() {
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"NorthArrow":{"frame":2,"style":"Classic","fill":[0,0,0,255],"outline":[0,0,0,255]}}}"#;
+        let e: Element = serde_json::from_str(j).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), j, "an empty symbol is not written");
+        // A symbol survives a round trip, and a long one is cut to the limit with sane sizes.
+        let one =
+            Symbol { fill: Rgba::rgb(1, 2, 3), stroke: Rgba::rgb(0, 0, 0), stroke_width: 1.0, size: 1e9, marker: crate::Marker::Square };
+        let mut kind = ElementKind::north_arrow(2);
+        if let ElementKind::NorthArrow { symbol, .. } = &mut kind {
+            *symbol = vec![one; MAX_NORTH_ARROW_SYMBOLS + 5];
+        }
+        let element =
+            Element { id: 1, name: "a".into(), x: 0.0, y: 0.0, w: 10.0, h: 10.0, visible: true, locked: false, frame_style: None, kind };
+        let mut l: Layout = serde_json::from_str(
+            r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":2,"name":"frame","x":0,"y":0,"w":100,"h":80,"kind":{"MapFrame":{"map":"M","center":{"x":0,"y":0},"scale":1e7}}}]}"#,
+        )
+        .unwrap();
+        l.elements.push(element);
+        let again: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(again, l);
+        let mut again = again;
+        again.clamp();
+        let Some(ElementKind::NorthArrow { symbol, .. }) = again.element(1).map(|e| &e.kind) else { panic!("not a north arrow") };
+        assert_eq!(symbol.len(), MAX_NORTH_ARROW_SYMBOLS);
+        assert!(symbol.iter().all(|s| s.size == MAX_NORTH_ARROW_SYMBOL_SIZE));
+    }
+
+    #[test]
     fn loaded_grids_and_scale_bars_are_limited() {
         let text = r#"{"name":"x","width":200,"height":100,"elements":[
             {"id":1,"name":"frame","x":0,"y":0,"w":100,"h":80,"kind":{"MapFrame":{"map":"M","center":{"x":0,"y":0},"scale":1e7,
@@ -1830,5 +3413,171 @@ mod tests {
             (1000.0, MAX_MEASURED_STEP, MIN_MEASURED_STEP)
         );
         assert_eq!(step("measured", 0.0), 0.0, "Auto");
+    }
+
+    fn rect(l: &mut Layout, (x, y, w, h): (f64, f64, f64, f64)) -> u32 {
+        let k = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0 };
+        l.add("r", (x, y, w, h), k)
+    }
+
+    fn group(l: &mut Layout, children: Vec<u32>) -> u32 {
+        l.add("Group", (0.0, 0.0, 1.0, 1.0), ElementKind::Group { children })
+    }
+
+    fn children(l: &Layout, id: u32) -> Vec<u32> {
+        match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Group { children }) => children.clone(),
+            other => panic!("not a group: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn groups_round_trip_and_clamp_drops_bad_children() {
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}},
+            {"id":2,"name":"b","x":20,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}},
+            {"id":3,"name":"g","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,99,3,2,1]}}},
+            {"id":4,"name":"h","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,5]}}},
+            {"id":5,"name":"loop","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[4,6]}}},
+            {"id":6,"name":"c","x":40,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        // The missing child, the group itself and the repeat are gone; 1 stays with the first
+        // group that lists it.
+        assert_eq!(children(&l, 3), vec![1, 2]);
+        // 4 and 5 hold each other: the first in element order keeps its child.
+        assert_eq!(children(&l, 4), vec![5]);
+        assert_eq!(children(&l, 5), vec![6]);
+        assert_eq!((l.group_of(1), l.group_of(2), l.group_of(5), l.group_of(4)), (Some(3), Some(3), Some(4), None));
+        // A group reads back as it was saved.
+        let s = serde_json::to_string(&l).unwrap();
+        assert!(s.contains(r#""kind":{"Group":{"children":[1,2]}}"#), "{s}");
+        assert_eq!(serde_json::from_str::<Layout>(&s).unwrap(), l);
+        let g = ElementKind::Group { children: vec![] };
+        assert_eq!((g.code(), g.label()), ("group", "Group"));
+        // Layouts without groups save as before.
+        let j = r#"{"id":1,"name":"a","x":1.0,"y":2.0,"w":3.0,"h":4.0,"visible":true,"kind":{"Picture":{"image":""}}}"#;
+        assert_eq!(serde_json::to_string(&serde_json::from_str::<Element>(j).unwrap()).unwrap(), j);
+        assert_eq!(serde_json::from_str::<ElementKind>(r#"{"Group":{}}"#).unwrap(), g);
+    }
+
+    /// A group whose children were all dropped goes too, as removing its last child removes it,
+    /// and so does a group left holding only that one.
+    #[test]
+    fn clamp_drops_a_group_left_with_no_children() {
+        let text = r#"{"name":"x","width":200,"height":100,"elements":[
+            {"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{"Picture":{"image":""}}},
+            {"id":2,"name":"gone","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[98,99]}}},
+            {"id":3,"name":"outer","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[2]}}},
+            {"id":4,"name":"kept","x":0,"y":0,"w":1,"h":1,"kind":{"Group":{"children":[1,2]}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap();
+        l.clamp();
+        assert!(l.element(2).is_none() && l.element(3).is_none(), "{:?}", l.elements);
+        assert_eq!(children(&l, 4), vec![1]);
+        let before = l.clone();
+        l.clamp();
+        assert_eq!(l, before);
+    }
+
+    #[test]
+    fn groups_nest_at_most_eight_deep() {
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let leaf = rect(&mut l, (0.0, 0.0, 10.0, 10.0));
+        let mut chain = vec![];
+        let mut inner = leaf;
+        for _ in 0..9 {
+            inner = group(&mut l, vec![inner]);
+            chain.push(inner);
+        }
+        l.clamp();
+        // The innermost group, ninth from the top, is gone: its leaf belongs to the eighth.
+        assert!(l.element(chain[0]).is_none());
+        assert_eq!(children(&l, chain[1]), vec![leaf]);
+        assert_eq!(l.group_depth(chain[8]), 8);
+        assert_eq!(l.group_box(chain[8]), Some((0.0, 0.0, 10.0, 10.0)));
+    }
+
+    #[test]
+    fn removing_a_group_removes_its_children() {
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let (a, b, c) = (rect(&mut l, (0.0, 0.0, 5.0, 5.0)), rect(&mut l, (10.0, 0.0, 5.0, 5.0)), rect(&mut l, (20.0, 0.0, 5.0, 5.0)));
+        let inner = group(&mut l, vec![a, b]);
+        let outer = group(&mut l, vec![inner, c]);
+        let other = rect(&mut l, (50.0, 50.0, 5.0, 5.0));
+        // A locked child keeps the group it's in.
+        l.element_mut(b).unwrap().locked = true;
+        assert_eq!(l.locked_in_removal(outer).map(|e| e.id), Some(b));
+        l.element_mut(b).unwrap().locked = false;
+        assert!(l.remove(outer));
+        assert_eq!(l.elements.iter().map(|e| e.id).collect::<Vec<_>>(), vec![other]);
+        // A locked group keeps what it holds: removing one of them would change it.
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let (a, b) = (rect(&mut l, (0.0, 0.0, 5.0, 5.0)), rect(&mut l, (10.0, 0.0, 5.0, 5.0)));
+        let g = group(&mut l, vec![a, b]);
+        let top = group(&mut l, vec![g]);
+        l.element_mut(top).unwrap().locked = true;
+        assert_eq!(l.locked_in_removal(a).map(|e| e.id), Some(top), "a locked group round it");
+        l.element_mut(top).unwrap().locked = false;
+        assert_eq!(l.locked_in_removal(a).map(|e| e.id), None);
+        // Removing a child takes it out of its group; the group that loses its last one goes too.
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let (a, b) = (rect(&mut l, (0.0, 0.0, 5.0, 5.0)), rect(&mut l, (10.0, 0.0, 5.0, 5.0)));
+        let g = group(&mut l, vec![a, b]);
+        let top = group(&mut l, vec![g]);
+        assert!(l.remove(a));
+        assert_eq!(children(&l, g), vec![b]);
+        assert!(l.remove(b));
+        assert!(l.element(g).is_none() && l.element(top).is_none(), "emptied groups go with their last child");
+        // A frame's surround in a group leaves it with the frame.
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let frame = l.add(
+            "f",
+            (0.0, 0.0, 50.0, 50.0),
+            ElementKind::MapFrame {
+                map: "M".into(),
+                center: Coord::new(0.0, 0.0),
+                scale: 1e6,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: indicator_color(),
+                extent_width: INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+                link: None,
+            },
+        );
+        let bar = l.add("bar", (0.0, 60.0, 30.0, 5.0), ElementKind::scale_bar(frame));
+        let note = rect(&mut l, (40.0, 60.0, 5.0, 5.0));
+        let g = group(&mut l, vec![bar, note]);
+        assert!(l.remove(frame));
+        assert_eq!(children(&l, g), vec![note]);
+    }
+
+    #[test]
+    fn group_box_is_the_union_of_its_children() {
+        let mut l = Layout::new("x", 200.0, 100.0);
+        let a = rect(&mut l, (10.0, 10.0, 20.0, 20.0));
+        let b = rect(&mut l, (50.0, 40.0, 10.0, 10.0));
+        let c = rect(&mut l, (5.0, 60.0, 5.0, 5.0));
+        let inner = group(&mut l, vec![a, b]);
+        assert_eq!(l.group_box(inner), Some((10.0, 10.0, 50.0, 40.0)));
+        let outer = group(&mut l, vec![inner, c]);
+        assert_eq!(l.group_box(outer), Some((5.0, 10.0, 55.0, 55.0)));
+        assert_eq!(l.element_box(outer), l.group_box(outer));
+        assert_eq!(l.element_box(c), Some((5.0, 60.0, 5.0, 5.0)));
+        assert_eq!(l.group_box(a), None, "not a group");
+        let empty = group(&mut l, vec![]);
+        assert_eq!(l.group_box(empty), None);
+        // Hits go to the children, never the group.
+        assert_eq!(l.hit(15.0, 15.0), Some(a));
+        assert_eq!(l.hit(40.0, 35.0), None, "between the children");
+        assert_eq!(l.descendants(outer), vec![inner, c, a, b]);
+        // A hand-made loop (only `clamp` cuts them) doesn't hang the walks.
+        if let Some(ElementKind::Group { children }) = l.element_mut(inner).map(|e| &mut e.kind) {
+            children.push(outer);
+        }
+        assert_eq!(l.group_box(outer), Some((5.0, 10.0, 55.0, 55.0)));
+        assert_eq!(l.descendants(outer).len(), 4);
     }
 }

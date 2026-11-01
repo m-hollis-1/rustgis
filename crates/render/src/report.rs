@@ -272,7 +272,7 @@ pub fn draw_page(doc: &Doc, pages: &[Page], n: usize, dpi: f64, layouts: &[Layou
     let dpi = if dpi.is_finite() { dpi.clamp(24.0, 600.0) } else { 96.0 };
     if let Page::Layout(li) = page {
         let l = layouts.get(*li)?;
-        let info = crate::layout::PageInfo { page: n + 1, pages: pages.len(), page_name: String::new() };
+        let info = crate::layout::PageInfo { page: n + 1, pages: pages.len(), page_name: String::new(), project: String::new() };
         return crate::layout::render(l, maps, dpi, &info).map(|pm| (pm, l.width, l.height));
     }
     let Page::Flow(items) = page else { return None };

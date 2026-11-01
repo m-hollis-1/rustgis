@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use base64::Engine;
 use rustgis_map::Map;
-use rustgis_map::layout::{ElementKind, FontFamily, Layout, LineHead, PT_PER_MM, TextAlign, frame_camera};
+use rustgis_map::layout::{ElementKind, FontFamily, FrameStyle, GroupFrame, Layout, LineHead, PT_PER_MM, TextAlign, VAlign};
 
 use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, render_element};
 
@@ -32,33 +32,88 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
         w = num(pw),
         h = num(ph)
     );
-    for e in layout.elements.iter().filter(|e| e.visible) {
+    // Linked frames take their view from the frame they follow.
+    let cameras = layout.resolved_cameras(maps);
+    // A group's frame goes round all it holds: its background under the lowest of them, its
+    // border over the highest. The group itself draws nothing; its elements draw themselves.
+    let mut groups: Vec<(GroupFrame, bool)> = layout.group_frames().into_iter().map(|g| (g, false)).collect();
+    for (i, e) in layout.elements.iter().enumerate().filter(|(_, e)| e.visible) {
+        groups.retain(|(g, _)| {
+            if g.last < i {
+                group_frame(&mut s, g, false);
+            }
+            g.last >= i
+        });
+        for (g, drawn) in groups.iter_mut().filter(|(g, drawn)| !drawn && g.first <= i) {
+            group_frame(&mut s, g, true);
+            *drawn = true;
+        }
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
+        // The frame's background first, behind the element; its border after.
+        let framed = e.frame_style.as_ref().filter(|_| !e.is_group()).map(|f| (f, f.grown(x, y, w, h)));
+        if let Some((f, fr)) = framed {
+            frame_background(&mut s, f, fr);
+        }
         match &e.kind {
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name } => {
-                let first = layout.first_frame().and_then(|id| layout.element(id)).and_then(|f| match &f.kind {
-                    ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
-                        let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
-                        Some((m, frame_camera(m, *center, *scale, *bearing, *pitch)))
+            ElementKind::Text {
+                text: t,
+                size,
+                color,
+                bold,
+                italic,
+                align,
+                letter_spacing,
+                font,
+                font_name,
+                frame: bound,
+                wrap,
+                valign,
+                line_spacing,
+                case,
+            } => {
+                // The frame its map tokens read: the one it is bound to, else the first.
+                let resolve = |id: u32| {
+                    let f = layout.element(id)?;
+                    match &f.kind {
+                        ElementKind::MapFrame { map, .. } => {
+                            let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
+                            let cam = cameras.iter().find(|(i, _)| *i == id)?.1;
+                            Some((m, cam, f.w * PT_PER_MM, f.h * PT_PER_MM))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                });
-                let text = expand(t, layout, info, first);
-                // As the page draws it: the size in points, lines 1.25 apart, the first baseline
-                // 0.6 of the size below the top, lines past the frame left out.
+                };
+                let from = bound.and_then(resolve).or_else(|| layout.first_frame().and_then(resolve));
+                let text = case.apply(expand(t, layout, info, from));
+                // As the page draws it: the size in points, lines 1.25 (times the line spacing)
+                // apart, the first baseline 0.6 of the size below the top of the block, which
+                // sits at the top, middle or bottom of the box; the lines broken at the box's
+                // width when wrapped (by the same measure), a top block's lines past the frame
+                // left out.
                 let em = size.clamp(2.0, 400.0) * 1.33 / PT_PER_MM;
+                let spacing = if line_spacing.is_finite() { line_spacing.clamp(0.5, 3.0) } else { 1.0 };
+                let face = crate::layout::text_face(*bold, *italic, *font, font_name.as_deref());
+                let broken = crate::layout::text_lines(
+                    &text,
+                    size.clamp(2.0, 400.0) as f32,
+                    face,
+                    *letter_spacing as f32,
+                    wrap.then_some((w * PT_PER_MM) as f32),
+                );
+                let top = y + crate::layout::block_shift(*valign, h, em, broken.len(), spacing);
                 let (anchor, tx) = match align {
                     TextAlign::Left => ("start", x),
                     TextAlign::Center => ("middle", x + w / 2.0),
                     TextAlign::Right => ("end", x + w),
                 };
-                let lines: Vec<(f64, &str)> = text
-                    .lines()
-                    .take(200)
+                let lines: Vec<(f64, &str)> = broken
+                    .iter()
                     .enumerate()
-                    .map(|(i, l)| (y + em * (0.6 + 1.25 * i as f64), l))
-                    .take_while(|(ly, _)| *ly <= y + h + em)
+                    .map(|(i, l)| (top + em * (0.6 + 1.25 * spacing * i as f64), l.as_str()))
+                    // A top block's lines more than an em past the box are left out, as the page
+                    // leaves them; a middle or bottom block's all draw.
+                    .take_while(|(ly, _)| *valign != VAlign::Top || *ly <= y + h + em)
                     .collect();
                 // A named family first (#762), quoted as CSS has it (its own backslashes and
                 // quotes escaped), then the generic one, for a viewer without it.
@@ -71,7 +126,7 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                     s,
                     r#"<text x="{}" y="{}" font-family="{}" font-size="{}" font-weight="{}" font-style="{}" text-anchor="{anchor}" letter-spacing="{}"{} xml:space="preserve">"#,
                     num(tx),
-                    num(lines.first().map_or(y + em * 0.6, |l| l.0)),
+                    num(lines.first().map_or(top + em * 0.6, |l| l.0)),
                     esc(&family),
                     num(em),
                     if *bold { "bold" } else { "normal" },
@@ -116,8 +171,9 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                 );
             }
             ElementKind::Line { color, width, dir, head } => line(&mut s, dir.ends((x, y, w, h)), *color, *width, *head, ppp),
+            ElementKind::Group { .. } => {}
             _ => {
-                if let Some((image, [ix, iy, iw, ih])) = render_element(layout, e.id, maps, picture_dpi, info)? {
+                if let Some((image, [ix, iy, iw, ih])) = render_element(layout, e.id, maps, picture_dpi, info, false)? {
                     let png = image.encode_png().ok()?;
                     let _ = writeln!(
                         s,
@@ -131,10 +187,65 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
                 }
             }
         }
+        if let Some((f, fr)) = framed {
+            frame_border(&mut s, f, fr);
+        }
         s.push_str("</g>\n");
+    }
+    for (g, _) in &groups {
+        group_frame(&mut s, g, false);
     }
     s.push_str("</svg>\n");
     Some(s)
+}
+
+/// A frame style's background: a rect filling `(x, y, w, h)` (mm, already grown by the gap).
+fn frame_background(s: &mut String, f: &FrameStyle, (x, y, w, h): (f64, f64, f64, f64)) {
+    if let Some(bg) = f.background {
+        let _ = writeln!(
+            s,
+            r#"<rect x="{}" y="{}" width="{}" height="{}"{} stroke="none"/>"#,
+            num(x),
+            num(y),
+            num(w),
+            num(h),
+            paint("fill", bg)
+        );
+    }
+}
+
+/// A frame style's border: an unfilled rect along `(x, y, w, h)` (mm, already grown by the gap).
+fn frame_border(s: &mut String, f: &FrameStyle, (x, y, w, h): (f64, f64, f64, f64)) {
+    if let Some(c) = f.border
+        && f.border_width > 0.0
+    {
+        let _ = writeln!(
+            s,
+            r#"<rect x="{}" y="{}" width="{}" height="{}" fill="none"{}/>"#,
+            num(x),
+            num(y),
+            num(w),
+            num(h),
+            stroke(c, f.border_width)
+        );
+    }
+}
+
+/// A group's frame background (`under`) or border, round its box, in a layer of its own.
+fn group_frame(s: &mut String, g: &GroupFrame, under: bool) {
+    let Some(f) = &g.group.frame_style else { return };
+    if (under && f.background.is_none()) || (!under && (f.border.is_none() || f.border_width <= 0.0)) {
+        return;
+    }
+    let (x, y, w, h) = g.rect;
+    let part = if under { "background" } else { "border" };
+    let _ = writeln!(s, r#"<g id="element-{}-{part}" inkscape:label="{}" inkscape:groupmode="layer">"#, g.group.id, esc(&g.group.name));
+    if under {
+        frame_background(s, f, f.grown(x, y, w, h));
+    } else {
+        frame_border(s, f, f.grown(x, y, w, h));
+    }
+    s.push_str("</g>\n");
 }
 
 /// The resolution the pictures are drawn at: `dpi`, unless together they would take more than
@@ -149,7 +260,11 @@ fn picture_dpi(layout: &Layout, dpi: f64) -> f64 {
         .filter(|e| {
             !matches!(
                 e.kind,
-                ElementKind::Text { .. } | ElementKind::Rectangle { .. } | ElementKind::Ellipse { .. } | ElementKind::Line { .. }
+                ElementKind::Text { .. }
+                    | ElementKind::Rectangle { .. }
+                    | ElementKind::Ellipse { .. }
+                    | ElementKind::Line { .. }
+                    | ElementKind::Group { .. }
             )
         })
         .map(|e| on_page(e.x, e.w, layout.width) * on_page(e.y, e.h, layout.height))
@@ -265,13 +380,124 @@ mod tests {
         layout
     }
 
+    /// A text in SVG is wrapped, aligned down its box, spaced and cased as the page draws it, and
+    /// reads the tokens of the frame it is bound to.
+    #[test]
+    fn text_is_wrapped_aligned_spaced_and_cased_and_reads_its_frame() {
+        use rustgis_map::layout::TextCase;
+        let mut layout = Layout::new("SVG", 100.0, 80.0);
+        let frame = |scale: f64| {
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": "Map", "center": {"x": 0, "y": 0}, "scale": scale}})).unwrap()
+        };
+        let _first = layout.add("First", (0.0, 0.0, 20.0, 20.0), frame(10_000.0));
+        let second = layout.add("Second", (0.0, 20.0, 20.0, 20.0), frame(50_000.0));
+        let mut kind = ElementKind::text(
+            "gypsy jumping quickly over typography pages {scale} while grumpy plumbers yell",
+            10.0,
+            rustgis_map::Rgba::rgb(0, 0, 0),
+            false,
+        );
+        if let ElementKind::Text { frame, wrap, valign, line_spacing, case, .. } = &mut kind {
+            (*frame, *wrap, *valign, *line_spacing, *case) = (Some(second), true, VAlign::Bottom, 1.5, TextCase::Upper);
+        }
+        layout.add("Text", (30.0, 10.0, 30.0, 60.0), kind.clone());
+        let svg = layout_svg(&layout, &mut [Map::new("Map")], 72.0, &PageInfo::default()).unwrap();
+        // Several lines, upper case, the token of the second frame.
+        let spans: Vec<(f64, String)> = svg
+            .split("<tspan ")
+            .skip(1)
+            .filter_map(|t| {
+                let y = t.split("y=\"").nth(1)?.split('"').next()?.parse().ok()?;
+                Some((y, t.split('>').nth(1)?.split('<').next()?.to_string()))
+            })
+            .collect();
+        assert!(spans.len() >= 3, "wrapped into lines: {spans:?}");
+        assert_eq!(
+            spans.iter().map(|s| s.1.as_str()).collect::<Vec<_>>().join(" "),
+            "GYPSY JUMPING QUICKLY OVER TYPOGRAPHY PAGES 1:50,000 WHILE GRUMPY PLUMBERS YELL"
+        );
+        // Lines 1.5 × 1.25 em apart; the last sits on the bottom (70 mm) as the page draws it.
+        let em = 10.0 * 1.33 / PT_PER_MM;
+        assert!(((spans[1].0 - spans[0].0) - em * 1.25 * 1.5).abs() < 0.01, "{spans:?}");
+        let last = spans[spans.len() - 1].0;
+        assert!((last - (70.0 - em * 1.25 + em * 0.6)).abs() < 0.01, "last baseline {last}");
+        // The same text unbound reads the first frame; top-aligned it starts at the top.
+        let unbound = {
+            let mut l = layout.clone();
+            if let Some(ElementKind::Text { frame, valign, .. }) = l.elements.last_mut().map(|e| &mut e.kind) {
+                (*frame, *valign) = (None, VAlign::Top);
+            }
+            layout_svg(&l, &mut [Map::new("Map")], 72.0, &PageInfo::default()).unwrap()
+        };
+        assert!(unbound.contains("1:10,000") && !unbound.contains("1:50,000"));
+        assert!(unbound.contains(&format!("y=\"{}\"", num(10.0 + em * 0.6))), "top: {unbound}");
+    }
+
+    /// A middle-aligned block taller than its box overflows both ways in SVG as on the page:
+    /// every line is written, centred on the box.
+    #[test]
+    fn a_middle_block_taller_than_its_box_keeps_its_lower_half() {
+        let em = 10.0 * 1.33 / PT_PER_MM;
+        let mut layout = Layout::new("SVG", 100.0, 80.0);
+        let mut kind = ElementKind::text("1\n2\n3\n4\n5\n6\n7\n8\n9", 10.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+        if let ElementKind::Text { valign, .. } = &mut kind {
+            *valign = VAlign::Middle;
+        }
+        layout.add("Text", (10.0, 30.0, 60.0, em * 1.25), kind);
+        let svg = layout_svg(&layout, &mut [], 72.0, &PageInfo::default()).unwrap();
+        let ys: Vec<f64> = svg.split("<tspan ").skip(1).filter_map(|t| t.split("y=\"").nth(1)?.split('"').next()?.parse().ok()).collect();
+        assert_eq!(ys.len(), 9, "{svg}");
+        // The fifth line is the box's: its baseline 0.6 em below the box's top.
+        assert!((ys[4] - (30.0 + em * 0.6)).abs() < 0.01, "{ys:?}");
+        assert!(((ys[4] - ys[0]) - (ys[8] - ys[4])).abs() < 0.01, "{ys:?}");
+    }
+
+    /// A group is vector and draws nothing of its own; its frame is rects round its children,
+    /// the background before the first and the border after the last.
+    #[test]
+    fn a_group_frame_is_rects_round_its_children() {
+        use rustgis_map::layout::FrameStyle;
+        let frame = FrameStyle {
+            border: Some(rustgis_map::Rgba::rgb(255, 0, 0)),
+            border_width: 2.0,
+            background: Some(rustgis_map::Rgba::rgb(255, 255, 255)),
+            gap: 1.0,
+        };
+        let (layout, g) = crate::layout::tests::grouped_page(frame);
+        assert_eq!(picture_dpi(&layout, 600.0), 600.0, "nothing to draw as a picture");
+        let svg = layout_svg(&layout, &mut [], 72.0, &PageInfo::default()).unwrap();
+        let at = |needle: &str| svg.find(needle).unwrap_or_else(|| panic!("no {needle} in {svg}"));
+        let background = at(r##"<rect x="19" y="19" width="42" height="42" fill="#ffffff""##);
+        let border = at(r#"<rect x="19" y="19" width="42" height="42" fill="none""#);
+        let (a, b) = (at(r#"inkscape:label="A""#), at(r#"inkscape:label="B""#));
+        assert!(background < a && b < border, "{svg}");
+        assert!(!svg.contains("<image"), "{svg}");
+        // The group's own layer is empty.
+        assert!(
+            svg.contains(&format!(
+                "<g id=\"element-{g}\" inkscape:label=\"Group\" inkscape:groupmode=\"layer\">
+</g>"
+            )),
+            "{svg}"
+        );
+    }
+
     #[test]
     fn surrounds_on_a_frame_keep_the_picture_resolution() {
         let (mut layout, _, frame) = page();
         layout.add(
             "Legend",
             (10.0, 10.0, 40.0, 30.0),
-            ElementKind::Legend { frame, title: "Map legend".into(), all_classes: true, hide_other: false, exclude: vec![] },
+            ElementKind::Legend {
+                frame,
+                title: "Map legend".into(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                fit: Default::default(),
+                show_layer_names: true,
+            },
         );
         assert_eq!(picture_dpi(&layout, 600.0), 600.0);
         // A frame and an inset filling an A0 page that is already drawn at its pixel limit.
@@ -297,12 +523,64 @@ mod tests {
     }
 
     #[test]
+    fn frame_styles_are_rects_around_every_kind_of_element() {
+        use rustgis_map::layout::FrameStyle;
+        let (mut layout, mut maps, _) = page();
+        let frame = FrameStyle {
+            border: Some(rustgis_map::Rgba::rgb(255, 0, 0)),
+            border_width: PT_PER_MM * 2.0,
+            background: Some(rustgis_map::Rgba::new(0, 0, 255, 128)),
+            gap: 3.0,
+        };
+        let text = layout.add("Words", (10.0, 10.0, 40.0, 20.0), ElementKind::text("hi", 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false));
+        let picture = layout.add("Pic", (10.0, 40.0, 20.0, 20.0), ElementKind::Picture { image: String::new(), source: None });
+        for id in [text, picture] {
+            if let Some(e) = layout.element_mut(id) {
+                e.frame_style = Some(frame.clone());
+            }
+        }
+        let svg = layout_svg(&layout, &mut maps, 72.0, &PageInfo::default()).unwrap();
+        let group = |id: u32| svg.split(&format!("<g id=\"element-{id}\"")).nth(1).unwrap().split("</g>").next().unwrap().to_string();
+        let back = r##"<rect x="7" y="7" width="46" height="26" fill="#0000ff" fill-opacity="0.502" stroke="none"/>"##;
+        let edge = r##"<rect x="7" y="7" width="46" height="26" fill="none" stroke="#ff0000" stroke-width="2"/>"##;
+        let g = group(text);
+        let (b, t, e) = (g.find(back), g.find("<text"), g.find(edge));
+        assert!(b.is_some() && t.is_some() && e.is_some(), "{g}");
+        assert!(b < t && t < e, "background, the text, then the border: {g}");
+        // A picture is framed the same, and its image stays the box's own size.
+        let g = group(picture);
+        let back = back.replace(r#"x="7" y="7" width="46" height="26""#, r#"x="7" y="37" width="26" height="26""#);
+        let edge = edge.replace(r#"x="7" y="7" width="46" height="26""#, r#"x="7" y="37" width="26" height="26""#);
+        let (b, i, e) = (g.find(&back), g.find("<image"), g.find(&edge));
+        assert!(b.is_some() && i.is_some() && e.is_some(), "{g}");
+        assert!(b < i && i < e, "{g}");
+        let image_x: f64 = g.split(r#"<image x=""#).nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+        assert!((image_x - 10.0).abs() < 0.5, "the picture is the box's, not the frame's: {g}");
+        // A border of no width, or none, leaves a rect out.
+        if let Some(e) = layout.element_mut(text) {
+            e.frame_style = Some(FrameStyle { border_width: 0.0, ..frame });
+        }
+        let svg = layout_svg(&layout, &mut maps, 72.0, &PageInfo::default()).unwrap();
+        let g = svg.split(&format!("<g id=\"element-{text}\"")).nth(1).unwrap().split("</g>").next().unwrap().to_string();
+        assert_eq!(g.matches("<rect").count(), 1, "{g}");
+    }
+
+    #[test]
     fn embedded_surrounds_preserve_transparency_and_page_context() {
         let (mut layout, mut maps, frame) = page();
         let legend = layout.add(
             "Legend",
             (10.0, 10.0, 40.0, 30.0),
-            ElementKind::Legend { frame, title: "Map legend".into(), all_classes: true, hide_other: false, exclude: vec![] },
+            ElementKind::Legend {
+                frame,
+                title: "Map legend".into(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                fit: Default::default(),
+                show_layer_names: true,
+            },
         );
         let info = PageInfo::default();
         let svg = layout_svg(&layout, &mut maps, 72.0, &info).unwrap();
@@ -315,7 +593,7 @@ mod tests {
         let (mut base, mut maps, _) = page();
         let mut expected = crate::layout::render(&base, &mut maps, 72.0, &info).unwrap();
         assert!(pm.width() < expected.width() / 2 && pm.height() < expected.height() / 2, "only the surround's bounds are allocated");
-        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info).unwrap().unwrap();
+        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info, false).unwrap().unwrap();
         let k = PT_PER_MM * 72.0 / 96.0;
         expected.draw_pixmap(
             (x * k).round() as i32,
@@ -332,12 +610,57 @@ mod tests {
         assert!(difference <= 2, "composited SVG pictures match the page within antialias rounding: {difference}");
     }
 
+    /// A legend that fits its frame runs over its box, in the SVG as on the page.
+    #[test]
+    fn an_adjust_frame_legend_is_not_cut_at_its_box() {
+        use rustgis_map::layout::LegendFit;
+        let (mut layout, mut maps, frame) = page();
+        for i in 0..9 {
+            maps[0].add_dataset(rustgis_data::Dataset::new(format!("Layer {i}"), rustgis_data::GeometryType::Point, vec![]));
+        }
+        let legend = layout.add(
+            "Legend",
+            (10.0, 10.0, 40.0, 20.0),
+            ElementKind::Legend {
+                frame,
+                title: String::new(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                fit: LegendFit::Manual,
+                show_layer_names: true,
+            },
+        );
+        let info = PageInfo::default();
+        let drawn = |layout: &Layout, maps: &mut Vec<Map>| {
+            let (pm, [_, y, _, h]) = render_element(layout, legend, maps, 96.0, &info, false).unwrap().unwrap();
+            let k = PT_PER_MM;
+            let ink = (0..pm.height()).filter(|&row| (0..pm.width()).any(|x| pm.pixel(x, row).is_some_and(|p| p.alpha() > 0))).max();
+            (y, h, ink.map(|row| (f64::from(row) + 1.0) / k + y))
+        };
+        // Manual stops at the box: 20 mm from 10 mm.
+        let (_, h, bottom) = drawn(&layout, &mut maps);
+        assert!((h - 20.0).abs() < 0.5 && bottom.is_some_and(|b| b <= 30.5), "{h} {bottom:?}");
+        // Nine rows are 135 points, 35.7 mm: the pixels reach that far and the SVG picture does.
+        if let Some(ElementKind::Legend { fit, .. }) = layout.element_mut(legend).map(|e| &mut e.kind) {
+            *fit = LegendFit::AdjustFrame;
+        }
+        let (y, h, bottom) = drawn(&layout, &mut maps);
+        assert!(h > 35.0, "{h}");
+        assert!(bottom.is_some_and(|b| b > 40.0 && b <= y + h + 0.1), "{bottom:?}");
+        let svg = layout_svg(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        let image = svg.split(&format!("<g id=\"element-{legend}\"")).nth(1).unwrap();
+        let height: f64 = image.split(r#"height=""#).nth(1).unwrap().split('"').next().unwrap().parse().unwrap();
+        assert!(height > 35.0, "{height}");
+    }
+
     #[test]
     fn cropped_images_use_their_actual_pixel_bounds() {
         let (mut layout, mut maps, _) = page();
-        let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new() });
+        let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new(), source: None });
         let info = PageInfo::default();
-        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info).unwrap().unwrap();
+        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info, false).unwrap().unwrap();
         let [x, y, w, h] = bounds;
         let k = PT_PER_MM * 36.0 / 96.0;
         assert_eq!(x, 0.0);
@@ -347,7 +670,7 @@ mod tests {
         let svg = layout_svg(&layout, &mut maps, 36.0, &info).unwrap();
         assert!(svg.contains(&format!(r#"<image x="{}" y="{}" width="{}" height="{}""#, num(x), num(y), num(w), num(h))));
         layout.element_mut(id).unwrap().x = 110.0;
-        assert!(render_element(&layout, id, &mut maps, 36.0, &info).unwrap().is_none());
+        assert!(render_element(&layout, id, &mut maps, 36.0, &info, false).unwrap().is_none());
         assert!(layout_svg(&layout, &mut maps, 36.0, &info).is_some(), "an off-page image is harmless");
     }
 

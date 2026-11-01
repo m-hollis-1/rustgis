@@ -1092,6 +1092,19 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.line(&[(8.0, 16.0), (7.0, 20.0), (9.0, 22.0)], 1.3, ink);
         }
         "no_fill" => p.rect(3.0, 4.0, 18.0, 16.0, None, Some((1.6, ink)), 0.0),
+        "layout_group" => {
+            // Two shapes held in one dashed frame.
+            p.dashed_rect(2.0, 2.0, 20.0, 20.0, accent);
+            p.rect(5.0, 5.0, 8.0, 8.0, Some(p.tint(70)), Some((1.3, ink)), 0.5);
+            p.circle(15.5, 15.5, 4.0, Some(p.tint(70)), Some((1.3, ink)));
+        }
+        "layout_ungroup" => {
+            // The same shapes, apart, out of their frame.
+            p.rect(2.0, 2.0, 8.0, 8.0, Some(p.tint(70)), Some((1.3, ink)), 0.5);
+            p.circle(17.5, 17.5, 4.0, Some(p.tint(70)), Some((1.3, ink)));
+            p.line(&[(12.0, 12.0), (14.5, 9.5)], 1.3, accent);
+            p.line(&[(9.5, 14.5), (12.0, 12.0)], 1.3, accent);
+        }
         "g_rect" => {
             p.rect(3.0, 6.0, 18.0, 12.0, Some(p.tint(70)), Some((1.4, ink)), 0.5);
         }

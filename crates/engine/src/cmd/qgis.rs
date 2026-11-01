@@ -230,7 +230,7 @@ fn add_layer(s: &mut Session, layer: &qgis::ProjectLayer, has_dir: bool, report:
 /// Checks what a style names against the layer's fields: its label classes' clauses and fields
 /// (a class that can't label is switched off) and the field a Unique Values or Graduated Colors
 /// renderer classes by.
-fn check_fields(l: &mut rustgis_map::Layer, name: &str, report: &mut Report) {
+pub(crate) fn check_fields(l: &mut rustgis_map::Layer, name: &str, report: &mut Report) {
     for c in std::iter::once(&mut l.labels.default).chain(l.labels.classes.iter_mut()) {
         if let Some(w) = c.where_.clone()
             && let Err(e) = rustgis_data::query::parse(&w, &l.dataset)
@@ -369,7 +369,7 @@ impl Geographic {
     }
 }
 
-fn note_json(n: &qgis::Note) -> Value {
+pub(crate) fn note_json(n: &qgis::Note) -> Value {
     json!({"layer": n.layer, "kind": n.kind, "text": n.text, "count": n.count})
 }
 

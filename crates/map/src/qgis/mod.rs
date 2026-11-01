@@ -14,7 +14,7 @@ mod labels;
 mod raster;
 mod renderer;
 mod source;
-mod symbol;
+pub(crate) mod symbol;
 #[cfg(test)]
 mod tests;
 

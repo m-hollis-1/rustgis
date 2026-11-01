@@ -29,6 +29,10 @@ The map's ESRI codes (`crates/data/src/raster/esri.rs`) are Esri's projected coo
 from Esri's [projection-engine-db-doc](https://github.com/Esri/projection-engine-db-doc)
 (Apache-2.0), as imported into the [PROJ](https://proj.org) 9.7.1 database (MIT) and written as
 PROJ definitions by PROJ 9.7.1.
+The names of the EPSG and ESRI coordinate systems (`crates/data/src/raster/epsg_names.rs`) are from the EPSG Geodetic
+Parameter Dataset v12.029 (© IOGP, used under its [terms of use](https://epsg.org/terms-of-use.html)); the
+ESRI ones are the names in Esri's database above (Apache-2.0), as the PROJ 9.7.1 database (MIT) holds them,
+read through pyproj 3.7.2.
 The WKT2 test corpus (`crates/data/src/raster/wkt2_corpus.tsv`) is 60 of those EPSG and Esri
 coordinate systems written as WKT2 by PROJ 9.7.1, through pyproj 3.7.2.
 The ESRI datum test corpus (`crates/data/src/raster/esri_datum_corpus.tsv`) contains 13 EPSG

@@ -289,23 +289,20 @@ pub fn measure_in(text: &str, size: f32, face: Face) -> f32 {
 }
 
 /// How wide `text` is on one line at `size` with `spacing` points between letters, in points.
-fn spaced_width(text: &str, size: f32, bold: bool, spacing: f32) -> f32 {
-    let w = measure(text, size, bold);
+fn spaced_width(text: &str, size: f32, face: Face, spacing: f32) -> f32 {
+    let w = measure_in(text, size, face);
     if spacing == 0.0 {
         return w;
     }
     (w + spacing * 1.33 * text.chars().count().saturating_sub(1) as f32).max(0.0)
 }
 
-/// A line of a label broken into lines about `max_w` points wide, as MapLibre wraps a label to
-/// `text-max-width`: at spaces, and after a hyphen, dash, slash or the like; the lines balanced
-/// (each near the same width) rather than filled, and a word longer than that a line of its
-/// own. A line that fits, or can't be broken, is kept as it is.
-pub fn wrap(line: &str, size: f32, bold: bool, spacing: f32, max_w: f32) -> Vec<String> {
-    // The pieces a line may break after: each with whether a space followed it.
+/// The pieces a line (its first `cap` characters) may break after: each with whether a space
+/// followed it. Breaks are at spaces, and after a hyphen, dash, slash or the like.
+fn pieces_of(line: &str, cap: usize) -> Vec<(String, bool)> {
     let mut pieces: Vec<(String, bool)> = Vec::new();
     let mut cur = String::new();
-    for c in line.chars().take(2000) {
+    for c in line.chars().take(cap) {
         if c == ' ' {
             if !cur.is_empty() {
                 pieces.push((std::mem::take(&mut cur), true));
@@ -323,7 +320,52 @@ pub fn wrap(line: &str, size: f32, bold: bool, spacing: f32, max_w: f32) -> Vec<
     if !cur.is_empty() {
         pieces.push((cur, true));
     }
-    let width = |s: &str| spaced_width(s, size, bold, spacing);
+    pieces
+}
+
+/// The most characters of a line [`fill_wrap`] breaks: a layout text's own limit.
+pub const FILL_WRAP_CHARS: usize = 5000;
+
+/// A line of a layout text broken into lines no wider than `max_w`, as a word processor (and
+/// ArcGIS Pro) fills them: each line takes pieces while they fit, the next starts with the one
+/// that does not. Breaks as [`wrap`]; a piece wider than `max_w` stays whole on a line of its
+/// own. A line that fits, or can't be broken, is kept as it is.
+pub fn fill_wrap(line: &str, size: f32, face: Face, spacing: f32, max_w: f32) -> Vec<String> {
+    let line: String = line.chars().take(FILL_WRAP_CHARS).collect();
+    let pieces = pieces_of(&line, FILL_WRAP_CHARS);
+    let width = |s: &str| spaced_width(s, size, face, spacing);
+    if pieces.len() < 2 || !(max_w.is_finite() && max_w > 0.0) || width(&line) <= max_w {
+        return vec![line];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut spaced = false;
+    for (piece, space_after) in pieces {
+        if cur.is_empty() {
+            cur = piece;
+        } else {
+            let longer = if spaced { format!("{cur} {piece}") } else { format!("{cur}{piece}") };
+            if width(&longer) <= max_w {
+                cur = longer;
+            } else {
+                out.push(std::mem::replace(&mut cur, piece));
+            }
+        }
+        spaced = space_after;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A line of a label broken into lines about `max_w` points wide, as MapLibre wraps a label to
+/// `text-max-width`: at spaces, and after a hyphen, dash, slash or the like; the lines balanced
+/// (each near the same width) rather than filled, and a word longer than that a line of its
+/// own. A line that fits, or can't be broken, is kept as it is.
+pub fn wrap(line: &str, size: f32, face: Face, spacing: f32, max_w: f32) -> Vec<String> {
+    let pieces = pieces_of(line, 2000);
+    let width = |s: &str| spaced_width(s, size, face, spacing);
     let total = width(line);
     if pieces.len() < 2 || !(max_w.is_finite() && max_w > 0.0) || total <= max_w {
         return vec![line.to_string()];

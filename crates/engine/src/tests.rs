@@ -702,7 +702,7 @@ fn a_character_of_a_font_is_a_marker_on_points_and_along_lines() {
     for (bad, says) in [
         (json!({"layer": "Cities", "char": ""}), "char is a character"),
         (json!({"layer": "Cities", "char": 7}), "char is a character"),
-        (json!({"layer": "Cities", "char": "a", "shape": "star"}), "not both"),
+        (json!({"layer": "Cities", "char": "a", "shape": "star"}), "give only one of"),
     ] {
         let err = s.run("layer.marker", &bad).unwrap_err();
         assert!(err.contains(says), "{bad}: {err}");
@@ -1928,10 +1928,116 @@ fn raster_masks_hide_values() {
     assert!(style(&s).mask.is_empty());
 }
 
+#[test]
+fn a_picture_is_a_marker_on_points() {
+    use rustgis_map::Marker;
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let mut s = world();
+    let symbol = |s: &Session| s.map().layer_by_name("Cities").unwrap().symbol(0);
+    s.run("layer.marker", &json!({"layer": "Cities", "image": png})).unwrap();
+    let Marker::Image(img) = symbol(&s).marker else { panic!("{:?}", symbol(&s).marker) };
+    assert_eq!(img.as_str(), png);
+    // A file is read natively, to the same picture.
+    let dir = std::env::temp_dir().join(format!("rustgis-marker-image-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("dot.png");
+    {
+        use base64::Engine;
+        std::fs::write(&file, base64::engine::general_purpose::STANDARD.decode(png).unwrap()).unwrap();
+    }
+    s.run("layer.marker", &json!({"layer": "Cities", "shape": "square"})).unwrap();
+    assert_eq!(symbol(&s).marker, Marker::Square);
+    s.run("layer.marker", &json!({"layer": "Cities", "imagePath": file.display().to_string()})).unwrap();
+    assert_eq!(symbol(&s).marker, Marker::Image(img));
+    // It draws in an export.
+    s.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 320, "height": 200})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    // What isn't a picture is refused, saying so, and changes nothing.
+    let depth = s.undo_depth();
+    for (bad, says) in [
+        (json!({"image": "***"}), "PNG or JPEG"),
+        (json!({"image": "AAAA"}), "PNG or JPEG"),
+        (json!({"imagePath": "no-such-picture.png"}), "no-such-picture.png"),
+        (json!({"image": png, "shape": "star"}), "only one"),
+        (json!({"image": png, "char": "x"}), "only one"),
+    ] {
+        let mut p = json!({"layer": "Cities"});
+        p.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        let err = s.run("layer.marker", &p).unwrap_err();
+        assert!(err.contains(says), "{bad}: {err}");
+    }
+    assert_eq!((s.undo_depth(), symbol(&s).marker), (depth, Marker::Image(img)));
+}
+
+/// A layout picture added from a file remembers it, and `path` relinks it to another.
+#[test]
+fn pictures_keep_their_path_and_relink() {
+    use base64::Engine;
+    use rustgis_map::layout::ElementKind;
+    let dot = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    // A second, different picture: one red pixel.
+    let red = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let dir = std::env::temp_dir().join(format!("rustgis-picture-source-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, b64: &str| {
+        let file = dir.join(name);
+        std::fs::write(&file, base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+        file.display().to_string()
+    };
+    let (first, second) = (write("first.png", dot), write("second.png", red));
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "L"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let id = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].as_u64().unwrap() as u32;
+    let picture = |s: &Session| match &s.project.layouts[li].element(id).unwrap().kind {
+        ElementKind::Picture { image, source } => (image.clone(), source.clone()),
+        k => panic!("{k:?}"),
+    };
+    assert_eq!(picture(&s), (dot.to_string(), Some(first.clone())));
+    // `path` relinks it: the new file's image, and the new file as the source.
+    s.run("layout.update", &json!({"element": id, "path": second})).unwrap();
+    let relinked = picture(&s);
+    assert_eq!(relinked, (red.to_string(), Some(second.clone())));
+    // A file that is missing, or isn't a picture, is refused and the element stays as it was.
+    let text = dir.join("not-a-picture.png");
+    std::fs::write(&text, b"plain text").unwrap();
+    let depth = s.undo_depth();
+    for bad in [dir.join("gone.png").display().to_string(), text.display().to_string(), String::new()] {
+        assert!(s.run("layout.update", &json!({"element": id, "path": bad, "x": 5})).is_err(), "{bad}");
+        assert_eq!(picture(&s), relinked, "{bad}");
+    }
+    assert_eq!(s.undo_depth(), depth);
+    // An image given directly changes the picture and keeps the file it was linked to.
+    s.run("layout.update", &json!({"element": id, "image": dot})).unwrap();
+    assert_eq!(picture(&s), (dot.to_string(), Some(second.clone())));
+    // Only pictures take one.
+    let title = s.run("layout.addElement", &json!({"kind": "text", "text": "T"})).unwrap()["element"].as_u64().unwrap();
+    assert!(s.run("layout.update", &json!({"element": title, "path": first})).is_err());
+    // A locked picture refuses a new file.
+    s.run("layout.update", &json!({"element": id, "locked": true})).unwrap();
+    let err = s.run("layout.update", &json!({"element": id, "path": first})).unwrap_err();
+    assert!(err.contains("locked"), "{err}");
+    assert_eq!(picture(&s), (dot.to_string(), Some(second.clone())));
+    // A picture added from an image has no file, and one added from a missing file isn't added.
+    let bare = s.run("layout.addElement", &json!({"kind": "picture", "image": dot})).unwrap()["element"].as_u64().unwrap() as u32;
+    assert!(matches!(&s.project.layouts[li].element(bare).unwrap().kind, ElementKind::Picture { source: None, .. }));
+    assert!(s.run("layout.addElement", &json!({"kind": "picture", "path": dir.join("gone.png").display().to_string()})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Every command with junk parameters returns Ok or Err, never panics, and leaves a usable session.
 #[test]
 fn hostile_params_never_panic() {
     let junk = [
+        json!({"image": "***"}),
+        json!({"image": 7}),
+        json!({"imagePath": "nope.png"}),
+        json!({"layer": "Cities", "image": "***"}),
+        json!({"layer": "Cities", "image": 7}),
+        json!({"layer": "Cities", "imagePath": "nope.png"}),
+        // A picture's file: missing, junk, of the wrong type.
+        json!({"element": 1, "path": "/nonexistent/x.png", "image": 7}),
+        json!({"kind": "picture", "element": 1, "path": ["a"], "x": "NaN"}),
         Value::Null,
         json!({}),
         // Shared vertex moves: valid row/destination, hostile node addresses and coordinate types.
@@ -1941,6 +2047,9 @@ fn hostile_params_never_panic() {
         json!({"layer": "Countries", "row": 1e30, "field": "nope", "value": [1], "scale": -1, "lon": 1e300, "lat": "x", "classes": 1e9, "type": "graduated"}),
         // Label halos and spacing: out of range, of the wrong type.
         json!({"layer": "Cities", "haloWidth": 1e308, "haloColor": 7, "spacing": "NaN"}),
+        // A north arrow's symbol: only null clears it.
+        json!({"kind": "northArrow", "element": 1, "symbol": [{"size": 1e308, "marker": {"Image": "***"}}], "style": "star"}),
+        json!({"kind": "northArrow", "element": 1, "symbol": null}),
         json!({"layer": "Cities", "haloWidth": -1, "haloColor": "#zzz", "spacing": -1e9}),
         json!({"layer": "Cities", "rows": [1, 99999999], "geometry": {"type": "Polygon", "coordinates": [[]]}, "width": 1e9, "height": -3, "expression": "'"}),
         json!({"band": -1, "red": 1e12, "green": "x", "blue": f64::MAX, "preset": "", "ramp": "nope", "classes": -5, "n": 1e308, "low": -50, "high": 900, "gamma": 0, "zFactor": -1, "fileName": "a.tif", "data": "!!!"}),
@@ -1951,7 +2060,16 @@ fn hostile_params_never_panic() {
         json!({"kind": "colorbar", "ticks": -1e308, "tickSide": 7, "orientation": "x", "layer": "", "reverse": "maybe"}),
         json!({"type": "albers", "lon_0": f64::MAX, "lat_1": "x", "lat_2": -1e308}),
         json!({"kind": "legend", "element": 1, "exclude": [null, 7, "", {"x": 1}]}),
+        json!({"kind": "legend", "element": 1, "columns": [null], "fit": {"x": 1}, "showLayerNames": 7}),
+        json!({"kind": "legend", "element": 1, "columns": 1e308, "fit": "", "showLayerNames": null}),
+        json!({"kind": "legend", "element": 1, "columns": -1e308, "fit": "adjustSize"}),
         json!({"kind": "text", "element": 1, "font": {"family": "serif"}, "italic": [], "align": 7}),
+        // A scale bar's details: of the wrong type, out of range, on elements that have none.
+        json!({"kind": "scaleBar", "element": 1, "subdivisions": [null], "divisionsBeforeZero": {}, "labelPosition": 7, "unitLabel": 7}),
+        json!({"kind": "scaleBar", "element": 1, "unitLabelPosition": "", "decimals": "x", "labelSize": "NaN", "fit": {"x": 1}}),
+        json!({"kind": "scaleBar", "element": 1, "subdivisions": 1e308, "divisionsBeforeZero": -1e308, "decimals": f64::MAX, "labelSize": -1e308, "unitLabel": null}),
+        json!({"kind": "scaleBar", "element": 1, "unitLabel": "x".repeat(5000), "fit": "adjustWidth", "labelPosition": "below", "unitLabelPosition": "afterBar"}),
+        json!({"kind": "legend", "element": 1, "decimals": 2, "labelSize": 9, "fit": "adjustDivision", "unitLabel": "m"}),
         // A QGIS project and style whose web layer and scale range are junk.
         json!({"text": "<qgis><projectlayers><maplayer type=\"raster\" hasScaleBasedVisibilityFlag=\"1\" minScale=\"NaN\" maxScale=\"-1e308\"><datasource>type=xyz&amp;url=&amp;zmax=999</datasource><layername></layername><provider>wms</provider><pipe><rasterrenderer opacity=\"inf\"/></pipe></maplayer></projectlayers></qgis>"}),
         // A label class placed along lines, with junk the placement and style read after it.
@@ -1959,6 +2077,18 @@ fn hostile_params_never_panic() {
         // A publication sheet's style, accent and orientation, and a shape's rounded corners.
         // (The profile left out or valid, so the style and accent are reached.)
         json!({"style": 7, "accent": "#XYZ", "kind": "ellipse", "element": 1, "radius": "x"}),
+        // A frame style's border, background, width and gap: of the wrong type, out of range.
+        json!({"kind": "text", "element": 1, "border": 7, "background": [], "borderWidth": "x", "gap": 1e308}),
+        json!({"kind": "rectangle", "element": 1, "border": "#12", "background": {}, "borderWidth": -1e308, "gap": f64::MAX}),
+        // A map frame's link to another: the wrong types, a loop, itself, out of range.
+        json!({"element": 1, "link": {"frame": "x", "mode": 7, "rotation": []}}),
+        json!({"element": 1, "link": {"frame": 1, "mode": "zoom"}}),
+        json!({"element": 1, "link": {"frame": 1}}),
+        json!({"element": 1, "link": {"frame": 1e300, "rotation": "yes"}}),
+        json!({"element": 1, "link": [7], "x": 1e308}),
+        json!({"element": 1, "link": 7}),
+        // Groups: elements of the wrong types.
+        json!({"elements": [1, "x", null]}),
         json!({"style": "", "accent": [], "kind": "rectangle", "element": 1, "radius": -1e308}),
         json!({"profile": "a3", "style": "poster", "accent": "#ZZZZZZ", "kind": "rectangle", "radius": 1e308}),
         // A STAC trend's source: a valid band and period so the junk after them is reached, and an
@@ -2001,6 +2131,11 @@ fn hostile_params_never_panic() {
         json!({"source": 7, "id": ["c1"]}),
         // A plugin browser: a junk node and query.
         json!({"id": "hostile-browser", "node": 1e300, "query": {}}),
+        // An ArcGIS Pro layout: frame bindings of the wrong type, a document with no layout.
+        json!({"maps": 1}),
+        json!({"maps": {"a": null}}),
+        json!({"text": "{\"type\":\"CIMLayoutDocument\"}"}),
+        json!({"text": "{\"type\":\"CIMLayoutDocument\",\"layoutDefinition\":{\"page\":{\"width\":1e308,\"height\":-1},\"elements\":[{\"type\":\"CIMMapFrame\",\"uRI\":7}]}}", "dir": 7}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);
@@ -3894,6 +4029,444 @@ fn a_frames_grid_can_be_a_measured_grid() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `layout.addElement` and `layout.update` set a border and background on any element: absent
+/// keeps, `null` clears, a bad value changes nothing, and a locked element takes none.
+#[test]
+fn layout_update_sets_and_clears_border_and_background() {
+    use rustgis_map::Rgba;
+    use rustgis_map::layout::FrameStyle;
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let frame_style = |s: &Session, id: u64| s.project.layouts[0].element(id as u32).unwrap().frame_style.clone();
+    let red = Rgba::rgb(255, 0, 0);
+    // Added with a frame style, on a kind with no outline of its own.
+    let add = |s: &mut Session, extra: serde_json::Value| {
+        let mut p = json!({"kind": "text", "text": "Hello", "x": 5, "y": 5, "w": 30, "h": 10});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        s.run("layout.addElement", &p).unwrap()["element"].as_u64().unwrap()
+    };
+    let bare = add(&mut s, json!({}));
+    assert_eq!(frame_style(&s, bare), None, "none unless asked for");
+    let id = add(&mut s, json!({"border": "#FF0000", "borderWidth": 2.5, "background": "#FFFFFF80", "gap": 3}));
+    assert_eq!(
+        frame_style(&s, id),
+        Some(FrameStyle { border: Some(red), border_width: 2.5, background: Some(Rgba::new(255, 255, 255, 128)), gap: 3.0 })
+    );
+    // Updated: what isn't given stays; any of the four on a bare element starts one with defaults.
+    s.run("layout.update", &json!({"element": bare, "gap": 4})).unwrap();
+    assert_eq!(frame_style(&s, bare), Some(FrameStyle { gap: 4.0, ..FrameStyle::default() }));
+    s.run("layout.update", &json!({"element": id, "borderWidth": 1})).unwrap();
+    let fs = frame_style(&s, id).unwrap();
+    assert_eq!((fs.border, fs.border_width, fs.gap), (Some(red), 1.0, 3.0));
+    s.run("layout.update", &json!({"element": id, "border": "#0000FF"})).unwrap();
+    assert_eq!(frame_style(&s, id).unwrap().border, Some(Rgba::rgb(0, 0, 255)));
+    assert_eq!(frame_style(&s, id).unwrap().background, Some(Rgba::new(255, 255, 255, 128)));
+    // null clears one and keeps the other; with neither left and the rest at their defaults the
+    // element has no frame style at all.
+    s.run("layout.update", &json!({"element": id, "border": null})).unwrap();
+    let fs = frame_style(&s, id).unwrap();
+    assert_eq!((fs.border, fs.background.is_some(), fs.gap), (None, true, 3.0));
+    s.run("layout.update", &json!({"element": id, "background": null})).unwrap();
+    assert_eq!(frame_style(&s, id), Some(FrameStyle { gap: 3.0, ..FrameStyle::default() }), "the gap is still set");
+    s.run("layout.update", &json!({"element": id, "gap": 0})).unwrap();
+    assert_eq!(frame_style(&s, id), None);
+    // Limits: 0 to 50 points and millimetres.
+    s.run("layout.update", &json!({"element": id, "border": "#00FF00", "borderWidth": 500, "gap": -2})).unwrap();
+    let fs = frame_style(&s, id).unwrap();
+    assert_eq!((fs.border_width, fs.gap), (50.0, 0.0));
+    s.run("layout.update", &json!({"element": id, "gap": 1e300})).unwrap();
+    assert_eq!(frame_style(&s, id).unwrap().gap, 50.0);
+    // A bad value is refused and changes nothing, in the same call too.
+    let before = s.project.layouts[0].clone();
+    for bad in [
+        json!({"border": "red"}),
+        json!({"border": 5}),
+        json!({"background": "#12"}),
+        json!({"borderWidth": "wide"}),
+        json!({"gap": [1]}),
+        json!({"x": 99, "border": "nope"}),
+    ] {
+        let mut p = bad.clone();
+        p["element"] = json!(id);
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+        assert_eq!(s.project.layouts[0], before, "{bad}");
+    }
+    let mut p = json!({"kind": "rectangle", "border": "red"});
+    assert!(s.run("layout.addElement", &p).is_err());
+    p = json!({"kind": "grid", "border": "#FF0000"});
+    assert!(s.run("layout.addElement", &p).is_err(), "a grid is not an element");
+    // The same on a kind that draws its own outline, and a locked element takes none, not even a clear.
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20, "border": "#FF0000"})).unwrap()["element"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(frame_style(&s, rect).unwrap().border, Some(red));
+    s.run("layout.update", &json!({"element": rect, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": rect, "border": null})).is_err());
+    assert!(s.run("layout.update", &json!({"element": rect, "background": "#000000"})).is_err());
+    assert_eq!(frame_style(&s, rect).unwrap().border, Some(red));
+    s.run("layout.update", &json!({"element": rect, "locked": false, "border": null})).unwrap();
+    assert_eq!(frame_style(&s, rect), None);
+}
+
+/// A north arrow drawn from an imported point symbol: `symbol: null` clears it so the style draws
+/// again, nothing else sets it, the rest of the arrow is kept, and a locked arrow keeps it.
+#[test]
+fn layout_update_clears_a_north_arrow_symbol() {
+    use rustgis_map::layout::{ArrowStyle, ElementKind};
+    use rustgis_map::{Marker, Rgba, Symbol};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let arrow = s.run("layout.addElement", &json!({"kind": "northArrow", "style": "star", "fill": "#AA0000"})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    let symbol_of = |s: &Session| match &s.project.layouts[0].element(arrow).unwrap().kind {
+        ElementKind::NorthArrow { symbol, .. } => symbol.clone(),
+        _ => panic!("not a north arrow"),
+    };
+    assert!(symbol_of(&s).is_empty());
+    // Nothing sets one by command, on a new arrow or an old one.
+    for bad in [json!([]), json!({"size": 4}), json!("x"), json!(true)] {
+        assert!(s.run("layout.update", &json!({"element": arrow, "symbol": bad})).unwrap_err().contains("import"), "{bad}");
+        assert!(s.run("layout.addElement", &json!({"kind": "northArrow", "symbol": bad})).is_err(), "{bad}");
+    }
+    assert!(symbol_of(&s).is_empty());
+    // As an import leaves it.
+    let imported =
+        vec![Symbol { fill: Rgba::rgb(1, 2, 3), stroke: Rgba::rgb(0, 0, 0), stroke_width: 1.0, size: 20.0, marker: Marker::Star }];
+    let set = |s: &mut Session, symbols: Vec<Symbol>| {
+        if let Some(ElementKind::NorthArrow { symbol, .. }) =
+            s.project.layouts[0].elements.iter_mut().find(|e| e.id == arrow).map(|e| &mut e.kind)
+        {
+            *symbol = symbols;
+        }
+    };
+    set(&mut s, imported.clone());
+    // Other changes keep it; a bad value in the same call changes nothing.
+    s.run("layout.update", &json!({"element": arrow, "outline": "#222222"})).unwrap();
+    assert_eq!(symbol_of(&s), imported);
+    let before = s.project.layouts[0].clone();
+    assert!(s.run("layout.update", &json!({"element": arrow, "symbol": null, "style": "sundial"})).is_err());
+    assert_eq!(s.project.layouts[0], before);
+    // A locked arrow keeps it.
+    s.run("layout.update", &json!({"element": arrow, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": arrow, "symbol": null})).is_err());
+    assert_eq!(symbol_of(&s), imported);
+    s.run("layout.update", &json!({"element": arrow, "locked": false})).unwrap();
+    // Cleared, the style, colours and the rest are as they were.
+    s.run("layout.update", &json!({"element": arrow, "symbol": null})).unwrap();
+    assert!(symbol_of(&s).is_empty());
+    assert!(matches!(
+        s.project.layouts[0].element(arrow).unwrap().kind,
+        ElementKind::NorthArrow { style: ArrowStyle::Star, fill, outline, .. } if fill == Rgba::rgb(0xAA, 0, 0) && outline == Rgba::rgb(0x22, 0x22, 0x22)
+    ));
+    // Clearing what isn't there is fine, and one undo brings the symbol back.
+    s.run("layout.update", &json!({"element": arrow, "symbol": null})).unwrap();
+    set(&mut s, imported.clone());
+    s.run("layout.update", &json!({"element": arrow, "symbol": null})).unwrap();
+    assert!(s.undo());
+    assert_eq!(symbol_of(&s), imported);
+}
+
+/// `layout.update` makes a map frame follow another (`link`), unlinks it with `null`, keeps it when
+/// absent, and refuses what would be dropped on load (itself, a non-frame, a loop) or isn't a
+/// link, changing nothing; a frame that follows takes no zoom, and a locked one no link.
+#[test]
+fn layout_update_sets_legend_columns_fit_and_layer_names() {
+    use rustgis_map::layout::{ElementKind, LegendFit};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let legend_of = |s: &Session, id: u32| match s.project.layouts[0].element(id).map(|e| &e.kind) {
+        Some(ElementKind::Legend { columns, fit, show_layer_names, .. }) => (*columns, *fit, *show_layer_names),
+        _ => panic!("not a legend"),
+    };
+    let legend = s.project.layouts[0].elements.iter().find(|e| matches!(e.kind, ElementKind::Legend { .. })).unwrap().id;
+    assert_eq!(legend_of(&s, legend), (1, LegendFit::Manual, true), "the defaults");
+    s.run("layout.update", &json!({"element": legend, "columns": 3, "fit": "adjustColumnsAndSize", "showLayerNames": false})).unwrap();
+    assert_eq!(legend_of(&s, legend), (3, LegendFit::AdjustColumnsAndSize, false));
+    // Absent keeps them; a number is limited to 1..6, as a colorbar's ticks are.
+    s.run("layout.update", &json!({"element": legend, "title": "Key"})).unwrap();
+    assert_eq!(legend_of(&s, legend), (3, LegendFit::AdjustColumnsAndSize, false));
+    s.run("layout.update", &json!({"element": legend, "columns": 99})).unwrap();
+    assert_eq!(legend_of(&s, legend).0, 6);
+    s.run("layout.update", &json!({"element": legend, "columns": 0})).unwrap();
+    assert_eq!(legend_of(&s, legend).0, 1);
+    for (code, fit) in [
+        ("manual", LegendFit::Manual),
+        ("adjustSize", LegendFit::AdjustSize),
+        ("adjustColumns", LegendFit::AdjustColumns),
+        ("adjustColumnsAndSize", LegendFit::AdjustColumnsAndSize),
+        ("adjustFrame", LegendFit::AdjustFrame),
+    ] {
+        s.run("layout.update", &json!({"element": legend, "fit": code})).unwrap();
+        assert_eq!(legend_of(&s, legend).1, fit, "{code}");
+    }
+    // Refused, and nothing in the call is applied.
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    let before = s.project.layouts[0].clone();
+    for (bad, why) in [
+        (json!({"element": legend, "columns": "many"}), "columns that isn't a number"),
+        (json!({"element": legend, "columns": [2]}), "columns as an array"),
+        (json!({"element": legend, "columns": true}), "columns as a bool"),
+        (json!({"element": legend, "fit": "shrink"}), "an unknown fit"),
+        (json!({"element": legend, "fit": 2}), "a fit that isn't text"),
+        (json!({"element": legend, "showLayerNames": "no"}), "layer names that isn't a bool"),
+        (json!({"element": legend, "title": "x", "columns": 2, "fit": "zoom"}), "other changes in the call"),
+        (json!({"element": rect, "columns": 2}), "a rectangle has no columns"),
+        (json!({"element": rect, "fit": "adjustSize"}), "a rectangle has no fit"),
+        (json!({"element": rect, "showLayerNames": false}), "a rectangle has no layer names"),
+    ] {
+        assert!(s.run("layout.update", &bad).is_err(), "{why}: {bad}");
+        assert_eq!(s.project.layouts[0], before, "{why}: {bad}");
+    }
+    // Locked, a legend keeps them.
+    s.run("layout.update", &json!({"element": legend, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": legend, "columns": 4})).is_err());
+    assert_eq!(legend_of(&s, legend).0, 1);
+    s.run("layout.update", &json!({"element": legend, "locked": false, "columns": 4})).unwrap();
+    assert_eq!(legend_of(&s, legend).0, 4);
+    // A new legend takes them, and only a legend does.
+    let added = s.run("layout.addElement", &json!({"kind": "legend", "columns": 2, "fit": "adjustFrame", "showLayerNames": false})).unwrap()
+        ["element"]
+        .as_u64()
+        .unwrap() as u32;
+    assert_eq!(legend_of(&s, added), (2, LegendFit::AdjustFrame, false));
+    let plain = s.run("layout.addElement", &json!({"kind": "legend"})).unwrap()["element"].as_u64().unwrap() as u32;
+    assert_eq!(legend_of(&s, plain), (1, LegendFit::Manual, true));
+    for bad in [json!({"kind": "legend", "fit": "x"}), json!({"kind": "legend", "columns": "x"}), json!({"kind": "scaleBar", "columns": 2})]
+    {
+        assert!(s.run("layout.addElement", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.project.layouts[0].elements.len(), before.elements.len() + 2, "no element added by a refused call");
+}
+
+#[test]
+fn layout_update_links_and_unlinks_frames_and_refuses_cycles() {
+    use rustgis_map::layout::{ElementKind, FrameLink, LinkMode};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let main = s.project.layouts[0].first_frame().unwrap();
+    s.run("layout.update", &json!({"element": main, "name": "Main map"})).unwrap();
+    let frame = |s: &mut Session, x: u32| {
+        s.run("layout.addFrame", &json!({"x": x, "y": 150, "w": 60, "h": 40})).unwrap()["element"].as_u64().unwrap() as u32
+    };
+    let (inset, third) = (frame(&mut s, 200), frame(&mut s, 100));
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    let link_of = |s: &Session, id: u32| match s.project.layouts[0].element(id).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { link, .. }) => *link,
+        _ => panic!("not a map frame"),
+    };
+    let view_of = |s: &Session, id: u32| match s.project.layouts[0].element(id).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { center, scale, bearing, .. }) => (*center, *scale, *bearing),
+        _ => panic!("not a map frame"),
+    };
+    assert_eq!(link_of(&s, inset), None, "frames follow nothing until told to");
+    let own = view_of(&s, inset);
+
+    // Centre, without turning, unless told otherwise; the frame's own view is kept for later.
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main}})).unwrap();
+    assert_eq!(link_of(&s, inset), Some(FrameLink { frame: main, mode: LinkMode::Center, rotation: false }));
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main, "mode": "extent", "rotation": true}})).unwrap();
+    let extent = FrameLink { frame: main, mode: LinkMode::Extent, rotation: true };
+    assert_eq!(link_of(&s, inset), Some(extent));
+    assert_eq!(view_of(&s, inset), own);
+    // Absent keeps the link, whatever else changes.
+    s.run("layout.update", &json!({"element": inset, "name": "Inset", "x": 190})).unwrap();
+    assert_eq!(link_of(&s, inset), Some(extent));
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main, "mode": "scale"}})).unwrap();
+    assert_eq!(link_of(&s, inset), Some(FrameLink { frame: main, mode: LinkMode::Scale, rotation: false }));
+    s.run("layout.update", &json!({"element": third, "link": {"frame": inset}})).unwrap();
+    assert_eq!(link_of(&s, third).map(|l| l.frame), Some(inset), "a chain is fine");
+
+    // Refused, and nothing in the call is applied.
+    let before = s.project.layouts[0].clone();
+    for (bad, why) in [
+        (json!({"element": inset, "link": {"frame": inset}}), "itself"),
+        (json!({"element": inset, "link": {"frame": rect}}), "a rectangle"),
+        (json!({"element": inset, "link": {"frame": 9999}}), "no such frame"),
+        (json!({"element": main, "link": {"frame": inset}}), "a loop of two"),
+        (json!({"element": main, "link": {"frame": third}}), "a loop of three"),
+        (json!({"element": rect, "link": {"frame": main}}), "a rectangle follows nothing"),
+        (json!({"element": rect, "link": null}), "a rectangle follows nothing"),
+        (json!({"element": inset, "link": 5}), "a number"),
+        (json!({"element": inset, "link": "Main map"}), "a name"),
+        (json!({"element": inset, "link": []}), "an array"),
+        (json!({"element": inset, "link": {}}), "no frame"),
+        (json!({"element": inset, "link": {"frame": "Main map"}}), "a frame by name"),
+        (json!({"element": inset, "link": {"frame": -1}}), "a negative frame"),
+        (json!({"element": inset, "link": {"frame": 1.5}}), "a fractional frame"),
+        (json!({"element": inset, "link": {"frame": 4294967297u64}}), "a frame past u32"),
+        (json!({"element": inset, "link": {"frame": main, "mode": "zoom"}}), "an unknown mode"),
+        (json!({"element": inset, "link": {"frame": main, "mode": 7}}), "a mode that isn't text"),
+        (json!({"element": inset, "link": {"frame": main, "mode": null}}), "a null mode"),
+        (json!({"element": inset, "link": {"frame": main, "rotation": "yes"}}), "a rotation that isn't a bool"),
+        (json!({"element": inset, "x": 99, "link": {"frame": main, "mode": "zoom"}}), "other changes in the call"),
+    ] {
+        assert!(s.run("layout.update", &bad).is_err(), "{why}: {bad}");
+        assert_eq!(s.project.layouts[0], before, "{why}: {bad}");
+    }
+
+    // A frame that follows another takes no zoom, naming the frame it follows.
+    let err = s.run("layout.frameZoom", &json!({"element": inset, "to": "full"})).unwrap_err();
+    assert_eq!(err, "the frame follows Main map: unlink it first");
+    assert_eq!(s.project.layouts[0], before);
+    if let Some(e) = s.project.layouts[0].element_mut(main) {
+        e.name.clear();
+    }
+    let err = s.run("layout.frameZoom", &json!({"element": inset})).unwrap_err();
+    assert_eq!(err, format!("the frame follows #{main}: unlink it first"));
+    // The frame followed zooms freely.
+    s.run("layout.frameZoom", &json!({"element": main, "to": "full"})).unwrap();
+
+    // Locked, a frame keeps its link: no change, not even an unlink.
+    s.run("layout.update", &json!({"element": inset, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": inset, "link": null})).is_err());
+    assert!(s.run("layout.update", &json!({"element": inset, "link": {"frame": third}})).is_err());
+    assert_eq!(link_of(&s, inset).map(|l| l.frame), Some(main));
+    // null unlinks (with the unlock in the same call), and the frame is its own again.
+    s.run("layout.update", &json!({"element": inset, "locked": false, "link": null})).unwrap();
+    assert_eq!(link_of(&s, inset), None);
+    assert_eq!(view_of(&s, inset), own);
+    s.run("layout.frameZoom", &json!({"element": inset, "to": "full"})).unwrap();
+    // The links survive a save, and removing the frame followed clears the links to it.
+    let saved: rustgis_map::layout::Layout = serde_json::from_str(&serde_json::to_string(&s.project.layouts[0]).unwrap()).unwrap();
+    assert_eq!(saved, s.project.layouts[0]);
+    s.run("layout.removeElement", &json!({"element": inset})).unwrap();
+    assert_eq!(link_of(&s, third), None);
+}
+
+/// A map series moves its frame page by page, so a frame that follows another can't have one, and
+/// the frame of a series can't be made to follow: each is refused, and changes nothing.
+#[test]
+fn a_map_series_and_a_link_refuse_the_same_frame() {
+    use rustgis_map::layout::{FrameLink, LinkMode};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let main = s.project.layouts[0].first_frame().unwrap();
+    s.run("layout.update", &json!({"element": main, "name": "Main map"})).unwrap();
+    let inset = s.run("layout.addFrame", &json!({"x": 200, "y": 150, "w": 60, "h": 40})).unwrap()["element"].as_u64().unwrap() as u32;
+    let third = s.run("layout.addFrame", &json!({"x": 100, "y": 150, "w": 60, "h": 40})).unwrap()["element"].as_u64().unwrap() as u32;
+    let series = json!({"layer": "Lakes", "nameField": "name"});
+    let with = |frame: u32| {
+        let mut p = series.clone();
+        p["frame"] = json!(frame);
+        p
+    };
+
+    // A frame that follows has no series.
+    s.run("layout.update", &json!({"element": inset, "link": {"frame": main}})).unwrap();
+    let before = s.project.layouts[0].clone();
+    let err = s.run("layout.series", &with(inset)).unwrap_err();
+    assert_eq!(err, "the frame follows Main map: unlink it first");
+    assert_eq!(s.project.layouts[0], before);
+
+    // The frame of a series follows nothing.
+    s.run("layout.series", &with(main)).unwrap();
+    s.run("layout.seriesPage", &json!({"page": "next"})).unwrap();
+    let before = s.project.layouts[0].clone();
+    let err = s.run("layout.update", &json!({"element": main, "link": {"frame": third}})).unwrap_err();
+    assert!(err.contains("map series"), "{err}");
+    assert_eq!(s.project.layouts[0], before);
+    // A frame can still follow the series frame, and the series goes on.
+    s.run("layout.update", &json!({"element": third, "link": {"frame": main, "mode": "extent"}})).unwrap();
+    s.run("layout.seriesPage", &json!({"page": "next"})).unwrap();
+
+    // A hand-edited layout whose series frame follows: its pages are refused too.
+    if let Some(rustgis_map::layout::ElementKind::MapFrame { link, .. }) = s.project.layouts[0].element_mut(main).map(|e| &mut e.kind) {
+        *link = Some(FrameLink { frame: third, mode: LinkMode::Center, rotation: false });
+    }
+    let before = s.project.layouts[0].clone();
+    let err = s.run("layout.seriesPage", &json!({"page": "next"})).unwrap_err();
+    let name = s.project.layouts[0].element(third).unwrap().name.clone();
+    assert_eq!(err, format!("the frame follows {name}: unlink it first"));
+    assert_eq!(s.project.layouts[0], before);
+}
+
+/// A layout's text is bound to a map frame, wrapped, aligned down its box, spaced and cased by
+/// `layout.addElement` and `layout.update`; a frame that isn't a map frame is refused, `null`
+/// unbinds, and the properties are text's alone.
+#[test]
+fn layout_text_takes_frame_wrap_valign_spacing_and_case() {
+    use rustgis_map::layout::{ElementKind, TextCase, VAlign};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let frame = s.project.layouts[0].first_frame().unwrap();
+    let rect =
+        s.run("layout.addElement", &json!({"kind": "rectangle", "x": 5, "y": 5, "w": 20, "h": 20})).unwrap()["element"].as_u64().unwrap();
+    let props = |s: &Session, id: u64| match &s.project.layouts[0].element(id as u32).unwrap().kind {
+        ElementKind::Text { frame, wrap, valign, line_spacing, case, .. } => (*frame, *wrap, *valign, *line_spacing, *case),
+        k => panic!("{k:?}"),
+    };
+    // Added unbound, unwrapped, from the top, at the usual spacing, as typed.
+    let plain = s.run("layout.addElement", &json!({"kind": "text", "text": "Scale {scale}"})).unwrap()["element"].as_u64().unwrap();
+    assert_eq!(props(&s, plain), (None, false, VAlign::Top, 1.0, TextCase::None));
+    let all = json!({"frame": frame, "wrap": true, "valign": "Bottom", "lineSpacing": 1.5, "case": "UPPER"});
+    let mut add = all.clone();
+    add["kind"] = json!("text");
+    let added = s.run("layout.addElement", &add).unwrap()["element"].as_u64().unwrap();
+    assert_eq!(props(&s, added), (Some(frame), true, VAlign::Bottom, 1.5, TextCase::Upper));
+    // Updated one at a time or together, read back; the rest stay.
+    let mut up = all.clone();
+    up["element"] = json!(plain);
+    s.run("layout.update", &up).unwrap();
+    assert_eq!(props(&s, plain), (Some(frame), true, VAlign::Bottom, 1.5, TextCase::Upper));
+    s.run("layout.update", &json!({"element": plain, "valign": "middle", "lineSpacing": 99})).unwrap();
+    assert_eq!(props(&s, plain), (Some(frame), true, VAlign::Middle, 3.0, TextCase::Upper), "line spacing is clamped");
+    s.run("layout.update", &json!({"element": plain, "lineSpacing": 0.01, "case": "lower", "wrap": false})).unwrap();
+    assert_eq!(props(&s, plain), (Some(frame), false, VAlign::Middle, 0.5, TextCase::Lower));
+    // `null` unbinds; a second call without `frame` leaves it alone.
+    s.run("layout.update", &json!({"element": plain, "frame": null})).unwrap();
+    assert_eq!(props(&s, plain).0, None);
+    s.run("layout.update", &json!({"element": plain, "frame": frame})).unwrap();
+    s.run("layout.update", &json!({"element": plain, "size": 14})).unwrap();
+    assert_eq!(props(&s, plain).0, Some(frame));
+    // A frame that isn't a map frame, or isn't there, changes nothing at all.
+    let before = props(&s, plain);
+    for bad in [json!(rect), json!(plain), json!(9999), json!("x")] {
+        let e = s.run("layout.update", &json!({"element": plain, "frame": bad, "case": "upper", "text": "changed"})).unwrap_err();
+        assert!(e.contains("frame must be a map frame"), "{bad}: {e}");
+        let add = json!({"kind": "text", "frame": bad});
+        assert!(s.run("layout.addElement", &add).unwrap_err().contains("frame must be a map frame"), "{bad}");
+    }
+    assert_eq!(props(&s, plain), before);
+    for bad in [json!({"valign": "diagonal"}), json!({"case": "title"}), json!({"wrap": "yes please"}), json!({"lineSpacing": "tall"})] {
+        let mut p = bad.clone();
+        p["element"] = json!(plain);
+        p["text"] = json!("changed");
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+        let mut p = bad.clone();
+        p["kind"] = json!("text");
+        assert!(s.run("layout.addElement", &p).is_err(), "{bad}");
+    }
+    assert_eq!(props(&s, plain), before);
+    assert!(matches!(&s.project.layouts[0].element(plain as u32).unwrap().kind, ElementKind::Text { text, .. } if text == "Scale {scale}"));
+    // Only text takes them.
+    for k in ["wrap", "valign", "lineSpacing", "case"] {
+        let value = json!(match k {
+            "wrap" => json!(true),
+            "valign" => json!("top"),
+            "lineSpacing" => json!(2),
+            _ => json!("upper"),
+        });
+        assert!(s.run("layout.update", &json!({"element": rect, k: value})).unwrap_err().contains("only text"), "{k}");
+        assert!(s.run("layout.addElement", &json!({"kind": "rectangle", k: value})).unwrap_err().contains("only text"), "{k}");
+    }
+    // A locked text takes no binding change either.
+    s.run("layout.update", &json!({"element": plain, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": plain, "frame": null})).is_err());
+    assert_eq!(props(&s, plain).0, Some(frame));
+    s.run("layout.update", &json!({"element": plain, "locked": false})).unwrap();
+    // Removing the frame unbinds the text and leaves it on the page.
+    s.run("layout.removeElement", &json!({"element": frame})).unwrap();
+    assert_eq!(props(&s, plain).0, None);
+    assert_eq!(props(&s, added).0, None);
+}
+
 /// Grids, north arrows and scale bars take their cartographic options through commands (#327):
 /// checked before anything changes, kept when other options change, and saved with the layout.
 #[test]
@@ -3976,6 +4549,144 @@ fn layout_surrounds_take_cartographic_options() {
     ));
     // The page draws with them all, and they survive a save.
     let out = std::env::temp_dir().join(format!("rustgis-surrounds-{}.png", std::process::id()));
+    s.run("layout.export", &json!({"path": out.to_string_lossy()})).unwrap();
+    let _ = std::fs::remove_file(&out);
+    let text = serde_json::to_string(&s.project.layouts[0]).unwrap();
+    let back: rustgis_map::layout::Layout = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, s.project.layouts[0]);
+}
+
+/// A scale bar's subdivisions, divisions before zero, labels, unit label, decimals and fitting
+/// take commands (#327): numbers are limited, names and types checked before anything changes, the
+/// details refused for other elements, and all saved with the layout.
+#[test]
+fn layout_scale_bars_take_their_details() {
+    use rustgis_map::layout::{BarLabels, ElementKind, ScaleFit, UnitLabel};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let find = |s: &Session, code: &str| s.project.layouts[0].elements.iter().find(|e| e.kind.code() == code).unwrap().clone();
+    let bar = find(&s, "scaleBar").id;
+    let details = |s: &Session, id: u32| match &s.project.layouts[0].element(id).unwrap().kind {
+        ElementKind::ScaleBar {
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            label_size,
+            fit,
+            ..
+        } => {
+            (*subdivisions, *divisions_before_zero, *label_position, unit_label.clone(), *unit_label_position, *decimals, *label_size, *fit)
+        }
+        k => panic!("{k:?}"),
+    };
+    assert_eq!(details(&s, bar), (0, 0, BarLabels::Above, None, UnitLabel::AfterLabels, 0, 8.0, ScaleFit::AdjustDivisionValue));
+    s.run(
+        "layout.update",
+        &json!({"element": bar, "subdivisions": 3, "divisionsBeforeZero": 1, "labelPosition": "below", "unitLabel": "Feet",
+                "unitLabelPosition": "afterBar", "decimals": 2, "labelSize": 10.5, "fit": "adjustDivision"}),
+    )
+    .unwrap();
+    let all = (3, 1, BarLabels::Below, Some("Feet".to_string()), UnitLabel::AfterBar, 2, 10.5, ScaleFit::AdjustDivision);
+    assert_eq!(details(&s, bar), all);
+    // Changing one keeps the others, units and divisions among them.
+    s.run("layout.update", &json!({"element": bar, "units": "feet", "labelSize": "12", "fit": "adjustWidth"})).unwrap();
+    assert_eq!(details(&s, bar), (3, 1, BarLabels::Below, Some("Feet".to_string()), UnitLabel::AfterBar, 2, 12.0, ScaleFit::AdjustWidth));
+    // Null is not set, except that a null unit label is the unit's abbreviation again; an empty
+    // one prints nothing.
+    s.run("layout.update", &json!({"element": bar, "decimals": null, "labelPosition": null, "fit": null, "unitLabel": ""})).unwrap();
+    assert_eq!(details(&s, bar), (3, 1, BarLabels::Below, Some(String::new()), UnitLabel::AfterBar, 2, 12.0, ScaleFit::AdjustWidth));
+    s.run("layout.update", &json!({"element": bar, "unitLabel": null})).unwrap();
+    assert_eq!(details(&s, bar).3, None);
+    // Numbers are limited.
+    s.run("layout.update", &json!({"element": bar, "subdivisions": 99, "divisionsBeforeZero": 9, "decimals": -4, "labelSize": 1e9}))
+        .unwrap();
+    let d = details(&s, bar);
+    assert_eq!((d.0, d.1, d.5, d.6), (10, 2, 0, 24.0));
+    s.run("layout.update", &json!({"element": bar, "decimals": 99, "labelSize": -5})).unwrap();
+    let d = details(&s, bar);
+    assert_eq!((d.5, d.6), (3, 4.0));
+    // A bad value changes nothing, not even the good ones given with it.
+    let before = details(&s, bar);
+    for bad in [
+        json!({"subdivisions": "many"}),
+        json!({"divisionsBeforeZero": []}),
+        json!({"labelPosition": "left"}),
+        json!({"labelPosition": 7}),
+        json!({"unitLabel": 7}),
+        json!({"unitLabel": ["ft"]}),
+        json!({"unitLabelPosition": "beside"}),
+        json!({"decimals": {}}),
+        json!({"labelSize": "big"}),
+        json!({"fit": "manual"}),
+        json!({"fit": 3}),
+        json!({"unitLabelPosition": "beside "}),
+    ] {
+        let mut p = bad.clone();
+        p["element"] = json!(bar);
+        p["divisions"] = json!(3);
+        p["style"] = json!("line");
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+        assert_eq!(details(&s, bar), before, "{bad}");
+        assert!(matches!(find(&s, "scaleBar").kind, ElementKind::ScaleBar { style: rustgis_map::layout::ScaleBarStyle::Alternating, .. }));
+    }
+    // Names ignore case and surrounding spaces, as the style and units do.
+    s.run("layout.update", &json!({"element": bar, "labelPosition": " ABOVE ", "unitLabelPosition": "AfterBar ", "fit": "AdjustWidth"}))
+        .unwrap();
+    let d = details(&s, bar);
+    assert_eq!((d.2, d.4, d.7), (BarLabels::Above, UnitLabel::AfterBar, ScaleFit::AdjustWidth));
+    // Added with them.
+    let added = s
+        .run(
+            "layout.addElement",
+            &json!({"kind": "scaleBar", "subdivisions": 2, "divisionsBeforeZero": 2, "labelPosition": "below", "unitLabel": "Kilometers",
+                    "unitLabelPosition": "above", "decimals": 1, "labelSize": 9, "fit": "adjustWidth"}),
+        )
+        .unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    assert_eq!(
+        details(&s, added),
+        (2, 2, BarLabels::Below, Some("Kilometers".to_string()), UnitLabel::Above, 1, 9.0, ScaleFit::AdjustWidth)
+    );
+    let count = s.project.layouts[0].elements.len();
+    for bad in [
+        json!({"kind": "scaleBar", "labelPosition": "middle"}),
+        json!({"kind": "scaleBar", "fit": "adjustSize"}),
+        json!({"kind": "scaleBar", "columns": 2}),
+        json!({"kind": "northArrow", "decimals": 2}),
+        json!({"kind": "northArrow", "labelSize": 9}),
+        json!({"kind": "legend", "unitLabel": "m"}),
+        json!({"kind": "legend", "fit": "adjustWidth"}),
+        json!({"kind": "text", "subdivisions": 2}),
+        json!({"kind": "colorbar", "fit": "adjustWidth"}),
+    ] {
+        assert!(s.run("layout.addElement", &bad).is_err(), "{bad}");
+        assert_eq!(s.project.layouts[0].elements.len(), count, "{bad}");
+    }
+    // The other elements refuse them too; a legend still takes its own fit.
+    let arrow = find(&s, "northArrow").id;
+    for bad in [json!({"decimals": 2}), json!({"unitLabelPosition": "below"}), json!({"fit": "adjustWidth"})] {
+        let mut p = bad.clone();
+        p["element"] = json!(arrow);
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+    }
+    let legend = s.run("layout.addElement", &json!({"kind": "legend"})).unwrap()["element"].as_u64().unwrap() as u32;
+    s.run("layout.update", &json!({"element": legend, "fit": "adjustSize"})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": legend, "labelSize": 9})).is_err());
+    assert!(s.run("layout.update", &json!({"element": bar, "columns": 2})).is_err(), "a scale bar has no columns");
+    // A locked bar takes no change, a null unit label included.
+    s.run("layout.update", &json!({"element": bar, "locked": true})).unwrap();
+    for p in [json!({"decimals": 1}), json!({"unitLabel": null}), json!({"unitLabel": "m"})] {
+        let mut p = p.clone();
+        p["element"] = json!(bar);
+        assert!(s.run("layout.update", &p).is_err(), "{p}");
+    }
+    s.run("layout.update", &json!({"element": bar, "locked": false})).unwrap();
+    // The page draws with them, and they survive a save.
+    let out = std::env::temp_dir().join(format!("rustgis-bar-details-{}.png", std::process::id()));
     s.run("layout.export", &json!({"path": out.to_string_lossy()})).unwrap();
     let _ = std::fs::remove_file(&out);
     let text = serde_json::to_string(&s.project.layouts[0]).unwrap();
@@ -15259,6 +15970,160 @@ fn layout_elements_are_brought_to_the_front_and_sent_to_the_back() {
     assert_eq!(s.undo_depth(), depth, "no empty undo step");
 }
 
+/// A group holding a map frame and its surrounds copies into one whose surrounds are on the
+/// copied frame: removing the original frame leaves the copy whole.
+#[test]
+fn a_copied_group_keeps_its_surrounds_on_its_own_frame() {
+    use rustgis_map::layout::ElementKind;
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Inset", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let id = |v: Value| v["element"].as_u64().unwrap() as u32;
+    let frame = id(s.run("layout.addFrame", &json!({"x": 10, "y": 10, "w": 60, "h": 40})).unwrap());
+    let other = id(s.run("layout.addFrame", &json!({"x": 100, "y": 10, "w": 60, "h": 40})).unwrap());
+    let bar = id(s.run("layout.addElement", &json!({"kind": "scaleBar", "frame": frame, "x": 10, "y": 55, "w": 40, "h": 8})).unwrap());
+    // A note bound to a frame outside the group stays bound to it.
+    let note = id(s.run("layout.addElement", &json!({"kind": "text", "text": "{scale}", "frame": other, "x": 10, "y": 65})).unwrap());
+    let g = id(s.run("layout.group", &json!({"elements": [frame, bar, note]})).unwrap());
+    let copy = id(s.run("layout.duplicateElement", &json!({"element": g})).unwrap());
+    let l = &s.project.layouts[li];
+    let kids = l.element(copy).unwrap().children().to_vec();
+    let of = |k: &ElementKind| std::mem::discriminant(k);
+    let find = |kind: &ElementKind| kids.iter().copied().find(|c| l.element(*c).is_some_and(|e| of(&e.kind) == of(kind))).unwrap();
+    let (new_frame, new_bar, new_note) =
+        (find(&l.element(frame).unwrap().kind), find(&l.element(bar).unwrap().kind), find(&l.element(note).unwrap().kind));
+    assert!(![frame, bar, note].contains(&new_frame) && new_bar != bar && new_note != note);
+    assert_eq!(l.element(new_bar).unwrap().kind.frame(), Some(new_frame), "the copy's bar measures the copy's frame");
+    assert!(matches!(l.element(new_note).unwrap().kind, ElementKind::Text { frame: Some(f), .. } if f == other));
+    s.run("layout.removeElement", &json!({"element": frame})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(bar).is_none(), "the original bar goes with its frame");
+    assert!(l.element(new_frame).is_some() && l.element(new_bar).is_some() && l.element(new_note).is_some());
+    assert_eq!(l.descendants(copy).len(), 3);
+}
+
+/// Grouped elements move, copy, reorder and delete together; a group's box is its children's.
+#[test]
+fn layout_group_and_ungroup_move_and_delete_together() {
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Groups", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let id = |v: Value| v["element"].as_u64().unwrap() as u32;
+    let add =
+        |s: &mut Session, x: f64| id(s.run("layout.addElement", &json!({"kind": "rectangle", "x": x, "y": 10, "w": 10, "h": 10})).unwrap());
+    let (a, b, c) = (add(&mut s, 10.0), add(&mut s, 30.0), add(&mut s, 60.0));
+    let g = id(s.run("layout.group", &json!({"elements": [a, b]})).unwrap());
+    let l = &s.project.layouts[li];
+    assert_eq!((l.element(g).unwrap().name.as_str(), l.elements.last().map(|e| e.id)), ("Group", Some(g)));
+    assert_eq!((l.group_of(a), l.group_of(b), l.group_of(c)), (Some(g), Some(g), None));
+    assert_eq!(l.group_box(g), Some((10.0, 10.0, 30.0, 10.0)));
+    // Moving the group moves both by the same delta: x and y are where its box goes.
+    s.run("layout.update", &json!({"element": g, "x": 15, "y": 20})).unwrap();
+    let l = &s.project.layouts[li];
+    let at = |l: &rustgis_map::layout::Layout, id: u32| l.element(id).map(|e| (e.x, e.y)).unwrap();
+    assert_eq!((at(l, a), at(l, b), at(l, c)), ((15.0, 20.0), (35.0, 20.0), (60.0, 10.0)));
+    // A group has no size, nor a kind's properties; bad values change nothing.
+    let before = s.project.layouts[li].clone();
+    assert_eq!(s.run("layout.update", &json!({"element": g, "w": 50})).unwrap_err(), "a group has no size of its own");
+    assert_eq!(s.run("layout.update", &json!({"element": g, "x": 0, "h": 5})).unwrap_err(), "a group has no size of its own");
+    for bad in [json!({"element": g, "x": "far"}), json!({"element": g, "fill": "#ff0000"}), json!({"element": g, "border": 7})] {
+        assert!(s.run("layout.update", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.project.layouts[li], before);
+    // Groups take two elements or more, that exist, ungrouped or in the same group.
+    for bad in [
+        json!({"elements": [a]}),
+        json!({"elements": [c, c]}),
+        json!({"elements": [c, 9999]}),
+        json!({"elements": [a, c]}),
+        json!({"elements": "all"}),
+        json!({"elements": [c, "x"]}),
+        json!({}),
+        json!({"elements": [c, g], "name": 7}),
+    ] {
+        assert!(s.run("layout.group", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.project.layouts[li], before);
+    assert_eq!(s.run("layout.ungroup", &json!({"element": c})).unwrap_err(), "not a group");
+    // A group of a group nests; ungrouped, the inner group stays whole.
+    let outer = id(s.run("layout.group", &json!({"elements": [g, c], "name": "Both"})).unwrap());
+    let l = &s.project.layouts[li];
+    assert_eq!((l.element(outer).unwrap().name.as_str(), l.group_of(g), l.group_depth(outer)), ("Both", Some(outer), 2));
+    assert_eq!(l.descendants(outer), vec![c, g, a, b], "listed in drawing order");
+    s.run("layout.ungroup", &json!({"element": outer})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(outer).is_none());
+    assert_eq!((l.group_of(g), l.group_of(c), l.group_of(a)), (None, None, Some(g)));
+    // Copied, the group's copy holds copies of its children, in new places, framed as they are,
+    // stacked as they are.
+    s.run("layout.update", &json!({"element": g, "border": "#ff0000"})).unwrap();
+    s.run("layout.update", &json!({"element": b, "background": "#00ff00"})).unwrap();
+    let n = s.project.layouts[li].elements.len();
+    let copy = id(s.run("layout.duplicateElement", &json!({"element": g})).unwrap());
+    let l = &s.project.layouts[li];
+    assert_eq!(l.elements.len(), n + 3);
+    let style = |id: u32| l.element(id).and_then(|e| e.frame_style.clone());
+    assert_eq!(style(copy), style(g));
+    let copied: Vec<u32> = l.elements.iter().skip(n).map(|e| e.id).collect();
+    assert_eq!(copied.get(2), Some(&copy), "the group after its elements, as the original is");
+    assert_eq!(copied.get(1).copied().and_then(style), style(b), "b's copy, drawn over a's");
+    let kids = l.descendants(copy);
+    assert_eq!(kids.len(), 2);
+    assert!(kids.iter().all(|k| ![a, b, g].contains(k)), "fresh ids");
+    assert_eq!(l.group_box(copy), Some((20.0, 25.0, 30.0, 10.0)));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.project.layouts[li].elements.len(), n, "one undo step");
+    // Sent to the back, the group's elements go together and keep their order.
+    s.run("layout.arrange", &json!({"element": g, "to": "back"})).unwrap();
+    let order: Vec<u32> = s.project.layouts[li].elements.iter().map(|e| e.id).collect();
+    assert_eq!(order, vec![a, b, g, c]);
+    s.run("layout.arrange", &json!({"element": g, "to": "forward"})).unwrap();
+    let order: Vec<u32> = s.project.layouts[li].elements.iter().map(|e| e.id).collect();
+    assert_eq!(order, vec![c, a, b, g]);
+    // A locked child holds the group still, and keeps it from being deleted.
+    s.run("layout.update", &json!({"element": a, "locked": true})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": g, "x": 0})).is_err());
+    assert!(s.run("layout.removeElement", &json!({"element": g})).is_err());
+    s.run("layout.update", &json!({"element": a, "locked": false})).unwrap();
+    // Locking and hiding the group locks and hides what it holds.
+    s.run("layout.update", &json!({"element": g, "locked": true, "visible": false})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(a).is_some_and(|e| e.locked && !e.visible) && l.element(b).is_some_and(|e| e.locked && !e.visible));
+    s.run("layout.update", &json!({"element": g, "locked": false, "visible": true})).unwrap();
+    // Deleting the group deletes its children.
+    s.run("layout.removeElement", &json!({"element": g})).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(a).is_none() && l.element(b).is_none() && l.element(g).is_none() && l.element(c).is_some());
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(s.project.layouts[li].element(a).is_some(), "undone");
+
+    // Pushed against the edge of the room, the group keeps its spacing.
+    s.run("layout.update", &json!({"element": g, "x": 5000})).unwrap();
+    let l = &s.project.layouts[li];
+    let (ax, bx) = (l.element(a).unwrap().x, l.element(b).unwrap().x);
+    assert_eq!((ax, bx), (4980.0, 5000.0));
+    s.run("layout.update", &json!({"element": g, "x": 15})).unwrap();
+
+    // Groups nest 8 deep: a ninth is refused, and a file nesting 9 deep is flattened.
+    let mut inner = g;
+    for _ in 1..8 {
+        let other = add(&mut s, 80.0);
+        inner = id(s.run("layout.group", &json!({"elements": [inner, other]})).unwrap());
+    }
+    assert_eq!(s.project.layouts[li].group_depth(inner), 8);
+    let other = add(&mut s, 90.0);
+    assert!(s.run("layout.group", &json!({"elements": [inner, other]})).unwrap_err().contains("8 deep"));
+    let mut elements = vec![json!({"id": 1, "name": "leaf", "x": 0, "y": 0, "w": 10, "h": 10, "kind": {"Picture": {"image": ""}}})];
+    for i in 2..=10u32 {
+        elements.push(json!({"id": i, "name": "g", "x": 0, "y": 0, "w": 1, "h": 1, "kind": {"Group": {"children": [i - 1]}}}));
+    }
+    let text = json!({"name": "Deep", "width": 100, "height": 100, "elements": elements}).to_string();
+    let r = s.run("layout.import", &json!({"text": text})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    assert!(l.element(2).is_none(), "the ninth group down is dissolved");
+    assert_eq!((l.group_of(1), l.group_depth(10)), (Some(3), 8));
+}
+
 #[test]
 fn layout_elements_duplicate_offset_on_top_and_undo() {
     let mut s = world();
@@ -21986,5 +22851,422 @@ fn merge_distinguishes_case_sensitive_file_paths() {
         })
         .collect();
     assert_eq!(coordinates, [1.0, 2.0]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ---- ArcGIS Pro layouts (.pagx) ----
+
+/// The shapefile the fixture's embedded map reads, written once for every test that uses it.
+fn pagx_shapefile() -> std::path::PathBuf {
+    static SHP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    SHP.get_or_init(|| line_of_points_shp("pagx-detail", 5)).clone()
+}
+
+/// A `w`×`h` black picture in `format`.
+fn picture_bytes(w: u32, h: u32, format: image::ImageFormat) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255])))
+        .write_to(&mut std::io::Cursor::new(&mut out), format)
+        .unwrap();
+    out
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The 11x17 template reduced by hand: two frames (the small one linked to the main one, with its
+/// extent indicator, and showing an embedded map of one shapefile layer), background boxes, text
+/// with dynamic tags, a legend, a scale bar, a north arrow, a logo, and two groups. `logo` is the
+/// COMPANY LOGO's picture keys (`referenceURI`, `sourceURL`); `arrow_url` the north arrow marker's
+/// data URL.
+fn pagx_with(logo: Value, arrow_url: &str) -> String {
+    let shp = pagx_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    let ring = |x0: f64, y0: f64, x1: f64, y1: f64| json!({"rings": [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]]});
+    let rgb = |r: u8, g: u8, b: u8| json!({"type": "CIMRGBColor", "values": [r, g, b, 100]});
+    let fill = |c: Value| json!({"type": "CIMSolidFill", "enable": true, "color": c});
+    let stroke = |c: Value| json!({"type": "CIMSolidStroke", "enable": true, "width": 1.0, "color": c});
+    let polygon =
+        |layers: Vec<Value>| json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMPolygonSymbol", "symbolLayers": layers}});
+    let rectangle = |name: &str, r: Value, c: Value| {
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "BottomLeftCorner", "visible": true,
+            "graphic": {"type": "CIMPolygonGraphic", "polygon": r, "symbol": polygon(vec![fill(c)])}})
+    };
+    let text = |name: &str, x: f64, y: f64, t: &str| {
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "TopLeftCorner", "visible": true,
+            "graphic": {"type": "CIMTextGraphic", "shape": {"x": x, "y": y}, "text": t,
+                "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "fontFamilyName": "Arial", "fontStyleName": "Regular",
+                    "height": 12, "symbol": {"type": "CIMPolygonSymbol", "symbolLayers": [fill(rgb(0, 0, 0))]}}}}})
+    };
+    let frame =
+        |name: &str, r: Value| json!({"type": "CIMMapFrame", "name": name, "anchor": "BottomLeftCorner", "visible": true, "frame": r});
+    let main = frame("MAIN MAP", ring(0.5, 0.5, 11.5, 10.0));
+    let mut detail = frame("SMALL DETAIL MAP", ring(12.0, 6.0, 16.5, 10.0));
+    detail["uRI"] = json!("CIMPATH=map/new_detail_map.json");
+    detail["view"] =
+        json!({"type": "CIMMapView", "camera": {"type": "CIMViewCamera", "x": -97.0, "y": 38.0, "scale": 25_000_000.0, "heading": 0}});
+    detail["autoCamera"] =
+        json!({"type": "CIMAutoCamera", "source": "MapFrameLink", "mapFrameLinkName": "MAIN MAP", "autoCameraType": "Center"});
+    detail["extentIndicators"] = json!([{"type": "CIMExtentIndicator", "sourceMapFrame": "MAIN MAP",
+        "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMLineSymbol", "symbolLayers": [stroke(rgb(255, 0, 0))]}}}]);
+    let surround = |ty: &str, name: &str, r: Value, extra: Value| {
+        let mut e = json!({"type": ty, "name": name, "anchor": "BottomLeftCorner", "visible": true, "mapFrame": "MAIN MAP", "frame": r});
+        e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        e
+    };
+    let legend = surround("CIMLegend", "LEGEND", ring(12.0, 2.5, 16.5, 5.5), json!({"title": "Legend", "showTitle": false, "columns": 1}));
+    let label = json!({"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 9.0, "fontStyleName": "Regular"}});
+    let bar = surround(
+        "CIMDoubleFillScaleBar",
+        "SCALE BAR",
+        ring(12.0, 1.5, 15.0, 2.0),
+        json!({"units": {"uwkid": 9002}, "divisions": 4, "subdivisions": 2, "divisionsBeforeZero": 0, "labelPosition": "Bottom",
+            "unitLabel": "Feet", "unitLabelPosition": "AfterBar", "labelSymbol": label, "fittingStrategy": "AdjustDivision"}),
+    );
+    let arrow = surround(
+        "CIMMarkerNorthArrow",
+        "NORTH ARROW",
+        ring(15.5, 1.0, 16.5, 2.5),
+        json!({"northType": "TrueNorth", "pointSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPointSymbol",
+            "symbolLayers": [{"type": "CIMPictureMarker", "enable": true, "size": 36.0, "url": arrow_url}]}}}),
+    );
+    let mut logo_graphic = json!({"type": "CIMPictureGraphic", "box": {"xmin": 0.76, "ymin": 10.3, "xmax": 1.83, "ymax": 10.9}});
+    logo_graphic.as_object_mut().unwrap().extend(logo.as_object().unwrap().clone());
+    let logo =
+        json!({"type": "CIMGraphicElement", "name": "COMPANY LOGO", "anchor": "CenterPoint", "visible": true, "graphic": logo_graphic});
+    let group = |name: &str, children: Vec<Value>| json!({"type": "CIMGroupElement", "name": name, "visible": true, "elements": children});
+    let elements = vec![
+        group(
+            "HEADER",
+            vec![
+                rectangle("TOP BACKGROUND", ring(0.0, 10.25, 17.0, 11.0), rgb(230, 230, 230)),
+                rectangle("LOGO RIBBON", ring(0.0, 10.25, 3.0, 11.0), rgb(20, 60, 120)),
+            ],
+        ),
+        group("TITLE BLOCK", vec![logo, text("TITLE", 3.5, 10.9, "PROJECT TITLE")]),
+        text("SCALE TEXT", 12.0, 1.4, r#"<dyn type="mapFrame" name="MAIN MAP" property="scale" preStr="1:"/>"#),
+        text("SPATIAL REF DATA", 12.0, 1.2, r#"<dyn type="mapFrame" name="MAIN MAP" property="sr" srProperty="name"/>"#),
+        text("DATE AUTO", 12.0, 1.0, r#"<dyn type="date"/>"#),
+        main,
+        detail,
+        legend,
+        bar,
+        arrow,
+    ];
+    let layer = json!({"type": "CIMFeatureLayer", "name": "Detail Points", "uRI": "CIMPATH=new_detail_map/detail_points.json", "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": format!("DATABASE={folder}"), "workspaceFactory": "Shapefile", "dataset": file, "datasetType": "esriDTFeatureClass"}},
+        "renderer": {"type": "CIMSimpleRenderer", "symbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMPointSymbol",
+            "symbolLayers": [{"type": "CIMVectorMarker", "enable": true, "size": 6.0}]}}}});
+    // Pro writes the document's type first, which is how `layout.import` tells a .pagx's text.
+    let doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0",
+        "binaryReferences": [{"type": "CIMBinaryReference", "uRI": "CIMPATH=Pictures/logo.png", "data": b64(&picture_bytes(4, 2, image::ImageFormat::Png))}],
+        "mapDefinitions": [{"type": "CIMMap", "name": "NEW DETAIL MAP", "uRI": "CIMPATH=map/new_detail_map.json",
+            "layers": ["CIMPATH=new_detail_map/detail_points.json"], "spatialReference": {"wkid": 4326, "latestWkid": 4326},
+            "defaultExtent": {"xmin": -125.0, "ymin": 24.0, "xmax": -66.0, "ymax": 50.0, "spatialReference": {"wkid": 4326}}}],
+        "layerDefinitions": [layer],
+        "layoutDefinition": {"type": "CIMLayout", "name": "11x17 LANDSCAPE",
+            "page": {"type": "CIMPage", "width": 17, "height": 11, "units": {"uwkid": 109008}, "guides": []},
+            "elements": elements}});
+    type_first(doc)
+}
+
+/// A CIM document's text with its `type` first, as Pro writes it (serde_json sorts the keys).
+fn type_first(mut doc: Value) -> String {
+    let ty = doc.as_object_mut().unwrap().remove("type").unwrap();
+    format!(r#"{{"type":{ty},{}"#, &doc.to_string()[1..])
+}
+
+/// The fixture with its logo from the document's binaries and a PNG north arrow.
+fn pagx() -> String {
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    pagx_with(json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": "logos/logo.png"}), &arrow)
+}
+
+#[test]
+fn a_pagx_imports_with_its_frames_bound_and_its_embedded_map_added() {
+    use rustgis_map::layout::{ElementKind, FrameLink};
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": "World"}})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    // (17 × 25.4 isn't 431.8 exactly in floating point.)
+    assert!((l.width - 431.8).abs() < 1e-9 && (l.height - 279.4).abs() < 1e-9, "{} × {}", l.width, l.height);
+    let main = l.elements.iter().find(|e| e.name == "MAIN MAP").unwrap();
+    let detail = l.elements.iter().find(|e| e.name == "SMALL DETAIL MAP").unwrap();
+    assert!(matches!(&main.kind, ElementKind::MapFrame { map, scale, .. } if map == "World" && *scale > 0.0), "{:?}", main.kind);
+    assert!(
+        matches!(&detail.kind, ElementKind::MapFrame { map, link: Some(FrameLink { frame, .. }), extent_of: Some(of), .. } if map == "NEW DETAIL MAP" && *frame == main.id && *of == main.id),
+        "{:?}",
+        detail.kind
+    );
+    assert!(s.project.maps.iter().any(|m| m.name == "NEW DETAIL MAP"));
+    let scale_text = l.elements.iter().find(|e| e.name == "SCALE TEXT").unwrap();
+    assert!(
+        matches!(&scale_text.kind, ElementKind::Text { text, frame: Some(f), .. } if text == "{scale}" && *f == main.id),
+        "{:?}",
+        scale_text.kind
+    );
+    assert!(l.elements.iter().any(|e| matches!(&e.kind, ElementKind::Group { children } if children.len() == 2)));
+    assert!(r["notes"].as_array().unwrap().iter().all(|n| n["kind"] != "skipped"), "{}", r["notes"]);
+    // The embedded map holds its shapefile layer, and the map that was active still is.
+    let added = s.project.maps.iter().find(|m| m.name == "NEW DETAIL MAP").unwrap();
+    assert_eq!(added.layers.iter().filter(|l| !l.graphics).count(), 1);
+    assert_eq!(added.basemap, rustgis_map::Basemap::Blank);
+    assert!(!added.graticule);
+    assert_eq!(s.map().name, "World");
+    assert_eq!(r["maps"], json!(["NEW DETAIL MAP"]));
+    assert_eq!(s.active_layout, Some(r["layout"].as_u64().unwrap() as usize));
+    // The logo comes from the document.
+    let logo = l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap();
+    assert!(matches!(&logo.kind, ElementKind::Picture { image, .. } if !image.is_empty()));
+}
+
+#[test]
+fn importing_the_same_pagx_twice_reuses_the_embedded_map() {
+    let mut s = world();
+    let maps = s.project.maps.len();
+    let layouts = s.project.layouts.len();
+    let text = pagx();
+    let params = json!({"text": text, "maps": {"MAIN MAP": "World"}});
+    let first = s.run("layout.import", &params).unwrap();
+    let second = s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!((&first["maps"], &second["maps"]), (&json!(["NEW DETAIL MAP"]), &json!(["NEW DETAIL MAP"])));
+    assert_eq!(s.project.layouts.len(), layouts + 2);
+    assert_ne!(first["name"], second["name"]);
+    // A map of that name with other layers isn't the template's: a new one is added.
+    let detail = s.project.maps.iter().position(|m| m.name == "NEW DETAIL MAP").unwrap();
+    s.project.maps[detail].layers.retain(|l| l.graphics);
+    let third = s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 2);
+    assert_ne!(third["maps"], json!(["NEW DETAIL MAP"]));
+}
+
+#[test]
+fn an_unbound_frame_takes_the_active_maps_view_and_says_so() {
+    use rustgis_map::layout::ElementKind;
+    let mut s = world();
+    s.map_mut().camera.bearing = 30.0;
+    let r = s.run("layout.import", &json!({"text": pagx()})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let main = l.elements.iter().find(|e| e.name == "MAIN MAP").unwrap();
+    let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &main.kind else { panic!("{:?}", main.kind) };
+    assert_eq!(map, "World");
+    assert_eq!((*bearing, *pitch), (s.map().camera.bearing, s.map().camera.pitch));
+    assert_eq!(*bearing, 30.0);
+    let m = s.map();
+    let expected = s.view_size.0 * m.ground_res() / (main.w / 1000.0);
+    assert!(*scale > 0.0 && (scale - expected).abs() <= 1e-6 * expected, "{scale} vs {expected}");
+    let c = m.center_lonlat();
+    assert!((center.x - c.x).abs() < 1e-9 && (center.y - c.y).abs() < 1e-9, "{center:?} vs {c:?}");
+    let notes = r["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n["layer"] == "MAIN MAP" && n["text"].as_str().unwrap().contains("template")), "{notes:?}");
+    // The frame the template binds says nothing of the kind.
+    assert!(!notes.iter().any(|n| n["layer"] == "SMALL DETAIL MAP" && n["text"].as_str().unwrap().contains("template")), "{notes:?}");
+    // A map the project hasn't is refused before anything changes.
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let e = s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": "Nowhere"}})).unwrap_err();
+    assert!(e.contains("maps: no map named Nowhere"), "{e}");
+    assert!(s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": 7}})).is_err());
+    assert!(s.run("layout.import", &json!({"text": pagx(), "maps": ["World"]})).is_err());
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+    // A frame the layout hasn't is said, not silently ignored.
+    let r = s.run("layout.import", &json!({"text": pagx(), "maps": {"MAIN MAP": "World", "INSET": "World"}})).unwrap();
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n["text"] == "maps: no frame named INSET"), "{}", r["notes"]);
+}
+
+#[test]
+fn a_pagx_whose_data_is_missing_still_reuses_its_map() {
+    // The embedded map has a second layer whose shapefile isn't there.
+    let mut doc: Value = serde_json::from_str(&pagx()).unwrap();
+    let mut missing = doc["layerDefinitions"][0].clone();
+    missing["name"] = json!("Gone");
+    missing["uRI"] = json!("CIMPATH=new_detail_map/gone.json");
+    missing["featureTable"]["dataConnection"]["dataset"] = json!("rustgis-no-such-file.shp");
+    doc["layerDefinitions"].as_array_mut().unwrap().push(missing);
+    doc["mapDefinitions"][0]["layers"].as_array_mut().unwrap().push(json!("CIMPATH=new_detail_map/gone.json"));
+    let text = type_first(doc);
+    let mut s = world();
+    let maps = s.project.maps.len();
+    let params = json!({"text": text, "maps": {"MAIN MAP": "World"}});
+    let first = s.run("layout.import", &params).unwrap();
+    assert!(first["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "Gone" && n["kind"] == "skipped"), "{}", first["notes"]);
+    s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 1);
+    // Another map of the embedded map's name: the import's own map, numbered, is still found.
+    let mut s = world();
+    s.run("map.new", &json!({"name": "NEW DETAIL MAP"})).unwrap();
+    s.run("map.activate", &json!({"name": "World"})).unwrap();
+    let maps = s.project.maps.len();
+    let first = s.run("layout.import", &params).unwrap();
+    let second = s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!(first["maps"], second["maps"]);
+    assert_eq!(first["maps"], json!(["NEW DETAIL MAP2"]));
+}
+
+#[test]
+fn layout_inspect_lists_frames_without_importing() {
+    let mut s = world();
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let r = s.run("layout.inspect", &json!({"text": pagx()})).unwrap();
+    assert_eq!(
+        r,
+        json!({"frames": [{"name": "MAIN MAP", "map": null}, {"name": "SMALL DETAIL MAP", "map": "NEW DETAIL MAP"}], "maps": ["NEW DETAIL MAP"]})
+    );
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+    // By path too; a document that isn't a layout is refused.
+    let dir = std::env::temp_dir().join(format!("rustgis-layout-inspect-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.pagx");
+    std::fs::write(&file, pagx()).unwrap();
+    assert_eq!(s.run("layout.inspect", &json!({"path": file.display().to_string()})).unwrap(), r);
+    assert!(s.run("layout.inspect", &json!({"text": "{\"type\":\"CIMMapDocument\"}"})).is_err());
+    assert!(s.run("layout.inspect", &json!({})).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_pagx_by_path_resolves_pictures_beside_it() {
+    use rustgis_map::layout::ElementKind;
+    use rustgis_map::symbology::Marker;
+    let dir = std::env::temp_dir().join(format!("rustgis-pagx-pictures-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("logo.png");
+    std::fs::write(&png, picture_bytes(3, 2, image::ImageFormat::Png)).unwrap();
+    std::fs::write(dir.join("logo.bmp"), picture_bytes(3, 2, image::ImageFormat::Bmp)).unwrap();
+    let gif_arrow = format!("data:image/gif;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Gif)));
+    let kind = |s: &Session, r: &Value, name: &str| {
+        let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+        l.elements.iter().find(|e| e.name == name).unwrap().kind.clone()
+    };
+    // An absolute path, and a north arrow whose GIF marker becomes a PNG.
+    let file = dir.join("abs.pagx");
+    std::fs::write(&file, pagx_with(json!({"sourceURL": png.display().to_string()}), &gif_arrow)).unwrap();
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"path": file.display().to_string(), "maps": {"MAIN MAP": "World"}})).unwrap();
+    let ElementKind::Picture { image, source } = kind(&s, &r, "COMPANY LOGO") else { panic!() };
+    assert_eq!(rustgis_render::picture_size(&image), Some((3, 2)));
+    assert_eq!(source.as_deref(), Some(png.display().to_string().as_str()));
+    let ElementKind::NorthArrow { symbol, .. } = kind(&s, &r, "NORTH ARROW") else { panic!() };
+    assert!(matches!(&symbol[0].marker, Marker::Image(i) if rustgis_render::picture_size(i.as_str()) == Some((2, 2))), "{symbol:?}");
+    // A relative path, beside the .pagx: a BMP, converted to PNG.
+    let file = dir.join("rel.pagx");
+    std::fs::write(&file, pagx_with(json!({"sourceURL": "logo.bmp"}), &gif_arrow)).unwrap();
+    let r = s.run("layout.import", &json!({"path": file.display().to_string()})).unwrap();
+    let ElementKind::Picture { image, source } = kind(&s, &r, "COMPANY LOGO") else { panic!() };
+    assert_eq!(rustgis_render::picture_size(&image), Some((3, 2)));
+    assert_eq!(source.as_deref(), Some("logo.bmp"));
+    // A picture that isn't there: noted, the element empty with its source.
+    let text = pagx_with(json!({"sourceURL": "missing.png"}), &gif_arrow);
+    let r = s.run("layout.import", &json!({"text": text, "dir": dir.display().to_string()})).unwrap();
+    let ElementKind::Picture { image, source } = kind(&s, &r, "COMPANY LOGO") else { panic!() };
+    assert!(image.is_empty() && source.as_deref() == Some("missing.png"));
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "COMPANY LOGO"), "{}", r["notes"]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// An embedded picture goes through the checks a file beside the layout does: a GIF in a data:
+/// URL (wrapped by newlines, as Pro writes it) becomes a PNG.
+#[test]
+fn an_embedded_gif_picture_imports_as_a_png() {
+    use rustgis_map::layout::ElementKind;
+    let text = b64(&picture_bytes(3, 2, image::ImageFormat::Gif));
+    let chars: Vec<char> = text.chars().collect();
+    let wrapped = chars.chunks(16).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    let mut s = world();
+    let logo = json!({"sourceURL": format!("data:image/gif;base64,{wrapped}")});
+    let r = s.run("layout.import", &json!({"text": pagx_with(logo, &arrow)})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap().kind else { panic!() };
+    assert!(image.starts_with("iVBORw0KGgo"), "a PNG: {}", image.get(..16).unwrap_or(image));
+    assert_eq!(rustgis_render::picture_size(image), Some((3, 2)));
+    assert!(!r["notes"].to_string().contains("COMPANY LOGO"), "{}", r["notes"]);
+}
+
+/// An embedded picture larger than `layout.addElement` takes, or that isn't a picture, is noted
+/// and left empty, with its source to relink.
+#[test]
+fn an_oversize_or_unreadable_embedded_picture_is_noted_and_left_empty() {
+    use rustgis_map::layout::ElementKind;
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    let mut png = picture_bytes(2, 2, image::ImageFormat::Png);
+    png.resize(17 << 20, 0);
+    for (logo, why) in [
+        (json!({"sourceURL": format!("data:image/png;base64,{}", b64(&png))}), "larger than 16 MB"),
+        (json!({"sourceURL": "data:image/png;base64,AAAA", "referenceURI": "CIMPATH=none"}), "not a PNG, JPEG, GIF or BMP"),
+    ] {
+        let mut s = world();
+        let r = s.run("layout.import", &json!({"text": pagx_with(logo, &arrow)})).unwrap();
+        let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+        let ElementKind::Picture { image, .. } = &l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap().kind else { panic!() };
+        assert!(image.is_empty(), "{why}: {}", image.len());
+        let notes = r["notes"].as_array().unwrap();
+        assert!(notes.iter().any(|n| n["layer"] == "COMPANY LOGO" && n["text"].as_str().unwrap().contains(why)), "{why}: {}", r["notes"]);
+    }
+}
+
+/// A relative picture path in text given without a folder isn't read against the working
+/// directory: it is noted, and the picture left to relink.
+#[test]
+fn a_relative_picture_with_no_folder_is_noted_not_read_from_the_working_directory() {
+    use rustgis_map::layout::ElementKind;
+    let arrow = format!("data:image/png;base64,{}", b64(&picture_bytes(2, 2, image::ImageFormat::Png)));
+    // A picture in the working directory that a CWD-relative read would find.
+    let name = format!("rustgis-cwd-picture-{}.png", std::process::id());
+    std::fs::write(&name, picture_bytes(3, 2, image::ImageFormat::Png)).unwrap();
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"text": pagx_with(json!({"sourceURL": name}), &arrow)}));
+    let _ = std::fs::remove_file(&name);
+    let r = r.unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let ElementKind::Picture { image, source } = &l.elements.iter().find(|e| e.name == "COMPANY LOGO").unwrap().kind else { panic!() };
+    assert!(image.is_empty() && source.as_deref() == Some(name.as_str()));
+    assert!(
+        r["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "COMPANY LOGO" && n["text"].as_str().unwrap().contains("no folder")),
+        "{}",
+        r["notes"]
+    );
+}
+
+#[test]
+fn a_north_arrow_gif_wrapped_by_newlines_becomes_a_png() {
+    use rustgis_map::layout::ElementKind;
+    use rustgis_map::symbology::Marker;
+    // Pro wraps the base64 of its data: URLs with newlines (every 76 characters; this GIF is short).
+    let text = b64(&picture_bytes(2, 2, image::ImageFormat::Gif));
+    let chars: Vec<char> = text.chars().collect();
+    let wrapped = chars.chunks(16).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(wrapped.contains('\n'));
+    let mut s = world();
+    let r = s.run("layout.import", &json!({"text": pagx_with(json!({}), &format!("data:image/gif;base64,{wrapped}"))})).unwrap();
+    let l = &s.project.layouts[r["layout"].as_u64().unwrap() as usize];
+    let arrow = l.elements.iter().find(|e| e.name == "NORTH ARROW").unwrap();
+    let ElementKind::NorthArrow { symbol, .. } = &arrow.kind else { panic!() };
+    assert!(matches!(&symbol[0].marker, Marker::Image(i) if rustgis_render::picture_size(i.as_str()) == Some((2, 2))), "{symbol:?}");
+    assert!(!r["notes"].to_string().contains("couldn't be converted"), "{}", r["notes"]);
+}
+
+#[test]
+fn rgislayout_files_still_import() {
+    let mut s = world();
+    let layouts = s.project.layouts.len();
+    s.run("layout.new", &json!({"name": "CIMLayoutDocument"})).unwrap();
+    let text = serde_json::to_string(s.project.layouts.last().unwrap()).unwrap();
+    // A RustGIS layout named like a CIM type is still a RustGIS layout.
+    let r = s.run("layout.import", &json!({"text": text})).unwrap();
+    assert_eq!(s.project.layouts.len(), layouts + 2);
+    assert_eq!(r["name"], "CIMLayoutDocument 2");
+    let dir = std::env::temp_dir().join(format!("rustgis-rgislayout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rgislayout");
+    std::fs::write(&file, &text).unwrap();
+    s.run("layout.import", &json!({"path": file.display().to_string()})).unwrap();
+    assert_eq!(s.project.layouts.len(), layouts + 3);
+    assert!(s.run("layout.import", &json!({"text": "{}"})).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }

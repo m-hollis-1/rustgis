@@ -37,12 +37,18 @@ impl Converted {
     /// Whether the strokes say more than the symbol's single line does: more than one, or one
     /// shifted sideways, dashed or of markers.
     pub fn stacked(&self) -> bool {
-        self.strokes.len() > 1 || self.strokes.iter().any(|s| s.offset != 0.0 || s.dash.is_some() || s.markers.is_some())
+        stacked(&self.strokes)
     }
 }
 
+/// Whether `strokes` say more than a symbol's single line does: more than one, or one shifted
+/// sideways, dashed or of markers. (The CIM map reader asks the same.)
+pub(crate) fn stacked(strokes: &[crate::symbology::LineStroke]) -> bool {
+    strokes.len() > 1 || strokes.iter().any(|s| s.offset != 0.0 || s.dash.is_some() || s.markers.is_some())
+}
+
 /// Nothing drawn: QGIS's hidden categories and empty symbols.
-pub(super) fn hidden() -> Symbol {
+pub(crate) fn hidden() -> Symbol {
     let none = Rgba::new(0, 0, 0, 0);
     Symbol { fill: none, stroke: none, stroke_width: 0.0, size: 0.0, marker: Marker::Circle }
 }

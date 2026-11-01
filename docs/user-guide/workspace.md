@@ -190,6 +190,48 @@ RustGIS works out a map's scale with the OGC's 0.28 mm screen pixel, QGIS at 96 
 inch, so the same view is a larger scale in QGIS; scales from QGIS (reference scales, visibility
 ranges) are multiplied by 0.945 on the way in, so a layer shows at the same zoom in both.
 
+### ArcGIS Pro layouts
+
+An ArcGIS Pro layout (`.pagx`) opens as a new layout of the current project, with the maps its
+frames show added as maps: **Home › New Layout › Import Layout…**, a double-click in the Browser
+pane, or `layout.import={"path": "…/Site plan.pagx"}`. What it brings, and how a frame is bound to
+a map, is under [Layouts](layouts.md#layouts). A notice counts what was drawn differently and
+what was left out; the command's `notes` name each, element by element. Pro projects (`.aprx`)
+and map files (`.mapx`) are not imported yet: that is a later part. A layer in a layout's map
+that RustGIS can't open is left out, and said.
+
+The layers of a layout's embedded maps come in with their symbols, renderers and labels
+approximated where RustGIS has no equivalent, each noted: a definition query is dropped, dashed
+polygon outlines are drawn solid, several marker layers are reduced to the first, a renderer
+RustGIS lacks is drawn with a default symbol, a label expression is drawn as the field it names (or
+its class left out), and label halos and justified text are simplified.
+
+What RustGIS draws differently from Pro:
+
+- **Text**: Pro's formatting tags (bold, italic and colour runs inside a text) are stripped, a
+  date in a format of Pro's is drawn as RustGIS's date, and small caps are shown as upper case.
+- **Coordinate system names** (`{crsName}`) are spelt as the EPSG dataset spells them
+  (`NAD83 / Texas Central (ftUS)`, where Pro says `NAD 1983 StatePlane Texas Central FIPS 4203
+  (US Feet)`). Codes from Esri's own series keep Esri's names.
+- **Shapes**: a polygon graphic that isn't a rectangle is drawn as the rectangle round it; a line
+  of several segments is drawn straight from its first point to its last; a fill other than one
+  solid colour is drawn in the top solid one; a shadow is left out. RustGIS elements don't turn,
+  so one rotated by other than a right angle fills the upright box round it.
+- **Legends**: a legend's per-item settings are drawn with the defaults, and a fitting strategy
+  RustGIS has no match for as Manual.
+- **Scale bars**: the heights and frequency of the marks are drawn as RustGIS draws them, and a
+  hollow or single-fill bar is drawn as an alternating bar.
+- **Layer symbols**: a GIF or BMP picture marker in a layer's point symbol is drawn as a circle
+  (PNG and JPEG markers come in as image markers, see
+  [Symbology](cartography.md#symbology)).
+- **Pictures**: a GIF or BMP is converted to PNG (up to 4096 pixels each way), whether the
+  layout embeds it or keeps it beside it, and a picture larger than 16 MB is left out. A picture
+  file is read from the layout's folder (or `dir`) when the layout is imported; a relative path
+  in layout text given without `dir` isn't read. One that can't be read (the browser can't read
+  files beside a layout, nor convert a GIF or BMP) keeps its place, empty, with a note, and
+  **Relink…** picks it again.
+- **Map grids** in a frame (graticules, measured grids) are left out, with a note.
+
 ## Panes and command search
 
 The left pane has tabs for **Layers**, **Browser** and **Data Sources**. Right-hand panes

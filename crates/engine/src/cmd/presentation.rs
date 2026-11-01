@@ -324,6 +324,7 @@ pub fn page_layout(s: &Session, pres: &Presentation, page: &Page) -> Layout {
                     extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                     bearing: 0.0,
                     pitch: 0.0,
+                    link: None,
                 },
             );
         }
@@ -337,7 +338,11 @@ pub fn page_layout(s: &Session, pres: &Presentation, page: &Page) -> Layout {
                 let k = (bw / iw.max(1) as f64).min(bh / ih.max(1) as f64);
                 (iw as f64 * k, ih as f64 * k)
             });
-            l.add("Picture", (m + (bw - pw) / 2.0, top + (bh - ph) / 2.0, pw, ph), ElementKind::Picture { image: image.clone() });
+            l.add(
+                "Picture",
+                (m + (bw - pw) / 2.0, top + (bh - ph) / 2.0, pw, ph),
+                ElementKind::Picture { image: image.clone(), source: None },
+            );
             if let PageKind::Video { source, .. } = &page.kind {
                 l.add(
                     "Play",
@@ -375,7 +380,7 @@ pub fn draw_page(s: &mut Session, i: usize, k: usize, dpi: f64) -> Result<rustgi
     let n = pres.pages.len();
     let page = pres.pages.get(k).ok_or_else(|| format!("no page {k}"))?;
     let layout = page_layout(s, pres, page);
-    let info = rustgis_render::layout::PageInfo { page: k + 1, pages: n, page_name: page.title.clone() };
+    let info = rustgis_render::layout::PageInfo { page: k + 1, pages: n, page_name: page.title.clone(), project: s.project.name.clone() };
     rustgis_render::layout::render(&layout, &mut s.project.maps, dpi, &info).ok_or_else(|| "the page is too large to draw".to_string())
 }
 

@@ -574,7 +574,10 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             let (dx, dy) = (p["dx"].as_f64().unwrap_or(0.0), p["dy"].as_f64().unwrap_or(0.0));
             if let (Some(li), Some(el)) = (app.session.active_layout, app.layout.selected)
                 && let Some((x, y)) =
-                    app.session.project.layouts.get(li).and_then(|l| l.element(el)).filter(|e| !e.locked).map(|e| (e.x + dx, e.y + dy))
+                    // A group by its box.
+                    app.session.project.layouts.get(li).and_then(|l| {
+                            l.element(el).filter(|e| !e.locked).and(l.element_box(el)).map(|(x, y, _, _)| (x + dx, y + dy))
+                        })
             {
                 let key = app.layout.nudge_key(li, el, ctx.input(|i| i.time));
                 app.session.merge_undo(key);

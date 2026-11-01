@@ -4,9 +4,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine;
 use rustgis_data::{Dataset, Value};
+use rustgis_map::ImageRef;
 use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 
 /// Pictures are drawn from at most this many pixels per side (bigger ones are scaled down).
@@ -72,6 +74,41 @@ pub fn decode(b64: &str) -> Option<Pixmap> {
         *dst = c.premultiply();
     }
     Some(pm)
+}
+
+/// Picture markers are kept at most this many pixels per side (a marker is drawn small).
+const MARKER_SIDE: u32 = 256;
+
+/// Decoded picture markers by the address of their interned text, which never moves or goes: a
+/// picture that doesn't decode is kept as `None` so it isn't tried again for every point. The
+/// table holds at most [`ImageRef::MAX_IMAGES`] pictures.
+type MarkerCache = Mutex<HashMap<usize, Option<Arc<Pixmap>>>>;
+
+/// A picture marker's pixels (premultiplied, at most [`MARKER_SIDE`] a side), `None` when its
+/// picture can't be read.
+pub(crate) fn marker_image(r: &ImageRef) -> Option<Arc<Pixmap>> {
+    static CACHE: OnceLock<MarkerCache> = OnceLock::new();
+    let key = r.as_str().as_ptr() as usize;
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit.clone();
+    }
+    let made = decode(r.as_str()).map(|pm| Arc::new(small(pm)));
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, made.clone());
+    made
+}
+
+/// `pm` scaled down to [`MARKER_SIDE`] a side, when it is larger.
+fn small(pm: Pixmap) -> Pixmap {
+    let k = MARKER_SIDE as f32 / pm.width().max(pm.height()) as f32;
+    if k >= 1.0 {
+        return pm;
+    }
+    let (w, h) = (((pm.width() as f32 * k).round() as u32).max(1), ((pm.height() as f32 * k).round() as u32).max(1));
+    let Some(mut out) = Pixmap::new(w, h) else { return pm };
+    let paint = PixmapPaint { quality: FilterQuality::Bicubic, ..PixmapPaint::default() };
+    out.draw_pixmap(0, 0, pm.as_ref(), &paint, Transform::from_scale(w as f32 / pm.width() as f32, h as f32 / pm.height() as f32), None);
+    out
 }
 
 /// Draws row `row`'s picture into the pixel rectangle (x0, y0)–(x1, y1).

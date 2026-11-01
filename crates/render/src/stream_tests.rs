@@ -535,12 +535,22 @@ fn layout_export_keeps_all_drawn_legend_classes() {
             extent_width: INDICATOR_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
+            link: None,
         },
     );
     page.add(
         "legend",
         (90.0, 0.0, 45.0, 95.0),
-        ElementKind::Legend { frame, title: "classes".into(), all_classes: false, hide_other: false, exclude: vec![] },
+        ElementKind::Legend {
+            frame,
+            title: "classes".into(),
+            all_classes: false,
+            hide_other: false,
+            exclude: vec![],
+            columns: 1,
+            fit: Default::default(),
+            show_layer_names: true,
+        },
     );
     let expected = layout::render(&page, &mut [base.clone()], 96.0, &layout::PageInfo::default()).unwrap();
     for size in [1, 3, 20] {
@@ -1148,6 +1158,7 @@ fn layout_export_rejects_unopened_local_shapefiles_and_required_masks() {
                 extent_width: INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch,
+                link: None,
             },
         );
         for masked in [false, true] {

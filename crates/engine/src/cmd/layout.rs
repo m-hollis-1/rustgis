@@ -6,9 +6,11 @@ use std::path::Path;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::Rgba;
 use rustgis_map::layout::{
-    Arrange, ArrowStyle, CoordFormat, ElementKind, FontFamily, FrameShape, Grid, GridEdges, GridKind, GridStyle, Guides, Layout, LineDir,
-    LineHead, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation,
-    PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, fit_scale, line_angle, line_at_angle, line_length,
+    Arrange, ArrowStyle, BarLabels, CoordFormat, ElementKind, FontFamily, FrameLink, FrameShape, FrameStyle, Grid, GridEdges, GridKind,
+    GridStyle, Guides, Layout, LegendFit, LineDir, LineHead, LinkMode, MAX_COLORBAR_TICKS, MAX_ELEMENTS, MAX_GRID_WIDTH, MAX_GROUP_DEPTH,
+    MAX_GUIDES, MAX_LEGEND_COLUMNS, MAX_LINK_STEPS, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS, MAX_SCALE_DIVISIONS, MAX_SCALE_SUBDIVISIONS,
+    MAX_TICK_MM, MAX_UNIT_LABEL_CHARS, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, SCALE_LABEL_SIZE, ScaleBarStyle, ScaleFit,
+    ScaleUnits, TextAlign, TextCase, TickSide, UnitLabel, VAlign, fit_scale, line_angle, line_at_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -85,19 +87,25 @@ pub fn commands() -> Vec<C> {
             r#"{"layout"?, "shape"?: "rectangle"|"circle"|"ellipse"|"polygon"|"lasso", "points"?: [[u, v], …] (polygon/lasso, 0..1 across the frame), "map"?: name, "x"?, "y"?, "w"?, "h"?: mm}"#,
         ),
         C::new("layout.addElement", "Add Element", "Publish › Map Surrounds", add_element).params(
-            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "x"?, "y"?, "w"?, "h"?: mm}"##,
+            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame; for text and dynamicText, the map frame whose map its tokens ({scale}, {map}, {extent}…) read, default none: the first frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "wrap"?: bool (text, dynamicText: break each line at the element's width; a word wider than it stays whole), "valign"?: "top"|"middle"|"bottom" (text, dynamicText: where the block of lines sits down the element, default top), "lineSpacing"?: 0.5 to 3 (text, dynamicText: the distance between lines as a multiple of the usual, default 1), "case"?: "none"|"upper"|"lower" (text, dynamicText: applied once the tokens have expanded; wrap, valign, lineSpacing and case are refused for other kinds), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "columns"?: 1..6 (legend: columns the rows run down and across, shared out so the columns are about equally tall; default 1), "fit"?: "manual"|"adjustSize"|"adjustColumns"|"adjustColumnsAndSize"|"adjustFrame" (legend: when the rows don't fit its box: manual cuts the tail; adjustSize shrinks the text down to 6 pt; adjustColumns adds columns up to 6; adjustColumnsAndSize adds columns, then shrinks the text; adjustFrame draws at the natural size, over the box's edges; default manual. A scaleBar's fit is "adjustDivisionValue"|"adjustDivision"|"adjustWidth": adjustDivisionValue stretches the divisions to the width, so their value may not be round; adjustDivision keeps the value round and adds or drops divisions to fill the width; adjustWidth keeps the divisions and their round value and draws the bar as wide as they need; default adjustDivisionValue), "showLayerNames"?: bool (legend: a layer's name over its classes; false keeps the classes and drops the name, except a layer drawn in one symbol, whose name labels its swatch; default true), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file (picture: the picture remembers it as its source, so a missing one can be relinked), "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "symbol"?: null (northArrow: no symbol, the default; an import gives one and nothing else sets it), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "subdivisions"?: 0..10 (scaleBar: parts the first division is cut into, not labelled; 0 or 1 leaves it whole), "divisionsBeforeZero"?: 0..2 (scaleBar: whole divisions left of zero, labelled with negatives), "labelPosition"?: "above"|"below" (scaleBar: the division labels, default above), "unitLabel"?: text (scaleBar: the unit's name as printed, default its abbreviation; "" prints none), "unitLabelPosition"?: "afterBar"|"afterLabels"|"above"|"below" (scaleBar: default afterLabels, after the last division label), "decimals"?: 0..3 (scaleBar: decimals of the division labels, thousands apart; 0 gives each the decimals it needs), "labelSize"?: points, 4 to 24 (scaleBar: default 8), "x"?, "y"?, "w"?, "h"?: mm; "border"?: "#RRGGBB"|"#RRGGBBAA" (a line round the element, whatever it is; not for a grid or extentIndicator), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA" (a fill behind it), "gap"?: mm, 0 to 50 (between the element and its border and background)}"##,
         ),
         C::new("layout.update", "Element Properties", "Publish › Element", update).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"?, "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"?, "frame"?: map frame id | null (text: the frame its tokens read; null: the first frame), "wrap"?: bool, "valign"?: "top"|"middle"|"bottom", "lineSpacing"?: 0.5 to 3, "case"?: "none"|"upper"|"lower" (text only: refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "columns"?: 1..6, "fit"?: "manual"|"adjustSize"|"adjustColumns"|"adjustColumnsAndSize"|"adjustFrame" (legend) or "adjustDivisionValue"|"adjustDivision"|"adjustWidth" (scaleBar), "showLayerNames"?: bool (legend, as in layout.addElement; refused for other elements), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "symbol"?: null (northArrow: drops the point symbol an import gave it, so its style draws again; no other value is accepted), "image"?: base64, "path"?: picture file (picture: re-reads it and remembers it as the source; an image alone keeps the source; a file that is missing or not a PNG or JPEG is refused and leaves the picture as it was), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"?, "subdivisions"?, "divisionsBeforeZero"?, "labelPosition"?, "unitLabel"? (null: the unit's abbreviation again), "unitLabelPosition"?, "decimals"?, "labelSize"? (scaleBar, as in layout.addElement; the scale bar's details are refused for other elements), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?, "border"?: "#RRGGBB"|"#RRGGBBAA"|null (a line round the element, whatever it is; null for none), "borderWidth"?: points, 0 to 50 (default 1), "background"?: "#RRGGBB"|"#RRGGBBAA"|null (a fill behind it; null for none), "gap"?: mm, 0 to 50 (between the element and its border and background; the frame style the four make is kept for any element kind, and not given keeps what it has), "link"?: {"frame": map frame id, "mode"?: "center"|"extent"|"scale", "rotation"?: bool} | null (map frame: follow another frame, taking its centre (the default; the frame keeps its scale), the scale that fits what it shows, or its scale (the frame keeps its centre), and with rotation its bearing too; a frame's own view returns when it's unlinked; null unlinks; a loop, the frame itself or an element that isn't a map frame is refused; so is the frame of a map series). center, scale and bearing on a frame that follows another change the view it keeps, shown again when it is unlinked. A group takes x and y (where its box goes: everything in it moves as far), name, visible and locked (given to everything in it too) and the frame style, drawn round its box; w, h and any other property are refused}"##,
         ),
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
         ),
         C::new("layout.duplicateElement", "Duplicate Element", "Publish › Element", duplicate_element).params(
-            r#"{"layout"?, "element": id, "dx"?, "dy"?: mm (offset of the copy, default 5)}"#,
+            r#"{"layout"?, "element": id, "dx"?, "dy"?: mm (offset of the copy, default 5; a group is copied with everything in it, the copies in a new group)}"#,
         ),
         C::new("layout.arrange", "Arrange Element", "Publish › Element", arrange).params(
-            r#"{"layout"?, "element": id, "to": "front"|"forward"|"backward"|"back" (later elements are drawn over earlier ones: front puts it over every other, forward over the one above it, backward under the one below, back under every other)}"#,
+            r#"{"layout"?, "element": id, "to": "front"|"forward"|"backward"|"back" (later elements are drawn over earlier ones: front puts it over every other, forward over the one above it, backward under the one below, back under every other; a group's elements move together, keeping their order)}"#,
+        ),
+        C::new("layout.group", "Group", "Publish › Element", group).params(
+            r#"{"layout"?, "elements": [element ids] (two or more; each in no group, or all in the same one, which the new group then joins), "name"?: string (default "Group")} → {"element": the new group's id}: grouped elements move, copy, reorder and delete together, and a click on one picks it alone; groups nest up to 8 deep"#,
+        ),
+        C::new("layout.ungroup", "Ungroup", "Publish › Element", ungroup).params(
+            r#"{"layout"?, "element": group id} → {"elements": [what it held]}: the group goes and its elements stay where they are, in the group it was in, if any"#,
         ),
         C::new("layout.removeElement", "Delete Element", "Publish › Element", |s, p| {
             let id = element_id(p)?;
@@ -108,9 +116,9 @@ pub fn commands() -> Vec<C> {
             }
             if l.remove(id) { Ok(Value::Null) } else { Err(format!("no element {id}")) }
         })
-        .params(r#"{"layout"?, "element": id}"#),
+        .params(r#"{"layout"?, "element": id (a map frame goes with its surrounds, a group with everything in it)}"#),
         C::new("layout.frameZoom", "Zoom Frame", "Publish › Map Frame", frame_zoom).params(
-            r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?}"#,
+            r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?; refused for a frame that follows another: unlink it first with layout.update}"#,
         ),
         C::new("layout.series", "Map Series", "Publish › Map Frames", series).params(
             r#"{"layout"?, "layer": index layer, "nameField"?: string, "frame"?: id, "margin"?: 0..1, "off"?: bool}"#,
@@ -131,25 +139,16 @@ pub fn commands() -> Vec<C> {
         .view()
         .params(r#"{"layout"?, "path": "*.rgislayout"}"#),
         C::new("layout.import", "Import Layout", "Home › Project", |s, p| {
-            let text = match (ps(p, "text"), ps(p, "path")) {
-                (Some(t), _) => t.to_string(),
-                (None, Some(path)) => {
-                    use std::io::Read;
-                    // Read at most one byte past the limit, so a file growing meanwhile is still refused.
-                    let mut text = String::new();
-                    std::fs::File::open(path)
-                        .and_then(|f| f.take(MAX_LAYOUT + 1).read_to_string(&mut text))
-                        .map_err(|e| format!("{path}: {e}"))?;
-                    if text.len() as u64 > MAX_LAYOUT {
-                        return Err("the layout file is too large".into());
-                    }
-                    text
-                }
-                (None, None) => return Err("path or text is required".into()),
-            };
+            let text = layout_text(p)?;
+            // An ArcGIS Pro layout: by its extension, or by its text, whose type Pro writes first.
+            let path = ps(p, "text").is_none().then(|| ps(p, "path")).flatten();
+            if super::arcgis_pro::is_pagx(&text, path) {
+                let dir = super::arcgis_pro::folder(p);
+                return super::arcgis_pro::import_layout(s, &text, dir.as_deref(), p);
+            }
             import(s, &text)
         })
-        .params(r#"{"path"?: "*.rgislayout", "text"?: layout JSON}"#),
+        .params(r#"{"path"?: "*.rgislayout|*.pagx", "text"?: layout JSON or a .pagx file's text, "maps"?: {frame name: map name} (.pagx: the project map a frame shows when the layout doesn't say; default: the active map), "dir"?: "the folder a .pagx's relative picture and data paths start from (default: the file's)"} → {"layout", "name"} (.pagx: and "maps" added or reused, "notes" on what wasn't carried over)"#),
     ]
 }
 
@@ -199,12 +198,16 @@ fn arrange(s: &mut Session, p: &Value) -> CmdResult {
     if l.element(id).is_none() {
         return Err(format!("no element {id}"));
     }
-    unlocked(l, id)?;
-    let before = l.draw_order(id).map(|(i, _)| i);
+    // A group's elements move with it.
+    for e in std::iter::once(id).chain(l.descendants(id)) {
+        unlocked(l, e)?;
+    }
+    let order = |l: &Layout| l.elements.iter().map(|e| e.id).collect::<Vec<u32>>();
+    let before = order(l);
     let index = l.arrange(id, to).ok_or_else(|| format!("no element {id}"))?;
     let of = l.elements.len();
     // A move that changes nothing (front for the element already on top) is no step to undo.
-    if before == Some(index) {
+    if before == order(l) {
         s.request_only = true;
     }
     Ok(json!({"element": id, "index": index, "of": of}))
@@ -218,7 +221,7 @@ fn unlocked(l: &Layout, id: u32) -> Result<(), String> {
     }
 }
 
-fn unique_name(s: &Session, base: &str) -> String {
+pub(crate) fn unique_name(s: &Session, base: &str) -> String {
     let base = base.trim();
     let base = if base.is_empty() { "Layout" } else { base };
     numbered(base, |n| s.project.layouts.iter().any(|l| l.name.eq_ignore_ascii_case(n)))
@@ -279,6 +282,7 @@ fn frame_kind(s: &Session, map: &str, w: f64, shape: FrameShape) -> ElementKind 
         extent_width: rustgis_map::layout::INDICATOR_WIDTH,
         bearing,
         pitch,
+        link: None,
     }
 }
 
@@ -303,7 +307,16 @@ pub(crate) fn new_layout(s: &mut Session, p: &Value) -> CmdResult {
             l.add(
                 "Legend",
                 (side, m + 16.0, sw, fh * 0.6),
-                ElementKind::Legend { frame, title: "Legend".into(), all_classes: false, hide_other: false, exclude: Vec::new() },
+                ElementKind::Legend {
+                    frame,
+                    title: "Legend".into(),
+                    all_classes: false,
+                    hide_other: false,
+                    exclude: Vec::new(),
+                    columns: 1,
+                    fit: Default::default(),
+                    show_layer_names: true,
+                },
             );
             l.add("North Arrow", (side + sw / 2.0 - 8.0, m + 16.0 + fh * 0.62, 16.0, 24.0), ElementKind::north_arrow(frame));
             l.add("Scale Bar", (side, m + 16.0 + fh * 0.62 + 28.0, sw, 12.0), ElementKind::scale_bar(frame));
@@ -500,7 +513,11 @@ fn pub_text(text: String, size: f64, color: Rgba, bold: bool, align: TextAlign) 
 
 /// [`pub_text`] in `font`.
 fn pub_text_in(text: String, size: f64, color: Rgba, bold: bool, align: TextAlign, font: FontFamily) -> ElementKind {
-    ElementKind::Text { text, size, color, bold, italic: false, align, letter_spacing: 0.0, font, font_name: None }
+    let mut k = ElementKind::text(text, size, color, bold);
+    if let ElementKind::Text { align: a, font: f, .. } = &mut k {
+        (*a, *f) = (align, font);
+    }
+    k
 }
 
 /// How a publication sheet is arranged around its map.
@@ -1387,6 +1404,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
+            link: None,
         },
     );
     // Over the map, clear of the graticule's labels (drawn inside the frame along its labelled
@@ -1547,7 +1565,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     };
     let lonlat = crate::render::view_lonlat(s.map(), &view);
     let reading = s.map_mut().sync_sources(&lonlat, render_scale, true);
-    let (mut cw, mut ch) = match crate::render::layout::legend_size_mm(s.map_mut(), render_scale, false, false, &[]) {
+    let (mut cw, mut ch) = match crate::render::layout::legend_size_mm(s.map_mut(), render_scale, false, false, &[], 1, true) {
         Some(size) => size,
         None => {
             // A complete source that can't be read: the export says why; the legend is sized by hand.
@@ -1703,6 +1721,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
+                link: None,
             },
         );
     }
@@ -1773,7 +1792,16 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             l.add(
                 "Legend",
                 (ix, iy, iw, rows_h),
-                ElementKind::Legend { frame, title: String::new(), all_classes: false, hide_other: false, exclude: Vec::new() },
+                ElementKind::Legend {
+                    frame,
+                    title: String::new(),
+                    all_classes: false,
+                    hide_other: false,
+                    exclude: Vec::new(),
+                    columns: 1,
+                    fit: Default::default(),
+                    show_layer_names: true,
+                },
             );
         }
         if let Some(layer) = &bar {
@@ -1897,12 +1925,200 @@ fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
     }
     let l = active(s, p)?;
     let e = l.element(id).cloned().ok_or_else(|| format!("no element {id}"))?;
+    if e.is_group() {
+        let n = 1 + l.descendants(id).len();
+        if l.elements.len() + n > MAX_ELEMENTS {
+            return Err(format!("a layout holds at most {MAX_ELEMENTS} elements"));
+        }
+        let copy = copy_group(l, id, (dx, dy)).ok_or_else(|| format!("no element {id}"))?;
+        let name = l.element(copy).map(|c| c.name.clone()).unwrap_or_default();
+        return Ok(json!({"element": copy, "name": name}));
+    }
     let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
     let copy = l.add(name.clone(), (e.x + dx, e.y + dy, e.w, e.h), e.kind);
     if let Some(c) = l.element_mut(copy) {
         c.visible = e.visible;
+        c.frame_style = e.frame_style;
     }
     Ok(json!({"element": copy, "name": name}))
+}
+
+/// Copies group `id` and everything in it, offset by `(dx, dy)`: each a new element on top, in the
+/// drawing order the originals have, with its frame style, the copied groups holding the copies.
+/// References between copied elements (a surround's or a text's frame, an extent indicator, a
+/// link) point at the copies; those to elements outside the group stay. The copy's id.
+fn copy_group(l: &mut Layout, id: u32, (dx, dy): (f64, f64)) -> Option<u32> {
+    let members: Vec<u32> = std::iter::once(id).chain(l.descendants(id)).collect();
+    // In drawing order, so the copy stacks as the original does.
+    let originals: Vec<rustgis_map::layout::Element> = l.elements.iter().filter(|e| members.contains(&e.id)).cloned().collect();
+    let mut copies: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for e in &originals {
+        let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
+        let copy = l.add(name, (e.x + dx, e.y + dy, e.w, e.h), e.kind.clone());
+        if let Some(c) = l.element_mut(copy) {
+            c.visible = e.visible;
+            c.frame_style = e.frame_style.clone();
+        }
+        copies.insert(e.id, copy);
+    }
+    for copy in copies.values() {
+        if let Some(c) = l.element_mut(*copy) {
+            c.kind.remap(|r| copies.get(&r).copied());
+        }
+    }
+    copies.get(&id).copied()
+}
+
+/// The ids in "elements", each once, in the order given.
+fn element_ids(p: &Value) -> Result<Vec<u32>, String> {
+    let list = p.get("elements").and_then(Value::as_array).ok_or("elements is a list of element ids")?;
+    if list.len() > MAX_ELEMENTS {
+        return Err(format!("a layout holds at most {MAX_ELEMENTS} elements"));
+    }
+    let mut out: Vec<u32> = Vec::new();
+    for v in list {
+        let id = v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("elements is a list of element ids")?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Groups elements: a new group, on top, holding them. They must be in no group, or all in the
+/// same one, which the new group joins in their place.
+fn group(s: &mut Session, p: &Value) -> CmdResult {
+    let ids = element_ids(p)?;
+    let name = match p.get("name") {
+        None | Some(Value::Null) => "Group".to_string(),
+        Some(Value::String(n)) if n.trim().is_empty() => "Group".to_string(),
+        Some(Value::String(n)) => n.trim().chars().take(200).collect(),
+        Some(_) => return Err("name is text".into()),
+    };
+    let l = active(s, p)?;
+    if ids.len() < 2 {
+        return Err("group two elements or more".into());
+    }
+    for id in &ids {
+        if l.element(*id).is_none() {
+            return Err(format!("no element {id}"));
+        }
+        unlocked(l, *id)?;
+    }
+    let parent = ids.first().and_then(|id| l.group_of(*id));
+    if ids.iter().any(|id| l.group_of(*id) != parent) {
+        return Err("the elements are in different groups: group ungrouped elements, or elements of one group".into());
+    }
+    if let Some(g) = parent {
+        unlocked(l, g)?;
+    }
+    let below = ids.iter().map(|id| l.group_depth(*id)).max().unwrap_or(0);
+    let above = parent.map_or(0, |g| 1 + l.groups_of(g).len());
+    if above + below + 1 > MAX_GROUP_DEPTH {
+        return Err(format!("groups nest at most {MAX_GROUP_DEPTH} deep"));
+    }
+    if l.elements.len() >= MAX_ELEMENTS {
+        return Err(format!("a layout holds at most {MAX_ELEMENTS} elements"));
+    }
+    // Listed in drawing order.
+    let children: Vec<u32> = l.elements.iter().map(|e| e.id).filter(|id| ids.contains(id)).collect();
+    // Its own box means nothing (`Layout::group_box` is where it is).
+    let id = l.add(name, (0.0, 0.0, 0.0, 0.0), ElementKind::Group { children });
+    if let Some(ElementKind::Group { children }) = parent.and_then(|g| l.element_mut(g)).map(|e| &mut e.kind) {
+        children.retain(|c| !ids.contains(c));
+        children.push(id);
+    }
+    Ok(json!({"element": id}))
+}
+
+/// Ungroups a group: it goes, and what it held stays where it is, in the group it was in.
+fn ungroup(s: &mut Session, p: &Value) -> CmdResult {
+    let id = element_id(p)?;
+    let l = active(s, p)?;
+    let e = l.element(id).ok_or_else(|| format!("no element {id}"))?;
+    if !e.is_group() {
+        return Err("not a group".into());
+    }
+    let children = e.children().to_vec();
+    unlocked(l, id)?;
+    let parent = l.group_of(id);
+    if let Some(g) = parent {
+        unlocked(l, g)?;
+    }
+    l.elements.retain(|e| e.id != id);
+    if let Some(ElementKind::Group { children: up }) = parent.and_then(|g| l.element_mut(g)).map(|e| &mut e.kind)
+        && let Some(i) = up.iter().position(|c| *c == id)
+    {
+        up.splice(i..=i, children.iter().copied());
+    }
+    Ok(json!({"elements": children}))
+}
+
+/// What `layout.update` changes on a group: where it is (everything in it moves as far), its
+/// name, visibility and lock (given to everything in it), and its frame style.
+fn update_group(s: &mut Session, li: usize, id: u32, p: &Value, frame_style: FrameParams) -> CmdResult {
+    const TAKES: [&str; 11] = ["layout", "element", "x", "y", "name", "visible", "locked", "border", "borderWidth", "background", "gap"];
+    if ["w", "h"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        return Err("a group has no size of its own".into());
+    }
+    if let Some((k, _)) = p.as_object().and_then(|o| o.iter().find(|(k, v)| !v.is_null() && !TAKES.contains(&k.as_str()))) {
+        return Err(format!("a group has no {k}: change the elements in it"));
+    }
+    let (x, y) = (given_num(p, "x", "a number of mm")?, given_num(p, "y", "a number of mm")?);
+    for k in ["visible", "locked"] {
+        if p.get(k).is_some_and(|v| !v.is_null() && !v.is_boolean()) {
+            return Err(format!("{k} is true or false"));
+        }
+    }
+    let name = match p.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) => Some(n.trim().chars().take(200).collect::<String>()).filter(|n| !n.is_empty()),
+        Some(_) => return Err("name is text".into()),
+    };
+    let l = s.project.layouts.get_mut(li).ok_or("no layout")?;
+    let all: Vec<u32> = std::iter::once(id).chain(l.descendants(id)).collect();
+    // Locked, it (and whatever in it is locked) takes no change but being unlocked.
+    let changes = p.as_object().is_some_and(|o| {
+        o.iter().any(|(k, v)| {
+            (!v.is_null() || matches!(k.as_str(), "border" | "background")) && !matches!(k.as_str(), "layout" | "element" | "locked")
+        })
+    });
+    if changes && b(p, "locked") != Some(false) {
+        for e in &all {
+            unlocked(l, *e)?;
+        }
+    }
+    let shift = match (x, y) {
+        (None, None) => None,
+        _ => {
+            let (gx, gy, _, _) = l.group_box(id).ok_or("the group is empty: there is nothing to move")?;
+            // One shift for all, kept to what leaves every element's corner within ±5000 mm, so
+            // the elements keep their spacing.
+            let corners: Vec<(f64, f64)> = l.elements.iter().filter(|e| all.contains(&e.id) && !e.is_group()).map(|e| (e.x, e.y)).collect();
+            let (hi_x, hi_y) = corners.iter().fold((gx, gy), |(a, b), (x, y)| (a.max(*x), b.max(*y)));
+            let within = |d: f64, lo: f64, hi: f64| d.clamp(-5000.0 - lo, (5000.0 - hi).max(-5000.0 - lo));
+            Some((x.map_or(0.0, |x| within(x - gx, gx, hi_x)), y.map_or(0.0, |y| within(y - gy, gy, hi_y))))
+        }
+    };
+    for e in l.elements.iter_mut().filter(|e| all.contains(&e.id)) {
+        if let Some((dx, dy)) = shift.filter(|_| !e.is_group()) {
+            e.x += dx;
+            e.y += dy;
+        }
+        if let Some(v) = b(p, "visible") {
+            e.visible = v;
+        }
+        if let Some(v) = b(p, "locked") {
+            e.locked = v;
+        }
+        if e.id == id {
+            if let Some(n) = &name {
+                e.name = n.clone();
+            }
+            e.frame_style = frame_style.apply(e.frame_style.as_ref());
+        }
+    }
+    Ok(Value::Null)
 }
 
 /// A shape's "width" in points: `default` when it's not given (or null), an error when it's not a
@@ -2024,21 +2240,92 @@ pub(crate) fn color(p: &Value, k: &str, d: Rgba) -> Result<Rgba, String> {
     }
 }
 
+/// The frame style an element is given or changed to: `"border"` and `"background"` (a colour, or
+/// null to clear), `"borderWidth"` (points) and `"gap"` (millimetres). Parameters not given keep
+/// what the element has; a style left at its defaults (no border, no background, the usual width
+/// and no gap) is no style, so the element is saved as one without.
+#[derive(Default)]
+struct FrameParams {
+    border: Option<Option<Rgba>>,
+    background: Option<Option<Rgba>>,
+    width: Option<f64>,
+    gap: Option<f64>,
+}
+
+impl FrameParams {
+    fn read(p: &Value) -> Result<Self, String> {
+        let colour = |k: &str| -> Result<Option<Option<Rgba>>, String> {
+            match p.get(k) {
+                None => Ok(None),
+                Some(Value::Null) => Ok(Some(None)),
+                Some(v) => match v.as_str().and_then(Rgba::from_hex) {
+                    Some(c) => Ok(Some(Some(c))),
+                    None => Err(format!("{k} must be #RRGGBB or #RRGGBBAA, or null for none")),
+                },
+            }
+        };
+        Ok(FrameParams {
+            border: colour("border")?,
+            background: colour("background")?,
+            width: given_num(p, "borderWidth", "a number of points")?,
+            gap: given_num(p, "gap", "a number of mm")?,
+        })
+    }
+
+    fn given(&self) -> bool {
+        self.border.is_some() || self.background.is_some() || self.width.is_some() || self.gap.is_some()
+    }
+
+    /// `current` with these applied: width and gap limited as a loaded file's are.
+    fn apply(&self, current: Option<&FrameStyle>) -> Option<FrameStyle> {
+        if !self.given() {
+            return current.cloned();
+        }
+        let mut f = current.cloned().unwrap_or_default();
+        if let Some(c) = self.border {
+            f.border = c;
+        }
+        if let Some(c) = self.background {
+            f.background = c;
+        }
+        f.border_width = self.width.unwrap_or(f.border_width);
+        f.gap = self.gap.unwrap_or(f.gap);
+        f.clamp();
+        (f != FrameStyle::default()).then_some(f)
+    }
+}
+
 fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     let kind = ps(p, "kind").ok_or("kind is required")?;
     if kind != "legend" && p.get("exclude").is_some_and(|v| !v.is_null()) {
         return Err("only legends leave layers out".into());
+    }
+    if kind != "legend" && has_legend_layout(p, kind == "scaleBar") {
+        return Err(ONLY_LEGEND_LAYOUT.into());
+    }
+    if kind != "scaleBar" && has_bar_details(p) {
+        return Err(ONLY_BAR_DETAILS.into());
     }
     // A family is a text's: refused elsewhere, as a legend's left-out layers are, so a script
     // doesn't take it as applied.
     if !matches!(kind, "text" | "dynamicText") && gives_font(p) {
         return Err(ONLY_TEXT_FONT.into());
     }
+    if !matches!(kind, "text" | "dynamicText") && gives_block(p) {
+        return Err(ONLY_TEXT_BLOCK.into());
+    }
     if kind != "rectangle" && p.get("radius").is_some_and(|v| !v.is_null()) {
         return Err(ONLY_RECTANGLE_RADIUS.into());
     }
+    let frame_style = FrameParams::read(p)?;
+    // A grid and an extent indicator are added to a map frame, not to the page: the frame has the
+    // style (layout.update).
+    if matches!(kind, "grid" | "extentIndicator") && frame_style.given() {
+        return Err(format!("a {kind} is part of a map frame, not an element of its own: set the frame's border with layout.update"));
+    }
     let i = index(s, p)?;
     let image = if kind == "picture" { Some(super::graphics::picture(p)?) } else { None };
+    let source = if kind == "picture" { picture_source(p) } else { None };
     let layer_name = |s: &Session, l: &Layout, frame: u32| -> Result<String, String> {
         let map = match l.element(frame).map(|e| &e.kind) {
             Some(ElementKind::MapFrame { map, .. }) => map.clone(),
@@ -2070,7 +2357,18 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
             let all_classes = b(p, "allClasses").unwrap_or(false);
             let hide_other = b(p, "hideOther").unwrap_or(false);
             let exclude = legend_exclude(s, l, frame, p)?.unwrap_or_default();
-            ("Legend", place(p, l, (pw - 70.0, 45.0, 60.0, 80.0))?, ElementKind::Legend { frame, title, all_classes, hide_other, exclude })
+            let (columns, fit, show_layer_names) = legend_layout(p)?;
+            let kind = ElementKind::Legend {
+                frame,
+                title,
+                all_classes,
+                hide_other,
+                exclude,
+                columns: columns.unwrap_or(1),
+                fit: fit.unwrap_or_default(),
+                show_layer_names: show_layer_names.unwrap_or(true),
+            };
+            ("Legend", place(p, l, (pw - 70.0, 45.0, 60.0, 80.0))?, kind)
         }
         "colorbar" => {
             let frame = frame_of(l, p)?;
@@ -2100,6 +2398,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
             let size = f(p, "size").unwrap_or(12.0).clamp(*fonts.start(), *fonts.end());
             let (italic, align, letter_spacing) = text_style(p, false, TextAlign::Left, 0.0)?;
             let (font, font_name) = text_font(p, (FontFamily::Sans, None))?;
+            let block = block_style(l, p, BlockStyle::default())?;
             let k = ElementKind::Text {
                 text,
                 size,
@@ -2110,11 +2409,16 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
                 letter_spacing,
                 font,
                 font_name,
+                frame: block.frame,
+                wrap: block.wrap,
+                valign: block.valign,
+                line_spacing: block.line_spacing,
+                case: block.case,
             };
             (if kind == "text" { "Text" } else { "Dynamic Text" }, place(p, l, (15.0, 12.0, 120.0, (size * 0.5).max(8.0)))?, k)
         }
         "picture" => {
-            ("Picture", place(p, l, (pw - 60.0, ph - 50.0, 45.0, 35.0))?, ElementKind::Picture { image: image.unwrap_or_default() })
+            ("Picture", place(p, l, (pw - 60.0, ph - 50.0, 45.0, 35.0))?, ElementKind::Picture { image: image.unwrap_or_default(), source })
         }
         "table" => {
             let frame = frame_of(l, p)?;
@@ -2247,6 +2551,9 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     };
     let l = s.project.layouts.get_mut(i).ok_or("no layout")?;
     let id = l.add(name, rect, k);
+    if let Some(e) = l.element_mut(id) {
+        e.frame_style = frame_style.apply(None);
+    }
     let mut out = json!({"element": id});
     if let Some(w) = warning {
         out["warning"] = json!(w);
@@ -2431,6 +2738,68 @@ pub(crate) fn text_style(p: &Value, italic: bool, align: TextAlign, spacing: f64
     Ok((italic, align, spacing))
 }
 
+/// A text element's frame, wrapping, vertical alignment, line spacing and case.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockStyle {
+    frame: Option<u32>,
+    wrap: bool,
+    valign: VAlign,
+    line_spacing: f64,
+    case: TextCase,
+}
+
+impl Default for BlockStyle {
+    fn default() -> BlockStyle {
+        BlockStyle { frame: None, wrap: false, valign: VAlign::Top, line_spacing: rustgis_map::layout::LINE_SPACING, case: TextCase::None }
+    }
+}
+
+/// What a `wrap`, `valign`, `lineSpacing` or `case` given for an element that isn't a text is told.
+const ONLY_TEXT_BLOCK: &str = "only text elements take wrap, valign, lineSpacing or case";
+
+/// Whether `p` gives a `wrap`, `valign`, `lineSpacing` or `case`, which only text elements take.
+fn gives_block(p: &Value) -> bool {
+    ["wrap", "valign", "lineSpacing", "case"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+/// A text element's [`BlockStyle`] from `frame`, `wrap`, `valign`, `lineSpacing` and `case` in `p`,
+/// each keeping `current` when not given. A `frame` must be a map frame of `l`; `null` unbinds it
+/// (the text reads the first frame). One given but not of its kind is an error.
+fn block_style(l: &Layout, p: &Value, current: BlockStyle) -> Result<BlockStyle, String> {
+    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+    let frame = match p.get("frame") {
+        None => current.frame,
+        Some(Value::Null) => None,
+        Some(v) => v
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| matches!(l.element(*id).map(|e| &e.kind), Some(ElementKind::MapFrame { .. })))
+            .map(Some)
+            .ok_or("frame must be a map frame")?,
+    };
+    let wrap = match p.get("wrap") {
+        None | Some(Value::Null) => current.wrap,
+        Some(Value::Bool(v)) => *v,
+        Some(_) => return Err("wrap must be true or false".into()),
+    };
+    let valign = match ps(p, "valign") {
+        Some(a) => VAlign::from_name(a).ok_or_else(|| format!("unknown valign '{a}' (top, middle or bottom)"))?,
+        None if given("valign") => return Err("valign must be top, middle or bottom".into()),
+        None => current.valign,
+    };
+    let line_spacing = match (given("lineSpacing"), f(p, "lineSpacing")) {
+        (_, Some(v)) => v.clamp(rustgis_map::layout::MIN_LINE_SPACING, rustgis_map::layout::MAX_LINE_SPACING),
+        (true, None) => return Err("lineSpacing must be a number, 0.5 to 3".into()),
+        (false, None) => current.line_spacing,
+    };
+    let case = match ps(p, "case") {
+        Some(c) => TextCase::from_name(c).ok_or_else(|| format!("unknown case '{c}' (none, upper or lower)"))?,
+        None if given("case") => return Err("case must be none, upper or lower".into()),
+        None => current.case,
+    };
+    Ok(BlockStyle { frame, wrap, valign, line_spacing, case })
+}
+
 /// What a `font` given for an element that isn't a text is told.
 const ONLY_TEXT_FONT: &str = "only text elements take a font or a fallback";
 
@@ -2540,6 +2909,60 @@ fn font_warning(font: FontFamily, name: Option<&str>, fallback_given: bool, styl
     }
 }
 
+const ONLY_LEGEND_LAYOUT: &str = "only legends have columns, a fit or layer names";
+
+/// Whether `p` gives a legend's `columns`, `fit` or `showLayerNames`.
+/// (A scale bar has a `fit` of its own: `bar` leaves it out.)
+fn has_legend_layout(p: &Value, bar: bool) -> bool {
+    ["columns", "fit", "showLayerNames"].iter().filter(|k| !(bar && **k == "fit")).any(|k| p.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+const ONLY_BAR_DETAILS: &str = "subdivisions, divisionsBeforeZero, labelPosition, unitLabel, unitLabelPosition, decimals and labelSize are for scale bars only (a scale bar's fit is adjustDivisionValue, adjustDivision or adjustWidth; legends have their own)";
+
+/// The options a scale bar takes besides its style, units and divisions.
+const BAR_DETAILS: [&str; 7] =
+    ["subdivisions", "divisionsBeforeZero", "labelPosition", "unitLabel", "unitLabelPosition", "decimals", "labelSize"];
+
+/// Whether `p` gives a scale bar's details.
+fn has_bar_details(p: &Value) -> bool {
+    BAR_DETAILS.iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+/// A name from `p` that `from` reads, `None` when not given (or null); a value that isn't one of
+/// `names` is an error.
+fn given_name<T>(p: &Value, k: &str, from: fn(&str) -> Option<T>, names: &str) -> Result<Option<T>, String> {
+    match p.get(k).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v.as_str().and_then(from).map(Some).ok_or_else(|| format!("{k} is {names}")),
+    }
+}
+
+/// A whole number from `p` within `lo..=hi`, `None` when not given (or null); a number is rounded
+/// and limited, as a colorbar's ticks are, and one that isn't a number is an error.
+fn given_count(p: &Value, k: &str, what: &str, hi: usize) -> Result<Option<usize>, String> {
+    Ok(given_num(p, k, what)?.map(|v| v.round().clamp(0.0, hi as f64) as usize))
+}
+
+/// A legend's `columns`, `fit` and `showLayerNames` from `p`, each `None` when not given (or
+/// null); one of the wrong type, or a `fit` that isn't one of the strategies, is an error.
+fn legend_layout(p: &Value) -> Result<(Option<usize>, Option<LegendFit>, Option<bool>), String> {
+    // A number is limited, as a colorbar's ticks are.
+    let columns = given_num(p, "columns", "a number of columns, 1 to 6")?.map(|c| c.round().clamp(1.0, MAX_LEGEND_COLUMNS as f64) as usize);
+    let fit = match p.get("fit").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(LegendFit::from_name)
+                .ok_or("fit is \"manual\", \"adjustSize\", \"adjustColumns\", \"adjustColumnsAndSize\" or \"adjustFrame\"")?,
+        ),
+    };
+    let names = match p.get("showLayerNames").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => Some(v.as_bool().ok_or("showLayerNames is true or false")?),
+    };
+    Ok((columns, fit, names))
+}
+
 /// A legend's `exclude` from `p`: the names of layers in its frame's map, as the map spells them;
 /// `None` when not given. Not a list of names, or a name the map hasn't, is an error.
 fn legend_exclude(s: &Session, l: &Layout, frame: u32, p: &Value) -> Result<Option<Vec<String>>, String> {
@@ -2573,10 +2996,16 @@ fn legend_exclude(s: &Session, l: &Layout, frame: u32, p: &Value) -> Result<Opti
 /// or when `p` has none. A bad value is an error, leaving nothing changed.
 fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String> {
     match kind {
-        ElementKind::NorthArrow { frame, style, fill, outline } => {
-            if ["style", "fill", "outline"].iter().all(|k| p.get(k).is_none()) {
+        ElementKind::NorthArrow { frame, style, fill, outline, symbol } => {
+            if ["style", "fill", "outline", "symbol"].iter().all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
+            // The symbol comes from an import: null drops it (the style draws again), nothing sets it.
+            let symbol = match p.get("symbol") {
+                None => symbol.clone(),
+                Some(Value::Null) => Vec::new(),
+                Some(_) => return Err("a north arrow's symbol comes from an import: null clears it, nothing else sets it".into()),
+            };
             let style = match ps(p, "style") {
                 Some(v) => ArrowStyle::from_name(v)
                     .ok_or_else(|| format!("unknown north arrow style '{v}' (classic, compass, triangle or star)"))?,
@@ -2587,10 +3016,24 @@ fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String>
                 style,
                 fill: color(p, "fill", *fill)?,
                 outline: color(p, "outline", *outline)?,
+                symbol,
             }))
         }
-        ElementKind::ScaleBar { frame, units, divisions, style } => {
-            if ["style", "units", "divisions"].iter().all(|k| p.get(k).is_none()) {
+        ElementKind::ScaleBar {
+            frame,
+            units,
+            divisions,
+            style,
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            label_size,
+            fit,
+        } => {
+            if ["style", "units", "divisions", "fit"].iter().chain(BAR_DETAILS.iter()).all(|k| p.get(*k).is_none()) {
                 return Ok(None);
             }
             let style = match ps(p, "style") {
@@ -2609,7 +3052,42 @@ fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String>
                 Some(_) => f(p, "divisions").ok_or("divisions is a number")?.round().clamp(1.0, MAX_SCALE_DIVISIONS as f64) as usize,
                 None => *divisions,
             };
-            Ok(Some(ElementKind::ScaleBar { frame: *frame, units, divisions, style }))
+            // The details, each checked before any is taken: numbers are limited as the divisions
+            // are, a name that isn't one of the choices is an error.
+            let subdivisions =
+                given_count(p, "subdivisions", "a number of parts, 0 to 10", MAX_SCALE_SUBDIVISIONS)?.unwrap_or(*subdivisions);
+            let divisions_before_zero = given_count(p, "divisionsBeforeZero", "a number of divisions, 0 to 2", MAX_SCALE_BEFORE_ZERO)?
+                .unwrap_or(*divisions_before_zero);
+            let label_position = given_name(p, "labelPosition", BarLabels::from_name, "\"above\" or \"below\"")?.unwrap_or(*label_position);
+            let unit_label = match p.get("unitLabel") {
+                // Null is the unit's own abbreviation again.
+                None => unit_label.clone(),
+                Some(Value::Null) => None,
+                Some(Value::String(t)) => Some(t.chars().take(MAX_UNIT_LABEL_CHARS).collect()),
+                Some(_) => return Err("unitLabel is text, or null for the unit's abbreviation".into()),
+            };
+            let unit_label_position =
+                given_name(p, "unitLabelPosition", UnitLabel::from_name, "\"afterBar\", \"afterLabels\", \"above\" or \"below\"")?
+                    .unwrap_or(*unit_label_position);
+            let decimals = given_count(p, "decimals", "a number of decimals, 0 to 3", MAX_SCALE_DECIMALS)?.unwrap_or(*decimals);
+            let label_size = given_num(p, "labelSize", "a size in points, 4 to 24")?
+                .map_or(*label_size, |v| v.clamp(*SCALE_LABEL_SIZE.start(), *SCALE_LABEL_SIZE.end()));
+            let fit = given_name(p, "fit", ScaleFit::from_name, "\"adjustDivisionValue\", \"adjustDivision\" or \"adjustWidth\"")?
+                .unwrap_or(*fit);
+            Ok(Some(ElementKind::ScaleBar {
+                frame: *frame,
+                units,
+                divisions,
+                style,
+                subdivisions,
+                divisions_before_zero,
+                label_position,
+                unit_label,
+                unit_label_position,
+                decimals,
+                label_size,
+                fit,
+            }))
         }
         ElementKind::Rectangle { fill, outline, width, .. } | ElementKind::Ellipse { fill, outline, width } => {
             if ["fill", "outline", "color", "width", "radius"].iter().all(|k| p.get(k).is_none()) {
@@ -2638,6 +3116,62 @@ fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String>
     }
 }
 
+/// The `link` of `layout.update` on element `id`: absent is `None` (keep), `null` unlinks, an
+/// object links to the map frame `"frame"` (`"mode"` and `"rotation"` as `layout.update` says).
+/// What `Layout::clamp` would drop, or isn't a link, is refused.
+fn read_link(l: &Layout, id: u32, p: &Value) -> Result<Option<Option<FrameLink>>, String> {
+    const USAGE: &str = r#"link is {"frame": map frame id, "mode"?: "center"|"extent"|"scale", "rotation"?: bool}, or null"#;
+    let Some(v) = p.get("link") else { return Ok(None) };
+    if !matches!(l.element(id).map(|e| &e.kind), Some(ElementKind::MapFrame { .. })) {
+        return Err("only map frames follow another frame".into());
+    }
+    let o = match v {
+        Value::Null => return Ok(Some(None)),
+        Value::Object(o) => o,
+        _ => return Err(USAGE.into()),
+    };
+    let frame = o.get("frame").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()).ok_or(USAGE)?;
+    let mode = match o.get("mode") {
+        None => LinkMode::default(),
+        Some(m) => m.as_str().and_then(LinkMode::from_name).ok_or("mode is \"center\", \"extent\" or \"scale\"")?,
+    };
+    let rotation = match o.get("rotation") {
+        None => false,
+        Some(r) => r.as_bool().ok_or("rotation is true or false")?,
+    };
+    if frame == id {
+        return Err("a frame can't follow itself".into());
+    }
+    // A map series moves its frame page by page: a view that is another's would not move.
+    if l.series.as_ref().is_some_and(|sr| sr.frame == id) {
+        return Err("the frame drives the map series: remove the series first".into());
+    }
+    if !matches!(l.element(frame).map(|e| &e.kind), Some(ElementKind::MapFrame { .. })) {
+        return Err(format!("no map frame {frame}"));
+    }
+    // The frames this one would follow, in turn: back at this one, they would go in a circle.
+    // A chain longer than a loaded layout keeps (`Layout::clamp`) is refused as well.
+    let mut at = frame;
+    let mut steps = 0;
+    while let Some(ElementKind::MapFrame { link: Some(next), .. }) = l.element(at).map(|e| &e.kind) {
+        if next.frame == id {
+            return Err(format!("frame {frame} already follows this frame, directly or through others"));
+        }
+        steps += 1;
+        if steps > MAX_LINK_STEPS {
+            return Err(format!("frames follow each other in a chain of {MAX_LINK_STEPS} at most"));
+        }
+        at = next.frame;
+    }
+    Ok(Some(Some(FrameLink { frame, mode, rotation })))
+}
+
+/// The file a picture was read from, as given in `path` (kept so a missing file can be relinked).
+fn picture_source(p: &Value) -> Option<String> {
+    let path = ps(p, "path")?.trim();
+    (!path.is_empty()).then(|| path.chars().take(rustgis_map::layout::MAX_PICTURE_SOURCE).collect())
+}
+
 fn update(s: &mut Session, p: &Value) -> CmdResult {
     let id = element_id(p)?;
     // Checked before anything changes, so a bad value leaves the element as it was.
@@ -2656,13 +3190,26 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
             return Err(format!("{k} must be a number of degrees"));
         }
     }
+    let frame_style = FrameParams::read(p)?;
     let li = index(s, p)?;
+    if s.project.layouts.get(li).and_then(|l| l.element(id)).is_some_and(|e| e.is_group()) {
+        return update_group(s, li, id, p, frame_style);
+    }
     // Locked, it takes no change but being unlocked, which may come with other changes.
-    let changes =
-        p.as_object().is_some_and(|o| o.iter().any(|(k, v)| !v.is_null() && !matches!(k.as_str(), "layout" | "element" | "locked")));
+    // Unbinding a text from its frame (`"frame": null`) is one.
+    let unbinds = p.get("frame").is_some_and(Value::is_null)
+        && matches!(s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind), Some(ElementKind::Text { .. }));
+    let changes = unbinds
+        || p.as_object().is_some_and(|o| {
+            o.iter().any(|(k, v)| {
+                (!v.is_null() || matches!(k.as_str(), "border" | "background" | "link" | "unitLabel" | "symbol"))
+                    && !matches!(k.as_str(), "layout" | "element" | "locked")
+            })
+        });
     if changes && b(p, "locked") != Some(false) {
         unlocked(s.project.layouts.get(li).ok_or("no layout")?, id)?;
     }
+    let new_link = read_link(s.project.layouts.get(li).ok_or("no layout")?, id, p)?;
     // A new layer (tables and charts) or field (charts) must exist in the frame's map.
     let checked = {
         let l = s.project.layouts.get(li).ok_or("no layout")?;
@@ -2795,6 +3342,14 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         Some(c) => Some(Rgba::from_hex(c).ok_or("color must be #RRGGBB or #RRGGBBAA")?),
         None => None,
     };
+    // A text element's frame, wrapping, vertical alignment, line spacing and case, checked first.
+    let new_block = match s.project.layouts.get(li).and_then(|l| l.element(id).map(|e| (l, &e.kind))) {
+        Some((l, ElementKind::Text { frame, wrap, valign, line_spacing, case, .. })) => {
+            Some(block_style(l, p, BlockStyle { frame: *frame, wrap: *wrap, valign: *valign, line_spacing: *line_spacing, case: *case })?)
+        }
+        _ if gives_block(p) => return Err(ONLY_TEXT_BLOCK.into()),
+        _ => None,
+    };
     // A text element's italic, alignment and spacing, checked before anything changes.
     let new_text_style = match s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind) {
         Some(ElementKind::Text { italic, align, letter_spacing, font, font_name, .. }) => {
@@ -2830,6 +3385,31 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
             _ => None,
         }
     };
+    // Its columns, fitting and layer names, likewise.
+    let new_layout = {
+        let l = s.project.layouts.get(li).ok_or("no layout")?;
+        let kind = l.element(id).map(|e| &e.kind);
+        let bar = matches!(kind, Some(ElementKind::ScaleBar { .. }));
+        if !matches!(kind, Some(ElementKind::Legend { .. })) && has_legend_layout(p, bar) {
+            return Err(ONLY_LEGEND_LAYOUT.into());
+        }
+        if !bar && has_bar_details(p) {
+            return Err(ONLY_BAR_DETAILS.into());
+        }
+        // A scale bar's fit is read with its other details.
+        if bar { (None, None, None) } else { legend_layout(p)? }
+    };
+    // A picture's new image, read (and checked) before anything changes: `path` reads the file and
+    // remembers it as the source, `image` given directly keeps the source it had.
+    let new_picture = {
+        let kind = s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind);
+        let gives = ["image", "path"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null()));
+        match kind {
+            Some(ElementKind::Picture { .. }) if gives => Some((super::graphics::picture(p)?, picture_source(p))),
+            _ if gives => return Err("only pictures take an image or a path".into()),
+            _ => None,
+        }
+    };
     let l = active(s, p)?;
     let e = l.element_mut(id).ok_or_else(|| format!("no element {id}"))?;
     let num = |k: &str, lo: f64, hi: f64| f(p, k).map(|v| v.clamp(lo, hi));
@@ -2854,6 +3434,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(v) = b(p, "locked") {
         e.locked = v;
     }
+    e.frame_style = frame_style.apply(e.frame_style.as_ref());
     // A colorbar turned keeps its size: its length and thickness swap, unless given.
     if let (ElementKind::Colorbar { orientation, .. }, Some((_, Some(o), _))) = (&e.kind, &colorbar)
         && o != orientation
@@ -2873,9 +3454,27 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     match &mut e.kind {
-        ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name } => {
+        ElementKind::Text {
+            text,
+            size,
+            color,
+            bold,
+            italic,
+            align,
+            letter_spacing,
+            font,
+            font_name,
+            frame,
+            wrap,
+            valign,
+            line_spacing,
+            case,
+        } => {
             if let Some(((i, a, l), (f, n))) = new_text_style {
                 (*italic, *align, *letter_spacing, *font, *font_name) = (i, a, l, f, n);
+            }
+            if let Some(b) = new_block {
+                (*frame, *wrap, *valign, *line_spacing, *case) = (b.frame, b.wrap, b.valign, b.line_spacing, b.case);
             }
             if let Some(t) = ps(p, "text") {
                 *text = t.chars().take(5000).collect();
@@ -2890,9 +3489,19 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *bold = v;
             }
         }
-        ElementKind::Legend { title, all_classes, hide_other, exclude, .. } => {
+        ElementKind::Legend { title, all_classes, hide_other, exclude, columns, fit, show_layer_names, .. } => {
             if let Some(names) = new_exclude {
                 *exclude = names;
+            }
+            let (new_columns, new_fit, new_names) = new_layout;
+            if let Some(v) = new_columns {
+                *columns = v;
+            }
+            if let Some(v) = new_fit {
+                *fit = v;
+            }
+            if let Some(v) = new_names {
+                *show_layer_names = v;
             }
             if let Some(t) = ps(p, "title") {
                 *title = t.chars().take(200).collect();
@@ -2926,7 +3535,10 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *reverse = v;
             }
         }
-        ElementKind::MapFrame { map, center, scale, grid, bearing, pitch, extent_of, extent_color, extent_width, .. } => {
+        ElementKind::MapFrame { map, center, scale, grid, bearing, pitch, extent_of, extent_color, extent_width, link, .. } => {
+            if let Some(l) = new_link {
+                *link = l;
+            }
             match new_indicator {
                 Some(None) => *extent_of = None,
                 Some(Some((c, w))) => (*extent_color, *extent_width) = (c, w),
@@ -2967,6 +3579,14 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
         }
+        ElementKind::Picture { image, source } => {
+            if let Some((new_image, new_source)) = new_picture {
+                *image = new_image;
+                if new_source.is_some() {
+                    *source = new_source;
+                }
+            }
+        }
         _ => {}
     }
     if let Some(w) = font_told {
@@ -2992,6 +3612,14 @@ fn set_frame(s: &mut Session, li: usize, frame: u32, e: &Extent) -> Result<(), S
     Ok(())
 }
 
+/// Refuses a frame that follows another, which is drawn at its source's view: what moves a
+/// frame's own view (a zoom, a map series) would show nothing.
+fn not_followed(l: &Layout, frame: u32) -> Result<(), String> {
+    let Some(ElementKind::MapFrame { link: Some(link), .. }) = l.element(frame).map(|e| &e.kind) else { return Ok(()) };
+    let name = l.element(link.frame).map(|e| e.name.trim()).filter(|n| !n.is_empty());
+    Err(format!("the frame follows {}: unlink it first", name.map_or_else(|| format!("#{}", link.frame), String::from)))
+}
+
 fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
     let li = index(s, p)?;
     let l = s.project.layouts.get(li).ok_or("no layout")?;
@@ -3000,6 +3628,8 @@ fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
         None => frame_of(l, p)?,
     };
     unlocked(l, frame)?;
+    // Its view is its source's: zooming would change what it keeps for when it is unlinked.
+    not_followed(l, frame)?;
     let map = match l.element(frame).map(|e| &e.kind) {
         Some(ElementKind::MapFrame { map, .. }) => map.clone(),
         _ => return Err("no such frame".into()),
@@ -3050,6 +3680,7 @@ fn series(s: &mut Session, p: &Value) -> CmdResult {
     }
     let l = s.project.layouts.get(li).ok_or("no layout")?;
     let frame = frame_of(l, p)?;
+    not_followed(l, frame)?;
     let map = match l.element(frame).map(|e| &e.kind) {
         Some(ElementKind::MapFrame { map, .. }) => map.clone(),
         _ => return Err("no such frame".into()),
@@ -3111,6 +3742,7 @@ fn series_page(s: &mut Session, p: &Value) -> CmdResult {
     let (n, _) = series_info(s, li, 0).ok_or("the layout has no map series")?;
     let l = s.project.layouts.get(li).ok_or("no layout")?;
     let sr = l.series.clone().ok_or("the layout has no map series")?;
+    not_followed(l, sr.frame)?;
     let page = match p.get("page") {
         Some(Value::String(t)) if t == "next" => (sr.page + 1).min(n.saturating_sub(1)),
         Some(Value::String(t)) if t == "previous" => sr.page.saturating_sub(1),
@@ -3196,6 +3828,7 @@ pub fn layout_bytes(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool) 
                     Some(n) => n.get(*page).cloned().unwrap_or_default(),
                     None => info.as_ref().map(|i| i.1.clone()).unwrap_or_default(),
                 },
+                project: s.project.name.clone(),
             };
             let img = rustgis_render::layout::render(layout, &mut s.project.maps, dpi, &info).ok_or("the page is too large to draw")?;
             // Each page is compressed as soon as it's drawn, within a memory budget.
@@ -3253,11 +3886,30 @@ fn layout_svg(s: &mut Session, li: usize, dpi: f64) -> Result<String, String> {
         page: current + 1,
         pages: series.as_ref().map_or(1, |i| i.0),
         page_name: series.map(|i| i.1).unwrap_or_default(),
+        project: s.project.name.clone(),
     };
     // Rendering borrows the current layout; it does not step or modify the series page.
     let layout = s.project.layouts.get(li).ok_or("no layout")?;
     rustgis_render::svg::layout_svg(layout, &mut s.project.maps, dpi, &info)
         .ok_or_else(|| "could not draw the page; check its map sources and export size".into())
+}
+
+/// A layout file's text: `text`, else the file at `path`, read up to [`MAX_LAYOUT`] bytes.
+pub(crate) fn layout_text(p: &Value) -> Result<String, String> {
+    match (ps(p, "text"), ps(p, "path")) {
+        (Some(t), _) => Ok(t.to_string()),
+        (None, Some(path)) => {
+            use std::io::Read;
+            // Read at most one byte past the limit, so a file growing meanwhile is still refused.
+            let mut text = String::new();
+            std::fs::File::open(path).and_then(|f| f.take(MAX_LAYOUT + 1).read_to_string(&mut text)).map_err(|e| format!("{path}: {e}"))?;
+            if text.len() as u64 > MAX_LAYOUT {
+                return Err("the layout file is too large".into());
+            }
+            Ok(text)
+        }
+        (None, None) => Err("path or text is required".into()),
+    }
 }
 
 pub(crate) fn import(s: &mut Session, text: &str) -> CmdResult {

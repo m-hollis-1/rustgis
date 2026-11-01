@@ -973,7 +973,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             } else if purpose == "ramp" {
                 rfd::AsyncFileDialog::new().add_filter("Colour ramps", &["rgisramp", "xml", "qml", "txt", "clr", "cpt"])
             } else if purpose == "layout" {
-                rfd::AsyncFileDialog::new().add_filter("RustGIS layout", &["rgislayout"])
+                rfd::AsyncFileDialog::new().add_filter("Layout file", &["rgislayout", "pagx"])
             } else if purpose == "plugin" {
                 rfd::AsyncFileDialog::new().add_filter("RustGIS plugin", &["rgplugin"])
             } else if purpose == "text" {

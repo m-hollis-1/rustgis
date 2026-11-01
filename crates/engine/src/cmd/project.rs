@@ -291,12 +291,25 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
         .layouts
         .iter()
         .map(|lo| {
+            // A frame that follows another is drawn at the scale of the view it follows.
+            let cameras = lo.resolved_cameras(&s.project.maps);
             let frames: Vec<Value> = lo
                 .elements
                 .iter()
                 .filter_map(|e| match &e.kind {
                     rustgis_map::layout::ElementKind::MapFrame { map, scale, .. } => {
-                        Some(json!({"id": e.id, "name": e.name, "map": map, "scale": scale.round()}))
+                        let drawn = cameras
+                            .iter()
+                            .find(|(id, _)| *id == e.id)
+                            .and_then(|(_, cam)| {
+                                s.project
+                                    .maps
+                                    .iter()
+                                    .find(|m| m.name.eq_ignore_ascii_case(map))
+                                    .map(|m| rustgis_map::layout::camera_scale(m, cam))
+                            })
+                            .unwrap_or(*scale);
+                        Some(json!({"id": e.id, "name": e.name, "map": map, "scale": drawn.round()}))
                     }
                     _ => None,
                 })

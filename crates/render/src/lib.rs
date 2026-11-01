@@ -1477,13 +1477,21 @@ pub(crate) fn marker_path(x: f32, y: f32, r: f32, marker: Marker) -> Option<tiny
             }
             pb.close();
         }
+        // The square the picture fills, for hit tests and a moving view's stand-in.
+        Marker::Image(_) => {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(x - r, y - r, r * 2.0, r * 2.0) {
+                pb.push_rect(rect)
+            }
+        }
         Marker::Char(g) => match glyphs::shape(g) {
             Some(s) => {
                 let em = 2.0 * r;
                 return s.path.clone().transform(Transform::from_row(em, 0.0, 0.0, em, x, y));
             }
-            // A space draws nothing; a character no font here has, a circle of its size, so the
-            // point still shows.
+            // A space draws nothing. A character no font here has, or an Esri symbol font's
+            // picture this machine can't draw (never the label font's character of its code: see
+            // `glyphs::symbol_family`), draws a circle of its size, so the point still shows; a
+            // north arrow draws its Classic arrow instead (`layout::symbol_arrow`).
             None if g.ch.is_whitespace() => return None,
             None => pb.push_circle(x, y, r),
         },
@@ -1508,11 +1516,35 @@ fn draw_marker(pm: &mut Pixmap, x: f32, y: f32, s: &Symbol, opacity: f32, halo: 
         let st = Stroke { width: 3.5 * ppp, line_join: LineJoin::Round, ..Stroke::default() };
         pm.stroke_path(&path, &paint(h, 1.0), &st, Transform::identity(), None);
     }
+    // A picture keeps its own colours: the symbol's fill and outline are not drawn.
+    if let Marker::Image(image) = s.marker {
+        draw_image_marker(pm, x, y, r, &image, opacity);
+        return;
+    }
     pm.fill_path(&path, &paint(s.fill, opacity), FillRule::Winding, Transform::identity(), None);
     if s.stroke_width > 0.0 && s.stroke.a() > 0 {
         let st = Stroke { width: s.stroke_width * ppp, line_join: LineJoin::Round, ..Stroke::default() };
         pm.stroke_path(&path, &paint(s.stroke, opacity), &st, Transform::identity(), None);
     }
+}
+
+/// A picture marker's picture centred at (`x`, `y`), its longer side `2 * r` pixels.
+pub(crate) fn draw_image_marker(pm: &mut Pixmap, x: f32, y: f32, r: f32, image: &rustgis_map::ImageRef, opacity: f32) {
+    let Some(img) = picture::marker_image(image) else { return };
+    let img: &Pixmap = &img;
+    let k = 2.0 * r / img.width().max(img.height()) as f32;
+    if !(k.is_finite() && x.is_finite() && y.is_finite()) || k <= 0.0 {
+        return;
+    }
+    let (dx, dy) = (x - img.width() as f32 * k / 2.0, y - img.height() as f32 * k / 2.0);
+    let paint = tiny_skia::PixmapPaint { opacity, quality: tiny_skia::FilterQuality::Bilinear, ..tiny_skia::PixmapPaint::default() };
+    pm.draw_pixmap(0, 0, img.as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, dx, dy), None);
+}
+
+/// A picture marker's pixels (premultiplied, at most 256 a side), `None` when its picture can't
+/// be read: for a swatch to show in an interface, which draws no pixmap of its own.
+pub fn marker_image(image: &rustgis_map::ImageRef) -> Option<std::sync::Arc<Pixmap>> {
+    picture::marker_image(image)
 }
 
 /// Composites premultiplied `src` over `dst` with its top left corner at (`x`, `y`).
@@ -1550,33 +1582,7 @@ fn blend_over(dst: &mut Pixmap, src: &Pixmap, x: i64, y: i64) {
 /// The longitude/latitude extent a view shows (the whole world on the globe, or when the
 /// projection can't say).
 pub fn view_lonlat(map: &Map, view: &View) -> Extent {
-    if map.projection.is_globe() {
-        return Extent::WORLD_LONLAT;
-    }
-    let flat = map.flat();
-    let e = view.camera.extent(view.width, view.height);
-    let mut out = Extent::EMPTY;
-    const N: usize = 8;
-    for i in 0..=N {
-        let t = i as f64 / N as f64;
-        let (x, y) = (e.min_x + t * e.width(), e.min_y + t * e.height());
-        for c in [Coord::new(x, e.min_y), Coord::new(x, e.max_y), Coord::new(e.min_x, y), Coord::new(e.max_x, y)] {
-            match flat.inverse(c) {
-                Some(p) if p.is_finite() => out.expand(p),
-                _ => return Extent::WORLD_LONLAT,
-            }
-        }
-    }
-    // A pole inside the view lies beyond every edge sample (a polar projection): reach it.
-    for pole in [Coord::new(0.0, 90.0), Coord::new(0.0, -90.0)] {
-        if let Some(p) = flat.forward(pole)
-            && p.is_finite()
-            && e.contains(p)
-        {
-            out = Extent::new(-180.0, out.min_y.min(pole.y), 180.0, out.max_y.max(pole.y));
-        }
-    }
-    if out.is_empty() { Extent::WORLD_LONLAT } else { out }
+    rustgis_map::layout::camera_lonlat(map, &view.camera, view.width, view.height)
 }
 
 /// Draws the map for the screen. Layers are drawn bottom-up (the last layer in the list first).
@@ -2566,7 +2572,8 @@ impl UprightMarker {
 /// The outline of a `marker` of radius `r` centred at (`x`, `y`), as [`draw_marker`] draws it
 /// (a circle as a polygon): for drawing upright markers as meshes. Every outline is seen whole
 /// from its centre, so a fan from the centre fills it. A character, which no fan fills, as a circle
-/// of its size (while a tilted view moves; the settled view draws the character).
+/// of its size (while a tilted view moves; the settled view draws the character), and a picture as
+/// the square it fills.
 pub fn marker_outline(marker: Marker, x: f32, y: f32, r: f32) -> Vec<(f32, f32)> {
     match marker {
         Marker::Circle | Marker::Char(_) => (0..24)
@@ -2578,6 +2585,7 @@ pub fn marker_outline(marker: Marker, x: f32, y: f32, r: f32) -> Vec<(f32, f32)>
         Marker::Square => {
             vec![(x - r * 0.9, y - r * 0.9), (x + r * 0.9, y - r * 0.9), (x + r * 0.9, y + r * 0.9), (x - r * 0.9, y + r * 0.9)]
         }
+        Marker::Image(_) => vec![(x - r, y - r), (x + r, y - r), (x + r, y + r), (x - r, y + r)],
         Marker::Triangle => vec![(x, y - r * 1.1), (x + r, y + r * 0.75), (x - r, y + r * 0.75)],
         Marker::Diamond => vec![(x, y - r * 1.15), (x + r * 0.9, y), (x, y + r * 1.15), (x - r * 0.9, y)],
         Marker::Star => (0..10)
@@ -5093,23 +5101,46 @@ mod tests {
         assert_eq!((text::line_count(&p.text), p.angle), (1, Some(0.5)));
     }
 
+    /// A layout text is filled the way Pro fills it: whole lines, then a tail; a label is balanced.
+    #[test]
+    fn layout_text_fills_lines_where_labels_are_balanced() {
+        let face = text::Face::default();
+        let width = |s: &str| text::measure(s, 10.0, false);
+        let four = width("a b c d") + 0.01;
+        assert_eq!(text::fill_wrap("a b c d e", 10.0, face, 0.0, four), ["a b c d", "e"]);
+        // The balanced wrap splits the same words into two near-equal lines.
+        let balanced = text::wrap("a b c d e", 10.0, face, 0.0, four);
+        assert_eq!(balanced.len(), 2);
+        assert_ne!(balanced, ["a b c d", "e"], "{balanced:?}");
+        // Dashes break; a piece wider than the box stays whole; what fits is left alone; junk is safe.
+        assert_eq!(text::fill_wrap("one-two three", 10.0, face, 0.0, width("one-two") + 0.01), ["one-two", "three"]);
+        assert_eq!(text::fill_wrap("Unbreakable", 10.0, face, 0.0, 1.0), ["Unbreakable"]);
+        assert_eq!(text::fill_wrap("Short words", 10.0, face, 0.0, 1000.0), ["Short words"]);
+        assert!(!text::fill_wrap("a b c", f32::NAN, face, f32::INFINITY, -1.0).is_empty());
+        // A layout text's 5,000 characters are all broken; none are lost.
+        let long = "word ".repeat(1000);
+        let lines = text::fill_wrap(long.trim_end(), 10.0, face, 0.0, width("word word word word"));
+        assert_eq!(lines.join(" "), long.trim_end());
+        assert!(lines.len() > 200 && lines.iter().all(|l| width(l) <= width("word word word word")));
+    }
+
     #[test]
     fn wraps_balanced_at_spaces_and_dashes() {
         let width = |s: &str| text::measure(s, 9.0, false);
         let w = width("Times Square–42nd Street");
-        let lines = text::wrap("Times Square–42nd Street", 9.0, false, 0.0, w * 0.6);
+        let lines = text::wrap("Times Square–42nd Street", 9.0, text::Face::default(), 0.0, w * 0.6);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines.join(" ").replace("– ", "–") == "Times Square–42nd Street", "{lines:?}");
         // Balanced: neither line much longer than the other.
         let (a, b) = (width(&lines[0]), width(&lines[1]));
         assert!(a.max(b) / a.min(b) < 2.0, "{lines:?}");
         // A space after an "&" is kept.
-        let lines = text::wrap("West 42nd Street & 8th Avenue", 9.0, false, 0.0, width("West 42nd Street"));
+        let lines = text::wrap("West 42nd Street & 8th Avenue", 9.0, text::Face::default(), 0.0, width("West 42nd Street"));
         assert!(lines.iter().all(|l| !l.contains("&8")), "{lines:?}");
         // What fits, or has nowhere to break, is left alone; junk is safe.
-        assert_eq!(text::wrap("Short", 9.0, false, 0.0, 1000.0), ["Short"]);
-        assert_eq!(text::wrap("Unbreakable", 9.0, false, 0.0, 1.0), ["Unbreakable"]);
-        assert!(!text::wrap("a b c", f32::NAN, false, f32::INFINITY, -1.0).is_empty());
+        assert_eq!(text::wrap("Short", 9.0, text::Face::default(), 0.0, 1000.0), ["Short"]);
+        assert_eq!(text::wrap("Unbreakable", 9.0, text::Face::default(), 0.0, 1.0), ["Unbreakable"]);
+        assert!(!text::wrap("a b c", f32::NAN, text::Face::default(), f32::INFINITY, -1.0).is_empty());
     }
 
     #[test]
@@ -5171,6 +5202,41 @@ mod tests {
 
     use super::*;
     use rustgis_data::{Field, FieldType, Value};
+
+    /// A picture marker draws the picture's own pixels, its longer side the symbol's size, centred
+    /// at the point, over any fill: the white around it stays.
+    #[test]
+    fn an_image_marker_draws_its_pixels() {
+        use base64::Engine;
+        let mut src = Pixmap::new(2, 2).unwrap();
+        src.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(src.encode_png().unwrap());
+        let marker = Marker::Image(rustgis_map::ImageRef::new(&b64).unwrap());
+        let s = Symbol { fill: Rgba::rgb(0, 0, 255), stroke: Rgba::rgb(0, 255, 0), stroke_width: 2.0, size: 20.0, marker };
+        let drawn = |opacity: f32| {
+            let mut pm = Pixmap::new(40, 40).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            draw_marker(&mut pm, 20.0, 20.0, &s, opacity, None, 1.0);
+            pm
+        };
+        let at = |pm: &Pixmap, x, y| {
+            let p = pm.pixel(x, y).unwrap();
+            [p.red(), p.green(), p.blue(), p.alpha()]
+        };
+        let pm = drawn(1.0);
+        assert_eq!(at(&pm, 20, 20), [255, 0, 0, 255]);
+        assert_eq!(at(&pm, 11, 20), [255, 0, 0, 255]);
+        assert_eq!(at(&pm, 28, 28), [255, 0, 0, 255]);
+        // Beyond the size on any side: untouched (no fill or outline of the symbol's colours).
+        assert_eq!(at(&pm, 8, 20), [255, 255, 255, 255]);
+        assert_eq!(at(&pm, 20, 31), [255, 255, 255, 255]);
+        // The layer's opacity lets the white through.
+        let [r, g, b, _] = at(&drawn(0.5), 20, 20);
+        assert!(r == 255 && (125..=130).contains(&g) && (125..=130).contains(&b), "{r} {g} {b}");
+        // Hit tests and the moving view's meshes see a square of the size.
+        let path = marker_path(20.0, 20.0, 10.0, marker).unwrap();
+        assert_eq!((path.bounds().left(), path.bounds().right()), (10.0, 30.0));
+    }
 
     #[test]
     fn worldview_detection_and_data() {

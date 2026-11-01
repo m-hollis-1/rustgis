@@ -29,6 +29,10 @@ pub struct Dialogs {
     /// Revision after the last count command, which itself advances the session revision.
     pub counted_revision: Option<u64>,
     pub counted_instance: Option<u64>,
+    /// Import Layout: the ArcGIS Pro layout file being imported.
+    pub layout_path: String,
+    /// Import Layout: each frame the file leaves unbound, with the project map it will show.
+    pub layout_frames: Vec<(String, String)>,
     pub text: String,
     pub a: String,
     pub b: String,
@@ -80,6 +84,7 @@ impl Dialogs {
             "renameLayer" => "renameLayer",
             "renameMap" => "renameMap",
             "renameLayout" => "renameLayout",
+            "importLayoutFrames" => "importLayoutFrames",
             "renameServiceGroup" => "renameServiceGroup",
             "renameGroup" => "renameGroup",
             "coordinateSystem" => "coordinateSystem",
@@ -270,6 +275,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "saveProject" => "Save Project As",
         "renameMap" => "Rename Map",
         "renameLayout" => "Rename Layout",
+        "importLayoutFrames" => "Import Layout",
         "renameServiceGroup" => "Rename Service Group",
         "renameGroup" => "Rename Group",
         _ => "Rename Layer",
@@ -513,6 +519,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     r.map(|_| ())
                 });
             }
+            "importLayoutFrames" => close = import_layout_frames(app, ui),
             "renameServiceGroup" => {
                 let input_label = ui.label(tl!("Name"));
                 ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY)).labelled_by(input_label.id);
@@ -545,6 +552,37 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     if (!open || close) && app.dialogs.open == Some(which) {
         app.dialogs.open = None;
     }
+}
+
+/// Import Layout: the project map each frame of an ArcGIS Pro layout shows, for the frames the
+/// file doesn't tie to a map.
+fn import_layout_frames(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("This layout doesn't say which map its frames show. Pick a map for each.")).weak());
+    let maps: Vec<String> = app.session.project.maps.iter().map(|m| m.name.clone()).collect();
+    egui::Grid::new("import_layout_frames").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        for (i, (frame, map)) in app.dialogs.layout_frames.iter_mut().enumerate() {
+            let label = ui.label(frame.as_str());
+            egui::ComboBox::from_id_salt(("import_layout_map", i))
+                .selected_text(map.clone())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for m in &maps {
+                        ui.selectable_value(map, m.clone(), m);
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+            ui.end_row();
+        }
+    });
+    buttons(app, ui, "Import", finish_layout_import)
+}
+
+/// What Import does in the Import Layout dialog: imports the file with the maps picked.
+pub(crate) fn finish_layout_import(app: &mut RustGisApp) -> Result<(), String> {
+    let maps: serde_json::Map<String, Value> = app.dialogs.layout_frames.iter().map(|(frame, map)| (frame.clone(), json!(map))).collect();
+    let path = app.dialogs.layout_path.clone();
+    app.run("layout.import", json!({"path": path, "maps": maps})).map(|_| ())
 }
 
 /// Save Project As in the browser, which has no save dialog: the file name to download the

@@ -481,6 +481,20 @@ fn glyph(p: &egui::Painter, at: egui::Pos2, g: Glyph, px: f32, c: egui::Color32)
     p.text(at, Align2::CENTER_CENTER, g.ch, egui::FontId::new(px, family), c);
 }
 
+/// A picture marker's texture, made once and kept in the context by the picture's address (the
+/// pictures a map keeps are bounded, and so are these); `None` when the picture can't be read.
+fn marker_texture(ctx: &egui::Context, image: &rustgis_engine::map::ImageRef) -> Option<egui::TextureHandle> {
+    let id = egui::Id::unique(("marker_image", image.as_str().as_ptr() as usize));
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(tex);
+    }
+    let pm = rustgis_engine::render::marker_image(image)?;
+    let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
+    let tex = ctx.load_texture("marker_image", img, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    Some(tex)
+}
+
 /// Paints a symbol patch for a layer of geometry type `g`.
 pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
     match g {
@@ -516,6 +530,19 @@ pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
                     let col = if s.fill.a() == 0 && s.stroke_width > 0.0 { s.stroke } else { s.fill };
                     glyph(p, c, g, (s.size * 1.4).clamp(8.0, 18.0), c32(col));
                 }
+                // A picture, in its own colours; one that can't be read is an empty ring.
+                Marker::Image(image) => match marker_texture(p.ctx(), &image) {
+                    Some(tex) => {
+                        let side = s.size.clamp(8.0, 20.0).min(r.height());
+                        let [w, h] = tex.size();
+                        let k = side / w.max(h).max(1) as f32;
+                        let target = Rect::from_center_size(c, vec2(w as f32 * k, h as f32 * k));
+                        p.image(tex.id(), target, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    }
+                    None => {
+                        p.circle_stroke(c, rad, Stroke::new(s.stroke_width.clamp(1.0, 2.0), c32(s.stroke)));
+                    }
+                },
                 _ => {
                     p.circle_filled(c, rad, c32(s.fill));
                     p.circle_stroke(c, rad, Stroke::new(s.stroke_width.min(2.0), c32(s.stroke)));
@@ -2562,6 +2589,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "rgismpk",
                         "rgislyr",
                         "rgislayout",
+                        "pagx",
                     ]
                     .iter()
                     .any(|x| n.to_lowercase().ends_with(&format!(".{x}"))))
@@ -2590,8 +2618,8 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 } else if name.ends_with(".rgismap") || name.ends_with(".rgismpk") {
                     let _ = app.run("map.import", json!({"path": path.display().to_string()}));
                     app.map.invalidate();
-                } else if name.ends_with(".rgislayout") {
-                    let _ = app.run("layout.import", json!({"path": path.display().to_string()}));
+                } else if name.ends_with(".rgislayout") || name.to_ascii_lowercase().ends_with(".pagx") {
+                    let _ = app.import_layout_file(&path.display().to_string());
                 } else {
                     let _ = crate::layerchooser::add_file(app, &path.display().to_string());
                 }

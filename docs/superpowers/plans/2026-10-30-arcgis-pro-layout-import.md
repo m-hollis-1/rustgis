@@ -19,7 +19,7 @@
 - Page coordinates: CIM is page units from the bottom-left; RustGIS is millimetres from the top-left: `y_mm = (page_h - (y + h)) * unit_mm`.
 - Interface text through `tl!("…")` and `i18n::fmt`; command ids and parameters never translated.
 - `cargo` is at `~/.cargo/bin`: run tool shells with `PATH="$HOME/.cargo/bin:$PATH"`.
-- Test fixtures are small synthetic CIM JSON strings in the test modules, never Mike's files from `G:`.
+- Test fixtures are small synthetic CIM JSON strings in the test modules, never the user's own files.
 - Commit after every task with a conventional message (`feat(layout): …`, `feat(cim): …`, `docs: …`) ending in `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 
 ## Review Focus
@@ -311,9 +311,9 @@ fn tokens_take_prefix_and_suffix_dropped_when_empty() {
     let mut v = TokenValues::default();
     v.crs_name = "NAD 1983 StatePlane Texas Central FIPS 4203 (US Feet)".into();
     assert_eq!(expand("{crsName|Name: |\\n}{crsWkid|WKID: |\\n}", &v), "Name: NAD 1983 StatePlane Texas Central FIPS 4203 (US Feet)\n");
-    assert_eq!(expand("{scale|1:}", &v), "");
+    assert_eq!(expand("{scale|Scale }", &v), "");
     v.scale = 24_000.0;
-    assert_eq!(expand("{scale|1:}", &v), "1:24,000");
+    assert_eq!(expand("{scale|Scale }", &v), "Scale 1:24,000");
     assert_eq!(expand("{nothing|x|y}", &v), "{nothing|x|y}");
 }
 #[test]
@@ -468,7 +468,7 @@ Note: Pro prints Esri's spelling (`NAD 1983 StatePlane Texas Central FIPS 4203 (
 ### Task 12: Scale bar details
 
 **Files:**
-- Modify: `crates/map/src/layout.rs:879-888` (`ScaleBar` gains `subdivisions: usize` 0, `divisions_before_zero: usize` 0, `label_position: BarLabels` {Above, Below} default Below, `unit_label: Option<String>` (None: the unit's abbreviation), `unit_label_position: UnitLabel` {AfterBar, AfterLabels, Above, Below} default AfterLabels, `decimals: usize` 0, `label_size: f64` 8.0, `fit: ScaleFit` {AdjustDivisionValue, AdjustDivision, AdjustWidth} default AdjustDivisionValue; `clamp`: subdivisions 0..=10, before-zero 0..=2, decimals 0..=3, label size 4..=24)
+- Modify: `crates/map/src/layout.rs:879-888` (`ScaleBar` gains `subdivisions: usize` 0, `divisions_before_zero: usize` 0, `label_position: BarLabels` {Above, Below} default Above, `unit_label: Option<String>` (None: the unit's abbreviation), `unit_label_position: UnitLabel` {AfterBar, AfterLabels, Above, Below} default AfterLabels, `decimals: usize` 0, `label_size: f64` 8.0, `fit: ScaleFit` {AdjustDivisionValue, AdjustDivision, AdjustWidth} default AdjustDivisionValue; `clamp`: subdivisions 0..=10, before-zero 0..=2, decimals 0..=3, label size 4..=24)
 - Modify: `crates/render/src/layout.rs:971` (`scale_bar` takes the `ElementKind::ScaleBar` fields as one struct `BarOptions`; draws subdivisions in the first division (alternating fill, half height ticks for line styles), divisions before zero to the left of 0 with negative labels, labels above or below, the unit label where asked, numbers with `decimals` and a thousands separator; `AdjustDivision` keeps the division value round and changes the count to fill the width; `AdjustWidth` keeps the count and value and draws the bar at the width they need)
 - Modify: `crates/engine/src/cmd/layout.rs:2574` (`restyle` ScaleBar arm: `subdivisions`, `divisionsBeforeZero`, `labelPosition`, `unitLabel`, `unitLabelPosition`, `decimals`, `labelSize`, `fit`)
 - Modify: `crates/ui-egui/src/layoutview.rs:1625` (ScaleBar properties: the new fields)
@@ -556,14 +556,14 @@ Note: Pro prints Esri's spelling (`NAD 1983 StatePlane Texas Central FIPS 4203 (
 
 **Interfaces:**
 - Produces: a `Text` element with `size`, `color`, `bold`, `italic`, `align`, `letter_spacing`, `font_name` (and `font: FontFamily::Sans`), plus Task 7's `wrap` (true for paragraph text, false for point text), `valign` (`Center` → `Middle`), `line_spacing`, `case`; a paragraph's `margin` (points) shrinks the box on every side; `frame` is filled in Task 17 from the frame name `translate` returns (store it on `FrameBinding`-like `text_frames: Vec<(u32, String)>` in `LayoutImport`).
-- `translate` rewrites each `<dyn …/>` tag (attributes in any order, single or double quotes) per the design's table: `mapFrame/scale` → `{scale|pre|suf}`, `mapFrame/sr` with `srProperty` `name|projection|units|wkid` → `{crsName|…}` etc., `mapFrame/center` → `{center|…}`, `mapFrame/extent` → `{extent|…}`, `project/name` → `{project|…}`, `layout/serviceLayerCredits` → `{credits|…}` (the `name` attribute ignored), `layout/name` → `{layout|…}`, `date` → `{date|…}` (a `format` attribute → note "date format <f>, drawn as RustGIS's"), `time` → `{time|…}`, `page/number` → `{page|…}`, `page/name` → `{pageName|…}`, `page/count` → `{pages|…}`; `preStr` → prefix, `postStr` → suffix, `newLine="true"` appends `\n` to the suffix, `emptyStr` is what the design's rule already gives (nothing) and any other `emptyStr` value is noted; any other `type`/`property` → removed with a note naming it. Pro's formatting tags `<BOL>`, `</BOL>`, `<ITA>`, `<UND>`, `<CLR …>`, `<FNT …>`, `<SUP>`, `<SUB>`, `<ACP>`, `<LCS>`, `<UCS>` and their closers are stripped with one note per element. `&amp;`, `&lt;`, `&gt;`, `&quot;` are unescaped. The frame name is the `name` attribute of the first `mapFrame` tag; a second, different name is noted.
+- `translate` rewrites each `<dyn …/>` tag (attributes in any order, single or double quotes) per the design's table: `mapFrame/scale` → `{scale|pre|suf}`, `mapFrame/sr` with `srProperty` `name|projection|units|wkid` → `{crsName|…}` etc., `mapFrame/center` → `{center|…}`, `mapFrame/extent` → `{extent|…}`, `project/name` → `{project|…}`, `layout/serviceLayerCredits` → `{credits|…}` (the `name` attribute ignored), `layout/name` → `{layout|…}`, `date` → `{date|…}` (a `format` attribute → note "date format <f>, drawn as RustGIS's"), `time` → `{time|…}`, `page/number` → `{page|…}`, `page/name` → `{pageName|…}`, `page/count` → `{pages|…}`; `preStr` → prefix, `postStr` → suffix, `newLine="true"` puts `\n` at the start of the prefix (a line break before the dynamic text), `emptyStr` is what the design's rule already gives (nothing) and any other `emptyStr` value is noted; any other `type`/`property` → removed with a note naming it. Pro's formatting tags `<BOL>`, `</BOL>`, `<ITA>`, `<UND>`, `<CLR …>`, `<FNT …>`, `<SUP>`, `<SUB>`, `<ACP>`, `<LCS>`, `<UCS>` and their closers are stripped with one note per element. `&amp;`, `&lt;`, `&gt;`, `&quot;` are unescaped. The frame name is the `name` attribute of the first `mapFrame` tag; a second, different name is noted.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn dyn_tags_become_tokens_with_prefix_suffix_and_newline() {
     let (t, frame) = dyntext::translate(r#"Spatial Reference<dyn type="mapFrame" name="MAIN MAP" property="sr" srProperty="name" preStr="Name: " newLine="true" emptyStr=""/><dyn type="mapFrame" name="MAIN MAP" property="scale" preStr="1:"/>"#, &mut Report::default(), "T");
-    assert_eq!(t, "Spatial Reference{crsName|Name: |\\n}{scale|1:}");
+    assert_eq!(t, "Spatial Reference{crsName|\\nName: }{scale}");
     assert_eq!(frame.as_deref(), Some("MAIN MAP"));
 }
 #[test] fn layout_and_project_and_date_tags_translate() { /* "Map Name: <dyn type="project" property="name"/>" → "Map Name: {project}"; credits with a stale name → "{credits}"; date short → "{date}" and a note */ }
@@ -676,7 +676,7 @@ Note: Pro prints Esri's spelling (`NAD 1983 StatePlane Texas Central FIPS 4203 (
     assert!(matches!(&detail.kind, ElementKind::MapFrame { map, link: Some(FrameLink { frame, .. }), extent_of: Some(of), .. } if map == "NEW DETAIL MAP" && *frame == main.id && *of == main.id));
     assert!(s.project.maps.iter().any(|m| m.name == "NEW DETAIL MAP"));
     let scale_text = l.elements.iter().find(|e| e.name == "SCALE TEXT").unwrap();
-    assert!(matches!(&scale_text.kind, ElementKind::Text { text, frame: Some(f), .. } if text == "{scale|1:}" && *f == main.id));
+    assert!(matches!(&scale_text.kind, ElementKind::Text { text, frame: Some(f), .. } if text == "{scale}" && *f == main.id));
     assert!(l.elements.iter().any(|e| matches!(&e.kind, ElementKind::Group { children } if children.len() == 2)));
     assert!(r["notes"].as_array().unwrap().iter().all(|n| n["kind"] != "skipped"));
 }
@@ -721,7 +721,7 @@ Note: Pro prints Esri's spelling (`NAD 1983 StatePlane Texas Central FIPS 4203 (
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-10-30-arcgis-pro-layout-import-checklist.md` (the results of this task, not committed until filled)
-- Use: `G:\1- NEW LAYOUT FILES\*.pagx`, Mike's PDF exports of the same six from Pro (ask Mike for them: File › Share › Export Layout, PDF, 300 dpi), a project with a map named `MAIN MAP`-worthy (any map with a few layers and a web basemap, so `{credits}` has something to say)
+- Use: the template folder's `*.pagx` files, the user's PDF exports of the same six from Pro (ask for them: File › Share › Export Layout, PDF, 300 dpi), a project with a map named `MAIN MAP`-worthy (any map with a few layers and a web basemap, so `{credits}` has something to say)
 
 - [ ] **Step 1: Import each template** with the desktop app (`PATH="$HOME/.cargo/bin:$PATH" cargo run --release -p rustgis`): Home › Project › Import Layout, pick the `.pagx`, bind MAIN MAP in the dialog. Note every notice.
 - [ ] **Step 2: Export each** (Publish › Export Layout, PDF, 300 dpi) and put it beside Pro's PDF.

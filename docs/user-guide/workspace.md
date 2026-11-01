@@ -224,10 +224,13 @@ What RustGIS draws differently from Pro:
 - **Layer symbols**: a GIF or BMP picture marker in a layer's point symbol is drawn as a circle
   (PNG and JPEG markers come in as image markers, see
   [Symbology](cartography.md#symbology)).
-- **Pictures**: a GIF or BMP is converted to PNG (up to 4096 pixels each way). A picture file
-  is read from the layout's folder (or `dir`) when the layout is imported; one that can't be
-  read (the browser can't read files beside a layout, nor convert a GIF or BMP) keeps its place,
-  empty, and **Relink…** picks it again.
+- **Pictures**: a GIF or BMP is converted to PNG (up to 4096 pixels each way), whether the
+  layout embeds it or keeps it beside it, and a picture larger than 16 MB is left out. A picture
+  file is read from the layout's folder (or `dir`) when the layout is imported; a relative path
+  in layout text given without `dir` isn't read. One that can't be read (the browser can't read
+  files beside a layout, nor convert a GIF or BMP) keeps its place, empty, with a note, and
+  **Relink…** picks it again.
+- **Map grids** in a frame (graticules, measured grids) are left out, with a note.
 
 ## Panes and command search
 

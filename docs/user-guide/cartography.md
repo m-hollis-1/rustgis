@@ -43,7 +43,9 @@ character of an installed font, picked under **Font**, as map signs often are (a
 church, tree or mine). Its **Size** is the font's size, and the character sits as QGIS draws a
 font marker: centred across the point, its baseline half the font's ascent below it. A font the
 machine lacks draws the character in the label font, and a character no font here has
-draws a circle, so the point still shows. By command:
+draws a circle, so the point still shows. An Esri symbol font ("ESRI Default Marker", "ESRI
+North" and the others named "ESRI …") the machine lacks draws a circle too, never the label
+font's character of the same code, which would be a different mark. By command:
 
 ```text
 layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}

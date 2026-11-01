@@ -188,8 +188,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `adjustColumns` adds columns up to six, `adjustColumnsAndSize` adds columns and then shrinks the
   text if six are not enough, and `adjustFrame` draws at the natural size over the edges of the
   box (the box is not resized). A legend that still doesn't fit at the smallest size or six
-  columns is cut as `manual` cuts it. A row wider than its column is cut at the column's edge, never
-  drawn over the next, and the fits that add columns add only as many as fit across the box.
+  columns is cut as `manual` cuts it. A row wider than its column (in every fit, one column
+  included) is cut at the column's edge and ends in "…" so the cut shows, never drawn over the
+  next, and the fits that add columns add only as many as fit across the box.
   Untick **Layer names** (`"showLayerNames": false`) to list
   only the classes: a layer drawn in a single symbol keeps its name, which labels its swatch.
 - **Colorbar**: the colour scale of a raster layer in the frame's map, as the map draws it (its
@@ -326,8 +327,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.export` accepts `dpi` and `"allPages": false` for just the current PDF
   page. **Print** opens the PDF in the system viewer on desktop; **Save Layout File** and
   **Import Layout** move layouts between projects (`.rgislayout`).
-- **Home › New Layout › Import Layout** also opens an ArcGIS Pro layout (`.pagx`), from the picker
-  or by double-clicking it in the Browser pane: `layout.import={"path": "…/Site plan.pagx"}`. The page
+- **Home › New Layout › Import Layout** also opens an ArcGIS Pro layout (`.pagx`), from the picker,
+  by double-clicking it in the Browser pane or by dropping it (or a `.rgislayout`) on the window:
+  `layout.import={"path": "…/Site plan.pagx"}`. The page
   comes in at its size, with its map frames (their shape, view and rotation, extent
   indicators and the frames that follow another), its text and dynamic text, rectangles, lines,
   pictures, groups, borders and backgrounds, legends, scale bars, north arrows, table frames and

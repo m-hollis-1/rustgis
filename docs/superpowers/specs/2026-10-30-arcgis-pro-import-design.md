@@ -267,13 +267,13 @@ Three behaviours are new and **required (Mike)**:
 2. **Prefix and suffix dropped when the value is empty.** `preStr="Name: " emptyStr=""` means
    "print `Name: ` and the value, or nothing at all when the value is empty". The token syntax
    needs a way to say this; the exact syntax is left to the builder (one option:
-   `{crsName|Name: |\n}` as token, prefix, suffix). `newLine="true"` is a line break after the
-   value, inside the conditional part.
+   `{crsName|Name: }` as token and prefix). `newLine="true"` is a line break before the dynamic
+   text, inside the conditional part: `{crsName|\nName: }`.
 3. **The new tokens above**, with `crsName` the coordinate system's full name (`NAD 1983
    StatePlane Texas Central FIPS 4203 (US Feet)`), `crsProjection` its method, `crsUnits` its
    linear or angular unit, `crsWkid` its EPSG code when it has one. RustGIS labels a projection
    by its code today, so **(Mike)** it gains a table of EPSG codes to names (and to method and
-   unit where the PROJ string doesn't say), shipped as a data file under `crates/map` with its
+   unit where the PROJ string doesn't say), shipped as a data file under `crates/data` with its
    row in `ATTRIBUTION.md` (the EPSG dataset's terms allow this with attribution), used by the
    tokens, the projection dialog and the status bar. Codes outside the table fall back to
    `EPSG:nnnn`.

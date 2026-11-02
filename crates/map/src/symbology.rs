@@ -2701,6 +2701,12 @@ impl LabelClass {
         }
     }
 
+    /// Whether it has text on `ds`: its field is one of `ds`'s, or a template naming one
+    /// ([`LabelSource::resolve`]).
+    pub fn labels_from(&self, ds: &Dataset) -> bool {
+        LabelSource::resolve(&self.field, ds).is_some()
+    }
+
     /// `text` broken into lines as this class wraps it ([`wrapped`]).
     pub fn wrap(&self, text: &str) -> String {
         wrapped(text, self.wrap_char.as_deref(), self.wrap_length)
@@ -2786,17 +2792,15 @@ impl Labeling {
         (self.default.name, self.default.visible, self.default.where_) = (old.name, old.visible, old.where_);
     }
 
-    /// Points every class on a field `ds` doesn't have at the Default class's field, or the first
-    /// name-like one when Default's is gone too (a field deleted, a style from another layer, a
-    /// service's fields changed). The class is kept, with its clause and text symbol.
+    /// Points every class on a field `ds` doesn't have (a template: none of its fields) at the
+    /// Default class's field, or the first name-like one when Default's is gone too (a field
+    /// deleted, a style from another layer, a service's fields changed). The class is kept, with
+    /// its clause and text symbol.
     pub fn repoint_missing_fields(&mut self, ds: &Dataset) {
         // Default's field, or (it is gone too, cleared by a refresh) the first name-like one, so
         // a class isn't left on no field.
-        let fallback = match ds.field_index(&self.default.field) {
-            Some(_) => self.default.field.clone(),
-            None => LabelClass::default_for(ds).field,
-        };
-        for c in self.classes.iter_mut().filter(|c| ds.field_index(&c.field).is_none()) {
+        let fallback = if self.default.labels_from(ds) { self.default.field.clone() } else { LabelClass::default_for(ds).field };
+        for c in self.classes.iter_mut().filter(|c| !c.labels_from(ds)) {
             c.field.clone_from(&fallback);
         }
     }

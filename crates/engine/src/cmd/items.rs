@@ -102,7 +102,7 @@ pub fn commands() -> Vec<C> {
             let relock = !super::labels::lock_holds(&l.labels, &st.labels);
             l.labels = st.labels;
             // The label field stays if the style's isn't in this layer.
-            if l.dataset.field_index(&l.labels.default.field).is_none() {
+            if !l.labels.default.labels_from(&l.dataset) {
                 l.labels.default.field = field;
             }
             l.labels.repoint_missing_fields(&l.dataset);

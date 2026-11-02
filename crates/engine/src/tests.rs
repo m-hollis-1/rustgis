@@ -2917,6 +2917,49 @@ fn an_imported_template_missing_a_field_is_noted_and_drawn() {
     assert!(!l.labels.default.visible, "a template of no field the layer has labels nothing");
 }
 
+/// A Cities class labelled by `{name} {pop_max}`, and Default by a template too.
+fn cities_with_template_classes() -> (Session, u32) {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    s.run("layer.select", &json!({"layer": id})).unwrap();
+    s.run("labels.class.add", &json!({"name": "Both"})).unwrap();
+    s.run("labels.field", &json!({"class": "Both", "field": "{name} {pop_max}"})).unwrap();
+    s.run("labels.field", &json!({"field": "{name} ({pop_max})"})).unwrap();
+    (s, id)
+}
+
+/// Deleting a field a template doesn't name leaves it as it was, Default's too.
+#[test]
+fn deleting_an_unrelated_field_keeps_a_label_template() {
+    let (mut s, id) = cities_with_template_classes();
+    s.run("edit.deleteField", &json!({"layer": id, "field": "adm0name"})).unwrap();
+    let l = &s.map().layer(id).unwrap().labels;
+    assert_eq!(l.classes[0].field, "{name} {pop_max}");
+    assert_eq!(l.default.field, "{name} ({pop_max})");
+    assert!(l.enabled);
+    // A template missing one of its fields still labels, and stays.
+    s.run("edit.deleteField", &json!({"layer": id, "field": "pop_max"})).unwrap();
+    let l = &s.map().layer(id).unwrap().labels;
+    assert_eq!(l.classes[0].field, "{name} {pop_max}");
+    assert_eq!(l.default.field, "{name} ({pop_max})");
+    assert!(l.enabled);
+}
+
+/// A template none of whose fields is left is repointed as a missing plain field is: Default
+/// starts again on a name-like field (labels off), and the other class takes its field.
+#[test]
+fn deleting_every_template_field_repoints_the_class() {
+    let (mut s, id) = cities_with_template_classes();
+    s.run("edit.deleteField", &json!({"layer": id, "field": "name"})).unwrap();
+    s.run("edit.deleteField", &json!({"layer": id, "field": "pop_max"})).unwrap();
+    let l = &s.map().layer(id).unwrap();
+    let labels = &l.labels;
+    assert!(!labels.enabled, "Default's text going turns the labels off");
+    assert_eq!(labels.default.field, rustgis_map::LabelClass::default_for(&l.dataset).field);
+    assert!(l.dataset.field_index(&labels.default.field).is_some());
+    assert_eq!(labels.classes[0].field, labels.default.field, "the class takes Default's field");
+}
+
 /// Converting labels drawn from a template gives each point the template's text.
 #[test]
 fn convert_to_annotation_uses_the_template() {

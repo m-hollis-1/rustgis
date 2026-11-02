@@ -2912,9 +2912,12 @@ fn an_imported_template_missing_a_field_is_noted_and_drawn() {
         notes,
         [(NoteKind::Approximated, "labels from the field gone, which the layer hasn't; the rest of the expression is drawn")]
     );
-    l.labels.default.field = "{gone}".into();
-    crate::cmd::qgis::check_fields(l, "Cities", &mut Report::default());
+    l.labels.default.field = "{gone} {lost}".into();
+    let mut report = Report::default();
+    crate::cmd::qgis::check_fields(l, "Cities", &mut report);
     assert!(!l.labels.default.visible, "a template of no field the layer has labels nothing");
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.kind, n.text.as_str())).collect();
+    assert_eq!(notes, [(NoteKind::Skipped, "labels from the fields gone, lost, which the layer hasn't")]);
 }
 
 /// A Cities class labelled by `{name} {pop_max}`, and Default by a template too.
@@ -2958,6 +2961,31 @@ fn deleting_every_template_field_repoints_the_class() {
     assert_eq!(labels.default.field, rustgis_map::LabelClass::default_for(&l.dataset).field);
     assert!(l.dataset.field_index(&labels.default.field).is_some());
     assert_eq!(labels.classes[0].field, labels.default.field, "the class takes Default's field");
+}
+
+/// A MapLibre style labels by a template as a concatenation of its text and fields, empty when
+/// every field is null (as the map draws none); a plain field as before.
+#[test]
+fn web_style_labels_by_a_template() {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let text_field = |s: &Session| {
+        let style = crate::cmd::sharing::web_style(s.map().layer(id).unwrap());
+        let label = style["layers"].as_array().unwrap().iter().find(|l| l["type"] == "symbol").cloned().unwrap();
+        label["layout"]["text-field"].clone()
+    };
+    s.run("labels.field", &json!({"layer": id, "field": "name"})).unwrap();
+    assert_eq!(text_field(&s), json!(["to-string", ["get", "name"]]));
+    s.run("labels.field", &json!({"layer": id, "field": "{NAME} ({pop_max}) {{x}}"})).unwrap();
+    assert_eq!(
+        text_field(&s),
+        json!([
+            "case",
+            ["all", ["==", ["get", "name"], null], ["==", ["get", "pop_max"], null]],
+            "",
+            ["concat", ["to-string", ["get", "name"]], " (", ["to-string", ["get", "pop_max"]], ") {x}"]
+        ])
+    );
 }
 
 /// Converting labels drawn from a template gives each point the template's text.

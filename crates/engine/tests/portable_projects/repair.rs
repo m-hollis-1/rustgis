@@ -38,6 +38,23 @@ fn incompatible_vector_repairs_leave_the_layer_unchanged() {
     reject_source(&mut s, id, f.file("not-there.fgb").to_str().unwrap(), "no such file or folder");
 }
 
+/// A label template's fields are required of the new file, as a plain label field is.
+#[test]
+fn repair_requires_a_label_templates_fields() {
+    use rustgis_engine::data::{Field, FieldType, Value};
+    let f = Fixture::new("repair-label-template");
+    let cities = f.file("cities.fgb");
+    let names = f.file("names.fgb");
+    sample_file(&cities, "Cities");
+    let mut points = Dataset::new("Names", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    points.push(Some(Geometry::Point(Coord::new(2.35, 48.85))), vec![Value::Text("Paris".into())]);
+    rustgis_engine::data::io::write_path(&points, &names).unwrap();
+    let mut s = session();
+    let id = add_stream(&mut s, &cities, None);
+    s.run("labels.field", &json!({"layer": id, "field": "{name} ({pop_max})"})).unwrap();
+    reject_source(&mut s, id, names.to_str().unwrap(), "no field pop_max");
+}
+
 #[test]
 fn repair_refuses_a_raster_that_cannot_draw_the_saved_rgb_bands() {
     let f = Fixture::new("repair-raster-rejection");

@@ -67,8 +67,11 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
                 }
                 let mut required: Vec<&str> = l.renderer.field().into_iter().collect();
                 if l.labels.enabled {
-                    required.push(&l.labels.default.field);
-                    required.extend(l.labels.classes.iter().map(|c| c.field.as_str()));
+                    // A template requires each of its fields.
+                    for c in l.labels.in_order() {
+                        let fields = rustgis_map::symbology::template_fields(&c.field);
+                        if fields.is_empty() { required.push(&c.field) } else { required.extend(fields) }
+                    }
                 }
                 if let Some(time) = &l.time {
                     required.push(&time.field);

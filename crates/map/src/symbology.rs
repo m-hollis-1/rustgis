@@ -2225,7 +2225,7 @@ pub fn wrapped(text: &str, wrap_char: Option<&str>, wrap_length: u32) -> String 
 pub const MAX_TEMPLATE: usize = 1000;
 
 /// A part of a template as written: text, or a field's name between braces.
-enum Part<'a> {
+pub enum TemplatePart<'a> {
     Text(String),
     Field(&'a str),
 }
@@ -2233,7 +2233,7 @@ enum Part<'a> {
 /// `field` read as a template: each `{name}` (a name with no brace in it) a field, `{{` and `}}`
 /// braces, everything else (an unclosed `{` too) text. Linear in its length, as a project file
 /// can hold any.
-fn template_parts(field: &str) -> Vec<Part<'_>> {
+pub fn template_parts(field: &str) -> Vec<TemplatePart<'_>> {
     let (mut parts, mut text, mut rest) = (Vec::new(), String::new(), field);
     while !rest.is_empty() {
         if let Some(r) = rest.strip_prefix("{{") {
@@ -2248,9 +2248,9 @@ fn template_parts(field: &str) -> Vec<Part<'_>> {
             && !name.is_empty()
         {
             if !text.is_empty() {
-                parts.push(Part::Text(std::mem::take(&mut text)));
+                parts.push(TemplatePart::Text(std::mem::take(&mut text)));
             }
-            parts.push(Part::Field(name));
+            parts.push(TemplatePart::Field(name));
             rest = after;
         } else {
             let mut chars = rest.chars();
@@ -2259,21 +2259,21 @@ fn template_parts(field: &str) -> Vec<Part<'_>> {
         }
     }
     if !text.is_empty() {
-        parts.push(Part::Text(text));
+        parts.push(TemplatePart::Text(text));
     }
     parts
 }
 
 /// Whether `field` is a template: holds a `{name}` (a `{{` is a literal brace).
 pub fn is_template(field: &str) -> bool {
-    template_parts(field).iter().any(|p| matches!(p, Part::Field(_)))
+    template_parts(field).iter().any(|p| matches!(p, TemplatePart::Field(_)))
 }
 
 /// The field names a template refers to, in order, each once; empty for a plain field.
 pub fn template_fields(field: &str) -> Vec<&str> {
     let mut names: Vec<&str> = Vec::new();
     for part in template_parts(field) {
-        if let Part::Field(name) = part
+        if let TemplatePart::Field(name) = part
             && !names.iter().any(|n| n.eq_ignore_ascii_case(name))
         {
             names.push(name);
@@ -2301,15 +2301,15 @@ impl LabelSource {
     /// template's missing field becomes empty text.
     pub fn resolve(field: &str, ds: &Dataset) -> Option<LabelSource> {
         let parts = template_parts(field);
-        if !parts.iter().any(|p| matches!(p, Part::Field(_))) {
+        if !parts.iter().any(|p| matches!(p, TemplatePart::Field(_))) {
             return ds.field_index(field).map(LabelSource::Field);
         }
         let mut found = false;
         let mut pieces = Vec::with_capacity(parts.len());
         for part in parts {
             match part {
-                Part::Text(t) => pieces.push(Piece::Text(t)),
-                Part::Field(name) => {
+                TemplatePart::Text(t) => pieces.push(Piece::Text(t)),
+                TemplatePart::Field(name) => {
                     if let Some(i) = ds.field_index(name) {
                         found = true;
                         pieces.push(Piece::Field(i));

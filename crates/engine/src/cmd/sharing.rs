@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use rustgis_data::{Dataset, Geometry, GeometryType};
 use rustgis_geom::Coord;
-use rustgis_map::symbology::{MAX_LABEL_CLASSES, Renderer};
+use rustgis_map::symbology::{MAX_LABEL_CLASSES, Renderer, TemplatePart, is_template, template_fields, template_parts};
 use rustgis_map::{Layer, Map, Rgba};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -649,7 +649,7 @@ pub fn web_style(l: &Layer) -> Value {
         // the one the map draws (light behind dark text, dark behind light) and thin.
         let halo_color = css(c.halo_color_for(c.color));
         let halo_width = if c.halo { c.halo_width.map_or(1.5, f64::from) } else { 0.0 };
-        let mut layout = json!({"text-field": ["to-string", prop(&c.field)], "text-size": c.size});
+        let mut layout = json!({"text-field": text_field(&l.dataset, &c.field), "text-size": c.size});
         // Letter spacing in ems, as MapLibre has it.
         if c.spacing != 0.0 && c.size > 0.0 {
             layout["text-letter-spacing"] = json!(f64::from(c.spacing) / f64::from(c.size));
@@ -672,6 +672,26 @@ pub fn web_style(l: &Layer) -> Value {
         }
     }
     json!({"version": 8, "name": l.name, "sources": {src.clone(): {"type": "geojson", "data": format!("{src}.geojson")}}, "layers": layers})
+}
+
+/// A MapLibre `text-field` for a label class's field: the field as text, or for a template its
+/// text and fields (a null one empty) concatenated, and nothing when every field is null, as
+/// `LabelSource::text` has it. Fields go by the layer's spelling of their names.
+fn text_field(ds: &Dataset, field: &str) -> Value {
+    let named = |n: &str| ds.field_index(n).and_then(|i| ds.fields.get(i)).map_or(n.to_string(), |f| f.name.clone());
+    if !is_template(field) {
+        return json!(["to-string", ["get", field]]);
+    }
+    let mut concat = vec![json!("concat")];
+    for part in template_parts(field) {
+        concat.push(match part {
+            TemplatePart::Text(t) => json!(t),
+            TemplatePart::Field(n) => json!(["to-string", ["get", named(n)]]),
+        });
+    }
+    let mut all_null = vec![json!("all")];
+    all_null.extend(template_fields(field).into_iter().map(|n| json!(["==", ["get", named(n)], null])));
+    json!(["case", all_null, "", concat])
 }
 
 /// The MapLibre zooms (`minzoom`, `maxzoom`) matching a layer's scale limits. A scale is a ground

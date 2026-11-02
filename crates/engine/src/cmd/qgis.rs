@@ -243,7 +243,13 @@ pub(crate) fn check_fields(l: &mut rustgis_map::Layer, name: &str, report: &mut 
         // its fields the layer hasn't, while it has one of them.
         if c.visible && !c.field.is_empty() {
             if LabelSource::resolve(&c.field, &l.dataset).is_none() {
-                report.skipped(name, format!("labels from the field {}, which the layer hasn't", c.field));
+                // A template's fields by name, as the layer has none of them.
+                let what = match template_fields(&c.field).as_slice() {
+                    [] => format!("the field {}", c.field),
+                    [one] => format!("the field {one}"),
+                    many => format!("the fields {}", many.join(", ")),
+                };
+                report.skipped(name, format!("labels from {what}, which the layer hasn't"));
                 c.visible = false;
             } else {
                 for f in template_fields(&c.field).into_iter().filter(|f| l.dataset.field_index(f).is_none()) {

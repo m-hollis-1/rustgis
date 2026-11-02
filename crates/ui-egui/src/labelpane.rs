@@ -8,7 +8,7 @@
 
 use egui::{Align2, CornerRadius, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::symbology::{
-    DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, Labeling, MAX_LABEL_CLASSES, label_class_name,
+    DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, Labeling, MAX_LABEL_CLASSES, MAX_TEMPLATE, is_template, label_class_name,
 };
 use rustgis_engine::map::{LabelPlacement, Layer, Rgba};
 use rustgis_engine::render::families;
@@ -426,9 +426,69 @@ pub(crate) fn end_search(ui: &Ui, id: egui::Id) {
     ui.data_mut(|d| d.remove::<String>(id));
 }
 
+/// What the class labels with: a field, or an expression (a template of fields, `{name} ({pop})`),
+/// switched between above them. A class labelled by a template opens on Expression.
+fn field(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+    let key = layer_key(app, l).with(("label_pane_expression", c.name));
+    let mut expression = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or_else(|| is_template(&c.it.field));
+    let was = expression;
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut expression, false, tl!("Field"));
+        ui.selectable_value(&mut expression, true, tl!("Expression"));
+    });
+    if expression != was {
+        ui.data_mut(|d| d.insert_temp(key, expression));
+    }
+    if expression { template(app, ui, l, c) } else { field_picker(app, ui, l, c) }
+}
+
+/// The class's template, typed (set once the box is left), with a list adding a field's `{name}`
+/// at its end. A class on a plain field starts on an empty box.
+fn template(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+    let cur = &c.it.field;
+    let current = if is_template(cur) { cur.clone() } else { String::new() };
+    let key = layer_key(app, l).with(("label_pane_template", c.name));
+    grid(ui, "template", |ui| {
+        let input_label = ui.label(tl!("Expression"));
+        let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| current.clone());
+        let r = ui
+            .add(egui::TextEdit::singleline(&mut buf).char_limit(MAX_TEMPLATE).desired_width(180.0).hint_text("{name}"))
+            .labelled_by(input_label.id)
+            .on_hover_text(tl!("The label's text, with each field's name in braces standing for its value. A doubled brace is a brace."));
+        if r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(key, buf));
+        } else {
+            ui.data_mut(|d| d.remove::<String>(key));
+            if r.lost_focus() && buf != current && !buf.trim().is_empty() {
+                run(app, "labels.field", c.params(json!({"field": buf})));
+            }
+        }
+        ui.end_row();
+        let input_label = ui.label(tl!("Insert field…"));
+        egui::ComboBox::from_id_salt("label_pane_insert_field")
+            .selected_text(tl!("Choose a field"))
+            .width(180.0)
+            .height(320.0)
+            .show_ui(ui, |ui| {
+                if l.dataset.fields.is_empty() {
+                    ui.weak(tl!("This layer has no fields."));
+                }
+                for f in &l.dataset.fields {
+                    if ui.selectable_label(false, &f.name).clicked() {
+                        let added = format!("{current}{{{}}}", f.name);
+                        run(app, "labels.field", c.params(json!({"field": added})));
+                    }
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
+        ui.end_row();
+    });
+}
+
 /// The field the class labels with, chosen as the font is: the box shows it (or says it is gone,
 /// as a style or a service can leave it), and the list has a search for a layer with many.
-fn field(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+fn field_picker(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     let fields = &l.dataset.fields;
     let cur = &c.it.field;
     // A layer without fields leaves its classes on none.
@@ -1745,6 +1805,40 @@ mod tests {
         search(&mut h, "zzz");
         assert_eq!(h.get_by_role(Role::TextInput).value().as_deref(), Some("zzz"), "the pick ended the search");
         assert!(h.query_by_label("No fields match").is_some());
+    }
+
+    /// The Expression switch shows a template box, set on Enter, and an Insert field list that
+    /// adds a `{name}`; a class labelled by a template opens on it.
+    #[test]
+    fn the_label_pane_expression_box_sets_a_template() {
+        use egui::accesskit::Role;
+        let mut h = harness(with_cities());
+        h.run();
+        assert!(h.query_by_role_and_label(Role::TextInput, "Expression").is_none(), "a plain field opens on Field");
+        h.get_by_role_and_label(Role::Button, "Expression").click();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Expression").focus();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Expression").type_text("{name} {pop_max}");
+        h.run();
+        assert_eq!(labels(h.state()).default.field, "name", "not while typing");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(labels(h.state()).default.field, "{name} {pop_max}");
+        // Insert field adds a field's name in braces at the end.
+        h.get_by_role_and_label(Role::ComboBox, "Insert field…").click();
+        h.run();
+        h.get_by_label("adm0name").click();
+        h.run();
+        assert_eq!(labels(h.state()).default.field, "{name} {pop_max}{adm0name}");
+        // Back on Field, the picker; a template class opens on Expression again.
+        h.get_by_role_and_label(Role::Button, "Field").click();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::ComboBox, "Field").is_some());
+        assert!(h.query_by_role_and_label(Role::TextInput, "Expression").is_none());
+        let mut h = harness(h.into_state());
+        h.run();
+        assert!(h.query_by_role_and_label(Role::TextInput, "Expression").is_some(), "a template opens on Expression");
     }
 
     /// A layer without fields has no label field to offer: the box shows none, and its list says

@@ -120,6 +120,7 @@ use rustgis_data::{Dataset, Geometry, GeometryType};
 use rustgis_geom::{Coord, Extent, extent_to_merc, lonlat_to_merc};
 use rustgis_map::globe::{V3, densify};
 use rustgis_map::layout::TextAlign;
+use rustgis_map::symbology::LabelSource;
 use rustgis_map::{Camera, Globe, LabelPlacement, LineStroke, Map, Marker, Rgba, Symbol};
 pub use text::halo_reach;
 /// The image type pages and maps are drawn into.
@@ -3604,9 +3605,12 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                 }
             }
             // Each label class labels every feature its clause takes, as in ArcGIS Pro (#732), when
-            // shown, in range and on a field the layer has (#618).
-            let label_fields: Vec<Option<usize>> = if labels.enabled && !display.paused {
-                labels.in_order().map(|c| ds_ptr.field_index(&c.field).filter(|_| c.visible && c.in_range(scale, distance))).collect()
+            // shown, in range and on a field the layer has (#618), or a template of them.
+            let label_fields: Vec<Option<LabelSource>> = if labels.enabled && !display.paused {
+                labels
+                    .in_order()
+                    .map(|c| (c.visible && c.in_range(scale, distance)).then(|| LabelSource::resolve(&c.field, ds_ptr)).flatten())
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -3681,12 +3685,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                         }
                         // (Along a line, the label is put on its stretch in view below.)
                         let (x, y) = point.unwrap_or_default();
-                        let Some(fi) = label_fields.get(ci).copied().flatten() else { continue };
-                        let v = ds_ptr.value(row, fi);
-                        if v.is_null() {
-                            continue;
-                        }
-                        let raw = v.to_string();
+                        let Some(raw) = label_fields.get(ci).and_then(Option::as_ref).and_then(|s| s.text(ds_ptr, row)) else { continue };
                         // Wrapped into lines as its class says; not a label curved character by
                         // character along a line (one line of characters, as QGIS curves it).
                         // (One too long to curve goes straight, and is wrapped as a straight one.)
@@ -5499,6 +5498,26 @@ mod tests {
         // A clause that doesn't read takes no feature.
         capitals(m.layer_mut(id).unwrap(), "gone = 1");
         assert_eq!(sizes(&mut m), both);
+    }
+
+    /// A class whose field is a template labels each feature with its fields' values.
+    #[test]
+    fn a_label_template_draws_both_fields() {
+        let mut m = Map::new("Map");
+        let fields = vec![Field::new("name", FieldType::Text), Field::new("pop", FieldType::Integer)];
+        let mut d = Dataset::new("pts", GeometryType::Point, fields);
+        d.push(Some(Geometry::Point(Coord::new(2.35, 48.85))), vec![Value::Text("Paris".into()), Value::Int(2000)]);
+        d.push(Some(Geometry::Point(Coord::new(4.83, 45.76))), vec![Value::Text("Lyon".into()), Value::Int(500)]);
+        let id = m.add_dataset(d);
+        if let Some(l) = m.layer_mut(id) {
+            l.labels.enabled = true;
+            l.labels.default.field = "{name} {pop}".into();
+        }
+        let camera = Camera { center: lonlat_to_merc(Coord::new(3.6, 47.3)), res: 5000.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        let mut texts: Vec<String> = render(&mut m, &view).unwrap().labels.into_iter().map(|l| l.text).collect();
+        texts.sort();
+        assert_eq!(texts, ["Lyon 500", "Paris 2000"]);
     }
 
     /// A point's label whose place another takes goes round the point when its class says so

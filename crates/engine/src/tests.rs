@@ -2875,6 +2875,64 @@ fn label_classes_convert_and_outlive_a_deleted_field() {
     assert_eq!((l.default.name.as_str(), l.default.visible, l.default.where_.as_deref()), ("Rest", false, Some("name <> 'x'")));
 }
 
+/// `labels.field` takes a `{Field}` template whose fields the layer has, and refuses one naming a
+/// field it hasn't, one with no field, and one too long.
+#[test]
+fn labels_field_accepts_a_template_and_refuses_a_missing_field() {
+    let mut s = world();
+    let field = |s: &Session| s.map().layer_by_name("Cities").unwrap().labels.default.field.clone();
+    s.run("labels.field", &json!({"layer": "Cities", "field": "{name} ({pop_max})"})).unwrap();
+    assert_eq!(field(&s), "{name} ({pop_max})");
+    assert!(s.map().layer_by_name("Cities").unwrap().labels.enabled);
+    let e = s.run("labels.field", &json!({"layer": "Cities", "field": "{name} {gone}"})).unwrap_err();
+    assert_eq!(e, "no field named 'gone'");
+    assert!(s.run("labels.field", &json!({"layer": "Cities", "field": "{}"})).is_err(), "a template of no field");
+    let long = format!("{{name}}{}", "x".repeat(rustgis_map::symbology::MAX_TEMPLATE));
+    assert!(s.run("labels.field", &json!({"layer": "Cities", "field": long})).is_err(), "too long");
+    assert_eq!(field(&s), "{name} ({pop_max})", "a refused template leaves the field");
+    // A plain field still takes the layer's own spelling.
+    s.run("labels.field", &json!({"layer": "Cities", "field": "NAME"})).unwrap();
+    assert_eq!(field(&s), "name");
+}
+
+/// An imported class labelled by a template stays on while the layer has one of its fields, and
+/// each field it lacks is noted; one with none of them is turned off.
+#[test]
+fn an_imported_template_missing_a_field_is_noted_and_drawn() {
+    use rustgis_map::qgis::{NoteKind, Report};
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let l = s.map_mut().layer_mut(id).unwrap();
+    l.labels.default.field = "{name} {gone}".into();
+    let mut report = Report::default();
+    crate::cmd::qgis::check_fields(l, "Cities", &mut report);
+    assert!(l.labels.default.visible);
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.kind, n.text.as_str())).collect();
+    assert_eq!(
+        notes,
+        [(NoteKind::Approximated, "labels from the field gone, which the layer hasn't; the rest of the expression is drawn")]
+    );
+    l.labels.default.field = "{gone}".into();
+    crate::cmd::qgis::check_fields(l, "Cities", &mut Report::default());
+    assert!(!l.labels.default.visible, "a template of no field the layer has labels nothing");
+}
+
+/// Converting labels drawn from a template gives each point the template's text.
+#[test]
+fn convert_to_annotation_uses_the_template() {
+    let mut s = world();
+    s.run("labels.field", &json!({"layer": "Cities", "field": "{name}: {pop_max}"})).unwrap();
+    let cities = s.map().layer_by_name("Cities").unwrap();
+    let (ni, pi) = (cities.dataset.field_index("name").unwrap(), cities.dataset.field_index("pop_max").unwrap());
+    let row = (0..cities.dataset.features.len()).find(|&r| cities.visible_rows().get(r) == Some(&true)).unwrap();
+    let want = format!("{}: {}", cities.dataset.value(row, ni), cities.dataset.value(row, pi));
+    let r = s.run("labels.convert", &json!({"layer": "Cities"})).unwrap();
+    let a = s.map().layer(u32::try_from(r["layer"].as_u64().unwrap()).unwrap()).unwrap();
+    let texts: Vec<String> = (0..a.dataset.features.len()).map(|r| a.dataset.value(r, 0).to_string()).collect();
+    assert!(texts.contains(&want), "{want} not among {:?}", texts.get(..3));
+    assert!(texts.iter().all(|t| t.contains(": ")));
+}
+
 #[test]
 fn graphics_draw_shapes_text_and_pictures() {
     use crate::render::View;

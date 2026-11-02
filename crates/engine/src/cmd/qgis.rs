@@ -5,6 +5,7 @@
 
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::qgis::{self, NoteKind, Report, Source};
+use rustgis_map::symbology::{LabelSource, template_fields};
 use serde_json::{Value, json};
 
 use super::{need_layer, ps};
@@ -238,10 +239,20 @@ pub(crate) fn check_fields(l: &mut rustgis_map::Layer, name: &str, report: &mut 
             report.skipped(name, format!("the label class \"{}\", whose clause `{w}` doesn't fit the layer ({e})", c.name));
             c.visible = false;
         }
-        // (A class with no field set labels nothing, and isn't noted.)
-        if c.visible && !c.field.is_empty() && l.dataset.field_index(&c.field).is_none() {
-            report.skipped(name, format!("labels from the field {}, which the layer hasn't", c.field));
-            c.visible = false;
+        // (A class with no field set labels nothing, and isn't noted.) A template draws without
+        // its fields the layer hasn't, while it has one of them.
+        if c.visible && !c.field.is_empty() {
+            if LabelSource::resolve(&c.field, &l.dataset).is_none() {
+                report.skipped(name, format!("labels from the field {}, which the layer hasn't", c.field));
+                c.visible = false;
+            } else {
+                for f in template_fields(&c.field).into_iter().filter(|f| l.dataset.field_index(f).is_none()) {
+                    report.approximated(
+                        name,
+                        format!("labels from the field {f}, which the layer hasn't; the rest of the expression is drawn"),
+                    );
+                }
+            }
         }
     }
     let field = match &l.renderer {

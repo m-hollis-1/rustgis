@@ -2074,6 +2074,8 @@ pub struct LabelClass {
     /// blank, takes every feature. One that no longer reads (a field since removed) takes none.
     #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
     pub where_: Option<String>,
+    /// The field it labels with, by name, or a template of them: text with each `{name}` a
+    /// field's value (`{{` and `}}` braces; see [`LabelSource`]).
     pub field: String,
     pub size: f32,
     pub color: Rgba,
@@ -2217,6 +2219,132 @@ pub fn wrapped(text: &str, wrap_char: Option<&str>, wrap_length: u32) -> String 
         out.push(current);
     }
     out.join("\n")
+}
+
+/// The longest [`LabelClass::field`] `labels.field` takes, in characters: a template's text.
+pub const MAX_TEMPLATE: usize = 1000;
+
+/// A part of a template as written: text, or a field's name between braces.
+enum Part<'a> {
+    Text(String),
+    Field(&'a str),
+}
+
+/// `field` read as a template: each `{name}` (a name with no brace in it) a field, `{{` and `}}`
+/// braces, everything else (an unclosed `{` too) text. Linear in its length, as a project file
+/// can hold any.
+fn template_parts(field: &str) -> Vec<Part<'_>> {
+    let (mut parts, mut text, mut rest) = (Vec::new(), String::new(), field);
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix("{{") {
+            text.push('{');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("}}") {
+            text.push('}');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('{')
+            && let Some((name, after)) = r.find(['{', '}']).and_then(|end| r.split_at_checked(end))
+            && let Some(after) = after.strip_prefix('}')
+            && !name.is_empty()
+        {
+            if !text.is_empty() {
+                parts.push(Part::Text(std::mem::take(&mut text)));
+            }
+            parts.push(Part::Field(name));
+            rest = after;
+        } else {
+            let mut chars = rest.chars();
+            text.extend(chars.next());
+            rest = chars.as_str();
+        }
+    }
+    if !text.is_empty() {
+        parts.push(Part::Text(text));
+    }
+    parts
+}
+
+/// Whether `field` is a template: holds a `{name}` (a `{{` is a literal brace).
+pub fn is_template(field: &str) -> bool {
+    template_parts(field).iter().any(|p| matches!(p, Part::Field(_)))
+}
+
+/// The field names a template refers to, in order, each once; empty for a plain field.
+pub fn template_fields(field: &str) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    for part in template_parts(field) {
+        if let Part::Field(name) = part
+            && !names.iter().any(|n| n.eq_ignore_ascii_case(name))
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// A piece of a template resolved against a dataset: text, or a field by its index.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Piece {
+    Text(String),
+    Field(usize),
+}
+
+/// Where a class's text comes from, resolved against a dataset once per frame.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LabelSource {
+    Field(usize),
+    Template(Vec<Piece>),
+}
+
+impl LabelSource {
+    /// `None` for a plain field the dataset lacks, or a template none of whose fields it has. A
+    /// template's missing field becomes empty text.
+    pub fn resolve(field: &str, ds: &Dataset) -> Option<LabelSource> {
+        let parts = template_parts(field);
+        if !parts.iter().any(|p| matches!(p, Part::Field(_))) {
+            return ds.field_index(field).map(LabelSource::Field);
+        }
+        let mut found = false;
+        let mut pieces = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part {
+                Part::Text(t) => pieces.push(Piece::Text(t)),
+                Part::Field(name) => {
+                    if let Some(i) = ds.field_index(name) {
+                        found = true;
+                        pieces.push(Piece::Field(i));
+                    }
+                }
+            }
+        }
+        found.then_some(LabelSource::Template(pieces))
+    }
+
+    /// The label's text for `row`: a null plain field is `None`; a template whose every field is
+    /// null is `None`; a null field inside a template is empty; `{{`/`}}` are braces; a newline in
+    /// the template is a line break.
+    pub fn text(&self, ds: &Dataset, row: usize) -> Option<String> {
+        match self {
+            LabelSource::Field(i) => Some(ds.value(row, *i)).filter(|v| !v.is_null()).map(ToString::to_string),
+            LabelSource::Template(pieces) => {
+                let mut any = false;
+                let mut out = String::new();
+                for piece in pieces {
+                    match piece {
+                        Piece::Text(t) => out.push_str(t),
+                        Piece::Field(i) => {
+                            let v = ds.value(row, *i);
+                            if !v.is_null() {
+                                any = true;
+                                out.push_str(&v.to_string());
+                            }
+                        }
+                    }
+                }
+                any.then_some(out)
+            }
+        }
+    }
 }
 
 /// How far a label's offset moves it each way (points).
@@ -3737,5 +3865,42 @@ mod tests {
         let mut more = fresh.clone();
         more.carry_edits_from(&gold, g);
         assert_eq!(more, fresh, "another number of classes starts fresh");
+    }
+
+    fn cities() -> Dataset {
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("NAME", FieldType::Text), Field::new("TYPE", FieldType::Text)]);
+        ds.push(None, vec![Value::Text("Paris".into()), Value::Text("city".into())]);
+        ds.push(None, vec![Value::Null, Value::Null]);
+        ds
+    }
+
+    /// A template's `{name}`s are its fields' values, `{{`/`}}` braces, and its newlines line
+    /// breaks; a row whose every field is null has no label.
+    #[test]
+    fn templates_expand_fields_literals_braces_and_newlines() {
+        let ds = cities();
+        let text = |t: &str, row: usize| LabelSource::resolve(t, &ds).and_then(|s| s.text(&ds, row));
+        assert_eq!(text("{NAME}\n({TYPE})", 0).as_deref(), Some("Paris\n(city)"));
+        assert_eq!(text("{{{NAME}}}", 0).as_deref(), Some("{Paris}"));
+        assert_eq!(text("{NAME}\n({TYPE})", 1), None, "every field null");
+        assert_eq!(text("NAME", 0).as_deref(), Some("Paris"), "a plain field");
+        assert_eq!(text("NAME", 1), None);
+        assert!(!is_template("NAME"));
+        assert!(is_template("{NAME}") && !is_template("{{NAME}}") && !is_template("{NAME"));
+        assert_eq!(template_fields("{A} {B} {A}"), ["A", "B"]);
+        assert_eq!(template_fields("{{{NAME}}}"), ["NAME"]);
+        assert!(template_fields("NAME").is_empty() && template_fields("{oops").is_empty());
+        assert_eq!(text("{oops {NAME}", 0).as_deref(), Some("{oops Paris"), "an unclosed brace is text");
+    }
+
+    /// A template's field the layer lacks is empty text; one with none of its fields has no source.
+    #[test]
+    fn a_template_with_a_missing_field_still_labels() {
+        let ds = cities();
+        let source = LabelSource::resolve("{NAME} {GONE}", &ds);
+        assert!(matches!(source, Some(LabelSource::Template(_))));
+        assert_eq!(source.and_then(|s| s.text(&ds, 0)).as_deref(), Some("Paris "));
+        assert!(LabelSource::resolve("{GONE}", &ds).is_none());
+        assert!(LabelSource::resolve("GONE", &ds).is_none());
     }
 }

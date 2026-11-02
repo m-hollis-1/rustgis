@@ -1969,6 +1969,31 @@ fn a_picture_is_a_marker_on_points() {
     assert_eq!((s.undo_depth(), symbol(&s).marker), (depth, Marker::Image(img)));
 }
 
+/// A drawn marker (an import's) keeps its paths when only its size changes; "Custom" is not a shape
+/// a command sets.
+#[test]
+fn a_drawn_marker_survives_a_new_size() {
+    use rustgis_map::{Marker, PathPart, PathRef, PathShape, Rgba};
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let part = PathPart {
+        points: vec![[0.0, 0.5], [0.5, -0.5], [-0.5, -0.5]],
+        closed: true,
+        fill: Some(Rgba::rgb(9, 9, 9)),
+        stroke: None,
+        width: 0.0,
+    };
+    let path = Marker::Path(PathRef::new(PathShape { parts: vec![part] }).unwrap());
+    let single = rustgis_map::Renderer::Single(rustgis_map::Symbol { marker: path, ..s.map().layer(id).unwrap().symbol(0) });
+    s.map_mut().layer_mut(id).unwrap().renderer = single;
+    let symbol = |s: &Session| s.map().layer_by_name("Cities").unwrap().symbol(0);
+    s.run("layer.marker", &json!({"layer": "Cities", "size": 12})).unwrap();
+    assert_eq!((symbol(&s).marker, symbol(&s).size), (path, 12.0));
+    let err = s.run("layer.marker", &json!({"layer": "Cities", "shape": "custom"})).unwrap_err();
+    assert!(err.contains("unknown marker shape"), "{err}");
+    assert_eq!(symbol(&s).marker, path);
+}
+
 /// A layout picture added from a file remembers it, and `path` relinks it to another.
 #[test]
 fn pictures_keep_their_path_and_relink() {

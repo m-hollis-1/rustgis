@@ -2168,6 +2168,11 @@ fn swatch(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, gt: GeometryType, s: 
                 crate::draw_image_marker(pm, x + w / 2.0, cy, rad, &image, 1.0);
                 return;
             }
+            // So do paths.
+            if let rustgis_map::Marker::Path(shape) = s.marker {
+                crate::draw_path_marker(pm, x + w / 2.0, cy, rad, &shape, 1.0);
+                return;
+            }
             if let Some(p) = PathBuilder::from_circle(x + w / 2.0, cy, rad) {
                 pm.fill_path(&p, &paint(s.fill, 1.0), FillRule::Winding, Transform::identity(), None);
                 pm.stroke_path(

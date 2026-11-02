@@ -23,10 +23,13 @@ pub enum Marker {
     Char(Glyph),
     /// A picture (a PNG), drawn at its own colours with its longer side the size.
     Image(ImageRef),
+    /// Paths drawn at their own colours ([`PathShape`]): a shape RustGIS hasn't, or several of a
+    /// file's marker layers stacked.
+    Path(PathRef),
 }
 
 impl Marker {
-    /// The shapes (every marker but [`Marker::Char`] and [`Marker::Image`]).
+    /// The shapes (every marker but [`Marker::Char`], [`Marker::Image`] and [`Marker::Path`]).
     pub const ALL: [Marker; 5] = [Marker::Circle, Marker::Square, Marker::Triangle, Marker::Diamond, Marker::Star];
     pub fn label(self) -> &'static str {
         match self {
@@ -37,12 +40,14 @@ impl Marker {
             Marker::Star => "Star",
             Marker::Char(_) => "Character",
             Marker::Image(_) => "Image",
+            Marker::Path(_) => "Custom",
         }
     }
 }
 
-/// [`Marker`] as a file holds it. Only the picture differs: a file is not trusted, so one that is
-/// not text, not a PNG or JPEG, too large, or past the pictures kept ([`ImageRef::new`]) reads as
+/// [`Marker`] as a file holds it. Only the picture and the paths differ: a file is not trusted, so
+/// a picture that is not text, not a PNG or JPEG, too large, or past the pictures kept
+/// ([`ImageRef::new`]), and paths that are not paths or leave no part ([`PathRef::new`]), read as
 /// a circle, and the rest of the file still reads.
 #[derive(Deserialize)]
 enum MarkerWire {
@@ -53,6 +58,15 @@ enum MarkerWire {
     Star,
     Char(Glyph),
     Image(WirePicture),
+    Path(WirePath),
+}
+
+/// A drawn marker's paths in a file, or anything else.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WirePath {
+    Shape(PathShape),
+    Other(serde::de::IgnoredAny),
 }
 
 /// A picture marker's text in a file, `None` when it is anything else or can't be kept.
@@ -74,6 +88,8 @@ impl From<MarkerWire> for Marker {
             MarkerWire::Char(g) => Marker::Char(g),
             MarkerWire::Image(WirePicture::Text(t)) => ImageRef::new(&t).map_or(Marker::Circle, Marker::Image),
             MarkerWire::Image(WirePicture::Other(_)) => Marker::Circle,
+            MarkerWire::Path(WirePath::Shape(p)) => PathRef::new(p).map_or(Marker::Circle, Marker::Path),
+            MarkerWire::Path(WirePath::Other(_)) => Marker::Circle,
         }
     }
 }
@@ -212,6 +228,130 @@ impl std::hash::Hash for ImageRef {
 impl Serialize for ImageRef {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.0)
+    }
+}
+
+/// The most parts a drawn marker keeps.
+pub const MAX_PATH_PARTS: usize = 64;
+/// The most points a drawn marker's part keeps.
+pub const MAX_PATH_POINTS: usize = 256;
+/// The most different drawn markers kept (each is kept for the rest of the run); one past them is refused.
+pub const MAX_PATHS: usize = 4096;
+/// How far a drawn marker's point may reach from its centre on either axis, in its sizes.
+const PATH_REACH: f32 = 2.0;
+
+/// A marker drawn from paths: a shape RustGIS hasn't, or several marker layers stacked. Unit space:
+/// the marker's size is the square from (−0.5, −0.5) to (0.5, 0.5), y up (as CIM's); parts may
+/// reach past it to ±2.0. Later parts draw over earlier ones.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathShape {
+    pub parts: Vec<PathPart>,
+}
+
+/// One path of a [`PathShape`], filled and stroked in its own colours (neither: drawn not at all).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathPart {
+    /// 2..=[`MAX_PATH_POINTS`] points in the shape's unit space.
+    pub points: Vec<[f32; 2]>,
+    /// Whether the last point joins the first (a ring); an open part is a line, which a fill
+    /// still closes.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Rgba>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<Rgba>,
+    /// The stroke's width as a fraction of the marker's size, 0..=0.5.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub width: f32,
+}
+
+impl PathShape {
+    /// The shape as [`PathRef::new`] keeps it: coordinates clamped to ±[`PATH_REACH`] (a
+    /// non-finite one 0), widths to 0..=0.5, parts of fewer than 2 points dropped, parts and
+    /// points cut to their limits. No value is −0, so equal shapes have equal [`PathShape::key`]s.
+    fn kept(self) -> PathShape {
+        let coord = |v: f32| if v.is_finite() { v.clamp(-PATH_REACH, PATH_REACH) + 0.0 } else { 0.0 };
+        let parts = self
+            .parts
+            .into_iter()
+            .filter(|p| p.points.len() >= 2)
+            .take(MAX_PATH_PARTS)
+            .map(|p| PathPart {
+                points: p.points.into_iter().take(MAX_PATH_POINTS).map(|[x, y]| [coord(x), coord(y)]).collect(),
+                width: if p.width.is_finite() { p.width.clamp(0.0, 0.5) + 0.0 } else { 0.0 },
+                ..p
+            })
+            .collect();
+        PathShape { parts }
+    }
+
+    /// The key a kept shape is found by: the bits of every value (floats aren't `Hash`).
+    fn key(&self) -> Vec<u32> {
+        let colour = |c: Option<Rgba>| c.map_or([0, 0], |c| [1, u32::from_le_bytes(c.0)]);
+        let mut key = Vec::new();
+        for p in &self.parts {
+            key.extend([p.points.len() as u32, p.closed as u32, p.width.to_bits()]);
+            key.extend(colour(p.fill).into_iter().chain(colour(p.stroke)));
+            key.extend(p.points.iter().flat_map(|[x, y]| [x.to_bits(), y.to_bits()]));
+        }
+        key
+    }
+}
+
+/// A drawn marker's paths, kept once for the rest of the run so a symbol holding them stays
+/// `Copy` (as [`ImageRef`] does a picture): equal shapes are one kept shape, so they compare and
+/// hash by address, and render caches may key on it.
+#[derive(Clone, Copy, Debug)]
+pub struct PathRef(&'static PathShape);
+
+impl PathRef {
+    /// Keeps `shape` with every coordinate clamped to ±2.0 (a non-finite one to 0), parts of fewer
+    /// than 2 points dropped, parts and points cut to [`MAX_PATH_PARTS`] and [`MAX_PATH_POINTS`],
+    /// and widths clamped to 0..=0.5; `None` when no part is left or [`MAX_PATHS`] shapes are kept.
+    pub fn new(shape: PathShape) -> Option<PathRef> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static PATHS: OnceLock<Mutex<HashMap<Vec<u32>, &'static PathShape>>> = OnceLock::new();
+        let shape = shape.kept();
+        if shape.parts.is_empty() {
+            return None;
+        }
+        let key = shape.key();
+        let mut paths = PATHS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = paths.get(&key) {
+            return Some(PathRef(kept));
+        }
+        if paths.len() >= MAX_PATHS {
+            return None;
+        }
+        let kept: &'static PathShape = Box::leak(Box::new(shape));
+        paths.insert(key, kept);
+        Some(PathRef(kept))
+    }
+
+    pub fn shape(&self) -> &'static PathShape {
+        self.0
+    }
+}
+
+impl PartialEq for PathRef {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for PathRef {}
+
+impl std::hash::Hash for PathRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::from_ref(self.0).hash(state);
+    }
+}
+
+impl Serialize for PathRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
     }
 }
 
@@ -1619,10 +1759,10 @@ impl Renderer {
         }
     }
 
-    /// Whether any symbol is a character of a font or a picture ([`Marker::Char`], [`Marker::Image`]):
-    /// the markers with no shape template for the GPU.
+    /// Whether any symbol is a character of a font, a picture or paths ([`Marker::Char`],
+    /// [`Marker::Image`], [`Marker::Path`]): the markers with no shape template for the GPU.
     pub fn has_char_markers(&self) -> bool {
-        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_) | Marker::Image(_));
+        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_) | Marker::Image(_) | Marker::Path(_));
         match self {
             Renderer::Single(s) | Renderer::Proportional { base: s, .. } => char(s),
             Renderer::Unique { classes, other, .. } => char(other) || classes.iter().any(|c| char(&c.1)),
@@ -2545,6 +2685,59 @@ mod tests {
     use rustgis_data::{Field, Value};
     use serde_json::json;
 
+    fn path_part(points: &[[f32; 2]]) -> PathPart {
+        PathPart { points: points.to_vec(), closed: true, fill: Some(Rgba::rgb(200, 0, 0)), stroke: None, width: 0.0 }
+    }
+
+    #[test]
+    fn path_markers_intern_clamp_and_round_trip() {
+        let square = [[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]];
+        let a = PathRef::new(PathShape { parts: vec![path_part(&square)] }).unwrap();
+        let b = PathRef::new(PathShape { parts: vec![path_part(&square)] }).unwrap();
+        assert!(std::ptr::eq(a.shape(), b.shape()));
+        assert_eq!(Marker::Path(a), Marker::Path(b));
+        // A NaN is 0, and a coordinate past ±2.0 is cut to it; widths are cut to 0..=0.5.
+        let mut wild = path_part(&[[f32::NAN, 1e30], [-1e30, f32::INFINITY]]);
+        wild.width = 9.0;
+        let w = PathRef::new(PathShape { parts: vec![wild] }).unwrap();
+        let part = &w.shape().parts[0];
+        assert_eq!(part.points, vec![[0.0, 2.0], [-2.0, 0.0]]);
+        assert_eq!(part.width, 0.5);
+        // 1000 parts are cut to the most kept.
+        let many =
+            PathRef::new(PathShape { parts: (0..1000).map(|i| path_part(&[[0.0, 0.0], [i as f32 / 1000.0, 0.1]])).collect() }).unwrap();
+        assert_eq!(many.shape().parts.len(), MAX_PATH_PARTS);
+        // Through a symbol, as a project holds it.
+        let sym = Symbol { marker: Marker::Path(a), ..Symbol::default_for(GeometryType::Point, 0) };
+        let json = serde_json::to_string(&sym).unwrap();
+        // A closed part's `closed`, and a missing stroke and width, are not written.
+        let part = r#"{"points":[[-0.25,-0.25],[0.25,-0.25],[0.25,0.25],[-0.25,0.25]],"fill":[200,0,0,255]}"#;
+        assert!(json.ends_with(&format!(r#""marker":{{"Path":{{"parts":[{part}]}}}}}}"#)), "{json}");
+        assert_eq!(serde_json::from_str::<Symbol>(&json).unwrap(), sym);
+        assert_eq!(Marker::Path(a).label(), "Custom");
+        assert!(!Marker::ALL.contains(&Marker::Path(a)));
+    }
+
+    #[test]
+    fn hostile_paths_are_clamped_or_refused() {
+        assert!(PathRef::new(PathShape { parts: vec![] }).is_none());
+        assert!(PathRef::new(PathShape { parts: vec![path_part(&[[0.0, 0.0]])] }).is_none());
+        let kept = PathRef::new(PathShape { parts: vec![path_part(&[[0.1, 0.1]]), path_part(&[[0.0, 0.0], [0.3, 0.3]])] }).unwrap();
+        assert_eq!(kept.shape().parts.len(), 1);
+        assert_eq!(kept.shape().parts[0].points.len(), 2);
+        let long: Vec<[f32; 2]> = (0..10_000).map(|i| [i as f32 / 10_000.0, 0.2]).collect();
+        let cut = PathRef::new(PathShape { parts: vec![path_part(&long)] }).unwrap();
+        assert_eq!(cut.shape().parts[0].points.len(), MAX_PATH_POINTS);
+        // A path a file holds that can't be kept reads as a circle, and the rest still reads.
+        for marker in [json!({"Path": {"parts": []}}), json!({"Path": 7}), json!({"Path": {"parts": [{"points": [[0, 0]]}]}})] {
+            let sym = json!({"fill": [1, 2, 3, 255], "stroke": [4, 5, 6, 255], "stroke_width": 1.5, "size": 9.0, "marker": marker});
+            let s: Symbol = serde_json::from_value(sym).unwrap_or_else(|e| panic!("{marker}: {e}"));
+            assert_eq!(s.marker, Marker::Circle, "{marker}");
+        }
+        let read: Marker = serde_json::from_value(json!({"Path": {"parts": [{"points": [[0, 0], [9, -9]], "closed": false}]}})).unwrap();
+        let Marker::Path(p) = read else { panic!("{read:?}") };
+        assert_eq!((p.shape().parts[0].points.clone(), p.shape().parts[0].closed), (vec![[0.0, 0.0], [2.0, -2.0]], false));
+    }
     #[test]
     fn image_markers_intern_and_round_trip() {
         let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";

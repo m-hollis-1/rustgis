@@ -36,7 +36,7 @@ pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
     ClassMethod, FontName, Glyph, ImageRef, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap,
-    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
+    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, PathPart, PathRef, PathShape, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 

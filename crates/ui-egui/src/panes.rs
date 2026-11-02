@@ -543,6 +543,28 @@ pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
                         p.circle_stroke(c, rad, Stroke::new(s.stroke_width.clamp(1.0, 2.0), c32(s.stroke)));
                     }
                 },
+                // Paths, in their own colours, their size as a picture's (y up in the shape).
+                Marker::Path(shape) => {
+                    let side = s.size.clamp(8.0, 20.0).min(r.height());
+                    for part in &shape.shape().parts {
+                        let points: Vec<egui::Pos2> = part.points.iter().map(|[x, y]| c + vec2(x * side, -y * side)).collect();
+                        // egui fills only closed paths: an open part's fill closes it, as the map's does.
+                        if let Some(fill) = part.fill {
+                            p.add(egui::epaint::PathShape {
+                                fill: c32(fill),
+                                ..egui::epaint::PathShape::closed_line(points.clone(), Stroke::NONE)
+                            });
+                        }
+                        if let Some(stroke) = part.stroke {
+                            let stroke = Stroke::new((part.width * side).max(0.5), c32(stroke));
+                            p.add(if part.closed {
+                                egui::epaint::PathShape::closed_line(points, stroke)
+                            } else {
+                                egui::epaint::PathShape::line(points, stroke)
+                            });
+                        }
+                    }
+                }
                 _ => {
                     p.circle_filled(c, rad, c32(s.fill));
                     p.circle_stroke(c, rad, Stroke::new(s.stroke_width.min(2.0), c32(s.stroke)));

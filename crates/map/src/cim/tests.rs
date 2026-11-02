@@ -2499,3 +2499,107 @@ fn path_keys_ignore_the_case_of_the_cimpath_prefix() {
             .unwrap();
     assert_eq!(d.resolve("CIMPATH=Map/M.json").unwrap()["name"], "M");
 }
+
+#[test]
+fn a_project_lists_its_maps_layouts_open_views_and_pictures() {
+    use base64::Engine;
+    let project = json!({
+        "type": "CIMGISProject",
+        "projectItems": [
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "First", "catalogPath": "CIMPATH=first/first.json"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Second", "catalogPath": "CIMPATH=second/second.json"},
+            {"type": "CIMProjectItem", "itemType": "Layout", "name": "Sheet", "catalogPath": "CIMPATH=sheet/sheet.json"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Old", "catalogPath": "CIMPATH=old/old.xml"},
+            {"type": "CIMProjectItem", "itemType": "Folder", "name": "Data", "catalogPath": "CIMPATH=data"},
+        ],
+        "views": [
+            {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=second/second.json", "camera": {"x": 1.0, "y": 2.0, "scale": 5000.0, "heading": 0.0}},
+            {"type": "CIMLayoutView", "viewableObjectPath": "CIMPATH=sheet/sheet.json"},
+            {"type": "CIMMapTableView", "viewableObjectPath": "CIMPATH=first/first.json"},
+        ],
+    });
+    let png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let zip =
+        rustgis_data::zip::write(&[("GISProject.json".into(), project.to_string().into_bytes()), ("Pictures/a.png".into(), png.clone())])
+            .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+
+    let items = d.items();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["First", "Second", "Sheet", "Old"]);
+    assert_eq!(items.iter().map(|i| i.kind.clone()).collect::<Vec<_>>(), [ItemKind::Map, ItemKind::Map, ItemKind::Layout, ItemKind::Map]);
+    assert_eq!(items.iter().map(|i| i.arcmap).collect::<Vec<_>>(), [false, false, false, true]);
+    assert_eq!(items.get(1).map(|i| i.uri.as_str()), Some("CIMPATH=second/second.json"));
+
+    assert_eq!(d.open_maps(), ["CIMPATH=second/second.json"]);
+    assert_eq!(d.view_camera("CIMPATH=second/second.json"), Some((1.0, 2.0, 5000.0)));
+    assert_eq!(d.view_camera("CIMPATH=first/first.json"), None);
+
+    let want = base64::engine::general_purpose::STANDARD.encode(&png);
+    assert_eq!(d.binary("CIMPATH=Pictures/A.PNG"), Some(want.as_str()));
+    assert_eq!(d.binary("CIMPATH=Pictures/b.png"), None);
+}
+
+#[test]
+fn a_document_that_is_not_a_project_has_no_items_or_views() {
+    let d = Document::from_json(r#"{"type":"CIMLayoutDocument"}"#).unwrap();
+    assert!(d.items().is_empty());
+    assert!(d.open_maps().is_empty());
+    assert_eq!(d.view_camera("CIMPATH=x.json"), None);
+}
+
+#[test]
+fn project_items_are_bounded() {
+    let items: Vec<_> = (0..MAX_ITEMS + 50)
+        .map(|i| json!({"itemType": "Map", "name": format!("M{i}"), "catalogPath": format!("CIMPATH=m{i}/m{i}.json")}))
+        .collect();
+    let d = Document::from_json(&json!({"type": "CIMGISProject", "projectItems": items}).to_string()).unwrap();
+    assert_eq!(d.items().len(), MAX_ITEMS);
+}
+
+#[test]
+fn a_mapx_and_a_lyrx_expose_their_definitions() {
+    let mapx =
+        Document::from_json(r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"M","layers":[]},"layerDefinitions":[]}"#)
+            .unwrap();
+    assert_eq!(mapx.map_definition().and_then(|m| m.get("name")).and_then(|n| n.as_str()), Some("M"));
+    assert!(mapx.layer_uris().is_empty());
+
+    let lyrx = Document::from_json(r#"{"type":"CIMLayerDocument","layers":["CIMPATH=a/a.json","CIMPATH=b/b.json"],"layerDefinitions":[]}"#)
+        .unwrap();
+    assert_eq!(lyrx.layer_uris(), ["CIMPATH=a/a.json", "CIMPATH=b/b.json"]);
+    assert!(lyrx.map_definition().is_none());
+
+    let pagx = Document::from_json(r#"{"type":"CIMLayoutDocument","layoutDefinition":{"type":"CIMLayout"}}"#).unwrap();
+    assert!(pagx.map_definition().is_none());
+    assert!(pagx.layer_uris().is_empty());
+}
+
+#[test]
+fn oversize_picture_entries_are_left_out() {
+    let project = br#"{"type":"CIMGISProject"}"#.to_vec();
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project),
+        ("Pictures/big.png".into(), vec![7u8; 17 << 20]),
+        ("Pictures/small.jpg".into(), vec![1, 2, 3]),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+    assert_eq!(d.binary("CIMPATH=Pictures/big.png"), None);
+    assert_eq!(d.binary("CIMPATH=Pictures/small.jpg"), Some("AQID"));
+}
+
+#[test]
+fn a_layout_definition_and_a_map_definition_read_like_their_documents() {
+    let text = r#"{"type":"CIMLayoutDocument","layoutDefinition":{"type":"CIMLayout","name":"P",
+      "page":{"type":"CIMPage","width":11,"height":8.5,"units":{"uwkid":109008}},"elements":[]}}"#;
+    let d = Document::from_json(text).unwrap();
+    let by_doc = read_layout(&d, &mut Report::default()).unwrap();
+    let def = d.root().get("layoutDefinition").unwrap();
+    let by_def = read_layout_def(&d, def, &mut Report::default()).unwrap();
+    assert_eq!(by_doc.layout.name, by_def.layout.name);
+
+    let m = Document::from_json(r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"Solo","layers":[]}}"#).unwrap();
+    let imp = read_map_def(&m, m.map_definition().unwrap(), &mut Report::default()).unwrap();
+    assert_eq!(imp.name, "Solo");
+}

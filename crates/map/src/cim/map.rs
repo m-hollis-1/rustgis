@@ -70,6 +70,11 @@ pub struct LayerImport {
 /// The map `uri` names, and its layers.
 pub fn read_map(doc: &Document, uri: &str, report: &mut Report) -> Result<MapImport, String> {
     let map = doc.resolve(uri).and_then(|m| typed(m, "CIMMap")).ok_or_else(|| format!("{} isn't a map of this document", shown(uri)))?;
+    read_map_def(doc, map, report)
+}
+
+/// The map `map` (a `CIMMap`, wherever the document found it), and its layers.
+pub fn read_map_def(doc: &Document, map: &Value, report: &mut Report) -> Result<MapImport, String> {
     let name = str_of(map, "name").unwrap_or("Map").to_string();
     let wkid = map.get("spatialReference").and_then(|s| {
         ["latestWkid", "wkid"].iter().find_map(|k| s.get(*k).and_then(Value::as_u64).and_then(|w| u32::try_from(w).ok()).filter(|w| *w > 0))

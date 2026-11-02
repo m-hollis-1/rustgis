@@ -26,12 +26,21 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 pub use crate::qgis::{Note, NoteKind, Report};
-pub use layout::{FrameBinding, LayoutImport, PictureSource, read_layout};
-pub use map::{LayerImport, MapImport, read_map};
+pub use layout::{FrameBinding, LayoutImport, PictureSource, read_layout, read_layout_def};
+pub use map::{LayerImport, MapImport, read_map, read_map_def};
 pub use symbol::base64_text;
 
 /// The most JSON text a document (or all of a project's entries together) is read from.
 pub const MAX_JSON: usize = 64 << 20;
+
+/// The most picture bytes a project's zip is read for, all pictures together.
+const MAX_PICTURE_TOTAL: usize = 64 << 20;
+/// The most bytes of one picture kept.
+const MAX_PICTURE_ENTRY: usize = 16 << 20;
+/// The extensions of the zip entries kept as pictures.
+const PICTURE_EXTENSIONS: [&str; 5] = [".png", ".jpg", ".jpeg", ".gif", ".bmp"];
+/// The most project items, views and layer paths listed.
+pub const MAX_ITEMS: usize = 1000;
 
 /// The lists of a document's root that hold definitions with a `uRI` to resolve.
 const DEFINITION_LISTS: [&str; 3] = ["mapDefinitions", "layerDefinitions", "elevationSurfaceLayerDefinitions"];
@@ -55,6 +64,24 @@ pub enum DocKind {
     Other(String),
 }
 
+/// What a project item is, of the kinds that can be imported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ItemKind {
+    Map,
+    Layout,
+}
+
+/// A map or layout of a project (an entry of `projectItems`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectItem {
+    pub name: String,
+    pub kind: ItemKind,
+    /// Its `catalogPath`: the `CIMPATH=…` of its definition.
+    pub uri: String,
+    /// `catalogPath` ends in `.xml`: saved by ArcMap, not CIM.
+    pub arcmap: bool,
+}
+
 /// A CIM document's JSON, with its embedded definitions and binaries findable by `uRI`.
 #[derive(Clone, Debug)]
 pub struct Document {
@@ -67,12 +94,14 @@ pub struct Document {
     binaries: HashMap<String, usize>,
     /// The other JSON entries of a project's zip, by lower-cased path.
     entries: HashMap<String, Value>,
+    /// The pictures of a project's zip as base64 text, by lower-cased path.
+    pictures: HashMap<String, String>,
 }
 
 impl Document {
     /// Reads a `.pagx`, `.mapx` or `.lyrx`.
     pub fn from_json(text: &str) -> Result<Document, String> {
-        Ok(Self::new(parse(text)?, HashMap::new()))
+        Ok(Self::new(parse(text)?, HashMap::new(), HashMap::new()))
     }
 
     /// Reads an `.aprx`: `GISProject.json` is the root, and the other JSON entries are what its
@@ -92,10 +121,10 @@ impl Document {
             }
         }
         let root = root.ok_or("the archive has no GISProject.json, so it isn't an ArcGIS Pro project")?;
-        Ok(Self::new(root, entries))
+        Ok(Self::new(root, entries, pictures(bytes)))
     }
 
-    fn new(root: Value, entries: HashMap<String, Value>) -> Document {
+    fn new(root: Value, entries: HashMap<String, Value>, pictures: HashMap<String, String>) -> Document {
         let mut definitions = HashMap::new();
         for (list, key) in DEFINITION_LISTS.iter().enumerate() {
             for (i, def) in root.get(key).and_then(Value::as_array).into_iter().flatten().enumerate() {
@@ -111,7 +140,7 @@ impl Document {
                 binaries.entry(path_key(uri)).or_insert(i);
             }
         }
-        Document { root, definitions, binaries, entries }
+        Document { root, definitions, binaries, entries, pictures }
     }
 
     /// What the root's `type` says this is.
@@ -139,11 +168,83 @@ impl Document {
         self.entries.get(&key)
     }
 
-    /// The `data` (base64) of the binary a `CIMPATH=…` names.
+    /// The `data` (base64) of the binary a `CIMPATH=…` names: one of the root's own, or else a
+    /// picture of the project's zip.
     pub fn binary(&self, uri: &str) -> Option<&str> {
-        let i = *self.binaries.get(&path_key(uri))?;
-        str_of(self.root.get(BINARIES)?.get(i)?, "data")
+        let key = path_key(uri);
+        if let Some(&i) = self.binaries.get(&key) {
+            return str_of(self.root.get(BINARIES)?.get(i)?, "data");
+        }
+        self.pictures.get(&key).map(String::as_str)
     }
+
+    /// A project's maps and layouts (`projectItems` of `itemType` Map or Layout), in file order, at
+    /// most [`MAX_ITEMS`]. Empty for a document that isn't a project.
+    pub fn items(&self) -> Vec<ProjectItem> {
+        let list = self.root.get("projectItems").and_then(Value::as_array).into_iter().flatten();
+        list.filter_map(|item| {
+            let kind = match str_of(item, "itemType")? {
+                "Map" => ItemKind::Map,
+                "Layout" => ItemKind::Layout,
+                _ => return None,
+            };
+            let uri = str_of(item, "catalogPath")?.to_string();
+            let arcmap = uri.trim().to_ascii_lowercase().ends_with(".xml");
+            Some(ProjectItem { name: str_of(item, "name").unwrap_or_default().to_string(), kind, uri, arcmap })
+        })
+        .take(MAX_ITEMS)
+        .collect()
+    }
+
+    /// The `CIMMapView`s of a project's `views`, bounded.
+    fn map_views(&self) -> impl Iterator<Item = &Value> {
+        let views = self.root.get("views").and_then(Value::as_array).into_iter().flatten();
+        views.take(MAX_ITEMS).filter(|v| str_of(v, "type") == Some("CIMMapView"))
+    }
+
+    /// The URIs of the maps whose panes were open when the project was saved, in order.
+    pub fn open_maps(&self) -> Vec<String> {
+        self.map_views().filter_map(|v| str_of(v, "viewableObjectPath")).map(str::to_string).collect()
+    }
+
+    /// The saved camera of the view on `map_uri`: `(x, y, scale)` in the map's spatial reference.
+    pub fn view_camera(&self, map_uri: &str) -> Option<(f64, f64, f64)> {
+        let key = path_key(map_uri);
+        let view = self.map_views().find(|v| str_of(v, "viewableObjectPath").is_some_and(|p| path_key(p) == key))?;
+        let camera = view.get("camera")?;
+        Some((num(camera, "x")?, num(camera, "y")?, num(camera, "scale")?))
+    }
+
+    /// A `.mapx`'s own map: its `mapDefinition`.
+    pub fn map_definition(&self) -> Option<&Value> {
+        self.root.get("mapDefinition").filter(|d| d.is_object())
+    }
+
+    /// A `.lyrx`'s `layers` (a `CIMLayerDocument`), else empty.
+    pub fn layer_uris(&self) -> Vec<String> {
+        if !matches!(self.kind(), DocKind::Layer) {
+            return Vec::new();
+        }
+        let layers = self.root.get("layers").and_then(Value::as_array).into_iter().flatten();
+        layers.filter_map(Value::as_str).take(MAX_ITEMS).map(str::to_string).collect()
+    }
+}
+
+/// The pictures of a project's zip as base64 text, by lower-cased path. A picture over
+/// [`MAX_PICTURE_ENTRY`] is left out, and so are all of them when together they pass
+/// [`MAX_PICTURE_TOTAL`] (or the zip is damaged there): the layout then notes a picture it can't find.
+fn pictures(zip: &[u8]) -> HashMap<String, String> {
+    use base64::Engine;
+    let is_picture = |name: &str| {
+        let lower = name.to_ascii_lowercase();
+        PICTURE_EXTENSIONS.iter().any(|e| lower.ends_with(e))
+    };
+    let Ok(files) = rustgis_data::zip::read_matching_within(zip, is_picture, MAX_PICTURE_TOTAL) else { return HashMap::new() };
+    files
+        .into_iter()
+        .filter(|(_, data)| data.len() <= MAX_PICTURE_ENTRY)
+        .map(|(name, data)| (path_key(&name), base64::engine::general_purpose::STANDARD.encode(data)))
+        .collect()
 }
 
 /// Parses `text` as a JSON object, once it is known to be of a size that can be read.

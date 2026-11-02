@@ -323,6 +323,12 @@ pub fn read_layout(doc: &Document, report: &mut Report) -> Result<LayoutImport, 
         .get("layoutDefinition")
         .filter(|d| d.is_object())
         .ok_or("not an ArcGIS Pro layout: the document has no layoutDefinition")?;
+    read_layout_def(doc, def, report)
+}
+
+/// Reads the layout `def` (a `CIMLayout`, wherever the document found it): the page, then each
+/// element as a RustGIS element.
+pub fn read_layout_def(doc: &Document, def: &Value, report: &mut Report) -> Result<LayoutImport, String> {
     let name = str_of(def, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Layout").to_string();
     let page = def.get("page").unwrap_or(&NULL);
     let unit_mm = page_unit_mm(page).unwrap_or_else(|| {

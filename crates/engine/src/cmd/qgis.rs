@@ -354,17 +354,17 @@ fn go_to_view(s: &mut Session, project: &qgis::Project, degrees: Option<Geograph
 
 /// A coordinate system in degrees (EPSG:4326, ETRS89, NAD83, …), which QGIS draws as plate carrée.
 #[derive(Clone, Copy, Debug)]
-struct Geographic {
+pub(crate) struct Geographic {
     /// On WGS 84, or a datum PROJ takes as the same (no shift to WGS 84).
-    wgs84: bool,
+    pub(crate) wgs84: bool,
     /// Longitudes from Greenwich (not from another prime meridian, such as Paris's).
-    greenwich: bool,
+    pub(crate) greenwich: bool,
 }
 
 impl Geographic {
     /// `None` for a coordinate system that isn't in degrees, or isn't known: an `EPSG:` code,
     /// `OGC:CRS84`, or a PROJ string (a project QGIS saved without an authority code).
-    fn of(crs: &str) -> Option<Geographic> {
+    pub(crate) fn of(crs: &str) -> Option<Geographic> {
         if crs.eq_ignore_ascii_case("OGC:CRS84") {
             return Some(Geographic { wgs84: true, greenwich: true });
         }

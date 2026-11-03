@@ -10,12 +10,13 @@
 
 use std::collections::HashMap;
 
-use rustgis_geom::{Coord, Extent, merc_to_lonlat};
+use rustgis_geom::{Coord, Extent};
 use rustgis_map::cim::{
-    self, DocKind, Document, Entry, LayerImport, LayerKind, LayerSource, LayoutImport, MapImport, PictureSource, Report,
+    self, DocKind, Document, Entry, GroupImport, LayerImport, LayerKind, LayerSource, LayoutImport, MapImport, PictureSource, Report,
 };
 use rustgis_map::layout::{ElementKind, MAX_FRAME_SCALE, MIN_FRAME_SCALE};
-use rustgis_map::qgis::NoteKind;
+use rustgis_map::qgis::{NoteKind, QGIS_SCALE};
+use rustgis_map::source::{ServiceOrigin, SourceLayer};
 use rustgis_map::symbology::{ImageRef, Marker};
 use serde_json::{Value, json};
 
@@ -175,7 +176,7 @@ pub(crate) fn import_layout(s: &mut Session, text: &str, dir: Option<&str>, p: &
     for (key, m) in &maps {
         let name = match reusable(s, m, dir) {
             Some(name) => name,
-            None => add_map(s, m, dir, &mut report)?,
+            None => add_map(s, m, dir, None, &mut report)?.name,
         };
         if !added.contains(&name) {
             added.push(name.clone());
@@ -249,45 +250,35 @@ fn absolute(path: &str) -> String {
     if cfg!(windows) { p.to_lowercase() } else { p }
 }
 
-/// A feature layer of a map on a file, as the layout path adds it.
-struct FileLayer<'a> {
-    layer: &'a LayerImport,
-    path: &'a str,
-    table: Option<&'a str>,
-    /// Shown: its own visibility and that of every group it is in.
-    visible: bool,
-}
-
-/// `m`'s feature layers on files, top first, its groups opened up in place. (The layout path adds
-/// these alone, as it did before maps kept their groups.)
-fn file_layers(m: &MapImport) -> Vec<FileLayer<'_>> {
-    fn walk<'a>(entries: &'a [Entry], shown: bool, out: &mut Vec<FileLayer<'a>>) {
+/// The files of `m`'s layers, top first, its groups opened up in place: a path (started from
+/// `dir`) and a table. A layer on a file comes in opened, or broken with that file, so each is
+/// compared, there or not. (A table listed among the layers becomes a project table.)
+fn layer_files(m: &MapImport, dir: Option<&str>) -> Vec<(String, Option<String>)> {
+    fn walk(entries: &[Entry], dir: Option<&str>, out: &mut Vec<(String, Option<String>)>) {
         for e in entries {
             match e {
-                Entry::Group(g) => walk(&g.children, shown && g.visible, out),
+                Entry::Group(g) => walk(&g.children, dir, out),
                 Entry::Layer(l) => {
-                    if let (LayerKind::Feature, LayerSource::File { path, table }) = (l.kind, &l.source) {
-                        out.push(FileLayer { layer: l, path, table: table.as_deref(), visible: shown && l.visible });
+                    if let (false, LayerSource::File { path, table }) = (l.kind == LayerKind::Table, &l.source) {
+                        out.push((absolute(&resolve(path, dir)), table.clone()));
                     }
                 }
             }
         }
     }
     let mut out = Vec::new();
-    walk(&m.entries, true, &mut out);
+    walk(&m.entries, dir, &mut out);
     out
 }
 
-/// The files of `m`'s layers that are there to open, top first: a path and a table. (A file that
-/// isn't there is left out of the map, so it is left out of the comparison too.)
-fn layer_files(m: &MapImport, dir: Option<&str>) -> Vec<(String, Option<String>)> {
-    file_layers(m)
-        .into_iter()
-        .filter_map(|l| {
-            let path = local_path(l.path, dir).ok()?;
-            std::path::Path::new(&path).exists().then(|| (absolute(&path), l.table.map(str::to_string)))
-        })
-        .collect()
+/// The file a project layer reads: its source's (a broken layer's too), its raster's, or, for a
+/// layer read whole, its dataset's.
+fn layer_file(l: &rustgis_map::Layer) -> Option<&str> {
+    l.source
+        .as_ref()
+        .and_then(|s| s.path.as_deref())
+        .or_else(|| l.raster.as_ref().and_then(|r| r.path.as_deref()))
+        .or(l.dataset.source.as_deref())
 }
 
 /// Whether a project map's name is `base`, or `base` numbered as `map.new` numbers a name that
@@ -311,80 +302,453 @@ fn reusable(s: &Session, m: &MapImport, dir: Option<&str>) -> Option<String> {
             if !named_as(&pm.name, &m.name) {
                 return false;
             }
-            let have: Vec<_> = pm.layers.iter().filter(|l| !l.graphics).collect();
+            let have: Vec<_> = pm.layers.iter().filter(|l| !l.graphics && layer_file(l).is_some()).collect();
             have.len() == want.len()
                 && have.iter().zip(&want).all(|(l, (path, table))| {
-                    let src = l.source.as_ref();
-                    // A layer read whole keeps its file as its dataset's source.
-                    let file = src.and_then(|s| s.path.as_deref()).or(l.dataset.source.as_deref());
-                    file.is_some_and(|f| absolute(f) == *path) && src.is_none_or(|s| s.table == *table)
+                    let file = layer_file(l);
+                    file.is_some_and(|f| absolute(f) == *path) && l.source.as_ref().is_none_or(|s| s.table == *table)
                 })
         })
         .map(|pm| pm.name.clone())
 }
 
-/// Adds embedded map `m` as a new map, with its coordinate system and its layers, and returns its
-/// name. A layer that can't be opened is noted and left out. The new map is active afterwards.
-fn add_map(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Report) -> Result<String, String> {
-    let added = s.run_part("map.new", &json!({"name": m.name}))?;
-    let name = added["name"].as_str().unwrap_or(&m.name).to_string();
-    // A template's map draws its layers alone: no basemap, no graticule.
+// ---- adding a map ------------------------------------------------------------------------------
+
+/// What adding a map, or layers to one, brought in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Added {
+    /// The project map's name.
+    pub name: String,
+    /// The layers added: opened, broken, and web layers drawn as tiles.
+    pub layers: usize,
+    /// Of those, the ones added broken.
+    pub broken: usize,
+}
+
+/// How a map's coordinates (its camera's, its default extent's) become longitude and latitude.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Units {
+    /// Longitude and latitude already.
+    Degrees,
+    /// In the project map's projection, which is the Pro map's.
+    Projected,
+    /// In a system RustGIS doesn't project: the view is left to the data.
+    Unknown,
+}
+
+/// What an entry became in the project map.
+enum Placed {
+    Layer(u32),
+    Group(u32),
+    /// Nothing a group can hold: a web layer drawn as tiles, a table, a group that couldn't be made.
+    Outside,
+}
+
+/// Where a broken layer's data was, for Repair and Retry.
+#[derive(Default)]
+struct Origin {
+    path: Option<String>,
+    table: Option<String>,
+    service: Option<ServiceOrigin>,
+}
+
+/// An import's state while it adds entries.
+struct Adding<'a> {
+    dir: Option<&'a str>,
+    /// The map's reference scale, which the layers whose symbols take it are given.
+    reference_scale: Option<f64>,
+    added: Added,
+}
+
+/// Adds `m` as a new map (its projection, groups, layers top to bottom, tables, view) and
+/// returns what it added, the map's name first; the new map is active afterwards. `camera` is
+/// the view Pro saved (`Document::view_camera`): `(x, y, scale)` in the map's coordinates.
+pub(crate) fn add_map(
+    s: &mut Session,
+    m: &MapImport,
+    dir: Option<&str>,
+    camera: Option<(f64, f64, f64)>,
+    report: &mut Report,
+) -> Result<Added, String> {
+    let made = s.run_part("map.new", &json!({"name": m.name}))?;
+    let name = made["name"].as_str().unwrap_or(&m.name).to_string();
+    // A Pro map draws its layers alone: no basemap, no graticule.
     let map = s.map_mut();
     map.basemap = rustgis_map::Basemap::Blank;
     map.graticule = false;
-    if let Some(wkid) = m.wkid {
-        let code = match wkid {
-            3857 | 102100 => "mercator".to_string(),
-            // Pro draws a map in degrees as plate carrée.
-            4326 => "equirectangular".to_string(),
-            w => format!("EPSG:{w}"),
-        };
-        if let Err(e) = s.run_part("map.projection", &json!({"type": code})) {
-            report.approximated(&name, format!("its coordinate system EPSG:{wkid} ({e}), drawn in Web Mercator"));
-        }
-    }
-    // Bottom first, so each is added on top of the ones below it.
-    for FileLayer { layer, path, table, visible } in file_layers(m).into_iter().rev() {
-        let path = match local_path(path, dir) {
-            Ok(p) => p,
-            Err(e) => {
-                report.skipped(&layer.name, format!("its data couldn't be opened ({e}), left out"));
-                continue;
-            }
-        };
-        let mut q = json!({"path": path, "name": layer.name});
-        if let Some(t) = table {
-            q["layer"] = json!(t);
-        }
-        let opened = s.run_part("layer.addData", &q);
-        let id = match opened {
-            Ok(r) => r["layer"].as_u64().and_then(|id| u32::try_from(id).ok()),
-            Err(e) => {
-                report.skipped(&layer.name, format!("its data couldn't be opened ({e}), left out"));
-                continue;
-            }
-        };
-        let Some(l) = id.and_then(|id| s.map_mut().layer_mut(id)) else { continue };
-        l.visible = visible;
-        layer.style.apply(l);
-        qgis::check_fields(l, &layer.name, report);
-    }
-    go_to_extent(s, m);
-    Ok(name)
+    let units = projection(s, m, &name, report);
+    let mut added = add_entries(s, m, dir, None, report);
+    added.name = name;
+    go_to_view(s, m, units, camera);
+    Ok(added)
 }
 
-/// Shows the new map at its default extent, when it is in a system RustGIS converts and holds some
-/// of the data, else at its data.
-fn go_to_extent(s: &mut Session, m: &MapImport) {
+/// Gives the active map `m`'s coordinate system, and says how `m`'s coordinates become
+/// longitude and latitude. One RustGIS doesn't project is noted, and the map stays in Web Mercator.
+fn projection(s: &mut Session, m: &MapImport, name: &str, report: &mut Report) -> Units {
+    let Some(wkid) = m.wkid else { return Units::Unknown };
+    if matches!(wkid, 3857 | 102100) {
+        return match s.run_part("map.projection", &json!({"type": "mercator"})) {
+            Ok(_) => Units::Projected,
+            Err(_) => Units::Unknown,
+        };
+    }
+    if let Some(g) = qgis::Geographic::of(&format!("EPSG:{wkid}")) {
+        // Pro draws a map in degrees as plate carrée.
+        match s.run_part("map.projection", &json!({"type": "equirectangular"})) {
+            Err(e) => report.approximated(name, format!("its coordinate system EPSG:{wkid} ({e}), drawn in Web Mercator")),
+            Ok(_) if !g.wgs84 || !g.greenwich => {
+                let meridian = if g.greenwich { "" } else { ", its longitudes taken as from Greenwich" };
+                report.approximated(name, format!("its coordinate system EPSG:{wkid}, drawn in Equirectangular on WGS 84{meridian}"));
+            }
+            Ok(_) => {}
+        }
+        // (A view in degrees from another meridian is left to the data.)
+        return if g.greenwich { Units::Degrees } else { Units::Unknown };
+    }
+    // Pro writes Esri's own codes (a state plane in feet, say) with the EPSG ones.
+    let mut first = None;
+    for code in [format!("EPSG:{wkid}"), format!("ESRI:{wkid}")] {
+        match s.run_part("map.projection", &json!({"type": code})) {
+            Ok(_) => return Units::Projected,
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    let why = first.unwrap_or_default();
+    report.approximated(name, format!("its coordinate system EPSG:{wkid} ({why}), drawn in Web Mercator"));
+    Units::Unknown
+}
+
+/// Adds `m`'s entries to the active map (a `.lyrx`, or a `.mapx`'s layers into an existing map),
+/// in `group` when it is one of the map's (above its layers), and its standalone tables.
+pub(crate) fn add_entries(s: &mut Session, m: &MapImport, dir: Option<&str>, group: Option<u32>, report: &mut Report) -> Added {
+    let mut a = Adding { dir, reference_scale: m.reference_scale, added: Added { name: s.map().name.clone(), ..Added::default() } };
+    let into = group.and_then(|g| s.map().group(g).map(|x| (g, x.name.clone())));
+    // The group's top layer before anything is added: what the entries go above.
+    let top = into.as_ref().and_then(|(g, _)| s.map().group_layers(*g).first().copied());
+    let placed = add_list(s, &m.entries, into.as_ref().map(|(_, n)| n.as_str()), &mut a, report);
+    if let Some((g, name)) = &into {
+        attach(s, *g, name, &placed, top, report);
+    }
+    add_tables(s, m, dir, report);
+    a.added
+}
+
+/// Adds `entries` (top first) bottom first, so each lands on top of the ones below it, and says
+/// what each became, top first. `within` names the group they are listed in, for notes.
+fn add_list(s: &mut Session, entries: &[Entry], within: Option<&str>, a: &mut Adding, report: &mut Report) -> Vec<Placed> {
+    let mut placed: Vec<Placed> = entries
+        .iter()
+        .rev()
+        .map(|e| match e {
+            Entry::Layer(l) => add_layer(s, l, within, a, report),
+            Entry::Group(g) => add_group(s, g, a, report),
+        })
+        .collect();
+    placed.reverse();
+    placed
+}
+
+/// Runs one of the import's commands; a failure is noted against `what`, and the import goes on.
+fn step(s: &mut Session, id: &str, p: &Value, what: &str, report: &mut Report) {
+    if let Err(e) = s.run_part(id, p) {
+        report.approximated(what, format!("{id} didn't apply ({e})"));
+    }
+}
+
+/// Adds a group: its children first, then the group holding them, as Pro shows it.
+fn add_group(s: &mut Session, g: &GroupImport, a: &mut Adding, report: &mut Report) -> Placed {
+    let children = add_list(s, &g.children, Some(&g.name), a, report);
+    let layers: Vec<u32> = children.iter().filter_map(|c| if let Placed::Layer(id) = c { Some(*id) } else { None }).collect();
+    let name = if g.name.trim().is_empty() { "Group" } else { g.name.as_str() };
+    let id = match s.run_part("group.add", &json!({"name": name, "layers": layers})) {
+        Ok(r) => r["group"].as_u64().and_then(|id| u32::try_from(id).ok()),
+        Err(e) => {
+            report.skipped(name, format!("the group itself ({e}): its layers are listed outside it"));
+            None
+        }
+    };
+    let Some(id) = id else { return Placed::Outside };
+    attach(s, id, name, &children, None, report);
+    let mut set = json!({"group": id, "visible": g.visible});
+    if let Some(t) = g.transparency {
+        set["transparency"] = json!(t);
+    }
+    step(s, "group.set", &set, name, report);
+    step(s, "group.expand", &json!({"group": id, "on": g.expanded}), name, report);
+    if g.min_scale.is_some() || g.max_scale.is_some() {
+        step(s, "group.scaleRange", &json!({"group": id, "min": g.min_scale, "max": g.max_scale}), name, report);
+    }
+    Placed::Group(id)
+}
+
+/// Puts what `children` (top first) became in `group`, in their order, above the layer `below`
+/// (none: at the group's end). What can't join it stays outside, noted where it was added.
+fn attach(s: &mut Session, group: u32, name: &str, children: &[Placed], below: Option<u32>, report: &mut Report) {
+    let mut below = below;
+    for c in children.iter().rev() {
+        let before = below.map_or(Value::Null, |b| json!(b));
+        match c {
+            Placed::Layer(id) => {
+                // (Moving a layer needs one active.)
+                s.active_layer = Some(*id);
+                match s.run_part("layer.group", &json!({"layer": id, "group": group, "before": before})) {
+                    Ok(_) => below = Some(*id),
+                    Err(e) => {
+                        let what = s.map().layer(*id).map(|l| l.name.clone()).unwrap_or_default();
+                        report.approximated(&what, format!("listed outside its group {} ({e})", shown(name)));
+                    }
+                }
+            }
+            Placed::Group(sub) => match s.run_part("group.setParent", &json!({"group": sub, "parent": group, "before": before})) {
+                Ok(_) => {
+                    if let Some(top) = s.map().group_layers(*sub).first() {
+                        below = Some(*top);
+                    }
+                }
+                Err(e) => {
+                    let what = s.map().group(*sub).map(|g| g.name.clone()).unwrap_or_default();
+                    report.approximated(&what, format!("listed outside its group {} ({e})", shown(name)));
+                }
+            },
+            Placed::Outside => {}
+        }
+    }
+}
+
+/// Adds a layer from its source: opened, or broken with its origin when it can't be.
+fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Adding, report: &mut Report) -> Placed {
+    let name = l.name.as_str();
+    let before = s.active_layer;
+    let service = |url: &str, kind: &str, layer: &str| ServiceOrigin { url: url.to_string(), kind: kind.into(), layer: layer.to_string() };
+    let (added, from) = match &l.source {
+        LayerSource::File { path, table } => {
+            let from = Origin { path: Some(resolve(path, a.dir)), table: table.clone(), service: None };
+            let opened = local_path(path, a.dir).and_then(|path| {
+                let mut q = json!({"path": path, "name": name});
+                if let Some(t) = table {
+                    q["layer"] = json!(t);
+                }
+                s.run_part("layer.addData", &q)
+            });
+            (opened, from)
+        }
+        LayerSource::FeatureService { url, layer } => (
+            s.run_part("service.add", &json!({"url": url, "type": "arcgis", "layer": layer, "name": name})),
+            Origin { service: Some(service(url, "arcgis", layer)), ..Origin::default() },
+        ),
+        LayerSource::MapService { url } => {
+            // A map service's whole map; an image service's one picture.
+            let image = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/').to_ascii_lowercase().ends_with("/imageserver");
+            let layer = if image { "image" } else { "map" };
+            (
+                s.run_part("service.add", &json!({"url": url, "type": "arcgis", "layer": layer, "name": name})),
+                Origin { service: Some(service(url, "arcgis", layer)), ..Origin::default() },
+            )
+        }
+        LayerSource::Wms { url, layer } => (
+            s.run_part("service.add", &json!({"url": url, "type": "wms", "layer": layer, "name": name})),
+            Origin { service: Some(service(url, "wms", layer)), ..Origin::default() },
+        ),
+        LayerSource::VectorTiles { url } => {
+            (s.run_part("map.addTiles", &json!({"url": style_url(url), "kind": "style", "name": name, "overlay": true})), Origin::default())
+        }
+        // (The reader said why.)
+        LayerSource::Unopenable => return broken_layer(s, l, Origin::default(), "RustGIS can't open this kind of data".into(), a),
+    };
+    match added {
+        Ok(r) => opened(s, l, &r, before, within, a, report),
+        Err(e) => {
+            report.skipped(name, format!("its data couldn't be opened ({e}); added broken, to repair or retry"));
+            broken_layer(s, l, from, e, a)
+        }
+    }
+}
+
+/// The style a vector tile layer draws with: an ArcGIS vector tile service's default style, else
+/// the address as it is (a style already).
+fn style_url(url: &str) -> String {
+    let (path, query) = url.split_once('?').map_or((url, None), |(p, q)| (p, Some(q)));
+    let path = path.trim_end_matches('/');
+    if !path.to_ascii_lowercase().ends_with("/vectortileserver") {
+        return url.to_string();
+    }
+    match query {
+        Some(q) => format!("{path}/resources/styles/root.json?{q}"),
+        None => format!("{path}/resources/styles/root.json"),
+    }
+}
+
+/// Settles what a layer's command answered `r`: a tile layer (outside any group), a project
+/// table, or a map layer, given what Pro kept with the layer.
+fn opened(
+    s: &mut Session,
+    l: &LayerImport,
+    r: &Value,
+    before: Option<u32>,
+    within: Option<&str>,
+    a: &mut Adding,
+    report: &mut Report,
+) -> Placed {
+    if let Some(index) = r.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok()) {
+        tile_settings(s, index, l, report);
+        if let Some(g) = within {
+            report.approximated(&l.name, format!("a web layer, listed outside its group {}", shown(g)));
+        }
+        a.added.layers += 1;
+        return Placed::Outside;
+    }
+    if r.get("table").is_some() {
+        report.approximated(&l.name, "a table, added to the project's tables");
+        return Placed::Outside;
+    }
+    let id =
+        r.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()).or(s.active_layer.filter(|id| Some(*id) != before));
+    let Some(id) = id.filter(|id| s.map().layer(*id).is_some()) else {
+        report.skipped(&l.name, "opened, but nothing was added to the map");
+        return Placed::Outside;
+    };
+    settle(s, id, l, a, report);
+    a.added.layers += 1;
+    Placed::Layer(id)
+}
+
+/// Gives an opened layer what Pro kept with it: its visibility, style and expansion; a feature
+/// layer its definition query (one that doesn't fit is noted and dropped, as the QGIS importer
+/// does), the fields its style names checked, and the map's reference scale when its symbols
+/// take it.
+fn settle(s: &mut Session, id: u32, l: &LayerImport, a: &Adding, report: &mut Report) {
+    let name = l.name.as_str();
+    s.active_layer = Some(id);
+    let Some(layer) = s.map_mut().layer_mut(id) else { return };
+    layer.visible = l.visible;
+    let raster = layer.is_raster();
+    if raster {
+        if let Some(why) = layer.raster.as_ref().and_then(|r| l.style.raster_misfit(r)) {
+            report.skipped(name, why);
+        }
+        l.style.apply(layer);
+    } else {
+        l.style.apply(layer);
+        if let Some(q) = &l.definition_query {
+            match rustgis_data::query::parse(q, &layer.dataset) {
+                Ok(_) => layer.definition_query = Some(q.clone()),
+                Err(e) => report.skipped(name, format!("its definition query `{}` ({e}), dropped", shown(q))),
+            }
+        }
+        qgis::check_fields(layer, name, report);
+    }
+    step(s, "layer.expand", &json!({"layer": id, "on": l.expanded}), name, report);
+    if !raster
+        && l.scale_symbols
+        && let Some(scale) = a.reference_scale
+    {
+        step(s, "layer.referenceScale", &json!({"layer": id, "scale": scale}), name, report);
+    }
+}
+
+/// Adds a layer that can't be opened as a broken one: its origin (never a password or user: the
+/// reader scrubbed it), where its data was (for Repair and Retry), why, and its style, visibility,
+/// expansion and definition query (unchecked: there are no fields yet; Retry and Repair check it).
+fn broken_layer(s: &mut Session, l: &LayerImport, from: Origin, error: String, a: &mut Adding) -> Placed {
+    let origin = if l.origin.trim().is_empty() { "an ArcGIS Pro layer whose source isn't known".to_string() } else { l.origin.clone() };
+    let src = SourceLayer::broken(origin, from.path, from.table, from.service, error);
+    let id = s.map_mut().add_streamed(l.name.clone(), src);
+    // Active, as a layer just added is (the layer commands that follow work on it).
+    s.active_layer = Some(id);
+    let (lo, hi) = rustgis_map::REFERENCE_SCALES;
+    if let Some(layer) = s.map_mut().layer_mut(id) {
+        l.style.apply_all(layer);
+        layer.visible = l.visible;
+        layer.expanded = l.expanded;
+        layer.definition_query = l.definition_query.clone();
+        if l.scale_symbols
+            && l.kind == LayerKind::Feature
+            && let Some(scale) = a.reference_scale.filter(|r| (lo..=hi).contains(r))
+        {
+            layer.reference_scale = Some(scale);
+        }
+    }
+    a.added.layers += 1;
+    a.added.broken += 1;
+    Placed::Layer(id)
+}
+
+/// Gives a web layer drawn as tiles the layer's visibility, opacity and blending mode, as
+/// `qgis::web_settings` does. A tile layer has no scale range, so one is noted.
+fn tile_settings(s: &mut Session, index: usize, l: &LayerImport, report: &mut Report) {
+    let st = &l.style;
+    if let Some(t) = s.map_mut().tiles.get_mut(index) {
+        t.visible = l.visible;
+        if let Some(blend) = st.blend {
+            t.blend = blend;
+        }
+        if let Some(tr) = st.transparency.filter(|t| t.is_finite() && *t > 0.0) {
+            t.opacity = (1.0 - tr / 100.0).clamp(0.0, 1.0);
+        }
+    }
+    if st.min_scale.flatten().is_some() || st.max_scale.flatten().is_some() {
+        report.approximated(&l.name, "its scale range: a web layer draws at every scale");
+    }
+}
+
+/// Adds `m`'s standalone tables on files (a dataset with no geometry becomes a project table);
+/// one that can't be opened, or isn't on a file, is noted.
+fn add_tables(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Report) {
+    for t in &m.tables {
+        match &t.source {
+            LayerSource::File { path, table } => {
+                let opened = local_path(path, dir).and_then(|path| {
+                    let mut q = json!({"path": path, "name": t.name});
+                    if let Some(tb) = table {
+                        q["layer"] = json!(tb);
+                    }
+                    s.run_part("layer.addData", &q)
+                });
+                if let Err(e) = opened {
+                    report.skipped(&t.name, format!("the table couldn't be opened ({e}), left out"));
+                }
+            }
+            // (The reader said why it can't be opened.)
+            LayerSource::Unopenable => {}
+            _ => report.skipped(&t.name, format!("a table on a service ({}), which RustGIS doesn't add", shown(&t.origin))),
+        }
+    }
+}
+
+/// Shows the new map at the view Pro saved (its centre and scale), else at its default extent
+/// when that holds some of the data, else at its data.
+fn go_to_view(s: &mut Session, m: &MapImport, units: Units, camera: Option<(f64, f64, f64)>) {
+    let lonlat = |s: &Session, x: f64, y: f64| -> Option<Coord> {
+        let c = match units {
+            Units::Degrees => Coord::new(x.clamp(-180.0, 180.0), y.clamp(-90.0, 90.0)),
+            Units::Projected => s.map().to_lonlat(Coord::new(x, y))?,
+            Units::Unknown => return None,
+        };
+        (c.x.is_finite() && c.y.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0).then_some(c)
+    };
+    if let Some((x, y, scale)) = camera
+        && let Some(c) = lonlat(s, x, y)
+    {
+        let mut q = json!({"lon": c.x, "lat": c.y});
+        // Pro's scale is at 96 dots to the inch, as QGIS's is.
+        if scale.is_finite() && scale > 0.0 {
+            q["scale"] = json!(scale * QGIS_SCALE);
+        }
+        if s.run_part("map.goToXY", &q).is_ok() {
+            return;
+        }
+    }
     let data = s.map().full_extent();
     let saved = m.extent.and_then(|[x0, y0, x1, y1]| {
-        let (a, b) = match m.wkid? {
-            4326 => (Coord::new(x0, y0), Coord::new(x1, y1)),
-            3857 | 102100 => (merc_to_lonlat(Coord::new(x0, y0)), merc_to_lonlat(Coord::new(x1, y1))),
-            _ => return None,
-        };
-        let e = Extent::new(a.x.max(-180.0), a.y.max(-90.0), b.x.min(180.0), b.y.min(90.0));
-        (!e.is_empty() && e.min_x.is_finite() && e.max_y.is_finite()).then_some(e)
+        let mut e = Extent::EMPTY;
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            let c = lonlat(s, x, y)?;
+            e = e.union(&Extent::new(c.x, c.y, c.x, c.y));
+        }
+        (!e.is_empty()).then_some(e)
     });
     let target = match saved {
         Some(e) if data.is_empty() || e.intersects(&data) => e,

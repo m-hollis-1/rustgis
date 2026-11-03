@@ -21,6 +21,9 @@ pub struct State {
     /// The browser's sign-in under way: who signed in, or why not.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pending: Option<crate::Slot<Result<String, String>>>,
+    /// The sign-in was under way when last looked at: its finishing then retries the broken layers.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    was_pending: bool,
 }
 
 /// Whether Add From Service shows the sign-in: the ArcGIS REST type, an ArcGIS-looking address,
@@ -75,6 +78,17 @@ pub fn section(app: &mut RustGisApp, ui: &mut egui::Ui) {
             ui.colored_label(t.red, e);
         }
     });
+}
+
+/// A sign-in has just completed: the layers that couldn't open (a secured service, say) are
+/// opened again, once, and the notice says how many came back. Nothing is said when none was broken.
+fn retry_broken_layers(app: &mut RustGisApp) {
+    let Ok(r) = app.run("layer.retry", json!({"all": true})) else { return };
+    if r.get("retried").and_then(serde_json::Value::as_u64).unwrap_or(0) == 0 {
+        return;
+    }
+    let opened = r.get("opened").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    app.session.notify(crate::i18n::fmt("Signed in: {n} layers opened", &[("n", &opened.to_string())]), false);
 }
 
 /// The portal and client id fields, with what to register.
@@ -132,7 +146,11 @@ fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
     let done = app.ui.arcgis.pending.as_ref().and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).take());
     if let Some(result) = done {
         app.ui.arcgis.pending = None;
+        let signed_in = result.is_ok();
         app.ui.arcgis.error = result.err();
+        if signed_in {
+            retry_broken_layers(app);
+        }
     }
     if app.ui.arcgis.pending.is_some() {
         ui.horizontal(|ui| {
@@ -157,7 +175,12 @@ fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
 fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
     use arcgis_auth::Progress;
     fields(app, ui);
-    match arcgis_auth::progress() {
+    let progress = arcgis_auth::progress();
+    let completed = finished(&mut app.ui.arcgis.was_pending, &progress);
+    if completed {
+        retry_broken_layers(app);
+    }
+    match progress {
         Progress::Pending { .. } => {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -178,6 +201,16 @@ fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
             }
         }
     }
+}
+
+/// Whether the sign-in turned from pending to done since `was_pending` was set; sets it to
+/// whether `progress` is pending now.
+#[cfg(not(target_arch = "wasm32"))]
+fn finished(was_pending: &mut bool, progress: &arcgis_auth::Progress) -> bool {
+    use arcgis_auth::Progress;
+    let completed = *was_pending && matches!(progress, Progress::Done(_));
+    *was_pending = matches!(progress, Progress::Pending { .. });
+    completed
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -214,5 +247,50 @@ mod tests {
         s.portal.clear();
         prefill(&mut s);
         assert_eq!(s.client_id, "mine");
+    }
+
+    /// A sign-in finishing retries the broken layers once: the turn from pending to done, not
+    /// done again on the frames after, nor a sign-in that failed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_sign_in_finishing_is_noticed_once() {
+        use arcgis_auth::Progress;
+        let pending = Progress::Pending { portal: "https://www.arcgis.com".into() };
+        let done = Progress::Done(arcgis_auth::Info {
+            portal: "https://www.arcgis.com".into(),
+            username: "someone".into(),
+            expires_at: None,
+            renews: true,
+            token: false,
+        });
+        let mut was = false;
+        assert!(!finished(&mut was, &Progress::Idle));
+        assert!(!finished(&mut was, &done), "a session that was already there");
+        assert!(!finished(&mut was, &pending));
+        assert!(finished(&mut was, &done));
+        assert!(!finished(&mut was, &done), "once");
+        assert!(!finished(&mut was, &pending));
+        assert!(!finished(&mut was, &Progress::Failed("no".into())));
+        assert!(!finished(&mut was, &done));
+    }
+
+    /// After signing in the broken layers are tried again and one notice says how many opened;
+    /// with none broken, nothing is said.
+    #[test]
+    fn signing_in_retries_the_broken_layers_and_says_so() {
+        let mut app = RustGisApp::with_sample();
+        retry_broken_layers(&mut app);
+        assert!(app.session.notices.is_empty(), "nothing was broken");
+        let src = rustgis_engine::map::source::SourceLayer::broken(
+            "a shapefile at D:/data/roads.shp".into(),
+            Some("D:/data/no-such-folder/roads.shp".into()),
+            None,
+            None,
+            "the file isn't there".into(),
+        );
+        app.session.map_mut().add_streamed("Roads", src);
+        retry_broken_layers(&mut app);
+        let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(said, ["Signed in: 0 layers opened"]);
     }
 }

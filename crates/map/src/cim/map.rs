@@ -286,14 +286,13 @@ fn look(v: &Value, what: &str, report: &mut Report) -> Option<Look> {
             if !p.pending_pictures.is_empty() {
                 report.approximated(what, "a GIF or BMP marker, drawn as a circle");
             }
-            if p.symbols.len() > 1 {
-                report.approximated(what, "point symbols of several marker layers, drawn as the first marker");
-            }
-            let symbol = p.symbols.first().copied();
-            if symbol.is_none() {
+            if p.symbols.is_empty() {
                 report.skipped(what, "point symbols with no marker to draw, left out");
+                return None;
             }
-            symbol.map(|symbol| Look { symbol, strokes: Vec::new(), fills: Vec::new() })
+            // Several marker layers are drawn as one marker.
+            let layers: Vec<_> = p.symbols.into_iter().zip(p.paths).collect();
+            Some(Look { symbol: symbol::stacked(&layers, what, report), strokes: Vec::new(), fills: Vec::new() })
         }
         Some(other) => {
             report.skipped(what, format!("{} symbols, left out", shown(other)));

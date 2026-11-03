@@ -401,15 +401,279 @@ fn vector_markers_are_recognised_by_shape() {
     assert_eq!(symbol::vector_shape(&tilted), None);
     assert_eq!(symbol::vector_shape(&json!({"type": "CIMVectorMarker"})), None);
 
-    // point() takes the graphic's fill and stroke, and the size in 96ths; a shape it can't tell is a noted circle.
+    // point() takes the graphic's fill and stroke, and the size in 96ths; a shape it can't tell is drawn.
     let mut report = Report::default();
     let p = symbol::point(&json!({"type": "CIMPointSymbol", "symbolLayers": [square, seven]}), "Pin", &mut report);
-    assert_eq!(p.symbols.len(), 2);
+    assert_eq!((p.symbols.len(), p.paths.len()), (2, 2));
     let s = p.symbols[0];
     assert_eq!((s.marker, s.fill, s.stroke), (Marker::Square, Rgba::rgb(200, 0, 0), Rgba::rgb(0, 0, 0)));
     assert!((s.size - 8.0).abs() < 1e-5 && (s.stroke_width - 0.5 * 96.0 / 72.0).abs() < 1e-5);
-    assert_eq!(p.symbols[1].marker, Marker::Circle);
-    assert_eq!(notes(&report), vec!["Pin: a drawn marker shape, shown as a circle".to_string()]);
+    assert!(matches!(p.symbols[1].marker, Marker::Path(_)), "{:?}", p.symbols[1].marker);
+    assert!(p.paths.iter().all(Option::is_some));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+/// A vector marker of `size` points drawing `geometry` in a 10 × 10 frame, filled `fill`.
+fn vector_marker(size: f64, geometry: serde_json::Value, fill: serde_json::Value) -> serde_json::Value {
+    json!({"type": "CIMVectorMarker", "enable": true, "size": size, "frame": {"xmin": -5, "ymin": -5, "xmax": 5, "ymax": 5},
+        "markerGraphics": [{"type": "CIMMarkerGraphic", "geometry": geometry, "symbol": polygon_symbol(vec![solid_fill(fill)])}]})
+}
+
+fn square_ring() -> serde_json::Value {
+    json!({"rings": [[[-5.0, -5.0], [-5.0, 5.0], [5.0, 5.0], [5.0, -5.0], [-5.0, -5.0]]]})
+}
+
+fn circle_rings() -> serde_json::Value {
+    json!({"curveRings": [[[5.0, 0.0], {"a": [[5.0, 0.0], [0.0, 0.0], 0, 1]}]]})
+}
+
+fn path_of(m: crate::symbology::Marker) -> &'static crate::symbology::PathShape {
+    match m {
+        crate::symbology::Marker::Path(p) => p.shape(),
+        other => panic!("not a path: {other:?}"),
+    }
+}
+
+#[test]
+fn a_vector_marker_rustgis_lacks_becomes_a_path() {
+    let hexagon: Vec<[f64; 2]> = (0..=6)
+        .map(|i| {
+            let a = f64::from(i) * std::f64::consts::PI / 3.0;
+            [5.0 * a.cos(), 5.0 * a.sin()]
+        })
+        .collect();
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [vector_marker(8.0, json!({"rings": [hexagon]}), rgb(255, 0, 0))]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "Hex", &mut report);
+    let shape = path_of(p.symbols[0].marker);
+    assert_eq!(shape.parts.len(), 1);
+    let part = &shape.parts[0];
+    assert!(part.closed);
+    assert_eq!(part.points.len(), 7);
+    assert!(part.points.iter().all(|[x, y]| x.abs() <= 0.5 + 1e-6 && y.abs() <= 0.5 + 1e-6), "{:?}", part.points);
+    assert!((part.points[0][0] - 0.5).abs() < 1e-6 && part.points[0][1].abs() < 1e-6, "{:?}", part.points[0]);
+    assert_eq!((part.fill, part.stroke), (Some(Rgba::rgb(255, 0, 0)), None));
+    assert!((p.symbols[0].size - 8.0 * 96.0 / 72.0).abs() < 1e-5);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn a_rotated_square_becomes_a_turned_path() {
+    let mut square = vector_marker(8.0, square_ring(), rgb(0, 0, 255));
+    square["rotation"] = json!(30);
+    let mut report = Report::default();
+    let p = symbol::point(&json!({"type": "CIMPointSymbol", "symbolLayers": [square]}), "Turned", &mut report);
+    let part = &path_of(p.symbols[0].marker).parts[0];
+    assert_eq!(part.points.len(), 5);
+    // (−0.5, −0.5) turned 30 degrees anticlockwise: no longer on the square's axes.
+    let [x, y] = part.points[0];
+    let (s, c) = 30f32.to_radians().sin_cos();
+    assert!((x - (-0.5 * c + 0.5 * s)).abs() < 1e-5 && (y - (-0.5 * s - 0.5 * c)).abs() < 1e-5, "{x} {y}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn stacked_marker_layers_become_one_path_sized_by_the_largest() {
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [
+        vector_marker(12.0, circle_rings(), rgb(255, 255, 255)),
+        vector_marker(6.0, square_ring(), rgb(0, 0, 0)),
+    ]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "Stack", &mut report);
+    assert_eq!(p.symbols[0].marker, crate::symbology::Marker::Circle);
+    let layers: Vec<_> = p.symbols.iter().copied().zip(p.paths).collect();
+    let s = symbol::stacked(&layers, "Stack", &mut report);
+    assert!((s.size - 16.0).abs() < 1e-5, "{}", s.size);
+    let shape = path_of(s.marker);
+    assert_eq!(shape.parts.len(), 2);
+    let (circle, square) = (&shape.parts[0], &shape.parts[1]);
+    assert_eq!((circle.points.len(), circle.fill), (32, Some(Rgba::rgb(255, 255, 255))));
+    assert!(circle.points.iter().all(|[x, y]| (x.hypot(*y) - 0.5).abs() < 1e-5), "{:?}", circle.points);
+    assert_eq!(square.fill, Some(Rgba::rgb(0, 0, 0)));
+    assert!(square.points.iter().all(|[x, y]| x.abs() <= 0.25 + 1e-6 && y.abs() <= 0.25 + 1e-6), "{:?}", square.points);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // Through a layer's renderer, the same.
+    let marks =
+        feature_layer("Marks", standard_connection("Shapefile", "DATABASE=/d", "marks.shp"), json!({"renderer": simple_renderer(sym)}));
+    let (map, report) = read_new_detail_map(&map_document(&[marks], &["CIMPATH=new_detail_map/marks.json"]));
+    let Some(crate::symbology::Renderer::Single(w)) = &map.layers[0].style.renderer else { panic!() };
+    assert_eq!(path_of(w.marker).parts.len(), 2);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn a_stack_with_a_picture_keeps_its_first_marker_and_says_so() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [
+        {"type": "CIMPictureMarker", "enable": true, "size": 10.0, "url": png},
+        vector_marker(6.0, square_ring(), rgb(0, 0, 0)),
+    ]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "Pic", &mut report);
+    assert!(p.paths[0].is_none() && p.paths[1].is_some());
+    let layers: Vec<_> = p.symbols.iter().copied().zip(p.paths).collect();
+    let s = symbol::stacked(&layers, "Pic", &mut report);
+    assert!(matches!(s.marker, crate::symbology::Marker::Image(_)), "{:?}", s.marker);
+    let n = notes(&report);
+    assert!(n.len() == 1 && n[0].starts_with("Pic: ") && n[0].contains("first marker"), "{n:?}");
+}
+
+/// A line symbol of a 1 pt black stroke under a red square marker (outlined 0.5 pt black) placed by `placement`.
+fn marker_line(placement: serde_json::Value) -> serde_json::Value {
+    let mut marker = vector_marker(6.0, square_ring(), rgb(255, 0, 0));
+    marker["markerGraphics"][0]["symbol"] = polygon_symbol(vec![solid_stroke(rgb(0, 0, 0), 0.5), solid_fill(rgb(255, 0, 0))]);
+    marker["markerPlacement"] = placement;
+    json!({"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(rgb(0, 0, 0), 1.0), marker]})
+}
+
+#[test]
+fn markers_along_a_line_become_line_markers() {
+    use crate::symbology::{LineMark, Marker, Placements};
+    let mut report = Report::default();
+    let end = symbol::line(
+        &marker_line(json!({"type": "CIMMarkerPlacementAtExtremities", "extremityPlacement": "JustEnd", "angleToLine": true, "offset": 3})),
+        "Flow",
+        &mut report,
+    );
+    assert_eq!(end.strokes.len(), 2);
+    // The line's own stroke stays the symbol's.
+    assert_eq!(end.stroke, Some((Rgba::rgb(0, 0, 0), 96.0 / 72.0)));
+    let st = &end.strokes[1];
+    let m = st.markers.unwrap();
+    assert_eq!((m.at, m.rotate, m.mark), (Placements::LAST, true, LineMark::Marker(Marker::Square)));
+    assert!((m.size - 8.0).abs() < 1e-5);
+    assert_eq!((st.color, m.outline), (Some(Rgba::rgb(255, 0, 0)), Some(Rgba::rgb(0, 0, 0))));
+    assert!((st.width.unwrap() - 0.5 * 96.0 / 72.0).abs() < 1e-5 && (st.offset - 4.0).abs() < 1e-5);
+    let both = symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementAtExtremities"})), "Flow", &mut report);
+    assert_eq!(both.strokes[1].markers.unwrap().at, Placements::FIRST.with(Placements::LAST));
+    let middle =
+        symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementAtRatioPositions", "positionArray": [0.5]})), "Flow", &mut report);
+    assert_eq!(middle.strokes[1].markers.unwrap().at, Placements::MIDDLE);
+    let along = symbol::line(
+        &marker_line(json!({"type": "CIMMarkerPlacementAlongLineSameSize", "placementTemplate": [20], "angleToLine": false})),
+        "Flow",
+        &mut report,
+    );
+    let m = along.strokes[1].markers.unwrap();
+    assert_eq!((m.at, m.rotate), (Placements::INTERVAL, false));
+    assert!((m.interval - 26.67).abs() < 1e-2, "{}", m.interval);
+    let vertices = symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementOnVertices"})), "Flow", &mut report);
+    assert_eq!(vertices.strokes[1].markers.unwrap().at, Placements::VERTICES);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // Ratios other than the middle are at intervals, noted.
+    let ratios =
+        symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementAtRatioPositions", "positionArray": [0.25]})), "Flow", &mut report);
+    assert_eq!(ratios.strokes[1].markers.unwrap().at, Placements::INTERVAL);
+    assert_eq!(report.notes.len(), 1, "{:?}", notes(&report));
+
+    // Through a layer's renderer, the markers are among its strokes.
+    let flow = feature_layer(
+        "Flow",
+        standard_connection("Shapefile", "DATABASE=/d", "flow.shp"),
+        json!({"renderer": simple_renderer(marker_line(
+            json!({"type": "CIMMarkerPlacementAtExtremities", "extremityPlacement": "JustEnd", "angleToLine": true})
+        ))}),
+    );
+    let (map, _) = read_new_detail_map(&map_document(&[flow], &["CIMPATH=new_detail_map/flow.json"]));
+    let strokes = map.layers[0].style.line_strokes.as_ref().unwrap();
+    assert_eq!(strokes.len(), 2);
+    assert_eq!(strokes[1].markers.unwrap().at, Placements::LAST);
+}
+
+#[test]
+fn dots_inside_polygons_become_a_dots_fill() {
+    use crate::fills::FillPattern;
+    use crate::symbology::Marker;
+    let mut marker = vector_marker(4.0, circle_rings(), rgb(0, 128, 0));
+    marker["markerPlacement"] = json!({"type": "CIMMarkerPlacementInsidePolygon", "stepX": 10, "stepY": 10, "gridType": "Fixed"});
+    let sym = polygon_symbol(vec![solid_fill(rgb(255, 255, 255)), marker]);
+    let mut report = Report::default();
+    let p = symbol::polygon(&sym, "Park", &mut report);
+    assert_eq!(p.fills.len(), 2);
+    assert_eq!(p.fills[1].color, Some(Rgba::rgb(0, 128, 0)));
+    let FillPattern::Dots { marker, size, spacing, .. } = p.fills[1].pattern else { panic!("{:?}", p.fills[1]) };
+    assert_eq!(marker, Marker::Circle);
+    assert!((size - 4.0 * 96.0 / 72.0).abs() < 1e-5);
+    assert!(spacing.iter().all(|s| (s - 13.33).abs() < 1e-2), "{spacing:?}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn hostile_marker_graphics_are_bounded() {
+    use crate::symbology::{LineMark, MAX_PATH_PARTS, MAX_PATH_POINTS, Marker, PathShape};
+    let long: Vec<[f64; 2]> = (0..5000).map(|i| [f64::from(i % 97) - 48.0, f64::from(i % 89) - 44.0]).collect();
+    let graphic = |geometry: serde_json::Value| json!({"type": "CIMMarkerGraphic", "geometry": geometry, "symbol": polygon_symbol(vec![solid_fill(rgb(1, 2, 3))])});
+    // (JSON has no NaN: serde_json writes one as null, which is what a damaged file holds.)
+    let mut graphics = vec![
+        graphic(json!({"rings": [long]})),
+        graphic(json!({"rings": [[[f64::NAN, f64::NAN], [f64::NAN, 1.0], [2.0, f64::NAN]]]})),
+        graphic(json!({"curveRings": [[[0, 0], {"a": "x"}, {"b": [[1, 1]]}, {"c": null}, [1e308, -1e308]]]})),
+        graphic(json!({"paths": 5})),
+        graphic(json!({"rings": [[[1, 2], [3]], "x", [[0, 0], [0, 0]]]})),
+    ];
+    graphics.extend((0..200).map(|i| graphic(json!({"paths": [[[0, 0], [i, 1]]]}))));
+    let hostile = [
+        json!({"type": "CIMVectorMarker", "size": 10, "rotation": 1e308, "offsetX": "x",
+            "frame": {"xmin": -50, "ymin": -50, "xmax": 50, "ymax": 50}, "markerGraphics": graphics}),
+        json!({"type": "CIMVectorMarker", "size": 0, "frame": {"xmin": 0, "ymin": 0, "xmax": 0, "ymax": 0}, "markerGraphics": graphics}),
+        json!({"type": "CIMVectorMarker", "size": -3, "markerGraphics": [graphic(json!({"rings": [[[0, 0], [0, 0], [0, 0]]]}))]}),
+        json!({"type": "CIMVectorMarker", "markerGraphics": "x"}),
+    ];
+    let bounded = |shape: &PathShape| {
+        assert!(shape.parts.len() <= MAX_PATH_PARTS);
+        for part in &shape.parts {
+            assert!(part.points.len() <= MAX_PATH_POINTS);
+            assert!(part.points.iter().flatten().all(|v| v.is_finite()), "{:?}", part.points);
+        }
+    };
+    let check = |m: Marker| {
+        if let Marker::Path(p) = m {
+            bounded(p.shape());
+        }
+    };
+    // The long ring is cut to the most points kept, and the graphics to the most parts (two of the first
+    // 64 draw nothing), noted.
+    let mut report = Report::default();
+    let shape = symbol::path_marker(&hostile[0], 10.0, "H", &mut report).unwrap();
+    assert_eq!((shape.parts.len(), shape.parts[0].points.len()), (MAX_PATH_PARTS - 2, MAX_PATH_POINTS));
+    bounded(&shape);
+    assert!(notes(&report).iter().any(|n| n.contains("cut short")), "{:?}", notes(&report));
+    for marker in &hostile {
+        let mut report = Report::default();
+        if let Some(shape) = symbol::path_marker(marker, 10.0, "H", &mut report) {
+            bounded(&shape);
+        }
+        let point = json!({"type": "CIMPointSymbol", "symbolLayers": [marker, marker, {"type": "CIMCharacterMarker"}]});
+        let p = symbol::point(&point, "H", &mut report);
+        p.symbols.iter().for_each(|s| check(s.marker));
+        let layers: Vec<_> = p.symbols.iter().copied().zip(p.paths).collect();
+        if !layers.is_empty() {
+            check(symbol::stacked(&layers, "H", &mut report).marker);
+        }
+        for placement in [
+            json!({"type": "CIMMarkerPlacementAlongLineSameSize", "placementTemplate": "x"}),
+            json!({"type": "CIMMarkerPlacementAtRatioPositions", "positionArray": [f64::NAN]}),
+            json!({"type": "CIMMarkerPlacementInsidePolygon", "stepX": -1, "stepY": 1e308, "offsetX": "x"}),
+            json!({"type": "CIMMarkerPlacementSomethingNew"}),
+            json!(7),
+        ] {
+            let mut m = marker.clone();
+            m["markerPlacement"] = placement;
+            let line = symbol::line(&json!({"type": "CIMLineSymbol", "symbolLayers": [m]}), "H", &mut report);
+            for s in line.strokes.iter().filter_map(|s| s.markers) {
+                if let LineMark::Marker(m) = s.mark {
+                    check(m);
+                }
+            }
+            let poly = symbol::polygon(&json!({"type": "CIMPolygonSymbol", "symbolLayers": [m]}), "H", &mut report);
+            for f in &poly.fills {
+                if let crate::fills::FillPattern::Dots { marker, .. } = f.pattern {
+                    check(marker);
+                }
+            }
+        }
+    }
 }
 
 #[test]

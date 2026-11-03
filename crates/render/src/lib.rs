@@ -1505,9 +1505,7 @@ pub(crate) fn marker_path(x: f32, y: f32, r: f32, marker: Marker) -> Option<tiny
 pub(crate) fn marker_reach(marker: Marker) -> f32 {
     match marker {
         Marker::Char(g) => glyphs::shape(g).map_or(0.6, |s| s.reach),
-        Marker::Path(p) => {
-            p.shape().parts.iter().flat_map(|part| part.points.iter().map(|[x, y]| x.hypot(*y) + part.width / 2.0)).fold(0.6, f32::max)
-        }
+        Marker::Path(p) => p.reach(),
         _ => 0.6,
     }
 }

@@ -286,6 +286,12 @@ impl PathShape {
         PathShape { parts }
     }
 
+    /// How far it reaches from its centre, in its sizes: its farthest point plus half that part's
+    /// stroke, and at least 0.6 (as far as the built-in shapes reach).
+    fn reach(&self) -> f32 {
+        self.parts.iter().flat_map(|part| part.points.iter().map(|[x, y]| x.hypot(*y) + part.width / 2.0)).fold(0.6, f32::max)
+    }
+
     /// The key a kept shape is found by: the bits of every value (floats aren't `Hash`).
     fn key(&self) -> Vec<u32> {
         let colour = |c: Option<Rgba>| c.map_or([0, 0], |c| [1, u32::from_le_bytes(c.0)]);
@@ -303,7 +309,14 @@ impl PathShape {
 /// `Copy` (as [`ImageRef`] does a picture): equal shapes are one kept shape, so they compare and
 /// hash by address, and render caches may key on it.
 #[derive(Clone, Copy, Debug)]
-pub struct PathRef(&'static PathShape);
+pub struct PathRef(&'static KeptPath);
+
+/// A kept shape and its reach, worked out once (renderers ask for it for every feature drawn).
+#[derive(Debug)]
+struct KeptPath {
+    shape: PathShape,
+    reach: f32,
+}
 
 impl PathRef {
     /// Keeps `shape` with every coordinate clamped to ±2.0 (a non-finite one to 0), parts of fewer
@@ -312,7 +325,7 @@ impl PathRef {
     pub fn new(shape: PathShape) -> Option<PathRef> {
         use std::collections::HashMap;
         use std::sync::{Mutex, OnceLock};
-        static PATHS: OnceLock<Mutex<HashMap<Vec<u32>, &'static PathShape>>> = OnceLock::new();
+        static PATHS: OnceLock<Mutex<HashMap<Vec<u32>, &'static KeptPath>>> = OnceLock::new();
         let shape = shape.kept();
         if shape.parts.is_empty() {
             return None;
@@ -325,13 +338,20 @@ impl PathRef {
         if paths.len() >= MAX_PATHS {
             return None;
         }
-        let kept: &'static PathShape = Box::leak(Box::new(shape));
+        let reach = shape.reach();
+        let kept: &'static KeptPath = Box::leak(Box::new(KeptPath { shape, reach }));
         paths.insert(key, kept);
         Some(PathRef(kept))
     }
 
     pub fn shape(&self) -> &'static PathShape {
-        self.0
+        &self.0.shape
+    }
+
+    /// How far the shape reaches from its centre, in its sizes: its farthest point plus half that
+    /// part's stroke, and at least 0.6 (as far as the built-in shapes reach).
+    pub fn reach(&self) -> f32 {
+        self.0.reach
     }
 }
 
@@ -351,7 +371,7 @@ impl std::hash::Hash for PathRef {
 
 impl Serialize for PathRef {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(s)
+        self.0.shape.serialize(s)
     }
 }
 
@@ -2848,6 +2868,17 @@ mod tests {
         assert_eq!(serde_json::from_str::<Symbol>(&json).unwrap(), sym);
         assert_eq!(Marker::Path(a).label(), "Custom");
         assert!(!Marker::ALL.contains(&Marker::Path(a)));
+    }
+
+    #[test]
+    fn a_kept_path_knows_its_reach() {
+        // Inside the unit square: the shapes' reach, 0.6.
+        let inside = PathRef::new(PathShape { parts: vec![path_part(&[[-0.3, -0.3], [0.3, 0.3]])] }).unwrap();
+        assert_eq!(inside.reach(), 0.6);
+        // Past it: the farthest point's distance, plus half its stroke.
+        let mut far = path_part(&[[0.0, 0.0], [1.2, 1.6]]);
+        far.width = 0.2;
+        assert!((PathRef::new(PathShape { parts: vec![far] }).unwrap().reach() - 2.1).abs() < 1e-6);
     }
 
     #[test]

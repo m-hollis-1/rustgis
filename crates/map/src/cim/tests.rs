@@ -887,8 +887,8 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
         json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint", "graphic": g})
     };
     let (imp, report) = read(&[
-        picture("COMPANY LOGO", json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Company Logo.png"})),
-        picture("FILE", json!({"sourceURL": r"G:\LOGOS\Other.png"})),
+        picture("COMPANY LOGO", json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"D:\logos\Company Logo.png"})),
+        picture("FILE", json!({"sourceURL": r"D:\logos\Other.png"})),
         picture("INLINE", json!({"sourceURL": "data:image/png;base64,AAAA"})),
     ]);
     // A data: URL that isn't base64 is neither a picture nor a file.
@@ -902,15 +902,15 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
     // Every picture is left for the engine to check and convert, embedded ones included: the
     // elements are empty until it does.
     assert!(
-        matches!(&els[0].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Company Logo.png"))
+        matches!(&els[0].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"D:\logos\Company Logo.png"))
     );
-    assert!(matches!(&els[1].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Other.png")));
+    assert!(matches!(&els[1].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"D:\logos\Other.png")));
     assert!(matches!(&els[2].kind, Picture { image, source } if image.is_empty() && source.is_none()));
     assert_eq!(
         imp.pictures,
         vec![
             (els[0].id, PictureSource::Embedded("iVBORw0KGgo=".into())),
-            (els[1].id, PictureSource::Path(r"G:\LOGOS\Other.png".into())),
+            (els[1].id, PictureSource::Path(r"D:\logos\Other.png".into())),
             (els[2].id, PictureSource::Embedded("AAAA".into())),
         ]
     );
@@ -1876,7 +1876,7 @@ fn group_element(name: &str, children: Vec<serde_json::Value>, extra: serde_json
 
 fn picture_element(name: &str) -> serde_json::Value {
     json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint",
-        "graphic": {"type": "CIMPictureGraphic", "referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Logo.png",
+        "graphic": {"type": "CIMPictureGraphic", "referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"D:\logos\Logo.png",
             "box": {"xmin": 0.76, "ymin": 9.0, "xmax": 1.83, "ymax": 9.41}}})
 }
 
@@ -2131,7 +2131,7 @@ fn hostile_layouts_never_panic() {
 
 // ---- embedded maps ----
 
-const LANDGRID: &str = r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN";
+const LANDGRID: &str = r"D:\data\landgrid";
 
 fn standard_connection(factory: &str, connection: &str, dataset: &str) -> serde_json::Value {
     json!({"type": "CIMStandardDataConnection", "workspaceConnectionString": connection, "workspaceFactory": factory,
@@ -2204,9 +2204,9 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     assert_eq!(map.layers.iter().map(|l| l.visible).collect::<Vec<_>>(), [true, false]);
 
     let s = &map.layers[0];
-    assert_eq!(s.path.as_deref(), Some(r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN\TAA_US_States.shp"));
+    assert_eq!(s.path.as_deref(), Some(r"D:\data\landgrid\TAA_US_States.shp"));
     assert_eq!(s.table, None);
-    assert_eq!(s.origin, r"Shapefile TAA_US_States.shp in G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN");
+    assert_eq!(s.origin, r"Shapefile TAA_US_States.shp in D:\data\landgrid");
     let Some(Renderer::Single(sym)) = &s.style.renderer else { panic!("{:?}", s.style.renderer) };
     assert_eq!(sym.stroke, Rgba::rgb(52, 52, 52));
     assert!((sym.stroke_width - 1.333).abs() < 1e-3, "{}", sym.stroke_width);
@@ -2226,7 +2226,7 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     assert_eq!((s.style.min_scale, s.style.max_scale), (None, None));
 
     let c = &map.layers[1];
-    assert_eq!(c.path.as_deref(), Some(r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN\Counties.shp"));
+    assert_eq!(c.path.as_deref(), Some(r"D:\data\landgrid\Counties.shp"));
     assert_eq!(c.style.transparency, None);
     // Pro's scales are at 96 dpi, as QGIS's are.
     let min = c.style.min_scale.flatten().unwrap();

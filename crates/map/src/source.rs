@@ -116,6 +116,11 @@ pub struct SourceLayer {
     /// For a broken layer read from a web service: the service, added again by Retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceOrigin>,
+    /// For a broken layer: why the importer couldn't open it, shown until the source opens. (Kept
+    /// apart from `error`, which isn't saved: an error read back would stop the source opening
+    /// again when the project loads.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The web service a broken layer is read from, as `service.add` takes it.
@@ -417,6 +422,7 @@ impl std::fmt::Debug for SourceLayer {
             .field("login", &self.login)
             .field("origin", &self.origin)
             .field("service", &self.service)
+            .field("reason", &self.reason)
             .finish_non_exhaustive()
     }
 }
@@ -674,7 +680,28 @@ impl SourceLayer {
         service: Option<ServiceOrigin>,
         error: String,
     ) -> SourceLayer {
-        SourceLayer { origin: Some(origin), path, table, service, error: Some(error), ..SourceLayer::default() }
+        SourceLayer {
+            origin: Some(origin),
+            path,
+            table,
+            service,
+            error: Some(error.clone()),
+            reason: Some(error),
+            ..SourceLayer::default()
+        }
+    }
+
+    /// Why the source isn't open: the last open's error, else why the importer couldn't open it.
+    pub fn why_broken(&self) -> Option<&str> {
+        self.error.as_deref().or(self.reason.as_deref())
+    }
+
+    /// Opened: it no longer needs where it came from, nor why it didn't open.
+    fn now_open(&mut self) {
+        self.window = None;
+        self.error = None;
+        self.origin = None;
+        self.reason = None;
     }
 
     /// A source that remembers where it came from and isn't open, nor opening.
@@ -761,8 +788,7 @@ impl SourceLayer {
         match src {
             Ok(s) => {
                 self.handle = Some(Arc::from(s));
-                self.window = None;
-                self.error = None;
+                self.now_open();
                 self.login = false;
                 Ok(())
             }
@@ -857,8 +883,7 @@ impl SourceLayer {
         match r {
             Ok(s) => {
                 self.handle = Some(s);
-                self.window = None;
-                self.error = None;
+                self.now_open();
                 Ok(())
             }
             Err(e) => {
@@ -1143,6 +1168,9 @@ mod tests {
         assert_eq!(back.origin.as_deref(), Some("ArcGIS Pro read it from a feature service"));
         assert_eq!(back.service, Some(service));
         assert!(back.is_broken());
+        // Why it is broken is kept; the open's error isn't saved, so it doesn't stop a reopen.
+        assert_eq!((back.reason.as_deref(), back.error.as_deref()), (Some("the service couldn't be reached"), None));
+        assert_eq!(back.why_broken(), Some("the service couldn't be reached"));
         // A file to open later keeps its path and table.
         let file =
             super::SourceLayer::broken("a shapefile".into(), Some("D:/data/roads.shp".into()), Some("roads".into()), None, "gone".into());
@@ -1154,7 +1182,7 @@ mod tests {
         assert_eq!((old.origin, old.service), (None, None));
         // And a source with neither writes neither key.
         let plain = serde_json::to_string(&super::SourceLayer { path: Some("x.fgb".into()), ..Default::default() }).unwrap();
-        assert!(!plain.contains("origin") && !plain.contains("service"), "{plain}");
+        assert!(!plain.contains("origin") && !plain.contains("service") && !plain.contains("reason"), "{plain}");
     }
 
     #[test]

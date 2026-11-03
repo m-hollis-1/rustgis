@@ -76,8 +76,8 @@ fn retry_layer(s: &mut Session, id: u32) -> Result<Outcome, String> {
     if !src.is_open() {
         return Ok(Outcome::Opening);
     }
-    let mut src = l.source.take().ok_or("the layer no longer exists")?;
-    src.origin = None;
+    // (Opened, it no longer has an origin.)
+    let src = l.source.take().ok_or("the layer no longer exists")?;
     l.replace_source(src);
     Ok(Outcome::Opened)
 }
@@ -93,18 +93,29 @@ fn retry_service(s: &mut Session, id: u32, service: &rustgis_map::source::Servic
     s.active_layer = active.filter(|a| s.map().layer(*a).is_some());
     let r = r?;
     let added = r.get("layer").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).filter(|n| *n != id);
-    let m = s.map_mut();
-    let features = added.and_then(|n| m.layer_index(n)).filter(|i| m.layers.get(*i).is_some_and(|l| l.raster.is_none()));
-    let Some(new) = features.map(|i| m.layers.remove(i)) else {
-        // Not a layer of features (a web layer drawn from tiles, a raster): it stays as its own,
-        // in place of the broken one, which would add it again at every retry.
-        let name = m.layer(id).map(|l| l.name.clone()).unwrap_or_default();
+    let raster = added.and_then(|n| s.map().layer(n)).map(|l| l.raster.is_some());
+    let tiles = r.get("index").is_some_and(Value::is_u64);
+    if raster == Some(true) || (added.is_none() && tiles) {
+        // A web layer drawn from tiles, or a raster: it stays as its own, in place of the broken
+        // one, which would add it again at every retry.
+        let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
         super::layer::remove(s, &json!({"layer": id}))?;
         s.notify(format!("{name}: {} came back as a web layer or a raster, added in its place", service.url), false);
         return Ok(Outcome::Opened);
+    }
+    let Some(new_id) = added.filter(|_| raster == Some(false)) else {
+        // Not a layer (a table, say): what came back stays, and so does the broken layer.
+        let what = if r.get("table").is_some() { "a table" } else { "no layer" };
+        return Err(format!("{}: '{}' came back as {what}, not a layer of features", service.url, service.layer));
     };
-    m.release_tiles(&[new.id]);
-    m.set_group(new.id, None);
+    // Taken out as Remove takes a layer out: the tile layers over it keep their place, its group
+    // and the legends forget it.
+    let m = s.map_mut();
+    m.release_tiles(&[new_id]);
+    m.set_group(new_id, None);
+    let new = m.layer_index(new_id).map(|i| m.layers.remove(i)).ok_or("the added layer no longer exists")?;
+    super::layer::legends_follow_layer(s, &new.name, None);
+    let m = s.map_mut();
     let l = m.layer_mut(id).ok_or("the layer no longer exists")?;
     let name = l.name.clone();
     l.dataset = new.dataset;

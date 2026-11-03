@@ -7541,6 +7541,19 @@ fn plugin_data_cubes_need_files_and_network() {
     rustgis_plugins::unload("eng-cube-files");
 }
 
+/// Retry reopens a broken layer's file or adds its service again: a plugin needs both `files`
+/// and `network` to run it.
+#[test]
+fn plugin_layer_retry_needs_files_and_network() {
+    let mut s = world();
+    for (name, permissions) in [("eng-retry-files", ["edit", "files"]), ("eng-retry-network", ["edit", "network"])] {
+        plugin(name, &permissions);
+        let e = forward(&mut s, name, "layer.retry", json!({"all": true})).unwrap_err();
+        assert!(e.contains("'files' and 'network' permissions"), "{name}: {e}");
+        rustgis_plugins::unload(name);
+    }
+}
+
 #[test]
 fn plugin_tile_layers_need_network() {
     let mut s = world();
@@ -23481,6 +23494,7 @@ fn a_broken_layer_round_trips_and_repairs() {
     let shp = dir.join("data").join("countries.shp");
     let mut s = Session::new(Project::default());
     let id = broken_countries(&mut s, &shp);
+    let service = broken_service(&mut s);
     s.run("group.add", &json!({"name": "Boundaries", "layers": [id]})).unwrap();
     let style = |s: &Session| {
         let l = s.map().layer(id).unwrap();
@@ -23500,6 +23514,13 @@ fn a_broken_layer_round_trips_and_repairs() {
     assert_eq!(src.origin.as_deref(), Some("ArcGIS Pro read it from a shapefile"));
     assert_eq!(src.path.as_deref().map(std::path::Path::new), Some(shp.as_path()));
     assert!(src.is_broken());
+    // Why each didn't open is kept, as the importer said it, before anything draws. (Loading
+    // tried the file again: its own error comes first.)
+    assert_eq!(src.reason.as_deref(), Some("the file isn't there"));
+    assert!(src.why_broken().is_some());
+    let src = t.map().layer(service).unwrap().source.as_ref().unwrap();
+    assert_eq!((src.reason.as_deref(), src.why_broken()), (Some("it needs a sign-in"), Some("it needs a sign-in")));
+    assert!(src.is_broken());
     // Drawn, it is still broken and says why.
     t.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 64, "height": 64})).unwrap();
     let src = t.map().layer(id).unwrap().source.as_ref().unwrap();
@@ -23514,9 +23535,40 @@ fn a_broken_layer_round_trips_and_repairs() {
     assert_eq!(l.geometry_type(), rustgis_data::GeometryType::Polygon);
     let src = l.source.as_ref().unwrap();
     assert!(src.is_open());
-    assert_eq!(src.origin, None);
+    assert_eq!((&src.origin, &src.reason), (&None, &None));
     assert!(!src.is_broken());
     assert_eq!(t.map().group_of(id).map(|g| g.name.as_str()), Some("Boundaries"));
+    // The service layer still says why it is broken after the map drew.
+    let src = t.map().layer(service).unwrap().source.as_ref().unwrap();
+    assert_eq!(src.why_broken(), Some("it needs a sign-in"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A broken layer whose file is back when the project opens again opens on its own, settling as
+/// Retry would: no origin or reason left, its geometry learnt, a query that doesn't fit dropped.
+#[test]
+fn a_broken_layer_whose_file_is_back_opens_on_its_own() {
+    let dir = broken_dir("reload");
+    let shp = dir.join("data").join("countries.shp");
+    let mut s = Session::new(Project::default());
+    let fits = broken_countries(&mut s, &shp);
+    let misfit = broken_countries(&mut s, &shp);
+    s.map_mut().layer_mut(misfit).unwrap().definition_query = Some("nope = 1".into());
+    let project = dir.join("broken.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+    countries_shapefile(&shp);
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    t.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 64, "height": 64})).unwrap();
+    for id in [fits, misfit] {
+        let l = t.map().layer(id).unwrap();
+        let src = l.source.as_ref().unwrap();
+        assert!(src.is_open() && !src.is_broken());
+        assert_eq!((&src.origin, &src.reason), (&None, &None));
+        assert_eq!(l.geometry_type(), rustgis_data::GeometryType::Polygon);
+    }
+    assert_eq!(t.map().layer(fits).unwrap().definition_query.as_deref(), Some("pop_est > 1000"));
+    assert_eq!(t.map().layer(misfit).unwrap().definition_query, None);
     std::fs::remove_dir_all(&dir).ok();
 }
 

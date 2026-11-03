@@ -174,7 +174,7 @@ pub fn read_map_def(doc: &Document, map: &Value, report: &mut Report) -> Result<
 /// A `.lyrx`'s layers (its `layers` list; groups kept), as a map with no name, projection or extent.
 pub fn read_layers(doc: &Document, uris: &[String], report: &mut Report) -> MapImport {
     let list = Value::Array(uris.iter().take(MAX_LAYERS + 1).map(|u| Value::String(u.clone())).collect());
-    let entries = Reader::new(doc, report, "").list(Some(&list), 0);
+    let entries = Reader::new(doc, report, "Layer file").list(Some(&list), 0);
     MapImport { name: String::new(), wkid: None, extent: None, reference_scale: None, entries, tables: Vec::new() }
 }
 
@@ -342,6 +342,13 @@ fn layer(def: &Value, name: String, report: &mut Report) -> LayerImport {
         _ => None,
     };
     let connection = data_connection(def);
+    let mut style = Style { transparency: transparency(def), ..Style::default() };
+    // Pro's minScale is the out-beyond limit, as RustGIS's min_scale is; a missing or 0 limit
+    // clears it (as the QGIS reader does).
+    if def.get("minScale").is_some() || def.get("maxScale").is_some() {
+        style.min_scale = Some(scale(def, "minScale"));
+        style.max_scale = Some(scale(def, "maxScale"));
+    }
     let (source, origin) = match (kind, connection) {
         (Some(_), Some(c)) => source_of(c, def, &name, report),
         (Some(_), None) => {
@@ -349,20 +356,25 @@ fn layer(def: &Value, name: String, report: &mut Report) -> LayerImport {
             (LayerSource::Unopenable, String::new())
         }
         (None, c) => {
+            // One note says it all: nothing else about a layer RustGIS doesn't draw is read.
             report.skipped(&name, format!("{} layers, which RustGIS doesn't draw", shown(ty)));
             // Where it was, for people; what reading the connection notes is beside the point.
             let origin = c.map(|c| source_of(c, def, &name, &mut Report::default()).1).unwrap_or_else(|| shown(ty));
-            (LayerSource::Unopenable, origin)
+            return LayerImport {
+                visible: flag(def, "visibility", true),
+                expanded: flag(def, "expanded", false),
+                scale_symbols: flag(def, "scaleSymbols", true),
+                kind: LayerKind::Other,
+                name,
+                source: LayerSource::Unopenable,
+                origin,
+                style,
+                definition_query: None,
+            };
         }
     };
 
-    let mut style = Style { transparency: transparency(def), blend: blend(def, &name, report), ..Style::default() };
-    // Pro's minScale is the out-beyond limit, as RustGIS's min_scale is; a missing or 0 limit
-    // clears it (as the QGIS reader does).
-    if def.get("minScale").is_some() || def.get("maxScale").is_some() {
-        style.min_scale = Some(scale(def, "minScale"));
-        style.max_scale = Some(scale(def, "maxScale"));
-    }
+    style.blend = blend(def, &name, report);
     if let Some(r) = def.get("renderer") {
         renderer(r, &name, &mut style, report);
     }
@@ -480,7 +492,12 @@ fn source_at(c: &Value, owner: &Value, what: &str, report: &mut Report, joins: u
             source_at(source, owner, what, report, joins + 1)
         }
         "CIMKMLDataConnection" => match str_of(c, "uRI").map(str::trim).filter(|u| !u.is_empty()) {
-            Some(path) => (LayerSource::File { path: path.to_string(), table: None }, format!("KML {path}")),
+            Some(path) => {
+                // (A KML file may be on the web, with a token in its address.)
+                let path = scrub_url(path);
+                let origin = format!("KML {path}");
+                (LayerSource::File { path, table: None }, origin)
+            }
             None => {
                 report.skipped(what, "a KML connection with no file, nothing to open");
                 (LayerSource::Unopenable, String::new())
@@ -509,8 +526,10 @@ fn source_at(c: &Value, owner: &Value, what: &str, report: &mut Report, joins: u
                 return (LayerSource::Unopenable, String::new());
             }
             let url = scrub_url(url);
-            let subs = owner.get("subLayers").and_then(Value::as_array).into_iter().flatten().take(MAX_LAYERS);
-            let layer = subs.filter(|s| flag(s, "visibility", true)).find_map(|s| str_of(s, "name")).unwrap_or_default().to_string();
+            let Some(layer) = wms_layer(owner) else {
+                report.skipped(what, "a WMS layer that names no visible sublayer, nothing to draw");
+                return (LayerSource::Unopenable, format!("WMS {url}"));
+            };
             let origin = format!("WMS {url} layer {}", shown(&layer));
             (LayerSource::Wms { url, layer }, origin)
         }
@@ -530,6 +549,38 @@ fn source_at(c: &Value, owner: &Value, what: &str, report: &mut Report, joins: u
             (LayerSource::Unopenable, shown(other))
         }
     }
+}
+
+/// The first named sublayer of a WMS layer that shows, depth first: a sublayer without a name
+/// (a WMS's root often has none) is looked into. A hidden sublayer hides the ones in it. At most
+/// [`MAX_LAYERS`] sublayers are looked at, [`MAX_GROUP_DEPTH`] deep.
+fn wms_layer(owner: &Value) -> Option<String> {
+    fn subs(v: &Value) -> &[Value] {
+        v.get("subLayers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
+    }
+    // Each level's sublayers still to look at, top of the stack first.
+    let mut stack = vec![subs(owner).iter()];
+    let mut seen = 0;
+    while let Some(level) = stack.last_mut() {
+        let Some(s) = level.next() else {
+            stack.pop();
+            continue;
+        };
+        seen += 1;
+        if seen > MAX_LAYERS {
+            return None;
+        }
+        if !flag(s, "visibility", true) {
+            continue;
+        }
+        if let Some(name) = str_of(s, "name").map(str::trim).filter(|n| !n.is_empty()) {
+            return Some(name.to_string());
+        }
+        if stack.len() < MAX_GROUP_DEPTH {
+            stack.push(subs(s).iter());
+        }
+    }
+    None
 }
 
 /// A connection's `dataset`, trimmed.

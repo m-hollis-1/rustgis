@@ -2220,8 +2220,8 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     let label_symbol = symbol_ref(text_symbol(json!({"fontFamilyName": "Yu Gothic UI", "fontStyleName": "Regular", "height": 10,
         "haloSize": 1, "haloSymbol": halo})));
     let states = feature_layer(
-        "TAA_US_States",
-        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "TAA_US_States.shp"),
+        "Sample_US_States",
+        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "Sample_US_States.shp"),
         json!({"transparency": 30, "renderer": simple_renderer(states_symbol), "labelVisibility": true,
             "labelClasses": [{"type": "CIMLabelClass", "expression": "$feature.STATE_NAME", "expressionEngine": "Arcade",
                 "visibility": true, "textSymbol": label_symbol, "name": "Class 1"}]}),
@@ -2231,7 +2231,7 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
         standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "Counties.shp"),
         json!({"visibility": false, "minScale": 5000000.0, "renderer": simple_renderer(polygon_symbol(vec![solid_fill(rgb(200, 100, 0))]))}),
     );
-    let doc = map_document(&[states, counties], &["CIMPATH=new_detail_map/taa_us_states.json", "CIMPATH=new_detail_map/counties.json"]);
+    let doc = map_document(&[states, counties], &["CIMPATH=new_detail_map/sample_us_states.json", "CIMPATH=new_detail_map/counties.json"]);
     let (map, report) = read_new_detail_map(&doc);
     assert!(report.notes.is_empty(), "{:?}", notes(&report));
 
@@ -2239,7 +2239,7 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     assert_eq!(map.wkid, Some(4326));
     assert_eq!(map.extent, Some([-125.0, 24.0, -66.0, 50.0]));
     let names: Vec<&str> = flat(&map).into_iter().map(|l| l.name.as_str()).collect();
-    assert_eq!(names, ["TAA_US_States", "Counties"]);
+    assert_eq!(names, ["Sample_US_States", "Counties"]);
     assert_eq!(flat(&map).into_iter().map(|l| l.visible).collect::<Vec<_>>(), [true, false]);
 
     assert!(map.entries.iter().all(|e| matches!(e, Entry::Layer(_))));
@@ -2247,8 +2247,8 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     assert_eq!(map.reference_scale, None);
 
     let s = nth(&map, 0);
-    assert_eq!(s.source, LayerSource::File { path: r"D:\data\landgrid\TAA_US_States.shp".into(), table: None });
-    assert_eq!(s.origin, r"Shapefile TAA_US_States.shp in D:\data\landgrid");
+    assert_eq!(s.source, LayerSource::File { path: r"D:\data\landgrid\Sample_US_States.shp".into(), table: None });
+    assert_eq!(s.origin, r"Shapefile Sample_US_States.shp in D:\data\landgrid");
     assert_eq!((s.kind, s.expanded, s.scale_symbols, s.definition_query.as_deref()), (LayerKind::Feature, false, true, None));
     assert_eq!(s.style.blend, None);
     let Some(Renderer::Single(sym)) = &s.style.renderer else { panic!("{:?}", s.style.renderer) };
@@ -2561,8 +2561,8 @@ fn point_and_line_symbols_become_symbols() {
 fn hostile_map_base() -> serde_json::Value {
     let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]));
     let states = feature_layer(
-        "TAA_US_States",
-        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "TAA_US_States.shp"),
+        "Sample_US_States",
+        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "Sample_US_States.shp"),
         json!({"transparency": 30, "minScale": 1e7, "maxScale": 1e3, "labelVisibility": true,
             "renderer": simple_renderer(polygon_symbol(vec![solid_stroke(rgb(52, 52, 52), 1.0), solid_fill(rgb(1, 2, 3))])),
             "labelClasses": [{"type": "CIMLabelClass", "expression": "$feature.STATE_NAME", "visibility": true, "minimumScale": 5e6,
@@ -2619,7 +2619,7 @@ fn hostile_map_base() -> serde_json::Value {
     json!({"type": "CIMLayoutDocument", "version": "3.7.0",
         "layerDefinitions": [states, zones, group, joined, sde, raster, tiles, wms, vector, annotation], "tableDefinitions": [table],
         "mapDefinitions": [{"type": "CIMMap", "name": "M", "uRI": "CIMPATH=map/m.json", "referenceScale": 24000,
-            "layers": ["CIMPATH=new_detail_map/taa_us_states.json", "CIMPATH=new_detail_map/g.json", "CIMPATH=new_detail_map/sde.json",
+            "layers": ["CIMPATH=new_detail_map/sample_us_states.json", "CIMPATH=new_detail_map/g.json", "CIMPATH=new_detail_map/sde.json",
                 "CIMPATH=new_detail_map/photo.json", "CIMPATH=new_detail_map/base.json", "CIMPATH=new_detail_map/wms.json",
                 "CIMPATH=new_detail_map/streets.json", "CIMPATH=new_detail_map/notes.json"],
             "standaloneTables": ["CIMPATH=new_detail_map/owners.json"],
@@ -2648,6 +2648,9 @@ fn read_map_and_check(doc: &serde_json::Value) {
             assert!(json.is_ok(), "{:?}", json.err());
             assert!(!l.origin.contains("PASSWORD") && !l.origin.contains("USER"), "{}", l.origin);
         }
+        for t in &map.tables {
+            assert!(!t.origin.contains("PASSWORD") && !t.origin.contains("USER"), "{}", t.origin);
+        }
     }
 }
 
@@ -2658,7 +2661,7 @@ fn hostile_maps_never_panic() {
     let doc = Document::from_json(&base.to_string()).unwrap();
     let map = read_map(&doc, "CIMPATH=map/m.json", &mut report).unwrap();
     // The fixture reads whole: its layer, then the group's (the group's own loop is cut), then the rest.
-    assert_eq!(flat(&map).first().map(|l| l.name.as_str()), Some("TAA_US_States"));
+    assert_eq!(flat(&map).first().map(|l| l.name.as_str()), Some("Sample_US_States"));
     for name in ["Zones", "Joined", "Sde", "Photo", "Base", "Wms", "Streets", "Notes"] {
         assert!(flat(&map).into_iter().any(|l| l.name == name), "{name}");
     }
@@ -3799,6 +3802,34 @@ fn every_connection_kind_has_a_source_and_an_origin() {
             LayerKind::Tiles,
         ),
         (
+            // A root with no name holds the layers: the first that shows is looked for inside it.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsNested",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMWMSSubLayer", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "off", "visibility": false},
+                        {"type": "CIMWMSSubLayer", "name": "rivers", "visibility": true}]}]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "rivers".into() },
+            "WMS https://example.org/wms layer rivers",
+            LayerKind::Tiles,
+        ),
+        (
+            layer_of(
+                "CIMWMSLayer",
+                "WmsHidden",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMWMSSubLayer", "name": "off", "visibility": false},
+                        {"type": "CIMWMSSubLayer", "visibility": false, "subLayers": [{"type": "CIMWMSSubLayer", "name": "in"}]}]}),
+            ),
+            Unopenable,
+            "WMS https://example.org/wms",
+            LayerKind::Tiles,
+        ),
+        (
             layer_of(
                 "CIMVectorTileLayer",
                 "Streets",
@@ -3855,11 +3886,12 @@ fn every_connection_kind_has_a_source_and_an_origin() {
         "Excel: data in Excel workspaces, which RustGIS can't open",
         "Sql: SQL query layers, which RustGIS can't open",
         "Joined: a join to owners, drawn without it",
+        "WmsHidden: a WMS layer that names no visible sublayer, nothing to draw",
     ] {
         assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
     }
     // Each of the others opens as it is, without a word.
-    assert_eq!(n.len(), 4, "{n:?}");
+    assert_eq!(n.len(), 5, "{n:?}");
 }
 
 #[test]
@@ -3887,7 +3919,12 @@ fn origins_never_carry_passwords() {
         ),
         json!({}),
     );
-    let (map, report) = read_listed(&[sde, sql, service]);
+    let kml = layer_of(
+        "CIMKMLLayer",
+        "Kml",
+        json!({"dataConnection": {"type": "CIMKMLDataConnection", "uRI": "https://example.org/sites.kmz?token=tk123"}}),
+    );
+    let (map, report) = read_listed(&[sde, sql, service, kml]);
     let layers = flat(&map);
     let origin = &layers[0].origin;
     for part in ["s", "d", "d.dbo.parcels"] {
@@ -3901,6 +3938,7 @@ fn origins_never_carry_passwords() {
     }
     let url = "https://example.org/arcgis/rest/services/P/FeatureServer?f=json";
     assert_eq!(layers[2].source, LayerSource::FeatureService { url: url.into(), layer: "3".into() });
+    assert_eq!(layers[3].source, LayerSource::File { path: "https://example.org/sites.kmz".into(), table: None });
 }
 
 #[test]
@@ -3968,7 +4006,8 @@ fn other_layer_types_and_tables_are_read() {
     let annotation = layer_of(
         "CIMAnnotationLayer",
         "Notes",
-        json!({"featureTable": {"type": "CIMAnnotationTable", "dataConnection": standard_connection("FileGDB", &gdb, "notes_anno")}}),
+        json!({"featureTable": {"type": "CIMAnnotationTable", "dataConnection": standard_connection("FileGDB", &gdb, "notes_anno")},
+            "popupInfo": {"type": "CIMPopupInfo"}, "blendingMode": "ColorBurn"}),
     );
     let dimension = layer_of("CIMDimensionLayer", "Dims", json!({}));
     let graph = layer_of("CIMKnowledgeGraphLayer", "Graph", json!({}));
@@ -4006,6 +4045,8 @@ fn other_layer_types_and_tables_are_read() {
         }]
     );
     assert!(n.iter().any(|t| t.contains("gone.json")), "{n:?}");
+    // A layer RustGIS doesn't draw has its one note, nothing about its pop-up or blending.
+    assert_eq!(n.iter().filter(|t| t.starts_with("Notes: ")).count(), 1, "{n:?}");
 }
 
 #[test]

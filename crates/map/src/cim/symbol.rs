@@ -384,7 +384,7 @@ pub(crate) fn path_marker(l: &Value, size_pt: f64, what: &str, report: &mut Repo
         }
         let geometry = g.get("geometry").unwrap_or(&NULL);
         for (key, closed) in [("rings", true), ("paths", false), ("curveRings", true)] {
-            for part in geometry.get(key).and_then(Value::as_array).into_iter().flatten() {
+            for part in geometry.get(key).and_then(Value::as_array).into_iter().flatten().take(MAX_PATH_PARTS) {
                 if raw.len() >= MAX_PATH_PARTS {
                     cut = true;
                     break 'graphics;
@@ -505,15 +505,15 @@ fn curve_ring(ring: &Value) -> (Vec<[f64; 2]>, bool) {
 
 /// Several marker layers (bottom first, each with its drawing) as one marker: each layer's paths
 /// scaled by its size over the largest, the marker the largest size and painted as the top layer
-/// (for the legend). One layer is itself. When a layer has no drawing (a picture or a character)
-/// or the paths can't be kept, the first marker, noted.
+/// (for the legend). One layer is itself. When a layer has no drawing (a picture, a character, or
+/// a vector marker with nothing to draw) or the paths can't be kept, the first marker, noted.
 pub(crate) fn stacked(symbols: &[(Symbol, Option<PathShape>)], what: &str, report: &mut Report) -> Symbol {
     let none = Paint { fill: None, stroke: None, strokes: Vec::new(), fills: Vec::new() };
     let first = symbols.first().map_or_else(|| marker_symbol(Marker::Circle, 0.0, &none), |(s, _)| *s);
     let (Some((top, _)), true) = (symbols.last(), symbols.len() > 1) else { return first };
     if symbols.iter().any(|(_, p)| p.is_none()) {
-        report
-            .approximated(what, "point symbols of several marker layers with a picture or character among them, drawn as the first marker");
+        let why = "a picture, a character or a marker with nothing to draw among them";
+        report.approximated(what, format!("point symbols of several marker layers with {why}, drawn as the first marker"));
         return first;
     }
     let largest = symbols.iter().map(|(s, _)| s.size).fold(0.0, f32::max);

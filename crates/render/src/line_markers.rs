@@ -3,7 +3,7 @@
 //! an interval counts from the line's start and its middle is the whole line's however much of it
 //! shows; only the marks near the image are drawn.
 
-use rustgis_map::{LineMark, LineMarkers, Placements, Rgba};
+use rustgis_map::{LineMark, LineMarkers, Marker, Placements, Rgba};
 use tiny_skia::{FillRule, LineCap, Path, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::{marker_path, marker_reach, paint};
@@ -211,10 +211,15 @@ fn places(run: &Run, m: &LineMarkers, ppp: f64, near: Window, room: usize) -> Ve
 pub(crate) fn draw(pm: &mut Pixmap, runs: &[Run], m: &LineMarkers, color: Rgba, width: f32, offset: f32, ppp: f32) {
     let outline = m.outline.filter(|c| c.a() > 0 && width > 0.0);
     let hash = matches!(m.mark, LineMark::Hash);
-    if (hash && (width <= 0.0 || color.a() == 0)) || (!hash && color.a() == 0 && outline.is_none()) {
+    let size = m.size.max(0.0) * ppp;
+    // A drawn marker keeps its own colours, its parts built once.
+    let drawn = match m.mark {
+        LineMark::Marker(Marker::Path(p)) => Some(crate::path_marker_parts(0.0, 0.0, size.max(ppp) / 2.0, &p)),
+        _ => None,
+    };
+    if drawn.is_none() && ((hash && (width <= 0.0 || color.a() == 0)) || (!hash && color.a() == 0 && outline.is_none())) {
         return;
     }
-    let size = m.size.max(0.0) * ppp;
     // The mark at the origin, the line running along x: a marker, or a hash mark across it.
     let shape: Option<Path> = match m.mark {
         LineMark::Marker(shape) => marker_path(0.0, 0.0, size.max(ppp) / 2.0, shape),
@@ -244,6 +249,10 @@ pub(crate) fn draw(pm: &mut Pixmap, runs: &[Run], m: &LineMarkers, color: Rgba, 
             let (x, y) = (x - dy * offset, y + dx * offset);
             let turn = if m.rotate { dy.atan2(dx).to_degrees() as f32 } else { 0.0 } + m.angle;
             let t = Transform::from_rotate(turn).post_translate(x as f32, y as f32);
+            if let Some(parts) = &drawn {
+                crate::paint_path_marker(pm, parts, size.max(ppp) / 2.0, 1.0, t);
+                continue;
+            }
             if hash {
                 pm.stroke_path(&shape, &paint(color, 1.0), &stroke, t, None);
                 continue;
@@ -327,5 +336,43 @@ mod tests {
     fn a_run_without_length_has_no_marks() {
         assert!(Run::new([(1.0, 1.0), (1.0, 1.0)]).is_none());
         assert!(Run::new([(f64::NAN, 0.0), (1.0, 1.0)]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod drawn_tests {
+    use super::*;
+    use rustgis_map::{PathPart, PathRef, PathShape};
+
+    #[test]
+    fn a_drawn_marker_along_a_line_keeps_its_parts_and_colours() {
+        let triangle = PathPart {
+            points: vec![[-0.5, -0.5], [0.5, -0.5], [0.0, 0.5]],
+            closed: true,
+            fill: Some(Rgba::rgb(255, 0, 0)),
+            stroke: None,
+            width: 0.0,
+        };
+        let shape = PathRef::new(PathShape { parts: vec![triangle] }).unwrap();
+        let m = LineMarkers {
+            mark: LineMark::Marker(Marker::Path(shape)),
+            size: 20.0,
+            at: Placements::LAST,
+            rotate: false,
+            ..LineMarkers::default()
+        };
+        let mut pm = Pixmap::new(100, 80).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        // No stroke colour: the parts' own colours still draw.
+        draw(&mut pm, &[Run::new([(10.0, 40.0), (70.0, 40.0)]).unwrap()], &m, Rgba::new(0, 0, 0, 0), 0.0, 0.0, 1.0);
+        let red = |x, y| {
+            let p = pm.pixel(x, y).unwrap();
+            (p.red(), p.green(), p.blue()) == (255, 0, 0)
+        };
+        // The triangle at the end, point up (its base 10 px below the end, its apex 10 px above).
+        assert!(red(70, 42) && red(62, 48) && red(70, 32));
+        assert!(!red(10, 40), "nothing at the start");
+        // Its bounding square's top corners stay clear.
+        assert!(!red(61, 31) && !red(79, 31));
     }
 }

@@ -1558,14 +1558,30 @@ pub(crate) fn draw_image_marker(pm: &mut Pixmap, x: f32, y: f32, r: f32, image: 
 /// A drawn marker's parts centred at (`x`, `y`), its size `2 * r` pixels: each filled in its fill,
 /// then stroked in its stroke `width * 2 * r` pixels wide (at least half a pixel), in order.
 pub(crate) fn draw_path_marker(pm: &mut Pixmap, x: f32, y: f32, r: f32, shape: &rustgis_map::PathRef, opacity: f32) {
-    for part in &shape.shape().parts {
-        let Some(path) = path_marker_part(x, y, r, part) else { continue };
+    paint_path_marker(pm, &path_marker_parts(x, y, r, shape), r, opacity, Transform::identity());
+}
+
+/// A drawn marker's parts as paths centred at (`x`, `y`), its size `2 * r` pixels, each with the
+/// part it draws: built once to be painted at many places ([`paint_path_marker`]).
+pub(crate) fn path_marker_parts(
+    x: f32,
+    y: f32,
+    r: f32,
+    shape: &rustgis_map::PathRef,
+) -> Vec<(tiny_skia::Path, &'static rustgis_map::PathPart)> {
+    shape.shape().parts.iter().filter_map(|part| Some((path_marker_part(x, y, r, part)?, part))).collect()
+}
+
+/// Paints a drawn marker's `parts` (built at size `2 * r` pixels) moved by `t`: each filled in its
+/// fill, then stroked in its stroke `width * 2 * r` pixels wide (at least half a pixel), in order.
+pub(crate) fn paint_path_marker(pm: &mut Pixmap, parts: &[(tiny_skia::Path, &rustgis_map::PathPart)], r: f32, opacity: f32, t: Transform) {
+    for (path, part) in parts {
         if let Some(fill) = part.fill {
-            pm.fill_path(&path, &paint(fill, opacity), FillRule::Winding, Transform::identity(), None);
+            pm.fill_path(path, &paint(fill, opacity), FillRule::Winding, t, None);
         }
         if let Some(stroke) = part.stroke {
             let st = Stroke { width: (part.width * 2.0 * r).max(0.5), line_join: LineJoin::Round, ..Stroke::default() };
-            pm.stroke_path(&path, &paint(stroke, opacity), &st, Transform::identity(), None);
+            pm.stroke_path(path, &paint(stroke, opacity), &st, t, None);
         }
     }
 }

@@ -2161,6 +2161,15 @@ fn hostile_params_never_panic() {
         json!({"maps": {"a": null}}),
         json!({"text": "{\"type\":\"CIMLayoutDocument\"}"}),
         json!({"text": "{\"type\":\"CIMLayoutDocument\",\"layoutDefinition\":{\"page\":{\"width\":1e308,\"height\":-1},\"elements\":[{\"type\":\"CIMMapFrame\",\"uRI\":7}]}}", "dir": 7}),
+        // ArcGIS Pro projects, maps and layer files: a missing file, a zip header alone, a project
+        // with nothing in it, a map whose definition isn't one, and junk lists of names.
+        json!({"path": "/nonexistent/x.aprx"}),
+        json!({"data": "UEsDBAo="}),
+        json!({"text": "{\"type\":\"CIMGISProject\"}"}),
+        json!({"text": "{\"type\":\"CIMMapDocument\",\"mapDefinition\":7}"}),
+        json!({"maps": 7}),
+        json!({"maps": [null, 1e308, ""]}),
+        json!({"layouts": {"a": 1}}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);
@@ -23940,4 +23949,194 @@ fn pro_map_relative_path_without_dir_is_broken() {
         notes.iter().any(|n| n == "Roads: added broken: a relative path, and no folder to find it from (repair or retry it)"),
         "{notes:?}"
     );
+}
+
+// ---- ArcGIS Pro projects (.aprx), maps (.mapx) and layer files (.lyrx) ----
+
+/// A feature layer `name` at `uri` on the sample's Countries shapefile.
+fn aprx_countries_layer(name: &str, uri: &str) -> Value {
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    json!({"type": "CIMFeatureLayer", "name": name, "uRI": uri, "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": format!("DATABASE={folder}"), "workspaceFactory": "Shapefile", "dataset": file,
+            "datasetType": "esriDTFeatureClass"}}})
+}
+
+/// A zip of `entries` (path, JSON), and the 2×2 PNG at `Pictures/p.png`.
+fn aprx_zip(entries: Vec<(&str, Value)>) -> Vec<u8> {
+    let mut files: Vec<(String, Vec<u8>)> = entries.into_iter().map(|(path, v)| (path.to_string(), v.to_string().into_bytes())).collect();
+    files.push(("Pictures/p.png".to_string(), picture_bytes(2, 2, image::ImageFormat::Png)));
+    rustgis_data::zip::write(&files).unwrap()
+}
+
+/// The project's root: maps Main, Detail, a layout Sheet and an ArcMap map Old; Detail's pane open.
+fn aprx_root() -> Value {
+    let item = |ty: &str, name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": ty, "name": name, "catalogPath": path});
+    json!({"type": "CIMGISProject", "version": "3.7.0",
+        "projectItems": [item("Map", "Main", "CIMPATH=main/main.json"), item("Map", "Detail", "CIMPATH=detail/detail.json"),
+            item("Layout", "Sheet", "CIMPATH=layout/sheet.json"), item("Map", "Old", "CIMPATH=old/old.xml")],
+        "views": [{"type": "CIMMapView", "viewableObjectPath": "CIMPATH=detail/detail.json"}]})
+}
+
+/// The layout Sheet: a frame on Main and a picture from the project's Pictures.
+fn aprx_sheet() -> Value {
+    let ring = |x0: f64, y0: f64, x1: f64, y1: f64| json!({"rings": [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]]});
+    json!({"type": "CIMLayout", "name": "Sheet", "uRI": "CIMPATH=layout/sheet.json",
+        "page": {"type": "CIMPage", "width": 11, "height": 8.5, "units": {"uwkid": 109008}},
+        "elements": [
+            {"type": "CIMMapFrame", "name": "Main Frame", "anchor": "BottomLeftCorner", "visible": true,
+                "frame": ring(0.5, 0.5, 8.0, 8.0), "uRI": "CIMPATH=main/main.json"},
+            {"type": "CIMGraphicElement", "name": "Logo", "anchor": "BottomLeftCorner", "visible": true,
+                "graphic": {"type": "CIMPictureGraphic", "box": {"xmin": 9.0, "ymin": 7.0, "xmax": 10.0, "ymax": 8.0},
+                    "referenceURI": "CIMPATH=Pictures/p.png"}}]})
+}
+
+/// The synthetic project: Main (the sample's shapefile and an SDE layer that comes in broken),
+/// Detail (the shapefile), the layout Sheet, and Old, saved by ArcMap.
+fn aprx() -> Vec<u8> {
+    let map = |name: &str, uri: &str, layers: Vec<&str>| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers, "spatialReference": {"wkid": 4326, "latestWkid": 4326}});
+    let sde = json!({"type": "CIMFeatureLayer", "name": "Mains", "uRI": "CIMPATH=main/mains.json", "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": "SERVER=gis-db;DATABASE=utility;USER=editor;PASSWORD=swordfish", "workspaceFactory": "SDE",
+            "dataset": "utility.dbo.mains", "datasetType": "esriDTFeatureClass"}}});
+    aprx_zip(vec![
+        ("GISProject.json", aprx_root()),
+        ("main/main.json", map("Main", "CIMPATH=main/main.json", vec!["CIMPATH=main/countries.json", "CIMPATH=main/mains.json"])),
+        ("main/countries.json", aprx_countries_layer("Countries", "CIMPATH=main/countries.json")),
+        ("main/mains.json", sde),
+        ("detail/detail.json", map("Detail", "CIMPATH=detail/detail.json", vec!["CIMPATH=detail/countries.json"])),
+        ("detail/countries.json", aprx_countries_layer("Detail Countries", "CIMPATH=detail/countries.json")),
+        ("layout/sheet.json", aprx_sheet()),
+    ])
+}
+
+#[test]
+fn inspecting_a_project_lists_maps_layouts_and_the_open_map() {
+    let mut s = world();
+    let r = s.run("project.inspectArcgis", &json!({"data": b64(&aprx())})).unwrap();
+    assert_eq!(r["kind"], "project");
+    let maps = r["maps"].as_array().unwrap();
+    assert_eq!(maps.len(), 3, "{r}");
+    let map = |name: &str| maps.iter().find(|m| m["name"] == name).unwrap_or_else(|| panic!("no map {name}: {r}"));
+    assert_eq!((map("Detail")["open"].clone(), map("Main")["open"].clone()), (json!(true), json!(false)));
+    assert_eq!((map("Old")["arcmap"].clone(), map("Main")["arcmap"].clone()), (json!(true), json!(false)));
+    assert_eq!(r["layouts"][0]["name"], "Sheet");
+    assert_eq!(r["layouts"][0]["maps"], json!(["Main"]));
+    assert_eq!(r["layouts"][0]["arcmap"], false);
+}
+
+#[test]
+fn importing_chosen_maps_and_a_layout_binds_the_frames() {
+    use rustgis_map::layout::ElementKind;
+    let mut s = world();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&aprx()), "maps": ["detail"], "layouts": ["Sheet"]})).unwrap();
+    // Main comes in with the layout that shows it.
+    assert_eq!(r["maps"], json!(["Detail", "Main"]), "{r}");
+    assert_eq!(r["layouts"], json!(["Sheet"]));
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(3), Some(1)), "{r}");
+    // The first imported map and layout are the active ones.
+    assert_eq!(s.map().name, "Detail");
+    let l = &s.project.layouts[s.active_layout.unwrap()];
+    assert_eq!(l.name, "Sheet");
+    let shows: Vec<&str> =
+        l.elements.iter().filter_map(|e| if let ElementKind::MapFrame { map, .. } = &e.kind { Some(map.as_str()) } else { None }).collect();
+    assert_eq!(shows, ["Main"]);
+    let picture = l.elements.iter().find_map(|e| if let ElementKind::Picture { image, .. } = &e.kind { Some(image) } else { None });
+    assert!(picture.is_some_and(|i| !i.is_empty()), "{r}");
+    // The SDE layer: in the map broken, and no secret in what the import says.
+    let main = s.project.maps.iter().find(|m| m.name == "Main").unwrap();
+    assert!(main.layer_by_name("Mains").and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken()));
+    for secret in ["swordfish", "editor", "PASSWORD"] {
+        assert!(!r.to_string().contains(secret), "{r}");
+    }
+}
+
+#[test]
+fn importing_nothing_lists_the_holdings() {
+    let mut s = world();
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let r = s.run("project.importArcgis", &json!({"data": b64(&aprx())})).unwrap();
+    assert_eq!((r["maps"].clone(), r["layouts"].clone()), (json!([]), json!([])), "{r}");
+    assert_eq!(r["holds"]["kind"], "project");
+    assert_eq!(r["holds"]["maps"].as_array().map(Vec::len), Some(3), "{r}");
+    assert_eq!(r["holds"]["layouts"][0]["maps"], json!(["Main"]));
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+}
+
+#[test]
+fn an_arcmap_item_is_refused_before_the_project_changes() {
+    let mut s = world();
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let data = b64(&aprx());
+    let e = s.run("project.importArcgis", &json!({"data": data, "maps": ["Main", "OLD"]})).unwrap_err();
+    assert_eq!(e, "Old was saved by ArcMap; open it in ArcGIS Pro first");
+    let e = s.run("project.importArcgis", &json!({"data": data, "maps": ["Main"], "layouts": ["Nowhere"]})).unwrap_err();
+    assert!(e.contains("Nowhere"), "{e}");
+    let e = s.run("project.importArcgis", &json!({"data": data, "maps": ["Nowhere"]})).unwrap_err();
+    assert_eq!(e, "no map named Nowhere");
+    assert!(s.run("project.importArcgis", &json!({"data": data, "maps": ["Main", 7]})).is_err());
+    assert!(s.run("project.importArcgis", &json!({"data": data, "maps": vec!["Main"; 501]})).is_err());
+    // A layout document is none of the kinds this imports.
+    let e = s.run("project.importArcgis", &json!({"text": pagx()})).unwrap_err();
+    assert_eq!(e, "not an ArcGIS Pro project, map or layer file");
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+}
+
+#[test]
+fn a_mapx_imports_one_map_and_a_lyrx_adds_to_the_active_map() {
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    let mut s = world();
+    let maps = s.project.maps.len();
+    // `maps` means nothing to a .mapx: its one map comes in.
+    let mapx = small_mapx(vec![small_layer("roads", &folder, &file)], &["CIMPATH=small/roads.json"]);
+    let r = s.run("project.importArcgis", &json!({"text": mapx, "maps": ["Other"]})).unwrap();
+    assert_eq!(r["maps"], json!(["Small"]), "{r}");
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(1), Some(0)), "{r}");
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!(s.run("project.inspectArcgis", &json!({"text": small_mapx(vec![], &[])})).unwrap()["kind"], "map");
+    // A layer file: added to the active map, no map made.
+    s.run("map.activate", &json!({"name": "World"})).unwrap();
+    let lyrx = type_first(json!({"type": "CIMLayerDocument", "version": "3.7.0", "layers": ["CIMPATH=small/rivers.json"],
+        "layerDefinitions": [small_layer("rivers", &folder, &file)]}));
+    assert_eq!(s.run("project.inspectArcgis", &json!({"text": lyrx})).unwrap()["kind"], "layers");
+    let r = s.run("project.importArcgis", &json!({"text": lyrx})).unwrap();
+    assert_eq!(r["maps"], json!([]), "{r}");
+    assert_eq!(r["layers"].as_u64(), Some(1), "{r}");
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!(s.map().name, "World");
+    assert!(s.map().layer_by_name("rivers").is_some());
+}
+
+#[test]
+fn hostile_project_files_never_panic() {
+    let mut long = aprx_root();
+    long["projectItems"][0]["catalogPath"] = json!(format!("CIMPATH={}.json", "a".repeat(10_000)));
+    let mut views = aprx_root();
+    views["views"] = Value::Array(vec![json!({"type": "CIMMapView", "viewableObjectPath": "CIMPATH=detail/detail.json"}); 10_000]);
+    let mut sheet = aprx_sheet();
+    sheet["elements"] = json!(7);
+    let zips = [
+        aprx_zip(vec![("a.json", json!({}))]),
+        aprx_zip(vec![("GISProject.json", json!([]))]),
+        aprx_zip(vec![("GISProject.json", long)]),
+        aprx_zip(vec![("GISProject.json", views)]),
+        aprx_zip(vec![("GISProject.json", aprx_root()), ("layout/sheet.json", sheet)]),
+    ];
+    let mut s = world();
+    for zip in &zips {
+        let data = b64(zip);
+        let _ = s.run("project.inspectArcgis", &json!({"data": data}));
+        for ask in [json!({}), json!({"maps": ["Main"]}), json!({"layouts": ["Sheet"]}), json!({"maps": ["Detail"], "layouts": ["Sheet"]})]
+        {
+            let mut p = ask.clone();
+            p["data"] = json!(data);
+            let _ = s.run("project.importArcgis", &p);
+        }
+    }
+    // The session is still usable.
+    assert!(s.run("project.inspectArcgis", &json!({"data": b64(&aprx())})).is_ok());
 }

@@ -194,6 +194,7 @@ pub fn gate(s: &Session, call: &ToolCall) -> Option<String> {
             "layer.addDownload" => "it completes a download that may import a project and its referenced sources".into(),
             "project.importGeolibre" => "it adds the files and web addresses a GeoLibre project names".into(),
             "project.importQgis" => "it adds the files and web addresses a QGIS project names".into(),
+            "project.importArcgis" => "it adds the files and web addresses an ArcGIS Pro project names".into(),
             _ => "it is reserved to you (plugins, scripts, tasks, models and the GeoLibre runner)".into(),
         });
     }

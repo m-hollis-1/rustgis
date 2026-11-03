@@ -4,15 +4,21 @@
 //! keeps beside it, and adds the layout. `layout.inspect` says which map each frame shows, so the
 //! app can ask about the frames the template leaves open before importing.
 //!
+//! ArcGIS Pro projects, maps and layer files: `project.importArcgis` imports the maps and layouts
+//! of an `.aprx` it is asked for (a layout with the maps its frames show), the one map of a
+//! `.mapx`, or the layers of a `.lyrx` into the active map; `project.inspectArcgis` lists what a
+//! file holds, so the app can ask which to import.
+//!
 //! Everything that can fail on the input (the document, the `maps` parameter, the pictures) is
 //! read before the project changes. What doesn't come across, or comes across changed, is said in
 //! the notes, as the QGIS importer says it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::cim::{
-    self, DocKind, Document, Entry, GroupImport, LayerImport, LayerKind, LayerSource, LayoutImport, MapImport, PictureSource, Report,
+    self, DocKind, Document, Entry, GroupImport, ItemKind, LayerImport, LayerKind, LayerSource, LayoutImport, MapImport, PictureSource,
+    ProjectItem, Report,
 };
 use rustgis_map::layout::{ElementKind, MAX_FRAME_SCALE, MIN_FRAME_SCALE};
 use rustgis_map::qgis::{NoteKind, QGIS_SCALE};
@@ -33,6 +39,12 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("layout.inspect", "Inspect Layout File", "Home › Project", inspect).view().params(
             r#"{"path"?: "*.pagx", "text"?: a .pagx file's text} → {"frames": [{"name", "map": the embedded map it shows | null (the layout doesn't say)}], "maps": [embedded map names]}"#,
+        ),
+        C::new("project.inspectArcgis", "Inspect ArcGIS Pro Project", "Project › Import", inspect_project).view().params(
+            r#"{"path"?: "*.aprx|*.mapx|*.lyrx", "text"?: "a .mapx or .lyrx file's text", "data"?: "an .aprx, .mapx or .lyrx file, base64"} → {"kind": "project"|"map"|"layers", "maps": [{"name", "open": bool (its pane was open when saved; the first open one is the one shown), "arcmap": bool (saved by ArcMap: it can't be imported)}], "layouts": [{"name", "maps": [the names of the maps its frames show], "arcmap": bool}]}"#,
+        ),
+        C::new("project.importArcgis", "Import ArcGIS Pro Project", "Project › Import", import_project).params(
+            r#"{"path"?: "*.aprx|*.mapx|*.lyrx", "text"?: "a .mapx or .lyrx file's text", "data"?: "an .aprx, .mapx or .lyrx file, base64", "maps"?: [names] (an .aprx: the maps to import; with none of these and no layouts, nothing is imported and "holds" says what the file holds, as project.inspectArcgis does), "layouts"?: [names] (an .aprx: the layouts to import, each with the maps its frames show), "dir"?: "the folder its relative paths start from (default: the file's)"} → the names of the maps and layouts added, the layers added and how many came in broken, notes on what wasn't carried over, and, when nothing was asked for, "holds": what the file holds"#,
         ),
     ]
 }
@@ -184,21 +196,34 @@ pub(crate) fn import_layout(s: &mut Session, text: &str, dir: Option<&str>, p: &
         bound.insert(key.clone(), name);
     }
     (s.project.active_map, s.active_layer, s.table_layer) = before;
-    bind_frames(s, &mut imp, &bound, &chosen, &mut report);
-
-    let mut l = imp.layout;
-    l.clamp();
-    l.name = super::layout::unique_name(s, &l.name);
-    let name = l.name.clone();
-    s.project.layouts.push(l);
-    let i = s.project.layouts.len() - 1;
-    s.active_layout = Some(i);
+    let (i, name) = import_layout_in(s, imp, &bound, &chosen, &mut report);
     if !report.notes.is_empty() {
         let left = report.notes.iter().filter(|n| n.kind == NoteKind::Skipped).count();
         s.notify(format!("Imported layout {name}: {} things drawn differently, {left} left out", report.notes.len() - left), false);
     }
     let notes: Vec<Value> = report.notes.iter().map(qgis::note_json).collect();
     Ok(json!({"layout": i, "name": name, "maps": added, "notes": notes}))
+}
+
+/// Adds layout `imp` (read, its pictures with it) with its frames bound to the project maps
+/// `bound` names by map `uRI` key, else to those `chosen` names by frame; it is the active layout
+/// afterwards. Its index and name.
+fn import_layout_in(
+    s: &mut Session,
+    mut imp: LayoutImport,
+    bound: &HashMap<String, String>,
+    chosen: &HashMap<String, (String, String)>,
+    report: &mut Report,
+) -> (usize, String) {
+    bind_frames(s, &mut imp, bound, chosen, report);
+    let mut l = imp.layout;
+    l.clamp();
+    l.name = super::layout::unique_name(s, &l.name);
+    let name = l.name.clone();
+    s.project.layouts.push(l);
+    let i = s.project.layouts.len().saturating_sub(1);
+    s.active_layout = Some(i);
+    (i, name)
 }
 
 /// Gives each map frame its project map: the embedded map it shows, else the one `maps` names
@@ -323,6 +348,8 @@ pub(crate) struct Added {
     pub layers: usize,
     /// Of those, the ones added broken.
     pub broken: usize,
+    /// The names of those added broken.
+    pub broken_names: Vec<String>,
 }
 
 /// How a map's coordinates (its camera's, its default extent's) become longitude and latitude.
@@ -687,6 +714,7 @@ fn broken_layer(s: &mut Session, l: &LayerImport, from: Origin, error: String, a
     }
     a.added.layers += 1;
     a.added.broken += 1;
+    a.added.broken_names.push(l.name.clone());
     Placed::Layer(id)
 }
 
@@ -900,6 +928,290 @@ fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(target_arch = "wasm32")]
 fn to_png(_: &[u8]) -> Result<Vec<u8>, String> {
     Err("the browser can't convert GIF and BMP pictures".into())
+}
+
+// ---- projects, maps and layer files ------------------------------------------------------------
+
+/// The most bytes of a file read from `path` (an `.aprx` holds its pictures and more beside its
+/// JSON, which [`cim::MAX_JSON`] bounds on its own).
+const MAX_PROJECT: usize = 512 << 20;
+/// The most names `maps` or `layouts` may list.
+const MAX_NAMES: usize = 500;
+const NOT_A_PRO_FILE: &str = "not an ArcGIS Pro project, map or layer file";
+
+/// The document of an `.aprx`, `.mapx` or `.lyrx`: `data` (base64), `text`, or the file at
+/// `path`. A zip (an `.aprx` path, or bytes starting `PK`) is read as a project; anything else as
+/// a JSON document.
+fn project_document(p: &Value) -> Result<Document, String> {
+    let (bytes, aprx) = match (ps(p, "data"), ps(p, "text"), ps(p, "path")) {
+        (Some(d), ..) => {
+            // Base64 is 4 characters for 3 bytes: a payload past the limit isn't decoded.
+            if d.len() > MAX_PROJECT / 3 * 4 + 4 {
+                return Err(format!("data is too large: at most {} MB can be read", MAX_PROJECT >> 20));
+            }
+            use base64::Engine;
+            (base64::engine::general_purpose::STANDARD.decode(d.trim()).map_err(|_| "data must be base64".to_string())?, false)
+        }
+        (None, Some(t), _) => return Document::from_json(t),
+        (None, None, Some(path)) => (read_project(path)?, path.trim().to_ascii_lowercase().ends_with(".aprx")),
+        _ => return Err("path, text or data is required".into()),
+    };
+    if aprx || bytes.starts_with(b"PK") {
+        return Document::from_zip(&bytes);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| NOT_A_PRO_FILE.to_string())?;
+    Document::from_json(&text)
+}
+
+/// Reads `path` whole, refused before it is read when it is over [`MAX_PROJECT`].
+#[cfg(not(target_arch = "wasm32"))]
+fn read_project(path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let too_large = || format!("{} is too large: at most {} MB can be read", shown(path), MAX_PROJECT >> 20);
+    let len = std::fs::metadata(path).map_err(|e| format!("{}: {e}", shown(path)))?.len();
+    if len > MAX_PROJECT as u64 {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    // At most one byte past the limit, so a file growing meanwhile is still refused.
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_PROJECT as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("{}: {e}", shown(path)))?;
+    if bytes.len() > MAX_PROJECT {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_project(_: &str) -> Result<Vec<u8>, String> {
+    Err("the browser can't read a file by its path; pass its data".into())
+}
+
+/// The names `p`'s `key` lists (trimmed): none when it is missing; an error when it isn't a list
+/// of at most [`MAX_NAMES`] strings.
+fn names(p: &Value, key: &str) -> Result<Vec<String>, String> {
+    let list = match p.get(key) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(a)) => a,
+        Some(_) => return Err(format!("{key} is a list of names")),
+    };
+    if list.len() > MAX_NAMES {
+        return Err(format!("{key}: at most {MAX_NAMES} names"));
+    }
+    list.iter().map(|v| v.as_str().map(|n| n.trim().to_string()).ok_or_else(|| format!("{key} is a list of names"))).collect()
+}
+
+/// The project items of `kind` that `wanted` names (in any case), in the order named: an unknown
+/// name, or an item ArcMap saved (not CIM: it can't be read), is refused.
+fn pick<'a>(items: &'a [ProjectItem], kind: ItemKind, wanted: &[String], what: &str) -> Result<Vec<&'a ProjectItem>, String> {
+    let mut out: Vec<&ProjectItem> = Vec::new();
+    for n in wanted {
+        let lower = n.to_lowercase();
+        let item = items
+            .iter()
+            .find(|i| i.kind == kind && i.name.trim().to_lowercase() == lower)
+            .ok_or_else(|| format!("no {what} named {}", shown(n)))?;
+        if item.arcmap {
+            return Err(format!("{} was saved by ArcMap; open it in ArcGIS Pro first", shown(&item.name)));
+        }
+        if !out.iter().any(|o| std::ptr::eq(*o, item)) {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
+/// The `CIMLayout` a layout item's `uri` names.
+fn layout_def<'a>(doc: &'a Document, uri: &str) -> Option<&'a Value> {
+    doc.resolve(uri).filter(|d| d.get("type").and_then(Value::as_str) == Some("CIMLayout"))
+}
+
+/// The names of the maps a project layout's frames show: the project's map of each frame's
+/// `uRI`, else the name that map's definition gives. Empty when the layout can't be read.
+fn frame_maps(doc: &Document, items: &[ProjectItem], uri: &str) -> Vec<String> {
+    let Some(def) = layout_def(doc, uri) else { return Vec::new() };
+    let Ok(imp) = cim::read_layout_def(doc, def, &mut Report::default()) else { return Vec::new() };
+    let mut names: Vec<String> = Vec::new();
+    for u in &imp.embedded_maps {
+        let key = uri_key(u);
+        let name = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Map && uri_key(&i.uri) == key)
+            .map(|i| i.name.clone())
+            .or_else(|| doc.resolve(u).and_then(|m| m.get("name")).and_then(Value::as_str).map(str::to_string));
+        if let Some(n) = name
+            && !names.contains(&n)
+        {
+            names.push(n);
+        }
+    }
+    names
+}
+
+/// What a document holds, as `project.inspectArcgis` says it.
+fn holdings(doc: &Document) -> CmdResult {
+    match doc.kind() {
+        DocKind::Project => {
+            let items = doc.items();
+            let open: HashSet<String> = doc.open_maps().iter().map(|u| uri_key(u)).collect();
+            let maps: Vec<Value> = items
+                .iter()
+                .filter(|i| i.kind == ItemKind::Map)
+                .map(|i| json!({"name": i.name, "open": open.contains(&uri_key(&i.uri)), "arcmap": i.arcmap}))
+                .collect();
+            let layouts: Vec<Value> = items
+                .iter()
+                .filter(|i| i.kind == ItemKind::Layout)
+                .map(|i| {
+                    let shows = if i.arcmap { Vec::new() } else { frame_maps(doc, &items, &i.uri) };
+                    json!({"name": i.name, "maps": shows, "arcmap": i.arcmap})
+                })
+                .collect();
+            Ok(json!({"kind": "project", "maps": maps, "layouts": layouts}))
+        }
+        DocKind::Map => {
+            let def = doc.map_definition().ok_or("the map file has no map")?;
+            let name = def.get("name").and_then(Value::as_str).unwrap_or("Map");
+            Ok(json!({"kind": "map", "maps": [{"name": name, "open": false, "arcmap": false}], "layouts": []}))
+        }
+        DocKind::Layer => Ok(json!({"kind": "layers", "maps": [], "layouts": []})),
+        _ => Err(NOT_A_PRO_FILE.into()),
+    }
+}
+
+fn inspect_project(_: &mut Session, p: &Value) -> CmdResult {
+    holdings(&project_document(p)?)
+}
+
+/// What an import brought in, all its maps, layouts and layers together.
+#[derive(Default)]
+struct Imported {
+    maps: Vec<String>,
+    layouts: Vec<String>,
+    layers: usize,
+    broken: usize,
+    /// The layers added broken, whose notes the notice doesn't count again.
+    broken_names: HashSet<String>,
+}
+
+impl Imported {
+    /// Counts `a`, a map it added when `map`.
+    fn add(&mut self, a: Added, map: bool) {
+        if map {
+            self.maps.push(a.name);
+        }
+        self.layers += a.layers;
+        self.broken += a.broken;
+        self.broken_names.extend(a.broken_names);
+    }
+}
+
+fn import_project(s: &mut Session, p: &Value) -> CmdResult {
+    let (map_names, layout_names) = (names(p, "maps")?, names(p, "layouts")?);
+    let doc = project_document(p)?;
+    let dir = folder(p);
+    let dir = dir.as_deref();
+    let mut report = Report::default();
+    let mut imported = Imported::default();
+    match doc.kind() {
+        // Nothing asked for: what the project holds, to choose from.
+        DocKind::Project if map_names.is_empty() && layout_names.is_empty() => {
+            return Ok(json!({"maps": [], "layouts": [], "layers": 0, "broken": 0, "notes": [], "holds": holdings(&doc)?}));
+        }
+        DocKind::Project => import_items(s, &doc, &map_names, &layout_names, dir, &mut report, &mut imported)?,
+        DocKind::Map => {
+            let def = doc.map_definition().ok_or("the map file has no map")?;
+            let m = cim::read_map_def(&doc, def, &mut report)?;
+            // The project changes from here.
+            let added = add_map(s, &m, dir, None, &mut report)?;
+            imported.add(added, true);
+        }
+        DocKind::Layer => {
+            let m = cim::read_layers(&doc, &doc.layer_uris(), &mut report);
+            let added = add_entries(s, &m, dir, None, &mut report);
+            imported.add(added, false);
+        }
+        _ => return Err(NOT_A_PRO_FILE.into()),
+    }
+    // A broken layer is counted as broken, not again by its notes.
+    let counted = |kind: NoteKind| report.notes.iter().filter(|n| n.kind == kind && !imported.broken_names.contains(&n.layer)).count();
+    let (approximated, skipped) = (counted(NoteKind::Approximated), counted(NoteKind::Skipped));
+    s.notify(
+        format!(
+            "Imported {} maps and {} layouts: {} layers, {} broken; {approximated} things drawn differently, {skipped} left out",
+            imported.maps.len(),
+            imported.layouts.len(),
+            imported.layers,
+            imported.broken
+        ),
+        false,
+    );
+    let notes: Vec<Value> = report.notes.iter().map(qgis::note_json).collect();
+    Ok(json!({"maps": imported.maps, "layouts": imported.layouts, "layers": imported.layers, "broken": imported.broken, "notes": notes}))
+}
+
+/// Imports a project's maps and layouts that `map_names` and `layout_names` name, with the maps
+/// each layout's frames show; everything is read (and refused) before the project changes. The
+/// maps come first, so the layouts' frames bind to them; the first of each is the active one.
+fn import_items(
+    s: &mut Session,
+    doc: &Document,
+    map_names: &[String],
+    layout_names: &[String],
+    dir: Option<&str>,
+    report: &mut Report,
+    imported: &mut Imported,
+) -> Result<(), String> {
+    let items = doc.items();
+    let maps = pick(&items, ItemKind::Map, map_names, "map")?;
+    let layouts = pick(&items, ItemKind::Layout, layout_names, "layout")?;
+    let mut ready = Vec::new();
+    for item in &layouts {
+        let def = layout_def(doc, &item.uri).ok_or_else(|| format!("the layout {} isn't in the project", shown(&item.name)))?;
+        let mut imp = cim::read_layout_def(doc, def, report).map_err(|e| format!("{}: {e}", shown(&item.name)))?;
+        read_pictures(&mut imp, dir, report);
+        convert_markers(&mut imp, report);
+        ready.push(imp);
+    }
+    // The maps asked for, then those the layouts show, each once.
+    let asked = maps.iter().map(|i| (i.uri.as_str(), true));
+    let shown_by_layouts = ready.iter().flat_map(|imp| imp.embedded_maps.iter().map(|u| (u.as_str(), false)));
+    let mut read: Vec<(String, &str, MapImport)> = Vec::new();
+    for (uri, asked) in asked.chain(shown_by_layouts) {
+        let key = uri_key(uri);
+        if read.iter().any(|(k, ..)| *k == key) {
+            continue;
+        }
+        match cim::read_map(doc, uri, report) {
+            Ok(m) => read.push((key, uri, m)),
+            Err(e) if asked => return Err(e),
+            // (A map the project lacks was noted by the frame that names it.)
+            Err(e) if doc.resolve(uri).is_some() => report.skipped(&shown(uri), e),
+            Err(_) => {}
+        }
+    }
+
+    // The project changes from here.
+    let mut bound: HashMap<String, String> = HashMap::new();
+    for (key, uri, m) in &read {
+        let added = add_map(s, m, dir, doc.view_camera(uri), report)?;
+        bound.insert(key.clone(), added.name.clone());
+        imported.add(added, true);
+    }
+    if let Some(first) = imported.maps.first() {
+        s.run_part("map.activate", &json!({"name": first}))?;
+    }
+    let mut first_layout = None;
+    for imp in ready {
+        let (i, name) = import_layout_in(s, imp, &bound, &HashMap::new(), report);
+        first_layout.get_or_insert(i);
+        imported.layouts.push(name);
+    }
+    if first_layout.is_some() {
+        s.active_layout = first_layout;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

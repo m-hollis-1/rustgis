@@ -273,6 +273,8 @@ const NEVER: &[&str] = &[
     // A QGIS project names the files and web addresses its layers come from, and the import
     // adds them without each one passing a plugin's permissions.
     "project.importQgis",
+    // So does an ArcGIS Pro project, map or layer file.
+    "project.importArcgis",
     "project.importGeolibre",
     // Completion callbacks can finish project imports; plugins never supply their state.
     "layer.addDownload",

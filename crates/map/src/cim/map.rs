@@ -6,7 +6,7 @@
 //! noted in the [`Report`] and left out, so the map still opens.
 //!
 //! The input is hostile: layers are capped at [`MAX_LAYERS`], classes at [`MAX_CLASSES`] and
-//! [`MAX_LABEL_CLASSES`], groups are followed to a bounded depth with a bounded amount of work,
+//! label classes (see `labels`), groups are followed to a bounded depth with a bounded amount of work,
 //! and a key that is missing or of another type reads as absent.
 
 use std::collections::BTreeMap;
@@ -15,18 +15,15 @@ use serde_json::Value;
 
 use super::color::symbol_of;
 use super::expr;
+use super::labels::labels;
 use super::symbol::{self, shown};
 use super::units::pt96;
 use super::{Document, Report, flag, num, str_of, typed};
 use crate::color::{Ramp, Rgba};
 use crate::fills::FillLayer;
-use crate::layout::TextAlign;
 use crate::qgis::symbol::{hidden as hidden_symbol, stacked};
 use crate::qgis::{QGIS_SCALE, Style};
-use crate::symbology::{
-    ClassMethod, DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, LabelPlacement, Labeling, LineStroke, MAX_LABEL_CLASSES, Marker,
-    OTHER_VALUES, Renderer, Symbol,
-};
+use crate::symbology::{ClassMethod, LineStroke, Marker, OTHER_VALUES, Renderer, Symbol};
 
 /// The most layers read from one map.
 const MAX_LAYERS: usize = 500;
@@ -38,7 +35,6 @@ const MAX_GROUP_DEPTH: usize = 8;
 const MAX_VISITS: usize = MAX_LAYERS * 8;
 
 const CLEAR: Rgba = Rgba::new(0, 0, 0, 0);
-const NULL: Value = Value::Null;
 
 /// A map of a template: its name, spatial reference, default extent and layers.
 #[derive(Clone, Debug, PartialEq)]
@@ -600,95 +596,4 @@ fn value_text(v: &Value) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
-}
-
-// ---- labels -----------------------------------------------------------------------------------
-
-/// A layer's `labelClasses` as its labeling, `None` when no class can be carried over.
-fn labels(def: &Value, what: &str, report: &mut Report) -> Option<Labeling> {
-    let mut classes: Vec<LabelClass> = Vec::new();
-    for c in def.get("labelClasses")?.as_array()?.iter().take(MAX_LABEL_CLASSES + 1) {
-        if classes.len() >= MAX_LABEL_CLASSES {
-            report.skipped(what, format!("label classes past the first {MAX_LABEL_CLASSES}"));
-            break;
-        }
-        classes.extend(label_class(c, what, report));
-    }
-    let enabled = flag(def, "labelVisibility", false);
-    // One class is the Default class; several are classes of their own, with Default (a hidden
-    // copy of the first) switched off. (The twin of how `qgis/labels.rs::read` composes them.)
-    if classes.len() == 1 {
-        let mut default = classes.pop()?;
-        default.name = DEFAULT_LABEL_CLASS.into();
-        return Some(Labeling { enabled, default, classes: Vec::new() });
-    }
-    for (i, c) in classes.iter_mut().enumerate() {
-        if c.name.is_empty() {
-            c.name = format!("Class {}", i + 1);
-        }
-    }
-    let first = classes.first()?.clone();
-    let default = LabelClass { name: DEFAULT_LABEL_CLASS.into(), visible: false, where_: None, ..first };
-    Some(Labeling { enabled, default, classes })
-}
-
-/// A `CIMLabelClass` as a label class, `None` when it has no field to label with (noted).
-fn label_class(c: &Value, what: &str, report: &mut Report) -> Option<LabelClass> {
-    let expression = str_of(c, "expression").unwrap_or_default();
-    let engine = str_of(c, "expressionEngine").unwrap_or("Arcade");
-    let Some(t) = expr::template(expression, engine) else {
-        report.skipped(what, format!("label expression {}, no field to draw it with, class left out", shown(expression)));
-        return None;
-    };
-    if !t.exact {
-        report.approximated(what, format!("label expression {}, drawn as {}", shown(expression), shown(&t.template)));
-    }
-    for (written, read) in &t.joins {
-        report.approximated(what, format!("field {} of a join, read as {}", shown(written), shown(read)));
-    }
-    if t.tags_dropped {
-        report.approximated(what, "text formatting tags, left out");
-    }
-    let field = t.template;
-    // The text symbol, without the halo the label class carries over itself.
-    let raw = c.get("textSymbol").and_then(symbol_of).unwrap_or(&NULL);
-    let mut plain = raw.clone();
-    if let Some(o) = plain.as_object_mut() {
-        o.remove("haloSymbol");
-    }
-    let t = symbol::text(&plain, what, report);
-    let halo_symbol = raw.get("haloSymbol").filter(|h| h.is_object());
-    let halo_size = num(raw, "haloSize").filter(|s| *s > 0.0);
-    let halo = halo_symbol.is_some() && halo_size.is_some();
-    let halo_color = halo_symbol.filter(|_| halo).and_then(|h| symbol::polygon(h, what, report).fill);
-    let halo_width = halo_size.filter(|_| halo).map(|s| f64::from(pt96(s)).clamp(*HALO_WIDTH.start(), *HALO_WIDTH.end()) as f32);
-    // (Scales at 96 dpi, as the layer's: see `feature_layer`.)
-    let scale = |k: &str| num(c, k).filter(|s| *s > 0.0).map(|s| s * QGIS_SCALE);
-    Some(LabelClass {
-        name: str_of(c, "name").unwrap_or_default().to_string(),
-        visible: flag(c, "visibility", true),
-        where_: str_of(c, "whereClause").map(str::trim).filter(|w| !w.is_empty()).map(str::to_string),
-        field,
-        size: t.size.clamp(*LABEL_SIZE.start(), *LABEL_SIZE.end()) as f32,
-        color: t.color,
-        halo,
-        bold: t.bold,
-        min_scale: scale("minimumScale"),
-        max_scale: scale("maximumScale"),
-        closest: None,
-        farthest: None,
-        placement: LabelPlacement::Auto,
-        other_positions: false,
-        italic: t.italic,
-        font: t.font,
-        halo_color,
-        halo_width,
-        spacing: 0.0,
-        offset: [0.0; 2],
-        background: None,
-        wrap_char: None,
-        wrap_length: 0,
-        line_align: TextAlign::Left,
-        repeat: None,
-    })
 }

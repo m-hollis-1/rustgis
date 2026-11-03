@@ -2221,7 +2221,7 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     assert_eq!((c.color, c.visible, c.bold, c.italic), (Rgba::rgb(10, 20, 30), true, false, false));
     assert!(c.halo);
     assert_eq!(c.halo_color, Some(Rgba::rgb(255, 255, 255)));
-    assert!((c.halo_width.unwrap() - 1.333).abs() < 1e-3);
+    assert_eq!(c.halo_width, Some(1.0), "points, as RustGIS keeps them");
     // Only what the file sets is set.
     assert_eq!((s.style.min_scale, s.style.max_scale), (None, None));
 
@@ -3201,4 +3201,318 @@ fn label_expressions_come_through_as_templates() {
     assert!(n.iter().any(|t| t == "Lots: field T.BLOCK of a join, read as BLOCK"), "{n:?}");
     assert_eq!(n.iter().filter(|t| t.contains("text formatting tags, left out")).count(), 1, "{n:?}");
     assert!(!n.iter().any(|t| t.contains("drawn as")), "{n:?}");
+}
+
+// ---- label placement, callouts and stacking ---------------------------------------------------
+
+/// The default label class and the report of a layer "Roads" with one label class: `class` is merged
+/// into the class, `text` into its text symbol.
+fn read_class(class: serde_json::Value, text: serde_json::Value) -> (crate::symbology::LabelClass, Report) {
+    let mut c = json!({"type": "CIMLabelClass", "expression": "$feature.NAME", "visibility": true,
+        "textSymbol": symbol_ref(text_symbol(text))});
+    if let (Some(o), Some(e)) = (c.as_object_mut(), class.as_object()) {
+        o.extend(e.clone());
+    }
+    let layer = feature_layer("Roads", standard_connection("Shapefile", "DATABASE=/d", "r.shp"), json!({"labelClasses": [c]}));
+    let (map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/roads.json"]));
+    (map.layers[0].style.labels.clone().unwrap().default, report)
+}
+
+fn maplex(props: serde_json::Value) -> serde_json::Value {
+    let mut p = json!({"type": "CIMMaplexLabelPlacementProperties"});
+    if let (Some(o), Some(e)) = (p.as_object_mut(), props.as_object()) {
+        o.extend(e.clone());
+    }
+    json!({"maplexLabelPlacementProperties": p})
+}
+
+fn standard(props: serde_json::Value) -> serde_json::Value {
+    let mut p = json!({"type": "CIMStandardLabelPlacementProperties"});
+    if let (Some(o), Some(e)) = (p.as_object_mut(), props.as_object()) {
+        o.extend(e.clone());
+    }
+    json!({"standardLabelPlacementProperties": p})
+}
+
+#[test]
+fn maplex_placements_map_by_feature_type() {
+    use crate::symbology::LabelPlacement::{self as P, *};
+    let rows: [(&str, &str, &str, P); 25] = [
+        ("Point", "pointPlacementMethod", "AroundPoint", Auto),
+        ("Point", "pointPlacementMethod", "CenteredOnPoint", Center),
+        ("Point", "pointPlacementMethod", "NorthOfPoint", Above),
+        ("Point", "pointPlacementMethod", "SouthOfPoint", Below),
+        ("Point", "pointPlacementMethod", "EastOfPoint", Right),
+        ("Point", "pointPlacementMethod", "WestOfPoint", Left),
+        ("Point", "pointPlacementMethod", "NorthEastOfPoint", AboveRight),
+        ("Point", "pointPlacementMethod", "NorthWestOfPoint", AboveLeft),
+        ("Point", "pointPlacementMethod", "SouthEastOfPoint", BelowRight),
+        ("Point", "pointPlacementMethod", "SouthWestOfPoint", BelowLeft),
+        ("Point", "pointPlacementMethod", "RotationField", Auto),
+        ("Line", "linePlacementMethod", "OffsetStraightFromLine", Parallel),
+        ("Line", "linePlacementMethod", "CenteredStraightOnLine", Parallel),
+        ("Line", "linePlacementMethod", "CenteredHorizontalOnLine", Parallel),
+        ("Line", "linePlacementMethod", "OffsetHorizontalFromLine", Parallel),
+        ("Line", "linePlacementMethod", "OffsetCurvedFromLine", Curved),
+        ("Line", "linePlacementMethod", "CenteredCurvedOnLine", Curved),
+        ("Polygon", "polygonPlacementMethod", "HorizontalInPolygon", Center),
+        ("Polygon", "polygonPlacementMethod", "AlwaysHorizontal", Center),
+        ("Polygon", "polygonPlacementMethod", "BoundaryPlacement", Center),
+        ("Polygon", "polygonPlacementMethod", "StraightInPolygon", Parallel),
+        ("Polygon", "polygonPlacementMethod", "CurvedInPolygon", Curved),
+        ("Polygon", "polygonPlacementMethod", "RepeatAlongBoundary", Curved),
+        // A method this reader does not know is Auto, noted.
+        ("Polygon", "polygonPlacementMethod", "SpiralInPolygon", Auto),
+        // A method of another feature type is none of this one's.
+        ("Line", "pointPlacementMethod", "NorthOfPoint", Auto),
+    ];
+    for (feature, key, method, want) in rows {
+        let mut props = json!({"featureType": feature, "primaryOffset": 0});
+        props[key] = json!(method);
+        let (c, report) = read_class(maplex(props), json!({}));
+        assert_eq!(c.placement, want, "{feature} {method}");
+        assert_eq!(c.repeat, None, "{feature} {method}");
+        let n = notes(&report);
+        let odd = matches!(method, "RotationField" | "SpiralInPolygon");
+        assert_eq!(n.len(), usize::from(odd), "{method}: {n:?}");
+        if odd {
+            assert_eq!(n[0], format!("Roads: label placement {method}, drawn as Auto"));
+        }
+    }
+}
+
+#[test]
+fn maplex_offsets_repeats_and_missing_feature_types() {
+    use crate::symbology::LabelPlacement::*;
+    let point = |method: &str, offset: f64| {
+        let (c, _) =
+            read_class(maplex(json!({"featureType": "Point", "pointPlacementMethod": method, "primaryOffset": offset})), json!({}));
+        (c.placement, c.offset)
+    };
+    // Points, above up and below down; around a point is above.
+    assert_eq!(point("NorthOfPoint", 4.0), (Above, [0.0, -4.0]));
+    assert_eq!(point("NorthWestOfPoint", 4.0), (AboveLeft, [0.0, -4.0]));
+    assert_eq!(point("SouthOfPoint", 4.0), (Below, [0.0, 4.0]));
+    assert_eq!(point("SouthEastOfPoint", 2.5), (BelowRight, [0.0, 2.5]));
+    assert_eq!(point("AroundPoint", 3.0), (Auto, [0.0, -3.0]));
+    assert_eq!(point("EastOfPoint", 3.0), (Right, [3.0, 0.0]));
+    assert_eq!(point("WestOfPoint", 3.0), (Left, [-3.0, 0.0]));
+    assert_eq!(point("CenteredOnPoint", 3.0), (Center, [0.0, 0.0]));
+    assert_eq!(point("NorthOfPoint", 500.0), (Above, [0.0, -200.0]));
+    assert_eq!(point("SouthOfPoint", 1e300).1, [0.0, 200.0]);
+    assert_eq!(point("NorthOfPoint", -4.0), (Above, [0.0, 0.0]), "a negative distance is none");
+
+    // Repeat along a boundary: points, within 10 to 10,000; none for a size that is not positive.
+    let boundary = |interval: serde_json::Value| {
+        let (c, _) = read_class(
+            maplex(json!({"featureType": "Polygon", "polygonPlacementMethod": "RepeatAlongBoundary", "repetitionInterval": interval})),
+            json!({}),
+        );
+        (c.placement, c.repeat)
+    };
+    assert_eq!(boundary(json!(120)), (Curved, Some(120.0)));
+    assert_eq!(boundary(json!(2)), (Curved, Some(10.0)));
+    assert_eq!(boundary(json!(1e9)), (Curved, Some(10_000.0)));
+    assert_eq!(boundary(json!(0)), (Curved, None));
+    assert_eq!(boundary(json!(-5)), (Curved, None));
+    assert_eq!(boundary(json!("far")), (Curved, None));
+    // The repeat belongs to that method alone.
+    let (c, _) = read_class(
+        maplex(json!({"featureType": "Polygon", "polygonPlacementMethod": "AlwaysHorizontal", "repetitionInterval": 50})),
+        json!({}),
+    );
+    assert_eq!((c.placement, c.repeat), (Center, None));
+
+    // Without a feature type, the method the block has is the one read.
+    let (c, report) = read_class(maplex(json!({"linePlacementMethod": "CenteredCurvedOnLine"})), json!({}));
+    assert_eq!(c.placement, Curved);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // No placement properties at all is Auto, unnoted; so is an empty block.
+    let (c, report) = read_class(json!({}), json!({}));
+    assert_eq!((c.placement, c.offset, c.repeat), (Auto, [0.0; 2], None));
+    assert!(report.notes.is_empty());
+    let (c, _) = read_class(maplex(json!({})), json!({}));
+    assert_eq!(c.placement, Auto);
+}
+
+#[test]
+fn maplex_settings_without_a_counterpart_are_noted() {
+    let (_, report) = read_class(
+        maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine",
+            "canOverrunFeature": true, "labelPriority": 3, "featureWeight": 5, "keyNumberMethod": "GetUniqueNumbers",
+            "polygonInternalZonePriorities": {"center": 1}, "pointPlacementPriorities": {"aboveLeft": 2},
+            "offsetAlongLineProperties": {"placementMethod": "OffsetFromStart"}, "thinDuplicateLabels": true,
+            "removeDuplicates": "ByLabel"})),
+        json!({}),
+    );
+    let n = notes(&report);
+    assert_eq!(n.len(), 8, "{n:?}");
+    assert!(n.iter().all(|t| t.starts_with("Roads: ") && t.ends_with(", left out")), "{n:?}");
+    // The defaults are not worth saying.
+    let (_, report) = read_class(
+        maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine",
+            "canOverrunFeature": false, "labelPriority": -1, "featureWeight": 0, "keyNumberMethod": "NoKey",
+            "polygonInternalZonePriorities": {}, "offsetAlongLineProperties": {}, "thinDuplicateLabels": false,
+            "removeDuplicates": "None"})),
+        json!({}),
+    );
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn standard_placements_map_too() {
+    use crate::symbology::LabelPlacement::{self as P, *};
+    let rows: Vec<(serde_json::Value, P)> = vec![
+        (json!({"featureType": "Point", "pointPlacementMethod": "AroundPoint"}), Auto),
+        (json!({"featureType": "Point", "pointPlacementMethod": "NorthEastOfPoint"}), AboveRight),
+        (json!({"featureType": "Point", "pointPlacementMethod": "WestOfPoint"}), Left),
+        (json!({"featureType": "Point", "pointPlacementMethod": "CenteredOnPoint"}), Center),
+        (json!({"featureType": "Line", "lineLabelPosition": {"parallel": true, "above": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"horizontal": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"perpendicular": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"below": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"online": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"inLine": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"parallel": true}, "produceCurvedLabels": true}), Curved),
+        (json!({"featureType": "Line", "lineLabelPosition": {"parallel": false}}), Auto),
+        (json!({"featureType": "Line"}), Auto),
+        (json!({"featureType": "Polygon", "polygonPlacementMethod": "AlwaysHorizontal"}), Center),
+        (json!({"featureType": "Polygon", "polygonPlacementMethod": "MixedStrategy"}), Center),
+        (json!({"featureType": "Polygon", "polygonPlacementMethod": "AlwaysStraight"}), Parallel),
+        // No feature type: the method the block has.
+        (json!({"polygonPlacementMethod": "AlwaysStraight"}), Parallel),
+        (json!({"lineLabelPosition": {"parallel": true}, "produceCurvedLabels": true}), Curved),
+        // A line setting on a point block is none of its business.
+        (json!({"featureType": "Point", "lineLabelPosition": {"parallel": true}}), Auto),
+    ];
+    for (props, want) in rows {
+        let (c, report) = read_class(standard(props.clone()), json!({}));
+        assert_eq!(c.placement, want, "{props}");
+        assert!(report.notes.is_empty(), "{props}: {:?}", notes(&report));
+    }
+    let (c, report) = read_class(standard(json!({"featureType": "Polygon", "polygonPlacementMethod": "Whirl"})), json!({}));
+    assert_eq!(c.placement, Auto);
+    assert_eq!(notes(&report), ["Roads: label placement Whirl, drawn as Auto"]);
+
+    // Maplex wins when both are there.
+    let mut both = standard(json!({"featureType": "Point", "pointPlacementMethod": "NorthOfPoint"}));
+    both["maplexLabelPlacementProperties"] = json!({"featureType": "Point", "pointPlacementMethod": "SouthOfPoint"});
+    let (c, _) = read_class(both, json!({}));
+    assert_eq!(c.placement, crate::symbology::LabelPlacement::Below);
+}
+
+fn background_callout(extra: serde_json::Value) -> serde_json::Value {
+    let mut c = json!({"type": "CIMBackgroundCallout",
+        "backgroundSymbol": polygon_symbol(vec![solid_stroke(rgb(128, 128, 128), 0.5), solid_fill(rgb(255, 255, 255))]),
+        "margin": {"left": 2, "right": 2, "top": 1, "bottom": 1}, "cornerRadius": 1});
+    if let (Some(o), Some(e)) = (c.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    c
+}
+
+#[test]
+fn background_callouts_become_label_backgrounds() {
+    let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 0))]));
+    let (c, report) = read_class(json!({}), json!({"callout": background_callout(json!({})), "haloSize": 1, "haloSymbol": halo.clone()}));
+    let b = c.background.expect("a background");
+    assert_eq!((b.fill, b.stroke), (Some(Rgba::rgb(255, 255, 255)), Some(Rgba::rgb(128, 128, 128))));
+    // Points, as they are.
+    assert!((b.stroke_width - 0.5).abs() < 1e-4, "{}", b.stroke_width);
+    assert_eq!((b.padding, b.radius), ([2.0, 1.0], 1.0));
+    // The background stands where the halo would: the halo is not kept.
+    assert!(!c.halo);
+    assert_eq!((c.halo_color, c.halo_width), (None, None));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // The wider margin of each pair; margins that are missing are 0; huge ones are kept within range.
+    let wide = background_callout(json!({"margin": {"left": 3, "right": 1, "top": 0.5, "bottom": 2}}));
+    let (c, _) = read_class(json!({}), json!({"callout": wide}));
+    assert_eq!(c.background.unwrap().padding, [3.0, 2.0]);
+    let (c, _) = read_class(json!({}), json!({"callout": background_callout(json!({"margin": null, "cornerRadius": null}))}));
+    let b = c.background.unwrap();
+    assert_eq!((b.padding, b.radius), ([0.0, 0.0], 0.0));
+    let huge = background_callout(json!({"margin": {"left": 9999, "top": -4}, "cornerRadius": 1e9}));
+    let (c, _) = read_class(json!({}), json!({"callout": huge}));
+    let b = c.background.unwrap();
+    assert_eq!((b.padding, b.radius), ([50.0, 0.0], 50.0));
+    // A fill alone has no outline.
+    let only_fill = polygon_symbol(vec![solid_fill(rgb(0, 0, 0))]);
+    let (c, _) = read_class(json!({}), json!({"callout": background_callout(json!({"backgroundSymbol": only_fill}))}));
+    let b = c.background.unwrap();
+    assert_eq!((b.fill, b.stroke, b.stroke_width), (Some(Rgba::rgb(0, 0, 0)), None, 0.0));
+
+    // Nothing to draw (no symbol, or one that draws nothing) is no background, and the halo stays.
+    for callout in [
+        json!({"type": "CIMBackgroundCallout", "margin": {"left": 2}}),
+        json!({"type": "CIMBackgroundCallout", "backgroundSymbol": polygon_symbol(vec![])}),
+    ] {
+        let (c, _) = read_class(json!({}), json!({"callout": callout, "haloSize": 1, "haloSymbol": halo.clone()}));
+        assert_eq!(c.background, None);
+        assert!(c.halo);
+        assert_eq!(c.halo_width, Some(1.0));
+    }
+}
+
+#[test]
+fn line_callouts_and_shadows_are_noted() {
+    let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]));
+    let leader = json!({"type": "CIMSimpleLineCallout", "leaderLineSymbol": {"type": "CIMLineSymbol", "symbolLayers": []}});
+    let (c, report) = read_class(json!({}), json!({"callout": leader, "haloSize": 1, "haloSymbol": halo}));
+    assert_eq!(c.background, None);
+    assert!(c.halo, "a leader line leaves the halo");
+    assert_eq!(notes(&report), ["Roads: a leader line, left out"]);
+
+    let composite = json!({"type": "CIMCompositeCallout", "callouts": [{"type": "CIMSimpleLineCallout"}]});
+    let (c, report) = read_class(json!({}), json!({"callout": composite}));
+    assert_eq!(c.background, None);
+    assert_eq!(notes(&report), ["Roads: a leader line, left out"]);
+
+    let (_, report) = read_class(json!({}), json!({"callout": {"type": "CIMFancyCallout"}}));
+    assert_eq!(notes(&report), ["Roads: callouts of type CIMFancyCallout, left out"]);
+
+    // A shadow: a colour that shows, or an offset.
+    let shadow = |extra: serde_json::Value| notes(&read_class(json!({}), extra).1);
+    assert_eq!(shadow(json!({"shadowColor": {"type": "CIMRGBColor", "values": [0, 0, 0, 50]}})), ["Roads: a text shadow, left out"]);
+    assert_eq!(shadow(json!({"shadowX": 1.5})), ["Roads: a text shadow, left out"]);
+    assert_eq!(shadow(json!({"shadowY": -1})), ["Roads: a text shadow, left out"]);
+    assert!(shadow(json!({"shadowColor": {"type": "CIMRGBColor", "values": [0, 0, 0, 0]}, "shadowX": 0, "shadowY": 0})).is_empty());
+    assert!(shadow(json!({})).is_empty());
+}
+
+#[test]
+fn a_hidden_stacking_separator_becomes_the_wrap_character() {
+    let separators = json!([{"separator": " ", "splitAfter": true}, {"separator": ",", "visible": true, "splitAfter": true}]);
+    // On the class, and inside the Maplex block (where Pro writes them).
+    let (c, report) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": separators}}), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some(" "));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    let (c, _) = read_class(maplex(json!({"canStackLabel": true, "labelStackingProperties": {"separators": separators}})), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some(" "));
+
+    // One that stays visible comes first: noted, and the next hidden one is the one.
+    let ordered = json!([{"separator": ",", "visible": true}, {"separator": ";", "visible": false}]);
+    let (c, report) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": ordered}}), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some(";"));
+    assert_eq!(notes(&report), ["Roads: stacking at , keeping it, drawn without"]);
+    // Only visible ones: no wrap character.
+    let visible = json!([{"separator": ",", "visible": true}]);
+    let (c, report) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": visible}}), json!({}));
+    assert_eq!(c.wrap_char, None);
+    assert_eq!(notes(&report), ["Roads: stacking at , keeping it, drawn without"]);
+
+    // No stacking: nothing, nothing noted.
+    for class in [
+        json!({"canStackLabel": false, "labelStackingProperties": {"separators": separators}}),
+        json!({"labelStackingProperties": {"separators": separators}}),
+        json!({"canStackLabel": true}),
+    ] {
+        let (c, report) = read_class(class, json!({}));
+        assert_eq!(c.wrap_char, None);
+        assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    }
+    // An empty separator is no character to break at; a long one is cut; a line break is no character.
+    let odd = json!([{"separator": ""}, {"separator": "\n"}, {"separator": 5}, {"separator": "0123456789"}]);
+    let (c, _) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": odd}}), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some("01234567"));
 }

@@ -1,13 +1,16 @@
-//! The maps and feature layers a `.pagx` template embeds, as the layers a RustGIS project opens.
-//! A `CIMMap` lists its layers by `CIMPATH=…`; each resolves to a `CIMFeatureLayer` whose data
-//! connection names a file (a shapefile, or a table of a file geodatabase) and whose renderer and
-//! label classes become a [`Style`] (the carrier the QGIS importer uses, so the caller applies it
-//! the same way). Every other kind of layer, and every other kind of connection or renderer, is
-//! noted in the [`Report`] and left out, so the map still opens.
+//! The maps a CIM document holds (a `.pagx` template's embedded maps, a `.mapx`'s map, an
+//! `.aprx`'s maps) and the layers of a `.lyrx`, as the layer tree a RustGIS project opens. A
+//! `CIMMap` lists its layers by `CIMPATH=…`; each resolves to a layer or a group of layers. A layer
+//! has a [`LayerSource`] read from its data connection (a file, a feature service, a map, image,
+//! WMS or vector tile service, or one RustGIS can't open, kept with its origin so it comes in
+//! broken), and its renderer and label classes become a [`Style`] (the carrier the QGIS importer
+//! uses, so the caller applies it the same way). What doesn't come across is noted in the
+//! [`Report`], and the map still opens.
 //!
 //! The input is hostile: layers are capped at [`MAX_LAYERS`], classes at [`MAX_CLASSES`] and
 //! label classes (see `labels`), groups are followed to a bounded depth with a bounded amount of work,
-//! and a key that is missing or of another type reads as absent.
+//! and a key that is missing or of another type reads as absent. A connection string's passwords,
+//! tokens and user names never reach an origin or a note (see [`scrub_connection`]).
 
 use std::collections::BTreeMap;
 
@@ -20,12 +23,13 @@ use super::symbol::{self, shown};
 use super::units::pt96;
 use super::{Document, Report, flag, num, str_of, typed};
 use crate::color::{Ramp, Rgba};
+use crate::effects::Blend;
 use crate::fills::FillLayer;
 use crate::qgis::symbol::{hidden as hidden_symbol, stacked};
 use crate::qgis::{QGIS_SCALE, Style};
 use crate::symbology::{ClassMethod, LineStroke, Marker, OTHER_VALUES, Renderer, Symbol};
 
-/// The most layers read from one map.
+/// The most layers read from one map, and the most standalone tables.
 const MAX_LAYERS: usize = 500;
 /// The most classes read from one unique value renderer.
 const MAX_CLASSES: usize = 500;
@@ -33,10 +37,12 @@ const MAX_CLASSES: usize = 500;
 /// group that lists itself, or a tree of groups, ends here.
 const MAX_GROUP_DEPTH: usize = 8;
 const MAX_VISITS: usize = MAX_LAYERS * 8;
+/// How many joins deep a joined table is followed to the table it starts from.
+const MAX_JOIN_DEPTH: usize = 4;
 
 const CLEAR: Rgba = Rgba::new(0, 0, 0, 0);
 
-/// A map of a template: its name, spatial reference, default extent and layers.
+/// A map: its name, spatial reference, default extent, reference scale, layers and tables.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MapImport {
     pub name: String,
@@ -45,23 +51,104 @@ pub struct MapImport {
     /// `defaultExtent` as `[xmin, ymin, xmax, ymax]`, as given (in the units of `wkid`: degrees
     /// for 4326): the caller converts.
     pub extent: Option<[f64; 4]>,
+    /// The scale symbols are drawn at their size (`referenceScale`), in RustGIS's scale (see
+    /// [`QGIS_SCALE`]); `None` when the map has none.
+    pub reference_scale: Option<f64>,
     /// Top first, as CIMMap.layers lists them.
-    pub layers: Vec<LayerImport>,
+    pub entries: Vec<Entry>,
+    /// Its standalone tables, in order.
+    pub tables: Vec<TableImport>,
+}
+
+/// One entry of a map's (or a group's) layer list. (A layer is much larger than a group; a map has
+/// at most a few hundred entries, read once, so they are kept unboxed for the callers' sake.)
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry {
+    Layer(LayerImport),
+    Group(GroupImport),
+}
+
+/// A group of layers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupImport {
+    pub name: String,
+    /// The group's own visibility: a hidden group hides its layers, which keep their own.
+    pub visible: bool,
+    /// Open in the table of contents.
+    pub expanded: bool,
+    /// 0 opaque to 100 invisible.
+    pub transparency: Option<f32>,
+    /// Drawn between these scales (RustGIS's, see [`QGIS_SCALE`]), as a layer's `min_scale` and
+    /// `max_scale`: `None` for no limit.
+    pub min_scale: Option<f64>,
+    pub max_scale: Option<f64>,
+    /// Top first.
+    pub children: Vec<Entry>,
+}
+
+/// What a layer draws, for notes and for the icon of a layer that doesn't open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Features: a feature layer (a file's, a service's, a database's) or KML.
+    Feature,
+    Raster,
+    /// Pictures a service draws: a map, image, WMS or vector tile service.
+    Tiles,
+    /// A table listed among the layers.
+    Table,
+    /// Annotation, dimensions, an elevation surface, a knowledge graph or a kind not known.
+    Other,
+}
+
+/// Where a layer's data is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayerSource {
+    /// A file, or a table of one: a shapefile, a file geodatabase's feature class or raster (a
+    /// feature dataset's too: `table` is the feature class), a raster, a CAD drawing's layer, KML.
+    /// A relative `path` is as Pro wrote it, for the caller to resolve.
+    File { path: String, table: Option<String> },
+    /// A layer (`layer`, its id) of an ArcGIS feature service at `url`.
+    FeatureService { url: String, layer: String },
+    /// An ArcGIS map service (…/MapServer) or image service (…/ImageServer).
+    MapService { url: String },
+    /// A WMS layer: the service at `url` and the first of its layers that shows.
+    Wms { url: String, layer: String },
+    /// A vector tile service (or package).
+    VectorTiles { url: String },
+    /// Data RustGIS can't open (a database, a spreadsheet, a query layer, a kind of layer it doesn't
+    /// draw): the layer comes in broken, with its `origin`.
+    Unopenable,
 }
 
 /// One layer of a map.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerImport {
     pub name: String,
+    /// The layer's own visibility (a group's isn't folded in).
     pub visible: bool,
-    /// The file to open: a shapefile's, or the `.gdb` folder of a file geodatabase. `None` for a
-    /// layer that has no file to open (noted).
-    pub path: Option<String>,
-    /// The feature class of a file geodatabase (`dataset`).
-    pub table: Option<String>,
-    /// Where the layer came from, as `<workspaceFactory> <dataset> in <DATABASE>`.
+    /// Open in the table of contents.
+    pub expanded: bool,
+    pub source: LayerSource,
+    /// Where Pro read it, for people and for `SourceLayer.origin`: "<factory> <dataset> in
+    /// <DATABASE>", "ArcGIS feature service <url> layer <id>", "an SDE geodatabase on <SERVER>,
+    /// database <DATABASE>, table <dataset>" — never a password or user.
     pub origin: String,
     pub style: Style,
+    /// The feature table's definition query, as Pro's SQL: the caller checks it.
+    pub definition_query: Option<String>,
+    /// Whether the layer's symbols take the map's reference scale.
+    pub scale_symbols: bool,
+    pub kind: LayerKind,
+}
+
+/// A standalone table of a map.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableImport {
+    pub name: String,
+    pub source: LayerSource,
+    /// As a layer's [`LayerImport::origin`].
+    pub origin: String,
 }
 
 /// The map `uri` names, and its layers.
@@ -77,19 +164,28 @@ pub fn read_map_def(doc: &Document, map: &Value, report: &mut Report) -> Result<
         ["latestWkid", "wkid"].iter().find_map(|k| s.get(*k).and_then(Value::as_u64).and_then(|w| u32::try_from(w).ok()).filter(|w| *w > 0))
     });
     let extent = map.get("defaultExtent").and_then(|e| Some([num(e, "xmin")?, num(e, "ymin")?, num(e, "xmax")?, num(e, "ymax")?]));
-    let mut reader = Reader { doc, report, map: &name, layers: Vec::new(), visits: 0, capped: false, exhausted: false };
-    reader.list(map, true, 0);
-    let layers = reader.layers;
-    Ok(MapImport { name, wkid, extent, layers })
+    let reference_scale = scale(map, "referenceScale");
+    let mut reader = Reader::new(doc, report, &name);
+    let entries = reader.list(map.get("layers"), 0);
+    let tables = reader.tables(map.get("standaloneTables"));
+    Ok(MapImport { name, wkid, extent, reference_scale, entries, tables })
 }
 
-/// Reads a map's layers, groups flattened in place.
+/// A `.lyrx`'s layers (its `layers` list; groups kept), as a map with no name, projection or extent.
+pub fn read_layers(doc: &Document, uris: &[String], report: &mut Report) -> MapImport {
+    let list = Value::Array(uris.iter().take(MAX_LAYERS + 1).map(|u| Value::String(u.clone())).collect());
+    let entries = Reader::new(doc, report, "").list(Some(&list), 0);
+    MapImport { name: String::new(), wkid: None, extent: None, reference_scale: None, entries, tables: Vec::new() }
+}
+
+/// Reads a map's layer tree.
 struct Reader<'a> {
     doc: &'a Document,
     report: &'a mut Report,
     /// The map's name, for notes about its layer list.
     map: &'a str,
-    layers: Vec<LayerImport>,
+    /// The layers read so far.
+    layers: usize,
     visits: usize,
     /// Whether the notes that the layer cap and the visit budget were reached are made.
     capped: bool,
@@ -97,66 +193,116 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    /// The entries of `parent`'s `layers` (a map's or a group's), shown only where `visible`.
-    fn list(&mut self, parent: &'a Value, visible: bool, depth: usize) {
-        for entry in parent.get("layers").and_then(Value::as_array).into_iter().flatten().take(MAX_LAYERS + 1) {
-            self.layer(entry, visible, depth);
-        }
+    fn new(doc: &'a Document, report: &'a mut Report, map: &'a str) -> Self {
+        Reader { doc, report, map, layers: 0, visits: 0, capped: false, exhausted: false }
     }
 
-    /// One entry: a `CIMPATH=…` that resolves to a layer, or a layer written out.
-    fn layer(&mut self, entry: &'a Value, visible: bool, depth: usize) {
+    /// The entries of a `layers` list (a map's or a group's), `depth` groups down.
+    fn list(&mut self, list: Option<&Value>, depth: usize) -> Vec<Entry> {
+        let mut out = Vec::new();
+        for entry in list.and_then(Value::as_array).into_iter().flatten().take(MAX_LAYERS + 1) {
+            if let Some(e) = self.entry(entry, depth) {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    /// One entry: a `CIMPATH=…` that resolves to a layer or group, or one written out.
+    fn entry(&mut self, entry: &Value, depth: usize) -> Option<Entry> {
         self.visits += 1;
-        if self.layers.len() >= MAX_LAYERS {
+        if self.layers >= MAX_LAYERS {
             if !std::mem::replace(&mut self.capped, true) {
                 self.report.skipped(self.map, format!("layers past the first {MAX_LAYERS}"));
             }
-            return;
+            return None;
         }
         if self.visits > MAX_VISITS {
             if !std::mem::replace(&mut self.exhausted, true) {
                 self.report.skipped(self.map, "more layers and groups than can be followed");
             }
-            return;
+            return None;
         }
-        let (def, uri) = match entry {
-            Value::String(uri) => (self.doc.resolve(uri), Some(uri.as_str())),
-            Value::Object(_) => (Some(entry), None),
-            _ => return,
-        };
+        let (def, uri) = definition(self.doc, entry)?;
         let Some(def) = def else {
-            let name = uri.map(stem).unwrap_or_default();
-            self.report.skipped(&name, format!("the layer {} isn't defined in this document, left out", shown(uri.unwrap_or_default())));
-            self.layers.push(unread(name, visible, uri.unwrap_or_default().to_string()));
-            return;
+            let uri = uri.unwrap_or_default();
+            let name = stem(uri);
+            self.report.skipped(&name, format!("the layer {} isn't defined in this document, left out", shown(uri)));
+            self.layers += 1;
+            return Some(Entry::Layer(unread(name, uri.to_string())));
         };
         let name = str_of(def, "name").map(str::to_string).or_else(|| uri.map(stem)).unwrap_or_else(|| "Layer".into());
-        let visible = visible && flag(def, "visibility", true);
-        match str_of(def, "type") {
-            Some("CIMFeatureLayer") => {
-                let layer = feature_layer(def, name, visible, self.report);
-                self.layers.push(layer);
+        if str_of(def, "type") == Some("CIMGroupLayer") {
+            if depth >= MAX_GROUP_DEPTH {
+                self.report.skipped(&name, format!("groups inside groups past {MAX_GROUP_DEPTH} levels"));
+                return None;
             }
-            Some("CIMGroupLayer") => {
-                self.report.approximated(&name, format!("group {}, its layers listed one by one", shown(&name)));
-                if depth >= MAX_GROUP_DEPTH {
-                    self.report.skipped(&name, format!("groups inside groups past {MAX_GROUP_DEPTH} levels"));
-                } else {
-                    self.list(def, visible, depth + 1);
-                }
-            }
-            other => {
-                let ty = other.unwrap_or_default();
-                self.report.skipped(&name, format!("{} layers, left out", shown(ty)));
-                self.layers.push(unread(name, visible, ty.to_string()));
-            }
+            let children = self.list(def.get("layers"), depth + 1);
+            return Some(Entry::Group(GroupImport {
+                visible: flag(def, "visibility", true),
+                expanded: flag(def, "expanded", false),
+                transparency: transparency(def),
+                min_scale: scale(def, "minScale"),
+                max_scale: scale(def, "maxScale"),
+                children,
+                name,
+            }));
         }
+        self.layers += 1;
+        Some(Entry::Layer(layer(def, name, self.report)))
+    }
+
+    /// The standalone tables a map lists, at most [`MAX_LAYERS`].
+    fn tables(&mut self, list: Option<&Value>) -> Vec<TableImport> {
+        let list = list.and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        if list.len() > MAX_LAYERS {
+            self.report.skipped(self.map, format!("tables past the first {MAX_LAYERS}"));
+        }
+        let mut out = Vec::new();
+        for entry in list.iter().take(MAX_LAYERS) {
+            let Some((def, uri)) = definition(self.doc, entry) else { continue };
+            let Some(def) = def else {
+                let uri = uri.unwrap_or_default();
+                self.report.skipped(&stem(uri), format!("the table {} isn't defined in this document, left out", shown(uri)));
+                continue;
+            };
+            let name = str_of(def, "name").map(str::to_string).or_else(|| uri.map(stem)).unwrap_or_else(|| "Table".into());
+            let (source, origin) = match data_connection(def) {
+                Some(c) => source_of(c, def, &name, self.report),
+                None => {
+                    self.report.skipped(&name, "a table with no data connection, nothing to open");
+                    (LayerSource::Unopenable, String::new())
+                }
+            };
+            out.push(TableImport { name, source, origin });
+        }
+        out
     }
 }
 
-/// A layer that has nothing to open.
-fn unread(name: String, visible: bool, origin: String) -> LayerImport {
-    LayerImport { name, visible, path: None, table: None, origin, style: Style::default() }
+/// A list entry's definition and `CIMPATH=…`: a path resolves in `doc` (to `None` when it doesn't),
+/// an object is its own definition. `None` for anything else.
+fn definition<'v>(doc: &'v Document, entry: &'v Value) -> Option<(Option<&'v Value>, Option<&'v str>)> {
+    match entry {
+        Value::String(uri) => Some((doc.resolve(uri), Some(uri.as_str()))),
+        Value::Object(_) => Some((Some(entry), None)),
+        _ => None,
+    }
+}
+
+/// A layer that isn't there to read.
+fn unread(name: String, origin: String) -> LayerImport {
+    LayerImport {
+        name,
+        visible: true,
+        expanded: false,
+        source: LayerSource::Unopenable,
+        origin,
+        style: Style::default(),
+        definition_query: None,
+        scale_symbols: true,
+        kind: LayerKind::Other,
+    }
 }
 
 /// The last part of a `CIMPATH=…`, without `.json`: what a layer is called when it has no name.
@@ -166,69 +312,303 @@ fn stem(uri: &str) -> String {
     last.get(..last.len() - if lower.ends_with(".json") { 5 } else { 0 }).unwrap_or(last).to_string()
 }
 
-// ---- a feature layer --------------------------------------------------------------------------
+/// A scale at `k` in RustGIS's scale; `None` when missing or 0 (no limit). Pro works its scales
+/// out at 96 dpi as QGIS does, so they take the same factor to RustGIS's 0.28 mm pixels.
+fn scale(v: &Value, k: &str) -> Option<f64> {
+    num(v, k).filter(|s| *s > 0.0).map(|s| s * QGIS_SCALE)
+}
 
-fn feature_layer(def: &Value, name: String, visible: bool, report: &mut Report) -> LayerImport {
-    let table = def.get("featureTable");
-    let (path, table_name, origin) = match table.and_then(|t| t.get("dataConnection")) {
-        Some(c) => connection(c, &name, report),
-        None => {
+/// `transparency`, 0 opaque to 100 invisible.
+fn transparency(v: &Value) -> Option<f32> {
+    num(v, "transparency").map(|t| (t as f32).clamp(0.0, 100.0))
+}
+
+// ---- a layer ----------------------------------------------------------------------------------
+
+/// A layer's data connection: its feature table's, else its own, else its service's.
+fn data_connection(def: &Value) -> Option<&Value> {
+    let table = def.get("featureTable").and_then(|t| t.get("dataConnection"));
+    [table, def.get("dataConnection"), def.get("serviceConnection")].into_iter().flatten().find(|c| c.is_object())
+}
+
+/// A layer (anything but a group) of type `def.type`.
+fn layer(def: &Value, name: String, report: &mut Report) -> LayerImport {
+    let ty = str_of(def, "type").unwrap_or_default();
+    let kind = match ty {
+        "CIMFeatureLayer" | "CIMKMLLayer" => Some(LayerKind::Feature),
+        "CIMRasterLayer" => Some(LayerKind::Raster),
+        "CIMTiledServiceLayer" | "CIMImageServiceLayer" | "CIMWMSLayer" | "CIMVectorTileLayer" => Some(LayerKind::Tiles),
+        "CIMStandaloneTable" => Some(LayerKind::Table),
+        _ => None,
+    };
+    let connection = data_connection(def);
+    let (source, origin) = match (kind, connection) {
+        (Some(_), Some(c)) => source_of(c, def, &name, report),
+        (Some(_), None) => {
             report.skipped(&name, "a layer with no data connection, nothing to open");
-            (None, None, String::new())
+            (LayerSource::Unopenable, String::new())
+        }
+        (None, c) => {
+            report.skipped(&name, format!("{} layers, which RustGIS doesn't draw", shown(ty)));
+            // Where it was, for people; what reading the connection notes is beside the point.
+            let origin = c.map(|c| source_of(c, def, &name, &mut Report::default()).1).unwrap_or_else(|| shown(ty));
+            (LayerSource::Unopenable, origin)
         }
     };
-    if let Some(q) = table.and_then(|t| str_of(t, "definitionExpression")).map(str::trim).filter(|q| !q.is_empty()) {
-        report.skipped(&name, format!("its definition query {}, drawn without it", shown(q)));
-    }
 
-    let mut style = Style { transparency: num(def, "transparency").map(|t| (t as f32).clamp(0.0, 100.0)), ..Style::default() };
+    let mut style = Style { transparency: transparency(def), blend: blend(def, &name, report), ..Style::default() };
     // Pro's minScale is the out-beyond limit, as RustGIS's min_scale is; a missing or 0 limit
-    // clears it (as the QGIS reader does). Pro works its scales out at 96 dpi as QGIS does, so
-    // they take the same factor to RustGIS's 0.28 mm pixels.
+    // clears it (as the QGIS reader does).
     if def.get("minScale").is_some() || def.get("maxScale").is_some() {
-        let scale = |k: &str| num(def, k).filter(|s| *s > 0.0).map(|s| s * QGIS_SCALE);
-        style.min_scale = Some(scale("minScale"));
-        style.max_scale = Some(scale("maxScale"));
+        style.min_scale = Some(scale(def, "minScale"));
+        style.max_scale = Some(scale(def, "maxScale"));
     }
     if let Some(r) = def.get("renderer") {
         renderer(r, &name, &mut style, report);
     }
     style.labels = labels(def, &name, report);
-    LayerImport { name, visible, path, table: table_name, origin, style }
+    unsupported_properties(def, &name, report);
+    let definition_query = def
+        .get("featureTable")
+        .and_then(|t| str_of(t, "definitionExpression"))
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_string);
+    LayerImport {
+        visible: flag(def, "visibility", true),
+        expanded: flag(def, "expanded", false),
+        scale_symbols: flag(def, "scaleSymbols", true),
+        kind: kind.unwrap_or(LayerKind::Other),
+        name,
+        source,
+        origin,
+        style,
+        definition_query,
+    }
 }
 
-/// The file a standard data connection names: `(path, table, origin)`.
-fn connection(c: &Value, what: &str, report: &mut Report) -> (Option<String>, Option<String>, String) {
-    let ty = str_of(c, "type").unwrap_or_default();
-    if ty != "CIMStandardDataConnection" {
-        report.skipped(what, format!("data connections of type {}, no file to open", shown(ty)));
-        return (None, None, ty.to_string());
+/// A layer's `blendingMode` as a blend; another mode is noted and drawn normally.
+fn blend(def: &Value, what: &str, report: &mut Report) -> Option<Blend> {
+    Some(match str_of(def, "blendingMode")? {
+        "Alpha" | "Normal" => Blend::Normal,
+        "Multiply" => Blend::Multiply,
+        "Screen" => Blend::Screen,
+        "Overlay" => Blend::Overlay,
+        "Darken" => Blend::Darken,
+        "Lighten" => Blend::Lighten,
+        "Difference" => Blend::Difference,
+        other => {
+            report.approximated(what, format!("its blending mode {}, drawn as normal", shown(other)));
+            return None;
+        }
+    })
+}
+
+/// Notes, once each, the layer properties RustGIS has no counterpart for.
+fn unsupported_properties(def: &Value, what: &str, report: &mut Report) {
+    if flag(def, "enableDisplayFilters", false) && set(def.get("displayFilters")) {
+        report.skipped(what, "display filters, every feature drawn at every scale");
     }
-    let factory = str_of(c, "workspaceFactory").unwrap_or_default();
-    let dataset = str_of(c, "dataset").map(str::trim).unwrap_or_default();
-    let database = connection_value(str_of(c, "workspaceConnectionString").unwrap_or_default(), "DATABASE").unwrap_or_default();
-    let origin = format!("{factory} {dataset} in {database}");
-    if database.is_empty() || dataset.is_empty() {
+    if set(def.get("layerMasks")) {
+        report.skipped(what, "layer masks, drawn without them");
+    }
+    if set(def.get("featureReduction")) {
+        report.skipped(what, "feature reduction (clusters or bins), every feature drawn");
+    }
+    if def.get("symbolLayerDrawing").is_some_and(|d| flag(d, "useSymbolLayerDrawing", false)) {
+        report.approximated(what, "symbol layer drawing, each feature drawn whole in turn");
+    }
+    if set(def.get("charts")) {
+        report.skipped(what, "charts, left out");
+    }
+    if set(def.get("popupInfo")) {
+        report.skipped(what, "its pop-up, left out");
+    }
+    if set(def.get("timeFilter")) {
+        report.skipped(what, "its time filter, every feature drawn");
+    }
+    if set(def.get("selectionSymbol")) {
+        report.approximated(what, "its selection symbol, selections drawn as RustGIS draws them");
+    }
+}
+
+/// Whether a property is there to say something: not missing, null, false or empty, and not an
+/// object that says it is off (`"enabled": false`).
+fn set(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(o @ Value::Object(m)) => !m.is_empty() && flag(o, "enabled", true),
+        Some(_) => true,
+    }
+}
+
+// ---- sources ----------------------------------------------------------------------------------
+
+/// The workspace factories whose data is a file (or a table of one) RustGIS may open.
+const FILE_FACTORIES: [&str; 4] = ["Shapefile", "FileGDB", "Raster", "Cad"];
+
+/// The source a data connection `c` names, and where it is for people. `owner` is the layer or
+/// table it belongs to (a WMS layer lists its sublayers there); `what` names it in notes.
+fn source_of(c: &Value, owner: &Value, what: &str, report: &mut Report) -> (LayerSource, String) {
+    source_at(c, owner, what, report, 0)
+}
+
+fn source_at(c: &Value, owner: &Value, what: &str, report: &mut Report, joins: usize) -> (LayerSource, String) {
+    let ty = str_of(c, "type").unwrap_or_default();
+    match ty {
+        "CIMStandardDataConnection" | "CIMFeatureDatasetDataConnection" => workspace(c, what, report),
+        "CIMSqlQueryDataConnection" => {
+            let conn = scrub_connection(str_of(c, "workspaceConnectionString").unwrap_or_default());
+            let factory = str_of(c, "workspaceFactory").map(str::trim).unwrap_or_default();
+            let place = if factory.eq_ignore_ascii_case("SDE") {
+                sde_place(&conn)
+            } else {
+                format!("{factory} {}", connection_value(&conn, "DATABASE").unwrap_or_default())
+            };
+            report.skipped(what, "SQL query layers, which RustGIS can't open");
+            (LayerSource::Unopenable, format!("SQL query {} on {place}", dataset_of(c)))
+        }
+        "CIMRelQueryTableDataConnection" => {
+            let Some(source) = c.get("sourceTable").filter(|s| s.is_object() && joins < MAX_JOIN_DEPTH) else {
+                report.skipped(what, "a join whose table can't be read, nothing to open");
+                return (LayerSource::Unopenable, String::new());
+            };
+            let joined = c.get("destinationTable").map(dataset_of).unwrap_or_default();
+            report.approximated(what, format!("a join to {}, drawn without it", shown(joined)));
+            source_at(source, owner, what, report, joins + 1)
+        }
+        "CIMKMLDataConnection" => match str_of(c, "uRI").map(str::trim).filter(|u| !u.is_empty()) {
+            Some(path) => (LayerSource::File { path: path.to_string(), table: None }, format!("KML {path}")),
+            None => {
+                report.skipped(what, "a KML connection with no file, nothing to open");
+                (LayerSource::Unopenable, String::new())
+            }
+        },
+        "CIMAGSServiceConnection" => {
+            let named = || {
+                let server = c.get("serverConnection").and_then(|s| str_of(s, "url"))?.trim().trim_end_matches('/');
+                let name = str_of(c, "objectName")?.trim();
+                Some(format!("{server}/{name}/{}", str_of(c, "objectType").unwrap_or("MapServer").trim()))
+            };
+            let Some(url) = str_of(c, "url").map(str::trim).filter(|u| !u.is_empty()).map(str::to_string).or_else(named) else {
+                report.skipped(what, "an ArcGIS service connection with no address, nothing to open");
+                return (LayerSource::Unopenable, String::new());
+            };
+            let url = scrub_url(&url);
+            let image = str_of(c, "objectType") == Some("ImageServer") || url.to_ascii_lowercase().ends_with("/imageserver");
+            let origin = format!("ArcGIS {} service {url}", if image { "image" } else { "map" });
+            (LayerSource::MapService { url }, origin)
+        }
+        "CIMWMSServiceConnection" => {
+            let url =
+                c.get("serverConnection").and_then(|s| str_of(s, "url")).or_else(|| str_of(c, "url")).map(str::trim).unwrap_or_default();
+            if url.is_empty() {
+                report.skipped(what, "a WMS connection with no address, nothing to open");
+                return (LayerSource::Unopenable, String::new());
+            }
+            let url = scrub_url(url);
+            let subs = owner.get("subLayers").and_then(Value::as_array).into_iter().flatten().take(MAX_LAYERS);
+            let layer = subs.filter(|s| flag(s, "visibility", true)).find_map(|s| str_of(s, "name")).unwrap_or_default().to_string();
+            let origin = format!("WMS {url} layer {}", shown(&layer));
+            (LayerSource::Wms { url, layer }, origin)
+        }
+        "CIMVectorTileDataConnection" => match str_of(c, "uRI").map(str::trim).filter(|u| !u.is_empty()) {
+            Some(url) => {
+                let url = scrub_url(url);
+                let origin = format!("vector tiles {url}");
+                (LayerSource::VectorTiles { url }, origin)
+            }
+            None => {
+                report.skipped(what, "a vector tile connection with no address, nothing to open");
+                (LayerSource::Unopenable, String::new())
+            }
+        },
+        other => {
+            report.skipped(what, format!("data connections of type {}, which RustGIS can't open", shown(other)));
+            (LayerSource::Unopenable, shown(other))
+        }
+    }
+}
+
+/// A connection's `dataset`, trimmed.
+fn dataset_of(c: &Value) -> &str {
+    str_of(c, "dataset").map(str::trim).unwrap_or_default()
+}
+
+/// The source of a workspace connection (a standard one, or a feature dataset's).
+fn workspace(c: &Value, what: &str, report: &mut Report) -> (LayerSource, String) {
+    let factory = str_of(c, "workspaceFactory").map(str::trim).unwrap_or_default();
+    let conn = scrub_connection(str_of(c, "workspaceConnectionString").unwrap_or_default());
+    let dataset = dataset_of(c);
+    if factory.eq_ignore_ascii_case("FeatureService") {
+        let url = connection_value(&conn, "URL").map(|u| scrub_url(&u)).unwrap_or_default();
+        let origin = format!("ArcGIS feature service {url} layer {dataset}");
+        if url.is_empty() || dataset.is_empty() {
+            report.skipped(what, "a feature service connection with no address or no layer, nothing to open");
+            return (LayerSource::Unopenable, origin);
+        }
+        return (LayerSource::FeatureService { url, layer: dataset.to_string() }, origin);
+    }
+    if factory.eq_ignore_ascii_case("SDE") {
+        report.skipped(what, "data in SDE workspaces, which RustGIS can't open");
+        return (LayerSource::Unopenable, format!("{}, table {dataset}", sde_place(&conn)));
+    }
+    // A CAD drawing is the feature dataset; its layer is the dataset (Pro may write it as
+    // `drawing.dwg:Polyline`).
+    let cad = factory.eq_ignore_ascii_case("Cad");
+    let feature_dataset = str_of(c, "featureDataset").map(str::trim).unwrap_or_default();
+    let (file, table) = match (cad, dataset.split_once(':')) {
+        (true, Some((file, table))) => (file.trim(), Some(table.trim())),
+        (true, None) if !feature_dataset.is_empty() => (feature_dataset, Some(dataset)),
+        _ => (dataset, None),
+    };
+    let database = connection_value(&conn, "DATABASE").unwrap_or_default();
+    let shown_dataset = match table {
+        Some(t) if cad => format!("{file}:{t}"),
+        _ => dataset.to_string(),
+    };
+    let origin = format!("{factory} {shown_dataset} in {database}");
+    if !FILE_FACTORIES.iter().any(|f| f.eq_ignore_ascii_case(factory)) {
+        report.skipped(what, format!("data in {} workspaces, which RustGIS can't open", shown(factory)));
+        return (LayerSource::Unopenable, origin);
+    }
+    if database.is_empty() || file.is_empty() || table.is_some_and(str::is_empty) {
         report.skipped(what, format!("a {} connection with no folder or no dataset, nothing to open", shown(factory)));
-        return (None, None, origin);
+        return (LayerSource::Unopenable, origin);
     }
     // A dataset is a name inside the folder, never a path out of it.
-    if dataset.contains(['/', '\\']) || dataset.contains("..") {
-        report.skipped(what, format!("a dataset named {}, which isn't a plain name, nothing to open", shown(dataset)));
-        return (None, None, origin);
+    if [file, table.unwrap_or_default()].iter().any(|d| d.contains(['/', '\\']) || d.contains("..")) {
+        report.skipped(what, format!("a dataset named {}, which isn't a plain name, nothing to open", shown(&shown_dataset)));
+        return (LayerSource::Unopenable, origin);
     }
-    if factory.eq_ignore_ascii_case("Shapefile") {
-        let folder = database.trim_end_matches(['/', '\\']);
-        let sep = if folder.contains('\\') { '\\' } else { '/' };
-        // (Pro writes a shapefile's dataset with its .shp; one without is the shapefile's name.)
-        let file = if dataset.contains('.') { dataset.to_string() } else { format!("{dataset}.shp") };
-        (Some(format!("{folder}{sep}{file}")), None, origin)
-    } else if factory.eq_ignore_ascii_case("FileGDB") {
-        (Some(database), Some(dataset.to_string()), origin)
+    let source = if factory.eq_ignore_ascii_case("FileGDB") {
+        LayerSource::File { path: database, table: Some(file.to_string()) }
     } else {
-        report.skipped(what, format!("data in {} workspaces, no file to open", shown(factory)));
-        (None, None, origin)
+        // Pro writes a shapefile's dataset with its .shp; one without is the shapefile's name.
+        let shp = factory.eq_ignore_ascii_case("Shapefile") && !file.contains('.');
+        let file = if shp { format!("{file}.shp") } else { file.to_string() };
+        LayerSource::File { path: joined(&database, &file), table: table.map(str::to_string) }
+    };
+    (source, origin)
+}
+
+/// `file` in `folder`, with the folder's own separator.
+fn joined(folder: &str, file: &str) -> String {
+    let folder = folder.trim_end_matches(['/', '\\']);
+    let sep = if folder.contains('\\') { '\\' } else { '/' };
+    format!("{folder}{sep}{file}")
+}
+
+/// An SDE connection's place, for people: "an SDE geodatabase on <SERVER>, database <DATABASE>".
+fn sde_place(conn: &str) -> String {
+    let server = ["SERVER", "DB_CONNECTION_PROPERTIES", "INSTANCE"].iter().find_map(|k| connection_value(conn, k));
+    let mut place = format!("an SDE geodatabase on {}", server.as_deref().unwrap_or("a server not named"));
+    if let Some(db) = connection_value(conn, "DATABASE") {
+        place.push_str(&format!(", database {db}"));
     }
+    place
 }
 
 /// The value of `key` (in any case) in a `KEY=VALUE;KEY=VALUE` connection string.
@@ -238,6 +618,39 @@ fn connection_value(s: &str, key: &str) -> Option<String> {
         .find(|(k, _)| k.trim().eq_ignore_ascii_case(key))
         .map(|(_, v)| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// A connection string's `KEY=VALUE` pairs without the ones that sign in: `PASSWORD`,
+/// `ENCRYPTED_PASSWORD…`, `TOKEN` and `USER` (in any case). A part that isn't `KEY=VALUE` (the
+/// rest of a value with a `;` in it) is left out too.
+pub(crate) fn scrub_connection(s: &str) -> String {
+    let secret = |key: &str| {
+        let key = key.trim().to_ascii_uppercase();
+        key.starts_with("ENCRYPTED_PASSWORD") || ["PASSWORD", "TOKEN", "USER"].contains(&key.as_str())
+    };
+    let pairs = s.split(';').filter(|pair| pair.split_once('=').is_some_and(|(k, _)| !k.trim().is_empty() && !secret(k)));
+    pairs.map(str::trim).collect::<Vec<_>>().join(";")
+}
+
+/// A service address without a user and password before its host or a `token` in its query.
+fn scrub_url(url: &str) -> String {
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let (host, path) = rest.split_once('/').map_or((rest, None), |(h, p)| (h, Some(p)));
+            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+            match path {
+                Some(p) => format!("{scheme}://{host}/{p}"),
+                None => format!("{scheme}://{host}"),
+            }
+        }
+        None => base.to_string(),
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.split_once('=').map_or(*p, |(k, _)| k).trim().eq_ignore_ascii_case("token"))
+        .collect();
+    if kept.is_empty() { base } else { format!("{base}?{}", kept.join("&")) }
 }
 
 // ---- renderers --------------------------------------------------------------------------------

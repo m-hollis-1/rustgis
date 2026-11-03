@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 
 use rustgis_geom::{Coord, Extent, merc_to_lonlat};
-use rustgis_map::cim::{self, DocKind, Document, LayoutImport, MapImport, PictureSource, Report};
+use rustgis_map::cim::{
+    self, DocKind, Document, Entry, LayerImport, LayerKind, LayerSource, LayoutImport, MapImport, PictureSource, Report,
+};
 use rustgis_map::layout::{ElementKind, MAX_FRAME_SCALE, MIN_FRAME_SCALE};
 use rustgis_map::qgis::NoteKind;
 use rustgis_map::symbology::{ImageRef, Marker};
@@ -247,14 +249,43 @@ fn absolute(path: &str) -> String {
     if cfg!(windows) { p.to_lowercase() } else { p }
 }
 
+/// A feature layer of a map on a file, as the layout path adds it.
+struct FileLayer<'a> {
+    layer: &'a LayerImport,
+    path: &'a str,
+    table: Option<&'a str>,
+    /// Shown: its own visibility and that of every group it is in.
+    visible: bool,
+}
+
+/// `m`'s feature layers on files, top first, its groups opened up in place. (The layout path adds
+/// these alone, as it did before maps kept their groups.)
+fn file_layers(m: &MapImport) -> Vec<FileLayer<'_>> {
+    fn walk<'a>(entries: &'a [Entry], shown: bool, out: &mut Vec<FileLayer<'a>>) {
+        for e in entries {
+            match e {
+                Entry::Group(g) => walk(&g.children, shown && g.visible, out),
+                Entry::Layer(l) => {
+                    if let (LayerKind::Feature, LayerSource::File { path, table }) = (l.kind, &l.source) {
+                        out.push(FileLayer { layer: l, path, table: table.as_deref(), visible: shown && l.visible });
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&m.entries, true, &mut out);
+    out
+}
+
 /// The files of `m`'s layers that are there to open, top first: a path and a table. (A file that
 /// isn't there is left out of the map, so it is left out of the comparison too.)
 fn layer_files(m: &MapImport, dir: Option<&str>) -> Vec<(String, Option<String>)> {
-    m.layers
-        .iter()
+    file_layers(m)
+        .into_iter()
         .filter_map(|l| {
-            let path = local_path(l.path.as_deref()?, dir).ok()?;
-            std::path::Path::new(&path).exists().then(|| (absolute(&path), l.table.clone()))
+            let path = local_path(l.path, dir).ok()?;
+            std::path::Path::new(&path).exists().then(|| (absolute(&path), l.table.map(str::to_string)))
         })
         .collect()
 }
@@ -313,8 +344,7 @@ fn add_map(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Repor
         }
     }
     // Bottom first, so each is added on top of the ones below it.
-    for layer in m.layers.iter().rev() {
-        let Some(path) = layer.path.as_deref() else { continue };
+    for FileLayer { layer, path, table, visible } in file_layers(m).into_iter().rev() {
         let path = match local_path(path, dir) {
             Ok(p) => p,
             Err(e) => {
@@ -323,7 +353,7 @@ fn add_map(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Repor
             }
         };
         let mut q = json!({"path": path, "name": layer.name});
-        if let Some(t) = &layer.table {
+        if let Some(t) = table {
             q["layer"] = json!(t);
         }
         let opened = s.run_part("layer.addData", &q);
@@ -335,7 +365,7 @@ fn add_map(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Repor
             }
         };
         let Some(l) = id.and_then(|id| s.map_mut().layer_mut(id)) else { continue };
-        l.visible = layer.visible;
+        l.visible = visible;
         layer.style.apply(l);
         qgis::check_fields(l, &layer.name, report);
     }

@@ -29,7 +29,7 @@ use serde_json::Value;
 
 pub use crate::qgis::{Note, NoteKind, Report};
 pub use layout::{FrameBinding, LayoutImport, PictureSource, read_layout, read_layout_def};
-pub use map::{LayerImport, MapImport, read_map, read_map_def};
+pub use map::{Entry, GroupImport, LayerImport, LayerKind, LayerSource, MapImport, TableImport, read_layers, read_map, read_map_def};
 pub use symbol::base64_text;
 
 /// The most JSON text a document (or all of a project's entries together) is read from.
@@ -45,7 +45,7 @@ const PICTURE_EXTENSIONS: [&str; 5] = [".png", ".jpg", ".jpeg", ".gif", ".bmp"];
 pub const MAX_ITEMS: usize = 1000;
 
 /// The lists of a document's root that hold definitions with a `uRI` to resolve.
-const DEFINITION_LISTS: [&str; 3] = ["mapDefinitions", "layerDefinitions", "elevationSurfaceLayerDefinitions"];
+const DEFINITION_LISTS: [&str; 4] = ["mapDefinitions", "layerDefinitions", "elevationSurfaceLayerDefinitions", "tableDefinitions"];
 /// The list of a document's root that holds its binaries (pictures, fonts).
 const BINARIES: &str = "binaryReferences";
 /// The prefix of a path to a definition inside the document or project.

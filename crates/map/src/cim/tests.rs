@@ -3053,6 +3053,18 @@ fn arcade_concatenations_become_templates() {
     assert_eq!(translated(" return $feature.A; ", "Arcade"), exact("A", &["A"]));
     assert_eq!(translated("RETURN \"x\" + $feature.A;", "Arcade"), exact("x{A}", &["A"]));
     assert_eq!(translated("StreetName", "Arcade"), exact("StreetName", &["StreetName"]));
+    // A bare dotted name and a dotted `$feature.` name are fields of a join.
+    let t = expr::template("BM_Parcel.StreetName", "Arcade").unwrap();
+    assert_eq!((t.template.as_str(), t.exact), ("StreetName", true));
+    assert_eq!(t.joins, [("BM_Parcel.StreetName".to_string(), "StreetName".to_string())]);
+    assert_eq!(translated("$feature.T.Name", "Arcade"), exact("Name", &["Name"]));
+    assert_eq!(translated("$feature.T.Name + \" \" + $feature.A", "Arcade"), exact("{Name} {A}", &["Name", "A"]));
+    // A quoted name can hold any character but its quote: alone it is the field; in a template
+    // only a plain name fits a placeholder, so the expression falls back to its first field.
+    assert_eq!(translated("$feature[\"Lot Number\"]", "Arcade"), exact("Lot Number", &["Lot Number"]));
+    assert_eq!(translated("$feature['A-B']", "Arcade"), exact("A-B", &["A-B"]));
+    assert_eq!(translated("\"Lot \" + $feature[\"Lot Number\"]", "Arcade"), inexact("Lot Number"));
+    assert_eq!(translated("$feature.A + \" \" + $feature['A-B']", "Arcade"), inexact("A"));
     // Newlines, each field once in order, escapes and a literal holding a `+`.
     assert_eq!(
         translated("$feature.A + TextFormatting.NewLine + $feature.B + \"\\r\\n\" + $feature.A", "Arcade"),
@@ -3135,14 +3147,23 @@ fn hostile_expressions_are_bounded() {
         format!("\"{}\" + $feature.A", "{".repeat(100_000)),
         "\"\\".repeat(50_000),
         "chr(".repeat(25_000),
+        // Thousands of different field names.
+        (0..8_000).map(|i| format!("$feature.f{i}")).collect::<Vec<_>>().join(" + "),
+        (0..8_000).map(|i| format!("[f{i}]")).collect::<Vec<_>>().join("&"),
     ];
     for e in &expressions {
         for engine in ["Arcade", "VBScript", "Python", "JScript"] {
-            let start = std::time::Instant::now();
-            let t = expr::template(e, engine);
-            let took = start.elapsed();
+            // The best of five runs, so a busy machine doesn't fail it.
+            let took = (0..5)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(expr::template(e, engine));
+                    start.elapsed()
+                })
+                .min()
+                .unwrap();
             assert!(took.as_millis() < 20, "{} chars took {took:?}", e.len());
-            if let Some(t) = t {
+            if let Some(t) = expr::template(e, engine) {
                 assert!(t.template.chars().count() <= crate::symbology::MAX_TEMPLATE);
                 assert!(!t.fields.is_empty());
             }
@@ -3150,6 +3171,14 @@ fn hostile_expressions_are_bounded() {
     }
     // Too long a template falls back to the first field.
     assert_eq!(translated(&format!("$feature.A + \"{long}\""), "Arcade"), inexact("A"));
+    let many = (0..8_000).map(|i| format!("$feature.f{i}")).collect::<Vec<_>>().join(" + ");
+    assert_eq!(translated(&many, "Arcade"), inexact("f0"));
+    // No field's name is longer than a template can be.
+    let name = "N".repeat(2_000);
+    assert_eq!(translated(&name, "Arcade"), None);
+    assert_eq!(translated(&format!("[{name}]"), "VBScript"), None);
+    assert_eq!(translated(&format!("\"a\" + [{name}]"), "VBScript"), None);
+    assert_eq!(translated(&format!("Upper($feature.{name})"), "Arcade"), None);
 }
 
 #[test]

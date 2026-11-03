@@ -30,18 +30,34 @@ pub(crate) struct Translated {
 /// `&`) and newlines; else the first field referenced (`exact: false`), or `None` when none.
 pub(crate) fn template(expression: &str, engine: &str) -> Option<Translated> {
     let e = body(expression);
-    if is_name(e) {
-        return Some(Translated::field(e, e, true));
+    // A bare name (a join's `T.Name` too) when the whole expression is one.
+    if name_in(e, true).is_some_and(|(_, rest)| rest.is_empty()) && newline(e).is_none() {
+        return Translated::field(e, true);
     }
     let vbscript = engine.trim().eq_ignore_ascii_case("VBScript");
     let Some((pieces, tags_dropped)) = scan(e, vbscript) else {
-        let written = first_reference(e)?;
-        return Some(Translated::field(written, read_as(written), false));
+        return Translated::field(first_reference(e)?, false);
     };
-    let mut fields: Vec<String> = Vec::new();
-    let mut joins: Vec<(String, String)> = Vec::new();
-    let mut text = String::new();
+    let first = pieces.iter().find_map(|p| match p {
+        Piece::Field(written) => Some(*written),
+        Piece::Text(_) => None,
+    })?;
+    // One field alone is a plain field name.
+    if let [Piece::Field(written)] = pieces.as_slice() {
+        return Translated::field(written, true);
+    }
+    // A placeholder only carries a plain name (a quoted one can hold anything).
+    if pieces.iter().any(|p| matches!(p, Piece::Field(written) if !written.chars().all(|c| is_name_char(c) || c == '.'))) {
+        return Translated::field(first, false);
+    }
+    let (mut fields, mut joins, mut text) = (Vec::<String>::new(), Vec::<(String, String)>::new(), String::new());
+    // The template's length so far, not counting `\r` (a `\r\n` or a lone `\r` ends up one
+    // character), so never more than its final length: building stops once it is too long.
+    let mut length = 0;
     for piece in &pieces {
+        if length > MAX_TEMPLATE {
+            return Translated::field(first, false);
+        }
         match piece {
             Piece::Text(t) => {
                 for c in t.chars() {
@@ -50,10 +66,16 @@ pub(crate) fn template(expression: &str, engine: &str) -> Option<Translated> {
                         '}' => text.push_str("}}"),
                         c => text.push(c),
                     }
+                    length += match c {
+                        '{' | '}' => 2,
+                        '\r' => 0,
+                        _ => 1,
+                    };
                 }
             }
             Piece::Field(written) => {
                 let name = read_as(written);
+                length += name.chars().count() + 2;
                 text.push('{');
                 text.push_str(name);
                 text.push('}');
@@ -66,17 +88,9 @@ pub(crate) fn template(expression: &str, engine: &str) -> Option<Translated> {
             }
         }
     }
-    let first = pieces.iter().find_map(|p| match p {
-        Piece::Field(written) => Some(*written),
-        Piece::Text(_) => None,
-    })?;
-    // One field alone is a plain field name.
-    if let [Piece::Field(written)] = pieces.as_slice() {
-        return Some(Translated::field(written, read_as(written), true));
-    }
     let template = text.replace("\r\n", "\n").replace('\r', "\n");
     if template.chars().count() > MAX_TEMPLATE {
-        return Some(Translated::field(first, read_as(first), false));
+        return Translated::field(first, false);
     }
     Some(Translated { template, exact: true, fields, tags_dropped, joins })
 }
@@ -87,10 +101,15 @@ pub(crate) fn field(expression: &str) -> Option<String> {
 }
 
 impl Translated {
-    /// The field `written` (read as `name`) on its own.
-    fn field(written: &str, name: &str, exact: bool) -> Translated {
+    /// The field `written` (read by the part after its last dot) on its own; `None` when that is
+    /// longer than a template can be, as no field's name is.
+    fn field(written: &str, exact: bool) -> Option<Translated> {
+        let name = read_as(written);
+        if name.chars().count() > MAX_TEMPLATE {
+            return None;
+        }
         let joins = if written == name { Vec::new() } else { vec![(written.to_string(), name.to_string())] };
-        Translated { template: name.to_string(), exact, fields: vec![name.to_string()], tags_dropped: false, joins }
+        Some(Translated { template: name.to_string(), exact, fields: vec![name.to_string()], tags_dropped: false, joins })
     }
 }
 
@@ -156,11 +175,8 @@ fn operand<'a>(s: &'a str, vbscript: bool, tags_dropped: &mut bool) -> Option<(P
         _ => {
             let end = s.find(|c: char| !is_name_char(c) && c != '.').unwrap_or(s.len());
             let (word, rest) = (s.get(..end)?, s.get(end..)?);
-            let newline = |n: &str| Some((Piece::Text(n.to_string()), rest));
-            if ["TextFormatting.NewLine", "vbNewLine", "vbCrLf"].iter().any(|w| word.eq_ignore_ascii_case(w)) {
-                newline("\r\n")
-            } else if word.eq_ignore_ascii_case("vbLf") {
-                newline("\n")
+            if let Some(text) = newline(word) {
+                Some((Piece::Text(text.to_string()), rest))
             } else if word.eq_ignore_ascii_case("chr") {
                 let (code, rest) = rest.strip_prefix('(')?.split_at_checked(2)?;
                 let rest = rest.strip_prefix(')')?;
@@ -177,16 +193,28 @@ fn operand<'a>(s: &'a str, vbscript: bool, tags_dropped: &mut bool) -> Option<(P
     }
 }
 
+/// The text of the newline `word` (`TextFormatting.NewLine`, `vbNewLine`, `vbCrLf`, `vbLf`).
+fn newline(word: &str) -> Option<&'static str> {
+    if ["TextFormatting.NewLine", "vbNewLine", "vbCrLf"].iter().any(|w| word.eq_ignore_ascii_case(w)) {
+        Some("\r\n")
+    } else if word.eq_ignore_ascii_case("vbLf") {
+        Some("\n")
+    } else {
+        None
+    }
+}
+
 /// The field of `$feature` followed by `after` (`.X`, `["X"]` or `['X']`), and what follows it.
+/// A quoted name is anything up to its closing quote.
 fn feature_field(after: &str) -> Option<(&str, &str)> {
     if let Some(r) = after.strip_prefix('.') {
-        return name_in(r, false);
+        return name_in(r, true);
     }
     let r = after.strip_prefix('[')?;
     let mut chars = r.chars();
     let quote = chars.next().filter(|q| *q == '"' || *q == '\'')?;
-    let (name, rest) = name_in(chars.as_str(), true)?;
-    Some((name, rest.strip_prefix(quote)?.strip_prefix(']')?))
+    let (name, rest) = chars.as_str().split_once(quote)?;
+    Some((name, rest.strip_prefix(']')?)).filter(|(name, _)| !name.is_empty())
 }
 
 /// The field name at the start of `s` (with dots when `dots`, not ending in one), and what
@@ -268,10 +296,6 @@ fn read_as(written: &str) -> &str {
 
 fn is_name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
-}
-
-fn is_name(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(is_name_char)
 }
 
 /// The first field reference in `e` (`$feature.X`, `$feature["X"]`, `[X]`, `!X!`), anywhere.

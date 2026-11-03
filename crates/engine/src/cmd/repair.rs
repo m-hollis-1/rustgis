@@ -89,7 +89,15 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
                     ));
                 }
             }
-            s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?.replace_source(new);
+            // A broken layer's query was kept unchecked while it had no fields to check it against.
+            let was_broken = src.is_broken();
+            let l = s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?;
+            l.replace_source(new);
+            let dropped = l.definition_query.take_if(|q| was_broken && rustgis_data::query::parse(q, &l.dataset).is_err());
+            if let Some(q) = dropped {
+                let name = l.name.clone();
+                s.notify(format!("{name}: its definition query ({q}) doesn't fit {full}'s fields, so it was cleared"), false);
+            }
         }
         Ok(json!({"layer": id, "path": full, "table": s.map().layer(id).and_then(|l| l.linked_table())}))
     }

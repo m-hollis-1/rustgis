@@ -39,7 +39,8 @@ pub(crate) fn frame_requires_complete(map: &Map, view: &View) -> bool {
         scales.extend(view.camera.tilt_bands(view.width, view.height).iter().map(|b| map.ground_res_at(&b.camera) / rustgis_geom::PIXEL_M));
     }
     let complete = |source: &rustgis_map::source::SourceLayer| {
-        source.chunk_source().is_some() || (!source.is_open() && crate::is_local_shapefile(source))
+        // (A broken layer draws nothing until retried or repaired.)
+        source.chunk_source().is_some() || (!source.is_open() && !source.is_broken() && crate::is_local_shapefile(source))
     };
     map.layers.iter().filter(|l| scales.iter().any(|scale| map.draws_at(l, *scale))).any(|layer| {
         layer.source.as_ref().is_some_and(complete)

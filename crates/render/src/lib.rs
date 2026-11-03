@@ -1695,8 +1695,11 @@ fn render_with_backend(map: &mut Map, view: &View, full_res_rasters: bool, backe
             if !complete_layers.contains(&layer.id) {
                 continue;
             }
+            // (A broken layer, one another app's project names that didn't open, draws nothing
+            // until it is retried or repaired: it doesn't stop the export.)
             if let Some(source) = &mut layer.source
                 && !source.is_open()
+                && !source.is_broken()
                 && is_local_shapefile(source)
             {
                 if let Err(e) = source.open() {

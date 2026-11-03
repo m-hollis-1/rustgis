@@ -4158,6 +4158,8 @@ mod record_tests {
             "layout.frameZoom",
             "report.update",
             "share.replaceWebLayer",
+            // A broken layer named, or every one (`all`): never the active layer by default.
+            "layer.retry",
         ];
         let mut app = RustGisApp::with_sample();
         // A raster too, for the commands that need one active (a 2×2 ASCII grid).

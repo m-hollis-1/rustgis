@@ -304,7 +304,7 @@ const NEVER: &[&str] = &[
 const WRITES_FILES: &[&str] = &["project.save", "project.saveAs"];
 
 /// Commands that read a file a layer names, not their parameters.
-const READS_FILES: &[&str] = &["gpkg.discardEdits"];
+const READS_FILES: &[&str] = &["gpkg.discardEdits", "layer.retry"];
 
 /// Parameter keys that name a file, folder or address. (`data` and `text` carry content, which
 /// plugins may pass: `layer.addDataBytes`, `map.import` from text.)

@@ -108,6 +108,26 @@ pub struct SourceLayer {
     /// For a layer read live from a SQL Server table (desktop only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlserver: Option<SqlServerOrigin>,
+    /// For a broken layer (one another app's project names, that couldn't be opened here): where
+    /// that app read it from, for people ("ArcGIS Pro read it from …"). Never holds a password.
+    /// Cleared once the source opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// For a broken layer read from a web service: the service, added again by Retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceOrigin>,
+}
+
+/// The web service a broken layer is read from, as `service.add` takes it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServiceOrigin {
+    pub url: String,
+    /// The service's kind (`service.add`'s `type`): `arcgis` or `wms`.
+    #[serde(default)]
+    pub kind: String,
+    /// The layer of the service (`service.add`'s `layer`).
+    #[serde(default)]
+    pub layer: String,
 }
 
 /// A PostGIS table a layer reads live.
@@ -395,6 +415,8 @@ impl std::fmt::Debug for SourceLayer {
             .field("window", &self.window)
             .field("error", &self.error)
             .field("login", &self.login)
+            .field("origin", &self.origin)
+            .field("service", &self.service)
             .finish_non_exhaustive()
     }
 }
@@ -641,6 +663,23 @@ impl SourceLayer {
     /// A SQL Server table read live.
     pub fn from_sqlserver(origin: SqlServerOrigin, handle: Box<dyn FeatureSource>) -> Self {
         SourceLayer { sqlserver: Some(origin), handle: Some(Arc::from(handle)), ..SourceLayer::default() }
+    }
+
+    /// An unopened source: `path`/`table` when there is a file to open later (Repair), `service`
+    /// when a service to retry, `error` why it is broken now.
+    pub fn broken(
+        origin: String,
+        path: Option<String>,
+        table: Option<String>,
+        service: Option<ServiceOrigin>,
+        error: String,
+    ) -> SourceLayer {
+        SourceLayer { origin: Some(origin), path, table, service, error: Some(error), ..SourceLayer::default() }
+    }
+
+    /// A source that remembers where it came from and isn't open, nor opening.
+    pub fn is_broken(&self) -> bool {
+        !self.is_open() && !self.is_pending() && self.origin.is_some()
     }
 
     /// A source read from a file's bytes, kept in the project.
@@ -1087,6 +1126,37 @@ pub fn generation() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_broken_source_round_trips_its_origin_and_service() {
+        let service = super::ServiceOrigin { url: "https://127.0.0.1:9/x/FeatureServer".into(), kind: "arcgis".into(), layer: "0".into() };
+        let src = super::SourceLayer::broken(
+            "ArcGIS Pro read it from a feature service".into(),
+            None,
+            None,
+            Some(service.clone()),
+            "the service couldn't be reached".into(),
+        );
+        assert!(src.is_broken());
+        assert_eq!(src.error.as_deref(), Some("the service couldn't be reached"));
+        let text = serde_json::to_string(&src).unwrap();
+        let back: super::SourceLayer = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.origin.as_deref(), Some("ArcGIS Pro read it from a feature service"));
+        assert_eq!(back.service, Some(service));
+        assert!(back.is_broken());
+        // A file to open later keeps its path and table.
+        let file =
+            super::SourceLayer::broken("a shapefile".into(), Some("D:/data/roads.shp".into()), Some("roads".into()), None, "gone".into());
+        let back: super::SourceLayer = serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!((back.path.as_deref(), back.table.as_deref(), back.service), (Some("D:/data/roads.shp"), Some("roads"), None));
+        // A project saved before broken layers reads with neither.
+        let old: super::SourceLayer = serde_json::from_str(r#"{"path": "D:/data/roads.gpkg", "table": "roads"}"#).unwrap();
+        assert!(!old.is_broken());
+        assert_eq!((old.origin, old.service), (None, None));
+        // And a source with neither writes neither key.
+        let plain = serde_json::to_string(&super::SourceLayer { path: Some("x.fgb".into()), ..Default::default() }).unwrap();
+        assert!(!plain.contains("origin") && !plain.contains("service"), "{plain}");
+    }
+
     #[test]
     fn postgis_edits_keep_their_row_versions() {
         let edit = super::PostgisEdit {

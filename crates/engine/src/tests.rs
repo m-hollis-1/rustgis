@@ -23424,3 +23424,165 @@ fn rgislayout_files_still_import() {
     assert!(s.run("layout.import", &json!({"text": "{}"})).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A broken layer named Borders: the sample Countries' unique-value symbology and labels and a
+/// definition query, on a shapefile at `path` that isn't there (yet).
+fn broken_countries(s: &mut Session, path: &std::path::Path) -> u32 {
+    let mut w = world();
+    w.run("layer.symbology", &json!({"layer": "Countries", "type": "unique", "field": "continent"})).unwrap();
+    w.run("labels.field", &json!({"layer": "Countries", "field": "name"})).unwrap();
+    let countries = w.map().layer_by_name("Countries").unwrap();
+    assert!(countries.labels.enabled);
+    let src = rustgis_map::source::SourceLayer::broken(
+        "ArcGIS Pro read it from a shapefile".into(),
+        Some(path.display().to_string()),
+        None,
+        None,
+        "the file isn't there".into(),
+    );
+    let id = s.map_mut().add_streamed("Borders", src);
+    let l = s.map_mut().layer_mut(id).unwrap();
+    l.renderer = countries.renderer.clone();
+    l.labels = countries.labels.clone();
+    l.definition_query = Some("pop_est > 1000".into());
+    id
+}
+
+/// A broken layer named Parcels on a feature service nobody answers at.
+fn broken_service(s: &mut Session) -> u32 {
+    let url = "https://127.0.0.1:9/x/FeatureServer";
+    let service = rustgis_map::source::ServiceOrigin { url: url.into(), kind: "arcgis".into(), layer: "0".into() };
+    let src = rustgis_map::source::SourceLayer::broken(
+        format!("ArcGIS Pro read it from {url}"),
+        None,
+        None,
+        Some(service),
+        "it needs a sign-in".into(),
+    );
+    s.map_mut().add_streamed("Parcels", src)
+}
+
+/// The sample's Countries written as a shapefile at `path`: the file a broken layer waited for.
+fn countries_shapefile(path: &std::path::Path) {
+    let mut w = world();
+    w.run("share.exportLayer", &json!({"layer": "Countries", "path": path.display().to_string()})).unwrap();
+}
+
+fn broken_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("rustgis-broken-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    dir
+}
+
+#[test]
+fn a_broken_layer_round_trips_and_repairs() {
+    let dir = broken_dir("repair");
+    let shp = dir.join("data").join("countries.shp");
+    let mut s = Session::new(Project::default());
+    let id = broken_countries(&mut s, &shp);
+    s.run("group.add", &json!({"name": "Boundaries", "layers": [id]})).unwrap();
+    let style = |s: &Session| {
+        let l = s.map().layer(id).unwrap();
+        (serde_json::to_value(&l.renderer).unwrap(), serde_json::to_value(&l.labels).unwrap(), l.definition_query.clone())
+    };
+    let before = style(&s);
+    let project = dir.join("broken.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    let l = t.map().layer(id).unwrap();
+    assert_eq!(l.name, "Borders");
+    assert_eq!(t.map().group_of(id).map(|g| g.name.as_str()), Some("Boundaries"));
+    assert_eq!(style(&t), before);
+    let src = l.source.as_ref().unwrap();
+    assert_eq!(src.origin.as_deref(), Some("ArcGIS Pro read it from a shapefile"));
+    assert_eq!(src.path.as_deref().map(std::path::Path::new), Some(shp.as_path()));
+    assert!(src.is_broken());
+    // Drawn, it is still broken and says why.
+    t.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 64, "height": 64})).unwrap();
+    let src = t.map().layer(id).unwrap().source.as_ref().unwrap();
+    assert!(src.error.is_some());
+    assert!(src.is_broken());
+
+    // The file turns up; Repair opens it, and the style stays.
+    countries_shapefile(&shp);
+    t.run("layer.repairSource", &json!({"layer": id, "path": shp.display().to_string()})).unwrap();
+    assert_eq!(style(&t), before);
+    let l = t.map().layer(id).unwrap();
+    assert_eq!(l.geometry_type(), rustgis_data::GeometryType::Polygon);
+    let src = l.source.as_ref().unwrap();
+    assert!(src.is_open());
+    assert_eq!(src.origin, None);
+    assert!(!src.is_broken());
+    assert_eq!(t.map().group_of(id).map(|g| g.name.as_str()), Some("Boundaries"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn layer_retry_reopens_a_file_and_reports_a_service_it_cannot_reach() {
+    let dir = broken_dir("retry");
+    let shp = dir.join("data").join("countries.shp");
+    let mut s = Session::new(Project::default());
+    let file = broken_countries(&mut s, &shp);
+    let service = broken_service(&mut s);
+    let renderer = serde_json::to_value(&s.map().layer(file).unwrap().renderer).unwrap();
+    // Neither layer nor all: there's nothing to retry.
+    assert!(s.run("layer.retry", &json!({})).is_err());
+    // Nothing is there yet: both fail, and both stay.
+    let r = s.run("layer.retry", &json!({"all": true})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["opened"].as_u64()), (Some(2), Some(0)), "{r}");
+    assert_eq!(r["failed"].as_array().map(Vec::len), Some(2), "{r}");
+
+    // The file turns up: it opens; the service still can't be reached.
+    countries_shapefile(&shp);
+    let r = s.run("layer.retry", &json!({"all": true})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["opened"].as_u64()), (Some(2), Some(1)), "{r}");
+    let failed = r["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{r}");
+    assert_eq!(failed[0]["layer"], "Parcels");
+    assert!(failed[0]["error"].as_str().is_some_and(|e| !e.is_empty()), "{r}");
+    let l = s.map().layer(file).unwrap();
+    assert_eq!(l.geometry_type(), rustgis_data::GeometryType::Polygon);
+    assert!(l.dataset.fields.iter().any(|f| f.name.eq_ignore_ascii_case("continent")));
+    assert_eq!(serde_json::to_value(&l.renderer).unwrap(), renderer);
+    assert_eq!(l.definition_query.as_deref(), Some("pop_est > 1000"));
+    let src = l.source.as_ref().unwrap();
+    assert!(src.is_open() && !src.is_broken() && src.origin.is_none());
+    let l = s.map().layer(service).unwrap();
+    assert!(l.source.as_ref().is_some_and(|src| src.is_broken() && src.service.is_some()));
+
+    // One layer by name; one that isn't broken is neither retried nor failed.
+    let r = s.run("layer.retry", &json!({"layer": "Borders"})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["opened"].as_u64(), r["failed"].as_array().map(Vec::len)), (Some(0), Some(0), Some(0)), "{r}");
+    let r = s.run("layer.retry", &json!({"layer": service})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["failed"][0]["layer"].as_str()), (Some(1), Some("Parcels")), "{r}");
+    // A query its opened data's fields don't fit is cleared, and said so.
+    let misfit = broken_countries(&mut s, &shp);
+    s.map_mut().layer_mut(misfit).unwrap().definition_query = Some("nope = 1".into());
+    let r = s.run("layer.retry", &json!({"layer": misfit})).unwrap();
+    assert_eq!(r["opened"].as_u64(), Some(1), "{r}");
+    assert_eq!(s.map().layer(misfit).unwrap().definition_query, None);
+    assert!(s.notices.iter().any(|n| n.text.contains("nope = 1")), "{:?}", s.notices);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_broken_layer_draws_nothing_and_is_not_a_table() {
+    let dir = broken_dir("draw");
+    let mut s = Session::new(Project::default());
+    let tables: Vec<String> = s.project.tables.iter().map(|t| t.name.clone()).collect();
+    let png = |s: &mut Session, name: &str| {
+        let path = dir.join(name);
+        s.run("share.exportMap", &json!({"path": path.display().to_string(), "width": 160, "height": 100})).unwrap();
+        std::fs::read(path).unwrap()
+    };
+    let empty = png(&mut s, "empty.png");
+    broken_countries(&mut s, &dir.join("data").join("missing.shp"));
+    broken_service(&mut s);
+    assert_eq!(png(&mut s, "broken.png"), empty);
+    assert_eq!(s.project.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), tables);
+    assert_eq!(s.map().layers.len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}

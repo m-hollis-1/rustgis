@@ -3045,7 +3045,7 @@ pub(crate) fn drop_layers(s: &mut Session, ids: &[u32]) {
     }
 }
 
-fn remove(s: &mut Session, p: &Value) -> CmdResult {
+pub(super) fn remove(s: &mut Session, p: &Value) -> CmdResult {
     let ids = layer_ids(s, p)?;
     let m = s.map_mut();
     // The layer that takes the place of the topmost one removed becomes the active layer.

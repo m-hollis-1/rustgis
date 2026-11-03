@@ -331,6 +331,10 @@ impl Layer {
         if let Some(info) = src.info() {
             self.dataset.fields = info.fields.clone();
             self.dataset.crs = info.coordinate_system();
+            // A broken layer learns its geometry when its source first opens.
+            if self.dataset.geometry_type == GeometryType::None {
+                self.dataset.geometry_type = info.geometry_type;
+            }
         }
         self.dataset.source = src.linked_file().map(String::from);
         self.source = Some(src);

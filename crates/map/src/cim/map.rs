@@ -23,8 +23,8 @@ use crate::layout::TextAlign;
 use crate::qgis::symbol::{hidden as hidden_symbol, stacked};
 use crate::qgis::{QGIS_SCALE, Style};
 use crate::symbology::{
-    DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, LabelPlacement, Labeling, LineStroke, MAX_LABEL_CLASSES, Marker, OTHER_VALUES,
-    Renderer, Symbol,
+    ClassMethod, DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, LabelPlacement, Labeling, LineStroke, MAX_LABEL_CLASSES, Marker,
+    OTHER_VALUES, Renderer, Symbol,
 };
 
 /// The most layers read from one map.
@@ -307,37 +307,220 @@ fn look(v: &Value, what: &str, report: &mut Report) -> Option<Look> {
 
 /// Sets `style`'s renderer (and the strokes and fills that go with it) from a layer's renderer.
 fn renderer(r: &Value, what: &str, style: &mut Style, report: &mut Report) {
-    let done = match str_of(r, "type") {
-        Some("CIMSimpleRenderer") => match r.get("symbol") {
-            // (A symbol that can't be read is noted by `look`.)
-            Some(s) => match look(s, what, report) {
-                Some(l) => {
-                    style.line_strokes = Some(l.strokes);
-                    style.fill_layers = Some(l.fills);
-                    style.renderer = Some(Renderer::Single(l.symbol));
-                    true
-                }
-                None => false,
-            },
-            None => {
-                report.skipped(what, "simple renderers with no symbol, drawn with a default symbol");
-                false
-            }
-        },
-        Some("CIMUniqueValueRenderer") => unique(r, what, style, report),
-        Some(other) => {
-            report.skipped(what, format!("{} renderers, drawn with a default symbol", shown(other)));
-            false
-        }
-        None => return,
+    let Some(kind) = str_of(r, "type") else { return };
+    let done = match kind {
+        "CIMSimpleRenderer" => simple(r, what, style, report),
+        "CIMUniqueValueRenderer" => unique(r, what, style, report),
+        "CIMClassBreaksRenderer" => class_breaks(r, what, style, report),
+        "CIMProportionalRenderer" => proportional(r, what, style, report),
+        other => first_symbol(r, other, what, style, report),
     };
-    if !done {
+    if done {
+        size_variable(r, what, style, report);
+    } else {
         let mut symbol = Symbol::default_for(rustgis_data::GeometryType::Polygon, 0);
         symbol.size = Symbol::default_for(rustgis_data::GeometryType::Point, 0).size;
         style.line_strokes = Some(Vec::new());
         style.fill_layers = Some(Vec::new());
         style.renderer = Some(Renderer::Single(symbol));
     }
+}
+
+/// Makes `l` the layer's single symbol.
+fn set_single(l: Look, style: &mut Style) {
+    style.line_strokes = Some(l.strokes);
+    style.fill_layers = Some(l.fills);
+    style.renderer = Some(Renderer::Single(l.symbol));
+}
+
+/// A `CIMSimpleRenderer`. `false` for one whose symbol can't be read (noted by `look`).
+fn simple(r: &Value, what: &str, style: &mut Style, report: &mut Report) -> bool {
+    let Some(s) = r.get("symbol") else {
+        report.skipped(what, "simple renderers with no symbol, drawn with a default symbol");
+        return false;
+    };
+    let Some(l) = look(s, what, report) else { return false };
+    set_single(l, style);
+    true
+}
+
+/// A `CIMClassBreaksRenderer` as graduated classes, sorted by their upper bounds. `false` for one
+/// with no field or no class to read.
+fn class_breaks(r: &Value, what: &str, style: &mut Style, report: &mut Report) -> bool {
+    let Some(field) = str_of(r, "field").map(str::trim).filter(|f| !f.is_empty()) else {
+        report.skipped(what, "class breaks renderers with no field, drawn with a default symbol");
+        return false;
+    };
+    if str_of(r, "classBreakType") == Some("UnclassedColor") {
+        report.approximated(what, "an unclassed colour ramp, drawn as its classes");
+    }
+    if let Some(n) = str_of(r, "normalizationType").filter(|n| *n != "Nothing") {
+        report.approximated(what, format!("values normalized ({}), drawn as they are", shown(n)));
+    }
+    let mut classes: Vec<(f64, Look, Option<String>)> = Vec::new();
+    for b in r.get("breaks").and_then(Value::as_array).into_iter().flatten().take(MAX_CLASSES + 1) {
+        if classes.len() >= MAX_CLASSES {
+            report.skipped(what, format!("classes past the first {MAX_CLASSES}"));
+            break;
+        }
+        let Some(upper) = num(b, "upperBound") else {
+            report.skipped(what, "class breaks with no upper bound, left out");
+            continue;
+        };
+        // A class switched off draws nothing, and its symbol isn't read.
+        let l = if flag(b, "visible", true) {
+            let Some(l) = b.get("symbol").and_then(|s| look(s, what, report)) else { continue };
+            l
+        } else {
+            hidden()
+        };
+        let label = str_of(b, "label").map(str::trim).filter(|l| !l.is_empty()).map(str::to_string);
+        classes.push((upper, l, label));
+    }
+    classes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let Some(first) = classes.first().map(|c| c.0) else {
+        report.skipped(what, "class breaks renderers with no class to read, drawn with a default symbol");
+        return false;
+    };
+    let min = num(r, "minimumBreak").unwrap_or(first);
+    let method = str_of(r, "classificationMethod").and_then(ClassMethod::from_name).unwrap_or(ClassMethod::Manual);
+    let count = classes.len();
+    let (mut breaks, mut symbols) = (Vec::new(), Vec::new());
+    let (mut class_labels, mut class_strokes, mut class_fills) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    for (i, (upper, l, label)) in classes.into_iter().enumerate() {
+        if let Some(label) = label {
+            class_labels.insert(i, label);
+        }
+        if !l.strokes.is_empty() {
+            class_strokes.insert(i, l.strokes);
+        }
+        if !l.fills.is_empty() {
+            class_fills.insert(i, l.fills);
+        }
+        breaks.push(upper);
+        symbols.push(l.symbol);
+    }
+    style.line_strokes = Some(Vec::new());
+    style.fill_layers = Some(Vec::new());
+    style.renderer = Some(Renderer::Graduated {
+        field: field.to_string(),
+        breaks,
+        symbols,
+        ramp: Ramp::default(),
+        method,
+        min,
+        classes: count,
+        class_labels,
+        class_strokes,
+        class_fills,
+    });
+    true
+}
+
+/// A `CIMProportionalRenderer`: marker sizes from its smallest and largest symbols over its data
+/// range. `false` for one with no field, no data range or no symbol.
+fn proportional(r: &Value, what: &str, style: &mut Style, report: &mut Report) -> bool {
+    let Some(field) = str_of(r, "field").map(str::trim).filter(|f| !f.is_empty()) else {
+        report.skipped(what, "proportional renderers with no field, drawn with a default symbol");
+        return false;
+    };
+    let (Some(min), Some(max)) = (num(r, "minDataValue"), num(r, "maxDataValue")) else {
+        report.skipped(what, "proportional renderers with no data range, drawn with a default symbol");
+        return false;
+    };
+    let mut read = |key: &str| r.get(key).and_then(|s| look(s, what, report));
+    let (small, large, own) = (read("minSymbol"), read("maxSymbol"), read("symbol"));
+    let (small_size, large_size) = (small.as_ref().map(|l| l.symbol.size), large.as_ref().map(|l| l.symbol.size));
+    let Some(base) = own.or(large).or(small) else {
+        report.skipped(what, "proportional renderers with no symbol to read, drawn with a default symbol");
+        return false;
+    };
+    let (min_size, max_size) = (small_size.unwrap_or(base.symbol.size), large_size.unwrap_or(base.symbol.size));
+    let symbol = base.symbol;
+    style.line_strokes = Some(base.strokes);
+    style.fill_layers = Some(base.fills);
+    style.renderer = Some(Renderer::Proportional { field: field.to_string(), base: symbol, min_size, max_size, min, max });
+    true
+}
+
+/// The most visual variables looked through on one renderer.
+const MAX_VARIABLES: usize = 64;
+
+/// A `CIMSizeVisualVariable` of the renderer `r` (already read into `style`). On a simple renderer
+/// whose symbol is a marker it makes the sizes proportional; any other size variable is noted and
+/// the symbols stay at one size.
+fn size_variable(r: &Value, what: &str, style: &mut Style, report: &mut Report) {
+    let Some(v) = r
+        .get("visualVariables")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_VARIABLES)
+        .find(|v| typed(v, "CIMSizeVisualVariable").is_some())
+    else {
+        return;
+    };
+    let expressions: Vec<&str> = v
+        .get("valueExpressionInfo")
+        .and_then(|e| str_of(e, "expression"))
+        .into_iter()
+        .chain(str_of(v, "expression"))
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let field = expressions.iter().find_map(|e| expression_field(e).filter(|(_, exact)| *exact)).map(|(f, _)| f);
+    let sizes = num(v, "minSize").zip(num(v, "maxSize"));
+    let values = num(v, "minValue").zip(num(v, "maxValue"));
+    // A simple renderer's marker grows with the field (only a marker has a size to grow).
+    let simple = str_of(r, "type") == Some("CIMSimpleRenderer");
+    let grown = match (&field, sizes, values, style.renderer.as_ref()) {
+        (Some(field), Some((min_size, max_size)), Some((min, max)), Some(Renderer::Single(base))) if simple && base.size > 0.0 => {
+            Some(Renderer::Proportional { field: field.clone(), base: *base, min_size: pt96(min_size), max_size: pt96(max_size), min, max })
+        }
+        _ => None,
+    };
+    if grown.is_some() {
+        style.renderer = grown;
+        return;
+    }
+    let by = match (&field, expressions.first()) {
+        (Some(field), _) => format!("by {}", shown(field)),
+        (None, Some(e)) if *e == "$view.scale" => "with the scale".to_string(),
+        (None, Some(e)) => format!("by {}", shown(e)),
+        (None, None) => "by an expression".to_string(),
+    };
+    report.approximated(what, format!("symbol sizes that change {by}, drawn at one size"));
+}
+
+/// How many nodes of a renderer [`first_symbol`] looks at.
+const MAX_SYMBOL_SEARCH: usize = 5000;
+
+/// A renderer of a kind that isn't read (a heat map, dot density, chart...) drawn with the first
+/// symbol in it (depth first). `false` when it holds none.
+fn first_symbol(r: &Value, kind: &str, what: &str, style: &mut Style, report: &mut Report) -> bool {
+    let mut stack = vec![r];
+    let mut budget = MAX_SYMBOL_SEARCH;
+    while let Some(node) = stack.pop() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        // (A symbol that can't be read is only noted when it is the one drawn.)
+        if symbol_of(node).is_some() && look(node, what, &mut Report::default()).is_some() {
+            let Some(l) = look(node, what, report) else { break };
+            report.approximated(what, format!("{} renderers, drawn with its first symbol", shown(kind)));
+            set_single(l, style);
+            return true;
+        }
+        // Pushed last-first, so the first child is looked at first.
+        match node {
+            Value::Array(items) => stack.extend(items.iter().rev()),
+            Value::Object(map) => stack.extend(map.values().rev()),
+            _ => {}
+        }
+    }
+    report.skipped(what, format!("{} renderers, drawn with a default symbol", shown(kind)));
+    false
 }
 
 /// A `CIMUniqueValueRenderer` on one field (the first of several, noted). `false` for one that

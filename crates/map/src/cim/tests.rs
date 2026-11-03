@@ -2425,7 +2425,7 @@ fn unsupported_layers_are_noted() {
     let classed = feature_layer(
         "Classed",
         standard_connection("Shapefile", "DATABASE=/d", "classed.shp"),
-        json!({"renderer": {"type": "CIMClassBreaksRenderer", "field": "X"}}),
+        json!({"renderer": {"type": "CIMDotDensityRenderer", "attributes": []}}),
     );
     let sql = feature_layer(
         "Query",
@@ -2463,7 +2463,7 @@ fn unsupported_layers_are_noted() {
         "Boundaries: group Boundaries, its layers listed one by one",
         "Imagery: CIMRasterLayer layers, left out",
         "Ground: CIMElevationSurfaceLayer layers, left out",
-        "Classed: CIMClassBreaksRenderer renderers, drawn with a default symbol",
+        "Classed: CIMDotDensityRenderer renderers, drawn with a default symbol",
     ] {
         assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
     }
@@ -2866,4 +2866,160 @@ fn a_layout_definition_and_a_map_definition_read_like_their_documents() {
     let m = Document::from_json(r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"Solo","layers":[]}}"#).unwrap();
     let imp = read_map_def(&m, m.map_definition().unwrap(), &mut Report::default()).unwrap();
     assert_eq!(imp.name, "Solo");
+}
+
+// ---- renderers: class breaks, proportional, the rest ----
+
+fn class_break(upper: f64, label: Option<&str>, symbol: serde_json::Value) -> serde_json::Value {
+    let mut b = json!({"type": "CIMClassBreak", "upperBound": upper, "symbol": symbol_ref(symbol)});
+    if let (Some(o), Some(l)) = (b.as_object_mut(), label) {
+        o.insert("label".into(), json!(l));
+    }
+    b
+}
+
+fn class_breaks_renderer(field: &str, breaks: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({"type": "CIMClassBreaksRenderer", "field": field, "classificationMethod": "NaturalBreaks", "minimumBreak": 0.0,
+        "normalizationType": "Nothing", "classBreakType": "GraduatedColor", "breaks": breaks})
+}
+
+/// A point symbol of one character marker, `size` points across.
+fn point_symbol(size: f64) -> serde_json::Value {
+    json!({"type": "CIMPointSymbol", "symbolLayers": [
+        {"type": "CIMCharacterMarker", "enable": true, "size": size, "characterIndex": 33, "fontFamilyName": "ESRI Default Marker",
+         "fontStyleName": "Regular", "symbol": polygon_symbol(vec![solid_fill(rgb(0, 128, 0))])}]})
+}
+
+fn size_variable(expression: &str) -> serde_json::Value {
+    json!({"type": "CIMSizeVisualVariable", "valueExpressionInfo": {"type": "CIMExpressionInfo", "expression": expression},
+        "minSize": 4.0, "maxSize": 20.0, "minValue": 0.0, "maxValue": 1000.0})
+}
+
+/// A layer of `renderer`, read back as the only layer of its map.
+fn layer_with_renderer(renderer: serde_json::Value) -> (crate::qgis::Style, Report) {
+    let layer = feature_layer("L", standard_connection("Shapefile", "DATABASE=/d", "l.shp"), json!({"renderer": renderer}));
+    let (mut map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/l.json"]));
+    (map.layers.remove(0).style, report)
+}
+
+#[test]
+fn class_breaks_read_as_graduated() {
+    use crate::symbology::{ClassMethod, Renderer};
+    let fill = |r, g, b| polygon_symbol(vec![solid_fill(rgb(r, g, b))]);
+    // Listed out of order: they are sorted by their upper bounds, each keeping its own symbol.
+    let (style, report) = layer_with_renderer(class_breaks_renderer(
+        "POP",
+        vec![
+            class_break(30.0, Some("20 to 30"), fill(0, 0, 255)),
+            class_break(10.0, Some("0 to 10"), fill(255, 0, 0)),
+            class_break(20.0, None, fill(0, 255, 0)),
+        ],
+    ));
+    let Some(Renderer::Graduated { field, breaks, symbols, method, min, classes, class_labels, class_strokes, class_fills, .. }) =
+        &style.renderer
+    else {
+        panic!("{:?}", style.renderer)
+    };
+    assert_eq!(field, "POP");
+    assert_eq!(breaks, &[10.0, 20.0, 30.0]);
+    assert_eq!(*method, ClassMethod::NaturalBreaks);
+    assert_eq!((*min, *classes), (0.0, 3));
+    let fills: Vec<_> = symbols.iter().map(|s| s.fill).collect();
+    assert_eq!(fills, [Rgba::rgb(255, 0, 0), Rgba::rgb(0, 255, 0), Rgba::rgb(0, 0, 255)]);
+    assert_eq!(class_labels.get(&0).map(String::as_str), Some("0 to 10"));
+    assert_eq!(class_labels.get(&2).map(String::as_str), Some("20 to 30"));
+    assert!(!class_labels.contains_key(&1));
+    assert!(class_strokes.is_empty() && class_fills.is_empty());
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // No field, or no break to read: a default symbol and a note.
+    let (style, report) = layer_with_renderer(json!({"type": "CIMClassBreaksRenderer", "breaks": []}));
+    assert!(matches!(style.renderer, Some(Renderer::Single(_))), "{:?}", style.renderer);
+    assert!(notes(&report).iter().any(|n| n.starts_with("L: ") && n.contains("class breaks")), "{:?}", notes(&report));
+    let (style, _) = layer_with_renderer(class_breaks_renderer("POP", vec![json!({"type": "CIMClassBreak", "upperBound": 5.0})]));
+    assert!(matches!(style.renderer, Some(Renderer::Single(_))), "{:?}", style.renderer);
+}
+
+#[test]
+fn unclassed_colour_is_graduated_and_noted() {
+    use crate::symbology::{ClassMethod, Renderer};
+    let fill = |r| polygon_symbol(vec![solid_fill(rgb(r, 0, 0))]);
+    let mut r = class_breaks_renderer("DENSITY", vec![class_break(50.0, None, fill(10)), class_break(100.0, None, fill(200))]);
+    r["classBreakType"] = json!("UnclassedColor");
+    r["normalizationType"] = json!("Field");
+    r["normalizationField"] = json!("AREA");
+    r["classificationMethod"] = json!("Something New");
+    r.as_object_mut().unwrap().remove("minimumBreak");
+    let (style, report) = layer_with_renderer(r);
+    let Some(Renderer::Graduated { breaks, method, min, classes, .. }) = &style.renderer else { panic!("{:?}", style.renderer) };
+    assert_eq!(breaks, &[50.0, 100.0]);
+    assert_eq!(*method, ClassMethod::Manual);
+    assert_eq!((*min, *classes), (50.0, 2), "without a minimum, the first bound");
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("unclassed colour ramp, drawn as its classes")), "{n:?}");
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("normalized")), "{n:?}");
+}
+
+#[test]
+fn proportional_and_size_variables_read() {
+    use crate::symbology::Renderer;
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+
+    let proportional = json!({"type": "CIMProportionalRenderer", "field": "TOTAL", "minDataValue": 0.0, "maxDataValue": 500.0,
+        "minSymbol": symbol_ref(point_symbol(4.0)), "maxSymbol": symbol_ref(point_symbol(20.0)), "symbol": symbol_ref(point_symbol(8.0))});
+    let (style, report) = layer_with_renderer(proportional);
+    let Some(Renderer::Proportional { field, base, min_size, max_size, min, max }) = &style.renderer else {
+        panic!("{:?}", style.renderer)
+    };
+    assert_eq!(field, "TOTAL");
+    assert!(near(*min_size, 5.33) && near(*max_size, 26.67), "{min_size} {max_size}");
+    assert!(near(base.size, 10.67), "{}", base.size);
+    assert_eq!((*min, *max), (0.0, 500.0));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    let mut by_field = simple_renderer(point_symbol(8.0));
+    by_field["visualVariables"] = json!([{"type": "CIMColorVisualVariable", "expression": "POP"}, size_variable("$feature.POP")]);
+    let (style, report) = layer_with_renderer(by_field);
+    let Some(Renderer::Proportional { field, base, min_size, max_size, min, max }) = &style.renderer else {
+        panic!("{:?}", style.renderer)
+    };
+    assert_eq!(field, "POP");
+    assert!(near(*min_size, 5.33) && near(*max_size, 26.67), "{min_size} {max_size}");
+    assert!(near(base.size, 10.67), "{}", base.size);
+    assert_eq!((*min, *max), (0.0, 1000.0));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // By the map scale: drawn at one size, noted.
+    let mut by_scale = simple_renderer(point_symbol(8.0));
+    by_scale["visualVariables"] = json!([size_variable("$view.scale")]);
+    let (style, report) = layer_with_renderer(by_scale);
+    let Some(Renderer::Single(s)) = &style.renderer else { panic!("{:?}", style.renderer) };
+    assert!(near(s.size, 10.67), "{}", s.size);
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("symbol sizes that change") && t.contains("drawn at one size")), "{n:?}");
+
+    // On another renderer: the same note, the renderer as it was.
+    let mut on_classes = class_breaks_renderer("POP", vec![class_break(10.0, None, point_symbol(6.0))]);
+    on_classes["visualVariables"] = json!([size_variable("$feature.POP")]);
+    let (style, report) = layer_with_renderer(on_classes);
+    assert!(matches!(style.renderer, Some(Renderer::Graduated { .. })), "{:?}", style.renderer);
+    assert!(notes(&report).iter().any(|t| t.contains("symbol sizes that change")), "{:?}", notes(&report));
+}
+
+#[test]
+fn other_renderers_draw_their_first_symbol() {
+    use crate::symbology::Renderer;
+    // The symbol is found anywhere in the renderer, past things that are not symbols.
+    let heat = json!({"type": "CIMHeatMapRenderer", "colorRamp": {"type": "CIMMultipartColorRamp", "colorRamps": []}, "radius": 10,
+        "dots": {"layers": [{"deep": [symbol_ref(polygon_symbol(vec![solid_fill(rgb(1, 2, 3))])), symbol_ref(point_symbol(9.0))]}]}});
+    let (style, report) = layer_with_renderer(heat);
+    let Some(Renderer::Single(s)) = &style.renderer else { panic!("{:?}", style.renderer) };
+    assert_eq!(s.fill, Rgba::rgb(1, 2, 3));
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("CIMHeatMapRenderer renderers, drawn with its first symbol")), "{n:?}");
+
+    // Nothing to draw with: the default symbol.
+    let (style, report) = layer_with_renderer(json!({"type": "CIMDotDensityRenderer", "attributes": []}));
+    assert!(matches!(style.renderer, Some(Renderer::Single(_))), "{:?}", style.renderer);
+    assert!(notes(&report).iter().any(|t| t.contains("CIMDotDensityRenderer")), "{:?}", notes(&report));
 }

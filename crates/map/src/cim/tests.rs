@@ -2387,7 +2387,7 @@ fn label_classes_read_their_expressions_text_and_ranges() {
         label(json!("[POP]"), json!({"minimumScale": 100000.0, "maximumScale": 5000.0})),
         label(json!("!CODE!"), json!({"visibility": false})),
         label(json!("ID"), json!({})),
-        label(json!("$feature.FIRST + \" \" + $feature.SECOND"), json!({})),
+        label(json!("Upper($feature.FIRST) + \" \" + $feature.SECOND"), json!({})),
         label(json!("\"no field here\""), json!({})),
     ];
     let layer = feature_layer(
@@ -2410,7 +2410,7 @@ fn label_classes_read_their_expressions_text_and_ranges() {
     assert_eq!((labels.default.name.as_str(), labels.default.visible, labels.default.field.as_str()), ("Default", false, "NAME"));
     assert!(!labels.classes[0].halo);
     let n = notes(&report);
-    assert!(n.iter().any(|t| t.contains("label expression $feature.FIRST") && t.contains("drawn as FIRST")), "{n:?}");
+    assert!(n.iter().any(|t| t.contains("label expression Upper($feature.FIRST)") && t.contains("drawn as FIRST")), "{n:?}");
     assert!(n.iter().any(|t| t.starts_with("Places: ") && t.contains("no field here")), "{n:?}");
 }
 
@@ -3022,4 +3022,154 @@ fn other_renderers_draw_their_first_symbol() {
     let (style, report) = layer_with_renderer(json!({"type": "CIMDotDensityRenderer", "attributes": []}));
     assert!(matches!(style.renderer, Some(Renderer::Single(_))), "{:?}", style.renderer);
     assert!(notes(&report).iter().any(|t| t.contains("CIMDotDensityRenderer")), "{:?}", notes(&report));
+}
+
+// ---- label expressions ------------------------------------------------------------------------
+
+/// `expression` in `engine` as `(template, exact, fields)`.
+fn translated(expression: &str, engine: &str) -> Option<(String, bool, Vec<String>)> {
+    expr::template(expression, engine).map(|t| (t.template, t.exact, t.fields))
+}
+
+fn exact(template: &str, fields: &[&str]) -> Option<(String, bool, Vec<String>)> {
+    Some((template.to_string(), true, fields.iter().map(|f| f.to_string()).collect()))
+}
+
+fn inexact(field: &str) -> Option<(String, bool, Vec<String>)> {
+    Some((field.to_string(), false, vec![field.to_string()]))
+}
+
+#[test]
+fn arcade_concatenations_become_templates() {
+    assert_eq!(translated("$feature.A + \"\\n \" + $feature.B", "Arcade"), exact("{A}\n {B}", &["A", "B"]));
+    assert_eq!(translated("\"SEC. \"+$feature.SECT_NO", "Arcade"), exact("SEC. {SECT_NO}", &["SECT_NO"]));
+    // A field of a join keeps the part after the last dot; alone it is a plain field.
+    let t = expr::template("$feature['T.Name']", "Arcade").unwrap();
+    assert_eq!((t.template.as_str(), t.exact, t.fields.as_slice()), ("Name", true, &["Name".to_string()][..]));
+    assert_eq!(t.joins, [("T.Name".to_string(), "Name".to_string())]);
+    assert_eq!(translated("\"(\" + $feature[\"T.Name\"] + \")\"", "Arcade"), exact("({Name})", &["Name"]));
+    // One field alone stays a plain field name, as do a bare name and a leading return.
+    assert_eq!(translated("$feature.A", "Arcade"), exact("A", &["A"]));
+    assert_eq!(translated(" return $feature.A; ", "Arcade"), exact("A", &["A"]));
+    assert_eq!(translated("RETURN \"x\" + $feature.A;", "Arcade"), exact("x{A}", &["A"]));
+    assert_eq!(translated("StreetName", "Arcade"), exact("StreetName", &["StreetName"]));
+    // Newlines, each field once in order, escapes and a literal holding a `+`.
+    assert_eq!(
+        translated("$feature.A + TextFormatting.NewLine + $feature.B + \"\\r\\n\" + $feature.A", "Arcade"),
+        exact("{A}\n{B}\n{A}", &["A", "B"])
+    );
+    assert_eq!(translated("'it\\'s ' + $feature.A + \" a+b \\\"q\\\" \\\\\"", "Arcade"), exact("it's {A} a+b \"q\" \\", &["A"]));
+    assert_eq!(translated("$feature.A + \"<br>\" + $feature.B + \"<BR>x\\ry\"", "Arcade"), exact("{A}\n{B}\nx\ny", &["A", "B"]));
+}
+
+#[test]
+fn vbscript_and_python_concatenations_become_templates() {
+    assert_eq!(translated("\"BLK \" & [BLOCK]", "VBScript"), exact("BLK {BLOCK}", &["BLOCK"]));
+    assert_eq!(translated("[rods]&\" RD\"", "VBScript"), exact("{rods} RD", &["rods"]));
+    assert_eq!(translated("\"A: \" + !A! + vbNewLine + !B!", "Python"), exact("A: {A}\n{B}", &["A", "B"]));
+    assert_eq!(translated("\"%s\" % !X!", "Python"), inexact("X"));
+    // VBScript doubles a quote, keeps a backslash, and has its own newlines.
+    assert_eq!(
+        translated("\"say \"\"hi\"\" C:\\n\" & [A] & vbCrLf & [B] & vbLf & [A]", "VBScript"),
+        exact("say \"hi\" C:\\n{A}\n{B}\n{A}", &["A", "B"])
+    );
+    assert_eq!(
+        translated("[A] & chr(13) & chr(10) & [B] & CHR(10) & [OWNER]", "VBScript"),
+        exact("{A}\n{B}\n{OWNER}", &["A", "B", "OWNER"])
+    );
+    assert_eq!(translated("[A]", "VBScript"), exact("A", &["A"]));
+    assert_eq!(translated("!A!", "Python"), exact("A", &["A"]));
+    assert_eq!(translated("[A] + \" \" + [B]", "JScript"), exact("{A} {B}", &["A", "B"]));
+}
+
+#[test]
+fn function_calls_fall_back_to_the_first_field() {
+    assert_eq!(translated("Split($feature.OWNER, ' ')[0]", "Arcade"), inexact("OWNER"));
+    assert_eq!(translated("Return Concatenate([$feature.a, $feature.b], ' ')", "Arcade"), inexact("a"));
+    assert_eq!(translated("1 + 2", "Arcade"), None);
+    assert_eq!(translated("IIf([A] > 0, [A], [B])", "VBScript"), inexact("A"));
+    assert_eq!(translated("$feature.A * 2", "Arcade"), inexact("A"));
+    assert_eq!(translated("$feature.A $feature.B", "Arcade"), inexact("A"), "two fields with nothing joining them");
+    assert_eq!(translated("$feature.A +", "Arcade"), inexact("A"));
+    assert_eq!(translated("\"unterminated + $feature.A", "Arcade"), inexact("A"));
+    // Nothing but text has no field to draw.
+    assert_eq!(translated("\"no field here\"", "Arcade"), None);
+    assert_eq!(translated("", "Arcade"), None);
+    assert_eq!(translated("return", "Arcade"), None);
+    assert_eq!(translated("return;", "Arcade"), None);
+    assert_eq!(translated("$feature.", "Arcade"), None);
+    assert_eq!(translated("[ ]", "VBScript"), None);
+}
+
+#[test]
+fn formatting_tags_and_braces() {
+    let t = expr::template("\"<BOL>\" + $feature.X + \"</BOL>\"", "Arcade").unwrap();
+    assert_eq!((t.template.as_str(), t.exact, t.tags_dropped), ("{X}", true, true));
+    assert_eq!(
+        translated("\"<CLR red='255'><ITA>\" + $feature.X + \"</ITA></CLR> <UND>u</UND><FNT name='A' size='9'>f</FNT>\"", "Arcade"),
+        exact("{X} uf", &["X"])
+    );
+    // Not a tag: kept as text.
+    assert_eq!(translated("\"a < b <i> <CLR\" + $feature.X", "Arcade"), exact("a < b <i> <CLR{X}", &["X"]));
+    assert!(!expr::template("\"a < b\" + $feature.X", "Arcade").unwrap().tags_dropped);
+    // Braces in text are doubled, so they stay text.
+    assert_eq!(translated("\"{x}\" + [A] + \"}\"", "VBScript"), exact("{{x}}{A}}}", &["A"]));
+    let t = expr::template("\"{x}\" + [A]", "VBScript").unwrap().template;
+    assert_eq!(crate::symbology::template_fields(&t), ["A"]);
+}
+
+#[test]
+fn hostile_expressions_are_bounded() {
+    let long = "x".repeat(100_000);
+    let expressions = [
+        format!("\"{long}"),
+        format!("'{long}"),
+        "[".repeat(100_000),
+        "!".repeat(100_000),
+        "$feature[\"".repeat(10_000),
+        "<CLR".repeat(25_000),
+        format!("\"{}\"", "<CLR".repeat(25_000)),
+        "[[[[$feature.A]]]]".repeat(5_000),
+        format!("$feature.A + \"{long}\""),
+        "$feature.A + ".repeat(8_000) + "$feature.A",
+        format!("\"{}\" + $feature.A", "{".repeat(100_000)),
+        "\"\\".repeat(50_000),
+        "chr(".repeat(25_000),
+    ];
+    for e in &expressions {
+        for engine in ["Arcade", "VBScript", "Python", "JScript"] {
+            let start = std::time::Instant::now();
+            let t = expr::template(e, engine);
+            let took = start.elapsed();
+            assert!(took.as_millis() < 20, "{} chars took {took:?}", e.len());
+            if let Some(t) = t {
+                assert!(t.template.chars().count() <= crate::symbology::MAX_TEMPLATE);
+                assert!(!t.fields.is_empty());
+            }
+        }
+    }
+    // Too long a template falls back to the first field.
+    assert_eq!(translated(&format!("$feature.A + \"{long}\""), "Arcade"), inexact("A"));
+}
+
+#[test]
+fn label_expressions_come_through_as_templates() {
+    let class = |expression: &str, engine: &str| {
+        json!({"type": "CIMLabelClass", "expression": expression, "expressionEngine": engine,
+            "textSymbol": symbol_ref(text_symbol(json!({"height": 10})))})
+    };
+    let classes = vec![
+        class("\"SEC. \" + $feature.SECT_NO + TextFormatting.NewLine + $feature['T.BLOCK']", "Arcade"),
+        class("$feature.OWNER", "Arcade"),
+        class("\"<BOL>\" & [StreetName] & \"</BOL>\"", "VBScript"),
+    ];
+    let layer = feature_layer("Lots", standard_connection("Shapefile", "DATABASE=/d", "l.shp"), json!({"labelClasses": classes}));
+    let (map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/lots.json"]));
+    let labels = map.layers[0].style.labels.as_ref().unwrap();
+    let fields: Vec<&str> = labels.classes.iter().map(|c| c.field.as_str()).collect();
+    assert_eq!(fields, ["SEC. {SECT_NO}\n{BLOCK}", "OWNER", "{StreetName}"]);
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t == "Lots: field T.BLOCK of a join, read as BLOCK"), "{n:?}");
+    assert_eq!(n.iter().filter(|t| t.contains("text formatting tags, left out")).count(), 1, "{n:?}");
+    assert!(!n.iter().any(|t| t.contains("drawn as")), "{n:?}");
 }

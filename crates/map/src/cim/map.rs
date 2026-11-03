@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::color::symbol_of;
+use super::expr;
 use super::symbol::{self, shown};
 use super::units::pt96;
 use super::{Document, Report, flag, num, str_of, typed};
@@ -468,7 +469,7 @@ fn size_variable(r: &Value, what: &str, style: &mut Style, report: &mut Report) 
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .collect();
-    let field = expressions.iter().find_map(|e| expression_field(e).filter(|(_, exact)| *exact)).map(|(f, _)| f);
+    let field = expressions.iter().copied().find_map(expr::field);
     let sizes = num(v, "minSize").zip(num(v, "maxSize"));
     let values = num(v, "minValue").zip(num(v, "maxValue"));
     // A simple renderer's marker grows with the field (only a marker has a size to grow).
@@ -634,13 +635,21 @@ fn labels(def: &Value, what: &str, report: &mut Report) -> Option<Labeling> {
 /// A `CIMLabelClass` as a label class, `None` when it has no field to label with (noted).
 fn label_class(c: &Value, what: &str, report: &mut Report) -> Option<LabelClass> {
     let expression = str_of(c, "expression").unwrap_or_default();
-    let Some((field, exact)) = expression_field(expression) else {
+    let engine = str_of(c, "expressionEngine").unwrap_or("Arcade");
+    let Some(t) = expr::template(expression, engine) else {
         report.skipped(what, format!("label expression {}, no field to draw it with, class left out", shown(expression)));
         return None;
     };
-    if !exact {
-        report.approximated(what, format!("label expression {}, drawn as {}", shown(expression), shown(&field)));
+    if !t.exact {
+        report.approximated(what, format!("label expression {}, drawn as {}", shown(expression), shown(&t.template)));
     }
+    for (written, read) in &t.joins {
+        report.approximated(what, format!("field {} of a join, read as {}", shown(written), shown(read)));
+    }
+    if t.tags_dropped {
+        report.approximated(what, "text formatting tags, left out");
+    }
+    let field = t.template;
     // The text symbol, without the halo the label class carries over itself.
     let raw = c.get("textSymbol").and_then(symbol_of).unwrap_or(&NULL);
     let mut plain = raw.clone();
@@ -682,48 +691,4 @@ fn label_class(c: &Value, what: &str, report: &mut Report) -> Option<LabelClass>
         line_align: TextAlign::Left,
         repeat: None,
     })
-}
-
-/// The field a label expression stands for, and whether the expression is only that field
-/// (`$feature.X`, `$feature["X"]`, `$feature['X']`, `[X]`, `!X!` or `X`). Of any other expression,
-/// the first field it refers to.
-fn expression_field(e: &str) -> Option<(String, bool)> {
-    let e = e.trim();
-    if is_name(e) {
-        return Some((e.to_string(), true));
-    }
-    let (field, start, end) = first_reference(e)?;
-    Some((field, start == 0 && end == e.len()))
-}
-
-fn is_name(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
-}
-
-/// The first field reference in `e`, with where it starts and ends (bytes).
-fn first_reference(e: &str) -> Option<(String, usize, usize)> {
-    const FEATURE: &str = "$feature";
-    for (i, ch) in e.char_indices() {
-        let rest = e.get(i..)?;
-        if let Some(after) = rest.strip_prefix(FEATURE) {
-            if let Some(name) = after.strip_prefix('.') {
-                let n: String = name.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                if !n.is_empty() {
-                    return Some((n.clone(), i, i + FEATURE.len() + 1 + n.len()));
-                }
-            } else if let Some(inner) = after.strip_prefix('[') {
-                let quote = inner.chars().next().filter(|q| *q == '"' || *q == '\'');
-                let quoted = quote.and_then(|q| inner.get(1..)?.split_once(q));
-                if let Some((n, _)) = quoted.filter(|(n, tail)| !n.is_empty() && tail.starts_with(']')) {
-                    return Some((n.to_string(), i, i + FEATURE.len() + 1 + 1 + n.len() + 1 + 1));
-                }
-            }
-        } else if ch == '[' || ch == '!' {
-            let close = if ch == '[' { ']' } else { '!' };
-            if let Some((n, _)) = rest.get(1..).and_then(|r| r.split_once(close)).filter(|(n, _)| is_name(n)) {
-                return Some((n.to_string(), i, i + 1 + n.len() + 1));
-            }
-        }
-    }
-    None
 }

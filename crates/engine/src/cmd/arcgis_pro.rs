@@ -390,7 +390,10 @@ fn projection(s: &mut Session, m: &MapImport, name: &str, report: &mut Report) -
     if matches!(wkid, 3857 | 102100) {
         return match s.run_part("map.projection", &json!({"type": "mercator"})) {
             Ok(_) => Units::Projected,
-            Err(_) => Units::Unknown,
+            Err(e) => {
+                report.approximated(name, format!("its coordinate system EPSG:{wkid} ({e}), drawn in Web Mercator"));
+                Units::Unknown
+            }
         };
     }
     if let Some(g) = qgis::Geographic::of(&format!("EPSG:{wkid}")) {
@@ -451,10 +454,11 @@ fn add_list(s: &mut Session, entries: &[Entry], within: Option<&str>, a: &mut Ad
     placed
 }
 
-/// Runs one of the import's commands; a failure is noted against `what`, and the import goes on.
-fn step(s: &mut Session, id: &str, p: &Value, what: &str, report: &mut Report) {
+/// Runs one of the import's commands, which gives `what` its `part` ("its visibility"); a
+/// failure is noted in those words, and the import goes on.
+fn step(s: &mut Session, id: &str, p: &Value, what: &str, part: &str, report: &mut Report) {
     if let Err(e) = s.run_part(id, p) {
-        report.approximated(what, format!("{id} didn't apply ({e})"));
+        report.approximated(what, format!("{part}, not applied ({e})"));
     }
 }
 
@@ -476,10 +480,10 @@ fn add_group(s: &mut Session, g: &GroupImport, a: &mut Adding, report: &mut Repo
     if let Some(t) = g.transparency {
         set["transparency"] = json!(t);
     }
-    step(s, "group.set", &set, name, report);
-    step(s, "group.expand", &json!({"group": id, "on": g.expanded}), name, report);
+    step(s, "group.set", &set, name, "its visibility and transparency", report);
+    step(s, "group.expand", &json!({"group": id, "on": g.expanded}), name, "its expanded state", report);
     if g.min_scale.is_some() || g.max_scale.is_some() {
-        step(s, "group.scaleRange", &json!({"group": id, "min": g.min_scale, "max": g.max_scale}), name, report);
+        step(s, "group.scaleRange", &json!({"group": id, "min": g.min_scale, "max": g.max_scale}), name, "its scale range", report);
     }
     Placed::Group(id)
 }
@@ -561,7 +565,8 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
     match added {
         Ok(r) => opened(s, l, &r, before, within, a, report),
         Err(e) => {
-            report.skipped(name, format!("its data couldn't be opened ({e}); added broken, to repair or retry"));
+            // In the map, drawing nothing until repaired: not left out.
+            report.approximated(name, format!("added broken: {e} (repair or retry it)"));
             broken_layer(s, l, from, e, a)
         }
     }
@@ -602,6 +607,7 @@ fn opened(
     }
     if r.get("table").is_some() {
         report.approximated(&l.name, "a table, added to the project's tables");
+        unapplied_query(l, report);
         return Placed::Outside;
     }
     let id =
@@ -630,6 +636,7 @@ fn settle(s: &mut Session, id: u32, l: &LayerImport, a: &Adding, report: &mut Re
             report.skipped(name, why);
         }
         l.style.apply(layer);
+        unapplied_query(l, report);
     } else {
         l.style.apply(layer);
         if let Some(q) = &l.definition_query {
@@ -640,12 +647,19 @@ fn settle(s: &mut Session, id: u32, l: &LayerImport, a: &Adding, report: &mut Re
         }
         qgis::check_fields(layer, name, report);
     }
-    step(s, "layer.expand", &json!({"layer": id, "on": l.expanded}), name, report);
+    step(s, "layer.expand", &json!({"layer": id, "on": l.expanded}), name, "its expanded state", report);
     if !raster
         && l.scale_symbols
         && let Some(scale) = a.reference_scale
     {
-        step(s, "layer.referenceScale", &json!({"layer": id, "scale": scale}), name, report);
+        step(s, "layer.referenceScale", &json!({"layer": id, "scale": scale}), name, "its reference scale", report);
+    }
+}
+
+/// Notes a definition query that has nothing to filter (the data opened as a raster or a table).
+fn unapplied_query(l: &LayerImport, report: &mut Report) {
+    if let Some(q) = &l.definition_query {
+        report.skipped(&l.name, format!("its definition query `{}`, not applied", shown(q)));
     }
 }
 
@@ -721,16 +735,18 @@ fn add_tables(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Re
 /// Shows the new map at the view Pro saved (its centre and scale), else at its default extent
 /// when that holds some of the data, else at its data.
 fn go_to_view(s: &mut Session, m: &MapImport, units: Units, camera: Option<(f64, f64, f64)>) {
-    let lonlat = |s: &Session, x: f64, y: f64| -> Option<Coord> {
+    // An extent's corners past the world's edge are brought to it; a camera there is refused.
+    let lonlat = |s: &Session, x: f64, y: f64, clamp: bool| -> Option<Coord> {
         let c = match units {
-            Units::Degrees => Coord::new(x.clamp(-180.0, 180.0), y.clamp(-90.0, 90.0)),
+            Units::Degrees if clamp => Coord::new(x.clamp(-180.0, 180.0), y.clamp(-90.0, 90.0)),
+            Units::Degrees => Coord::new(x, y),
             Units::Projected => s.map().to_lonlat(Coord::new(x, y))?,
             Units::Unknown => return None,
         };
         (c.x.is_finite() && c.y.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0).then_some(c)
     };
     if let Some((x, y, scale)) = camera
-        && let Some(c) = lonlat(s, x, y)
+        && let Some(c) = lonlat(s, x, y, false)
     {
         let mut q = json!({"lon": c.x, "lat": c.y});
         // Pro's scale is at 96 dots to the inch, as QGIS's is.
@@ -745,7 +761,7 @@ fn go_to_view(s: &mut Session, m: &MapImport, units: Units, camera: Option<(f64,
     let saved = m.extent.and_then(|[x0, y0, x1, y1]| {
         let mut e = Extent::EMPTY;
         for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-            let c = lonlat(s, x, y)?;
+            let c = lonlat(s, x, y, true)?;
             e = e.union(&Extent::new(c.x, c.y, c.x, c.y));
         }
         (!e.is_empty()).then_some(e)

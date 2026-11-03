@@ -23260,7 +23260,9 @@ fn a_pagx_whose_data_is_missing_still_reuses_its_map() {
     let maps = s.project.maps.len();
     let params = json!({"text": text, "maps": {"MAIN MAP": "World"}});
     let first = s.run("layout.import", &params).unwrap();
-    assert!(first["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "Gone" && n["kind"] == "skipped"), "{}", first["notes"]);
+    // In the map broken, so said, but not as left out.
+    let gone = |kind: &str| first["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "Gone" && n["kind"] == kind);
+    assert!(gone("approximated") && !gone("skipped"), "{}", first["notes"]);
     s.run("layout.import", &params).unwrap();
     assert_eq!(s.project.maps.len(), maps + 1);
     // Another map of the embedded map's name: the import's own map, numbered, is still found.
@@ -23732,12 +23734,22 @@ fn pro_mapx() -> String {
 /// Adds `text`'s map (a `CIMMapDocument`) to `s` as `project.importArcgis` will, with the
 /// shapefile's folder for its relative paths: what was added, and the notes as `"layer: text"`.
 fn add_pro_map(s: &mut Session, text: &str, camera: Option<(f64, f64, f64)>) -> (crate::cmd::arcgis_pro::Added, Vec<String>) {
+    let dir = pro_map_shapefile().parent().unwrap().display().to_string();
+    add_pro_map_in(s, text, Some(&dir), camera)
+}
+
+/// `add_pro_map`, with `dir` for the folder relative paths start from.
+fn add_pro_map_in(
+    s: &mut Session,
+    text: &str,
+    dir: Option<&str>,
+    camera: Option<(f64, f64, f64)>,
+) -> (crate::cmd::arcgis_pro::Added, Vec<String>) {
     use rustgis_map::cim::{self, Document, Report};
     let doc = Document::from_json(text).unwrap();
     let mut report = Report::default();
     let m = cim::read_map_def(&doc, doc.map_definition().unwrap(), &mut report).unwrap();
-    let dir = pro_map_shapefile().parent().unwrap().display().to_string();
-    let added = crate::cmd::arcgis_pro::add_map(s, &m, Some(&dir), camera, &mut report).unwrap();
+    let added = crate::cmd::arcgis_pro::add_map(s, &m, dir, camera, &mut report).unwrap();
     (added, report.notes.iter().map(|n| format!("{}: {}", n.layer, n.text)).collect())
 }
 
@@ -23854,10 +23866,78 @@ fn the_layout_path_now_keeps_groups() {
     // Nothing disappears unsaid: the layer whose file isn't there comes in broken, and said; the
     // query that doesn't fit is said.
     assert!(m.layer(id("Gone")).unwrap().source.as_ref().is_some_and(|src| src.is_broken()));
-    assert!(notes.iter().any(|n| n["layer"] == "Gone" && n["kind"] == "skipped"), "{notes:?}");
+    let gone = |kind: &str| notes.iter().any(|n| n["layer"] == "Gone" && n["kind"] == kind);
+    assert!(gone("approximated") && !gone("skipped"), "{notes:?}");
+    assert!(notes.iter().any(|n| n["layer"] == "Gone" && n["text"].as_str().unwrap().starts_with("added broken: ")), "{notes:?}");
     assert!(notes.iter().any(|n| n["layer"] == "Detail Points" && n["text"].as_str().unwrap().contains("nope = 1")), "{notes:?}");
     assert!(!notes.iter().any(|n| n["text"].as_str().unwrap().contains("one by one")), "{notes:?}");
     // Imported again, the map is reused.
     s.run("layout.import", &params).unwrap();
     assert_eq!(s.project.maps.len(), maps + 1);
+}
+
+/// A `CIMMapDocument` "Small" listing `listed` (top first), with `defs` its layer definitions.
+fn small_mapx(defs: Vec<Value>, listed: &[&str]) -> String {
+    type_first(json!({"type": "CIMMapDocument", "version": "3.7.0",
+        "mapDefinition": {"type": "CIMMap", "name": "Small", "layers": listed, "spatialReference": {"wkid": 3857}},
+        "layerDefinitions": defs}))
+}
+
+/// A shapefile layer `name` at `CIMPATH=small/<name>.json`, its file in `folder` (relative or not).
+fn small_layer(name: &str, folder: &str, file: &str) -> Value {
+    json!({"type": "CIMFeatureLayer", "name": name, "uRI": format!("CIMPATH=small/{name}.json"), "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": format!("DATABASE={folder}"), "workspaceFactory": "Shapefile", "dataset": file,
+            "datasetType": "esriDTFeatureClass"}}})
+}
+
+#[test]
+fn pro_map_nested_group_order() {
+    use rustgis_map::Outline;
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    let inner = json!({"type": "CIMGroupLayer", "name": "Inner", "uRI": "CIMPATH=small/inner.json", "layers": ["CIMPATH=small/mid.json"]});
+    let outer = json!({"type": "CIMGroupLayer", "name": "Outer", "uRI": "CIMPATH=small/outer.json",
+        "layers": ["CIMPATH=small/top.json", "CIMPATH=small/inner.json", "CIMPATH=small/bottom.json"]});
+    let defs = vec![
+        outer,
+        inner,
+        small_layer("top", &folder, &file),
+        small_layer("mid", &folder, &file),
+        small_layer("bottom", &folder, &file),
+        small_layer("below", &folder, &file),
+    ];
+    let text = small_mapx(defs, &["CIMPATH=small/outer.json", "CIMPATH=small/below.json"]);
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &text, None);
+    assert_eq!((added.layers, added.broken), (4, 0), "{notes:?}");
+    let m = s.map();
+    let id = |name: &str| m.layer_by_name(name).unwrap().id;
+    let group = |name: &str| m.groups.iter().find(|g| g.name == name).unwrap().id;
+    let order: Vec<&str> = m.layers.iter().filter(|l| !l.graphics).map(|l| l.name.as_str()).collect();
+    assert_eq!(order, ["top", "mid", "bottom", "below"]);
+    assert_eq!(m.group(group("Inner")).unwrap().parent, Some(group("Outer")));
+    assert_eq!(m.outline(None), vec![Outline::Group(group("Outer")), Outline::Layer(id("below"))]);
+    assert_eq!(
+        m.outline(Some(group("Outer"))),
+        vec![Outline::Layer(id("top")), Outline::Group(group("Inner")), Outline::Layer(id("bottom"))]
+    );
+    assert_eq!(m.outline(Some(group("Inner"))), vec![Outline::Layer(id("mid"))]);
+}
+
+#[test]
+fn pro_map_relative_path_without_dir_is_broken() {
+    let text = small_mapx(vec![small_layer("Roads", "data", "roads.shp")], &["CIMPATH=small/Roads.json"]);
+    let mut s = world();
+    let (added, notes) = add_pro_map_in(&mut s, &text, None, None);
+    assert_eq!((added.layers, added.broken), (1, 1), "{notes:?}");
+    let src = s.map().layer_by_name("Roads").unwrap().source.as_ref().unwrap();
+    assert!(src.is_broken());
+    assert_eq!(src.why_broken(), Some("a relative path, and no folder to find it from"));
+    assert!(src.path.as_deref().is_some_and(|p| p.ends_with("roads.shp")), "{src:?}");
+    assert!(
+        notes.iter().any(|n| n == "Roads: added broken: a relative path, and no folder to find it from (repair or retry it)"),
+        "{notes:?}"
+    );
 }

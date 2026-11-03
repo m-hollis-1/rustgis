@@ -13,7 +13,7 @@ pub(crate) mod color;
 pub(crate) mod dyntext;
 pub(crate) mod expr;
 pub(crate) mod frame;
-mod labels;
+pub(crate) mod labels;
 pub mod layout;
 pub mod map;
 pub(crate) mod surround;

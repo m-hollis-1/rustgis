@@ -9,6 +9,7 @@ use serde_json::Value;
 use super::color::{color, symbol_of};
 use super::expr;
 use super::symbol::{self, shown};
+use super::units::pt_from_96;
 use super::{Report, flag, num, str_of};
 use crate::layout::TextAlign;
 use crate::qgis::QGIS_SCALE;
@@ -251,34 +252,41 @@ fn point_offset(placement: LabelPlacement, distance: f64) -> [f32; 2] {
 
 /// The Maplex settings RustGIS has nothing for, each noted when set off its default.
 fn unread(props: &Value, what: &str, report: &mut Report) {
-    const SETTINGS: [(&[&str], &str); 8] = [
-        (&["canOverrunFeature"], "labels overrunning their features"),
-        (&["labelPriority"], "label priorities"),
-        (&["pointPlacementPriorities", "polygonInternalZonePriorities", "polygonExternalZonePriorities"], "placement zone priorities"),
-        (&["featureWeight"], "feature weights"),
-        (&["keyNumberMethod"], "key numbering"),
-        (&["offsetAlongLineProperties"], "label offsets along a line"),
-        (&["thinDuplicateLabels"], "thinning duplicate labels"),
-        (&["removeDuplicates"], "removing duplicate labels"),
+    // (The zone priorities only rank candidate places, which RustGIS has no model of: Pro writes
+    // them on every class, and they are not noted.)
+    const SETTINGS: [(&str, &str); 6] = [
+        ("canOverrunFeature", "labels overrunning their features"),
+        ("labelPriority", "label priorities"),
+        ("featureWeight", "feature weights"),
+        ("keyNumberMethod", "key numbering"),
+        ("thinDuplicateLabels", "thinning duplicate labels"),
+        ("removeDuplicates", "removing duplicate labels"),
     ];
-    for (keys, setting) in SETTINGS {
-        if keys.iter().any(|k| props.get(k).is_some_and(is_set)) {
+    for (key, setting) in SETTINGS {
+        if props.get(key).is_some_and(is_set) {
             report.skipped(what, format!("{setting}, left out"));
         }
+    }
+    if props.get("offsetAlongLineProperties").is_some_and(moves_along_line) {
+        report.skipped(what, "label offsets along a line, left out");
     }
 }
 
 /// Whether a setting is off its default: true, a number but 0 (and -1, Pro's no priority), a
-/// name but "None" or "NoKey", an object or list with something in it.
+/// name but "None" or "NoKey".
 fn is_set(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0 && n != -1.0),
         Value::String(s) => !matches!(s.as_str(), "" | "None" | "NoKey"),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-        Value::Null => false,
+        _ => false,
     }
+}
+
+/// Whether `offsetAlongLineProperties` moves the label: a distance, or a place along the line
+/// other than the best one (which is where RustGIS puts it).
+fn moves_along_line(v: &Value) -> bool {
+    num(v, "distance").is_some_and(|d| d != 0.0) || str_of(v, "placementMethod").is_some_and(|m| m != "BestPositionAlongLine")
 }
 
 // ---- callouts, shadows and stacking -----------------------------------------------------------
@@ -309,16 +317,16 @@ fn background(c: &Value, what: &str, report: &mut Report) -> (Option<LabelBackgr
     let Some(paint) = c.get("backgroundSymbol").map(|s| symbol::polygon(s, what, report)) else {
         return (None, true);
     };
-    let stroke = paint.stroke.map(|(color, _)| color);
-    if paint.fill.is_none() && stroke.is_none() {
+    // (The outline is read in 96ths: back to points. A zero-width one is no outline.)
+    let outline = paint.stroke.map(|(color, w)| (color, pt_from_96(w))).filter(|(_, w)| *w > 0.0);
+    if paint.fill.is_none() && outline.is_none() {
         return (None, true);
     }
     let side = |k: &str| c.get("margin").and_then(|m| num(m, k)).unwrap_or(0.0).max(0.0);
     let background = LabelBackground {
         fill: paint.fill,
-        stroke,
-        // (The outline is read in 96ths: back to points.)
-        stroke_width: paint.stroke.map_or(0.0, |(_, w)| w * 0.75),
+        stroke: outline.map(|(color, _)| color),
+        stroke_width: outline.map_or(0.0, |(_, w)| w),
         padding: [side("left").max(side("right")) as f32, side("top").max(side("bottom")) as f32],
         radius: num(c, "cornerRadius").unwrap_or(0.0) as f32,
     };

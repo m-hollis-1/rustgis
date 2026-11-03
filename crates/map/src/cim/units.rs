@@ -29,6 +29,11 @@ pub(crate) fn pt96(v: f64) -> f32 {
     if v.is_finite() { ((v * 96.0 / 72.0) as f32).clamp(0.0, MAX_PX) } else { 0.0 }
 }
 
+/// A size in 96ths of an inch (what [`pt96`] gives) back in points.
+pub(crate) fn pt_from_96(v: f32) -> f32 {
+    v * 72.0 / 96.0
+}
+
 /// A text size in points, within what text can be drawn at (a non-finite size is the smallest).
 #[allow(dead_code)]
 pub(crate) fn text_pt(v: f64) -> f64 {

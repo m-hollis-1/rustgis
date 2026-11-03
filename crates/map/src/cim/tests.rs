@@ -3341,12 +3341,13 @@ fn maplex_settings_without_a_counterpart_are_noted() {
         maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine",
             "canOverrunFeature": true, "labelPriority": 3, "featureWeight": 5, "keyNumberMethod": "GetUniqueNumbers",
             "polygonInternalZonePriorities": {"center": 1}, "pointPlacementPriorities": {"aboveLeft": 2},
-            "offsetAlongLineProperties": {"placementMethod": "OffsetFromStart"}, "thinDuplicateLabels": true,
+            "offsetAlongLineProperties": {"placementMethod": "OffsetFromStart", "distance": 0}, "thinDuplicateLabels": true,
             "removeDuplicates": "ByLabel"})),
         json!({}),
     );
     let n = notes(&report);
-    assert_eq!(n.len(), 8, "{n:?}");
+    assert_eq!(n.len(), 7, "{n:?}");
+    assert!(!n.iter().any(|t| t.contains("zone")), "zone priorities are never noted: {n:?}");
     assert!(n.iter().all(|t| t.starts_with("Roads: ") && t.ends_with(", left out")), "{n:?}");
     // The defaults are not worth saying.
     let (_, report) = read_class(
@@ -3357,6 +3358,24 @@ fn maplex_settings_without_a_counterpart_are_noted() {
         json!({}),
     );
     assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // Populated but default, as Pro writes them on every class: priorities for the zones, and an
+    // offset along a line that stays at the best position, no distance.
+    let (_, report) = read_class(
+        maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine",
+            "pointPlacementPriorities": {"aboveLeft": 2, "aboveCenter": 1}, "polygonInternalZonePriorities": {"center": 1},
+            "polygonExternalZonePriorities": {"aboveLeft": 1},
+            "offsetAlongLineProperties": {"placementMethod": "BestPositionAlongLine", "distance": 0, "distanceUnit": "Percentage"}})),
+        json!({}),
+    );
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // A distance along the line moves the label; so does a place other than the best one.
+    for offset in [json!({"placementMethod": "BestPositionAlongLine", "distance": 15}), json!({"placementMethod": "OffsetFromEnd"})] {
+        let (_, report) = read_class(
+            maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine", "offsetAlongLineProperties": offset})),
+            json!({}),
+        );
+        assert_eq!(notes(&report), ["Roads: label offsets along a line, left out"]);
+    }
 }
 
 #[test]
@@ -3441,6 +3460,11 @@ fn background_callouts_become_label_backgrounds() {
     let (c, _) = read_class(json!({}), json!({"callout": background_callout(json!({"backgroundSymbol": only_fill}))}));
     let b = c.background.unwrap();
     assert_eq!((b.fill, b.stroke, b.stroke_width), (Some(Rgba::rgb(0, 0, 0)), None, 0.0));
+    // An outline of no width is no outline, not a hairline.
+    let hairline = polygon_symbol(vec![solid_stroke(rgb(128, 128, 128), 0.0), solid_fill(rgb(255, 255, 255))]);
+    let (c, _) = read_class(json!({}), json!({"callout": background_callout(json!({"backgroundSymbol": hairline}))}));
+    let b = c.background.unwrap();
+    assert_eq!((b.fill, b.stroke, b.stroke_width), (Some(Rgba::rgb(255, 255, 255)), None, 0.0));
 
     // Nothing to draw (no symbol, or one that draws nothing) is no background, and the halo stays.
     for callout in [
@@ -3515,4 +3539,8 @@ fn a_hidden_stacking_separator_becomes_the_wrap_character() {
     let odd = json!([{"separator": ""}, {"separator": "\n"}, {"separator": 5}, {"separator": "0123456789"}]);
     let (c, _) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": odd}}), json!({}));
     assert_eq!(c.wrap_char.as_deref(), Some("01234567"));
+    // Cut by characters, not bytes: ten of a three-byte character leave eight whole ones.
+    let wide = json!([{"separator": "\u{2192}".repeat(10)}]);
+    let (c, _) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": wide}}), json!({}));
+    assert_eq!(c.wrap_char, Some("\u{2192}".repeat(8)));
 }

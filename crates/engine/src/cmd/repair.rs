@@ -10,7 +10,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.repairSource", "Repair Data Source", "Data › Data Source", repair_source).params(
             r#"{"layer"?: name|id (default: the active layer), "path": "the file or folder (a Zarr store, a File Geodatabase) the layer's data moved to", "table"?: "the dataset in a GeoPackage, GDAL or DuckDB file, or a raster's subdataset (default: the one the layer reads now)"}"#),
         C::new("layer.repairFolder", "Repair Data Sources in a Folder", "Data › Data Source", repair_folder).params(
-            r#"{"from": "the folder the broken layers' data was in", "to": "the folder it moved to"} → "repaired" (the names of the layers fixed, each to the file of the same name in the new folder) and "skipped" (each with its "layer" name and the "why" it wasn't fixed); fails when no broken layer had its data in the old folder"#),
+            r#"{"from": "the folder the broken layers' data was in", "to": "the folder it moved to"} → "repaired" (the names of the layers fixed, each to the file of the same name in the new folder) and "skipped" (each with its "layer" name and the "why" it wasn't fixed); fails when no broken layer had its data in the old folder, or when none of them could be repaired (the error says why for each)"#),
         C::new("map.repairTiles", "Repair Tile Archive", "Layers", repair_tiles).params(
             r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id, "path": "the .pmtiles or .mbtiles file the archive moved to"}"#),
     ]

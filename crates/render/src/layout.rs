@@ -39,7 +39,8 @@ pub(crate) fn frame_requires_complete(map: &Map, view: &View) -> bool {
         scales.extend(view.camera.tilt_bands(view.width, view.height).iter().map(|b| map.ground_res_at(&b.camera) / rustgis_geom::PIXEL_M));
     }
     let complete = |source: &rustgis_map::source::SourceLayer| {
-        source.chunk_source().is_some() || (!source.is_open() && crate::is_local_shapefile(source))
+        // (A broken layer draws nothing until retried or repaired.)
+        source.chunk_source().is_some() || (!source.is_open() && !source.is_broken() && crate::is_local_shapefile(source))
     };
     map.layers.iter().filter(|l| scales.iter().any(|scale| map.draws_at(l, *scale))).any(|layer| {
         layer.source.as_ref().is_some_and(complete)
@@ -2166,6 +2167,11 @@ fn swatch(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, gt: GeometryType, s: 
             // A picture keeps its own colours, its longer side the marker's size.
             if let rustgis_map::Marker::Image(image) = s.marker {
                 crate::draw_image_marker(pm, x + w / 2.0, cy, rad, &image, 1.0);
+                return;
+            }
+            // So do paths.
+            if let rustgis_map::Marker::Path(shape) = s.marker {
+                crate::draw_path_marker(pm, x + w / 2.0, cy, rad, &shape, 1.0);
                 return;
             }
             if let Some(p) = PathBuilder::from_circle(x + w / 2.0, cy, rad) {

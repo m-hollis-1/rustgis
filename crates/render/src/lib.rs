@@ -120,6 +120,7 @@ use rustgis_data::{Dataset, Geometry, GeometryType};
 use rustgis_geom::{Coord, Extent, extent_to_merc, lonlat_to_merc};
 use rustgis_map::globe::{V3, densify};
 use rustgis_map::layout::TextAlign;
+use rustgis_map::symbology::LabelSource;
 use rustgis_map::{Camera, Globe, LabelPlacement, LineStroke, Map, Marker, Rgba, Symbol};
 pub use text::halo_reach;
 /// The image type pages and maps are drawn into.
@@ -837,7 +838,7 @@ impl Ctx<'_> {
             return; // behind the globe
         }
         // Off the image by more than any marker's reach: nothing to draw.
-        let reach = (s.size.max(1.0) * 0.6 + s.stroke_width.max(0.0) + 4.0) * self.ppp;
+        let reach = (s.size.max(1.0) * marker_reach(s.marker).max(0.6) + s.stroke_width.max(0.0) + 4.0) * self.ppp;
         if x < -reach || y < -reach || x > pm.width() as f32 + reach || y > pm.height() as f32 + reach {
             return;
         }
@@ -1477,8 +1478,8 @@ pub(crate) fn marker_path(x: f32, y: f32, r: f32, marker: Marker) -> Option<tiny
             }
             pb.close();
         }
-        // The square the picture fills, for hit tests and a moving view's stand-in.
-        Marker::Image(_) => {
+        // The square the picture or the paths fill, for hit tests and a moving view's stand-in.
+        Marker::Image(_) | Marker::Path(_) => {
             if let Some(rect) = tiny_skia::Rect::from_xywh(x - r, y - r, r * 2.0, r * 2.0) {
                 pb.push_rect(rect)
             }
@@ -1500,10 +1501,11 @@ pub(crate) fn marker_path(x: f32, y: f32, r: f32, marker: Marker) -> Option<tiny
 }
 
 /// How far a `marker` reaches from its centre, in its sizes: a shape (a star's points) 0.6, a
-/// character as far as its outline does.
+/// character as far as its outline does, paths as far as their farthest point and its stroke.
 pub(crate) fn marker_reach(marker: Marker) -> f32 {
     match marker {
         Marker::Char(g) => glyphs::shape(g).map_or(0.6, |s| s.reach),
+        Marker::Path(p) => p.reach(),
         _ => 0.6,
     }
 }
@@ -1511,10 +1513,22 @@ pub(crate) fn marker_reach(marker: Marker) -> f32 {
 /// A marker centred at (`x`, `y`) device pixels.
 fn draw_marker(pm: &mut Pixmap, x: f32, y: f32, s: &Symbol, opacity: f32, halo: Option<Rgba>, ppp: f32) {
     let r = (s.size.max(1.0) * ppp) / 2.0;
+    let halo_stroke = Stroke { width: 3.5 * ppp, line_join: LineJoin::Round, ..Stroke::default() };
+    // Paths keep their own colours, and their halo follows every part.
+    if let Marker::Path(shape) = s.marker {
+        if let Some(h) = halo {
+            for part in &shape.shape().parts {
+                if let Some(path) = path_marker_part(x, y, r, part) {
+                    pm.stroke_path(&path, &paint(h, 1.0), &halo_stroke, Transform::identity(), None);
+                }
+            }
+        }
+        draw_path_marker(pm, x, y, r, &shape, opacity);
+        return;
+    }
     let Some(path) = marker_path(x, y, r, s.marker) else { return };
     if let Some(h) = halo {
-        let st = Stroke { width: 3.5 * ppp, line_join: LineJoin::Round, ..Stroke::default() };
-        pm.stroke_path(&path, &paint(h, 1.0), &st, Transform::identity(), None);
+        pm.stroke_path(&path, &paint(h, 1.0), &halo_stroke, Transform::identity(), None);
     }
     // A picture keeps its own colours: the symbol's fill and outline are not drawn.
     if let Marker::Image(image) = s.marker {
@@ -1539,6 +1553,52 @@ pub(crate) fn draw_image_marker(pm: &mut Pixmap, x: f32, y: f32, r: f32, image: 
     let (dx, dy) = (x - img.width() as f32 * k / 2.0, y - img.height() as f32 * k / 2.0);
     let paint = tiny_skia::PixmapPaint { opacity, quality: tiny_skia::FilterQuality::Bilinear, ..tiny_skia::PixmapPaint::default() };
     pm.draw_pixmap(0, 0, img.as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, dx, dy), None);
+}
+
+/// A drawn marker's parts centred at (`x`, `y`), its size `2 * r` pixels: each filled in its fill,
+/// then stroked in its stroke `width * 2 * r` pixels wide (at least half a pixel), in order.
+pub(crate) fn draw_path_marker(pm: &mut Pixmap, x: f32, y: f32, r: f32, shape: &rustgis_map::PathRef, opacity: f32) {
+    paint_path_marker(pm, &path_marker_parts(x, y, r, shape), r, opacity, Transform::identity());
+}
+
+/// A drawn marker's parts as paths centred at (`x`, `y`), its size `2 * r` pixels, each with the
+/// part it draws: built once to be painted at many places ([`paint_path_marker`]).
+pub(crate) fn path_marker_parts(
+    x: f32,
+    y: f32,
+    r: f32,
+    shape: &rustgis_map::PathRef,
+) -> Vec<(tiny_skia::Path, &'static rustgis_map::PathPart)> {
+    shape.shape().parts.iter().filter_map(|part| Some((path_marker_part(x, y, r, part)?, part))).collect()
+}
+
+/// Paints a drawn marker's `parts` (built at size `2 * r` pixels) moved by `t`: each filled in its
+/// fill, then stroked in its stroke `width * 2 * r` pixels wide (at least half a pixel), in order.
+pub(crate) fn paint_path_marker(pm: &mut Pixmap, parts: &[(tiny_skia::Path, &rustgis_map::PathPart)], r: f32, opacity: f32, t: Transform) {
+    for (path, part) in parts {
+        if let Some(fill) = part.fill {
+            pm.fill_path(path, &paint(fill, opacity), FillRule::Winding, t, None);
+        }
+        if let Some(stroke) = part.stroke {
+            let st = Stroke { width: (part.width * 2.0 * r).max(0.5), line_join: LineJoin::Round, ..Stroke::default() };
+            pm.stroke_path(path, &paint(stroke, opacity), &st, t, None);
+        }
+    }
+}
+
+/// One part of a drawn marker in device pixels: its unit space scaled by the size `2 * r` about
+/// (`x`, `y`), y flipped (the shape's runs up, the screen's down).
+fn path_marker_part(x: f32, y: f32, r: f32, part: &rustgis_map::PathPart) -> Option<tiny_skia::Path> {
+    let k = 2.0 * r;
+    let mut pb = PathBuilder::new();
+    for (i, [px, py]) in part.points.iter().enumerate() {
+        let (px, py) = (x + px * k, y - py * k);
+        if i == 0 { pb.move_to(px, py) } else { pb.line_to(px, py) }
+    }
+    if part.closed {
+        pb.close();
+    }
+    pb.finish()
 }
 
 /// A picture marker's pixels (premultiplied, at most 256 a side), `None` when its picture can't
@@ -1649,8 +1709,11 @@ fn render_with_backend(map: &mut Map, view: &View, full_res_rasters: bool, backe
             if !complete_layers.contains(&layer.id) {
                 continue;
             }
+            // (A broken layer, one another app's project names that didn't open, draws nothing
+            // until it is retried or repaired: it doesn't stop the export.)
             if let Some(source) = &mut layer.source
                 && !source.is_open()
+                && !source.is_broken()
                 && is_local_shapefile(source)
             {
                 if let Err(e) = source.open() {
@@ -2572,8 +2635,8 @@ impl UprightMarker {
 /// The outline of a `marker` of radius `r` centred at (`x`, `y`), as [`draw_marker`] draws it
 /// (a circle as a polygon): for drawing upright markers as meshes. Every outline is seen whole
 /// from its centre, so a fan from the centre fills it. A character, which no fan fills, as a circle
-/// of its size (while a tilted view moves; the settled view draws the character), and a picture as
-/// the square it fills.
+/// of its size (while a tilted view moves; the settled view draws the character), and a picture or
+/// paths as the square of the size.
 pub fn marker_outline(marker: Marker, x: f32, y: f32, r: f32) -> Vec<(f32, f32)> {
     match marker {
         Marker::Circle | Marker::Char(_) => (0..24)
@@ -2585,7 +2648,7 @@ pub fn marker_outline(marker: Marker, x: f32, y: f32, r: f32) -> Vec<(f32, f32)>
         Marker::Square => {
             vec![(x - r * 0.9, y - r * 0.9), (x + r * 0.9, y - r * 0.9), (x + r * 0.9, y + r * 0.9), (x - r * 0.9, y + r * 0.9)]
         }
-        Marker::Image(_) => vec![(x - r, y - r), (x + r, y - r), (x + r, y + r), (x - r, y + r)],
+        Marker::Image(_) | Marker::Path(_) => vec![(x - r, y - r), (x + r, y - r), (x + r, y + r), (x - r, y + r)],
         Marker::Triangle => vec![(x, y - r * 1.1), (x + r, y + r * 0.75), (x - r, y + r * 0.75)],
         Marker::Diamond => vec![(x, y - r * 1.15), (x + r * 0.9, y), (x, y + r * 1.15), (x - r * 0.9, y)],
         Marker::Star => (0..10)
@@ -3559,9 +3622,12 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                 }
             }
             // Each label class labels every feature its clause takes, as in ArcGIS Pro (#732), when
-            // shown, in range and on a field the layer has (#618).
-            let label_fields: Vec<Option<usize>> = if labels.enabled && !display.paused {
-                labels.in_order().map(|c| ds_ptr.field_index(&c.field).filter(|_| c.visible && c.in_range(scale, distance))).collect()
+            // shown, in range and on a field the layer has (#618), or a template of them.
+            let label_fields: Vec<Option<LabelSource>> = if labels.enabled && !display.paused {
+                labels
+                    .in_order()
+                    .map(|c| (c.visible && c.in_range(scale, distance)).then(|| LabelSource::resolve(&c.field, ds_ptr)).flatten())
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -3636,12 +3702,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                         }
                         // (Along a line, the label is put on its stretch in view below.)
                         let (x, y) = point.unwrap_or_default();
-                        let Some(fi) = label_fields.get(ci).copied().flatten() else { continue };
-                        let v = ds_ptr.value(row, fi);
-                        if v.is_null() {
-                            continue;
-                        }
-                        let raw = v.to_string();
+                        let Some(raw) = label_fields.get(ci).and_then(Option::as_ref).and_then(|s| s.text(ds_ptr, row)) else { continue };
                         // Wrapped into lines as its class says; not a label curved character by
                         // character along a line (one line of characters, as QGIS curves it).
                         // (One too long to curve goes straight, and is wrapped as a straight one.)
@@ -5238,6 +5299,60 @@ mod tests {
         assert_eq!((path.bounds().left(), path.bounds().right()), (10.0, 30.0));
     }
 
+    /// A drawn marker's parts in their own colours, later parts over earlier ones, y up in the
+    /// shape (a screen's y runs down): the symbol's fill and outline are not drawn.
+    #[test]
+    fn a_path_marker_draws_its_parts_in_their_colours() {
+        use rustgis_map::symbology::{PathPart, PathRef, PathShape};
+        let diagonal =
+            PathPart { points: vec![[-0.5, -0.5], [0.5, 0.5]], closed: false, fill: None, stroke: Some(Rgba::rgb(0, 0, 255)), width: 0.1 };
+        let square = PathPart {
+            points: vec![[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]],
+            closed: true,
+            fill: Some(Rgba::rgb(255, 0, 0)),
+            stroke: None,
+            width: 0.0,
+        };
+        let marker = Marker::Path(PathRef::new(PathShape { parts: vec![diagonal, square] }).unwrap());
+        let s = Symbol { fill: Rgba::rgb(0, 255, 0), stroke: Rgba::rgb(0, 255, 0), stroke_width: 2.0, size: 40.0, marker };
+        let drawn = |opacity: f32| {
+            let mut pm = Pixmap::new(80, 80).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            draw_marker(&mut pm, 40.0, 40.0, &s, opacity, None, 1.0);
+            pm
+        };
+        let at = |pm: &Pixmap, x, y| {
+            let p = pm.pixel(x, y).unwrap();
+            [p.red(), p.green(), p.blue(), p.alpha()]
+        };
+        let pm = drawn(1.0);
+        // The square (40 px a side, its half 20) over the diagonal at the centre.
+        assert_eq!(at(&pm, 40, 40), [255, 0, 0, 255]);
+        assert_eq!(at(&pm, 47, 47), [255, 0, 0, 255]);
+        // The diagonal runs from the bottom left to the top right: (0.4, 0.4) is up and right.
+        assert_eq!(at(&pm, 56, 24), [0, 0, 255, 255]);
+        assert_eq!(at(&pm, 24, 56), [0, 0, 255, 255]);
+        // Off both parts, inside the marker's size: the background, no symbol fill or outline.
+        assert_eq!(at(&pm, 56, 56), [255, 255, 255, 255]);
+        assert_eq!(at(&pm, 24, 24), [255, 255, 255, 255]);
+        assert_eq!(at(&pm, 20, 40), [255, 255, 255, 255]);
+        // The layer's opacity lets the white through.
+        let [r, g, b, _] = at(&drawn(0.5), 47, 47);
+        assert!(r == 255 && (125..=130).contains(&g) && (125..=130).contains(&b), "{r} {g} {b}");
+        // A halo follows the parts (just past the square's right side), not the marker's square.
+        let mut haloed = Pixmap::new(80, 80).unwrap();
+        haloed.fill(tiny_skia::Color::WHITE);
+        draw_marker(&mut haloed, 40.0, 40.0, &s, 1.0, Some(Rgba::rgb(0, 255, 255)), 1.0);
+        assert_eq!(at(&pm, 51, 47), [255, 255, 255, 255]);
+        assert!(matches!(at(&haloed, 51, 47), [0..100, 255, 255, 255]), "{:?}", at(&haloed, 51, 47));
+        assert_eq!(at(&haloed, 59, 47), [255, 255, 255, 255]);
+        // Hit tests see the square of the size; the reach is the farthest point's.
+        let path = marker_path(40.0, 40.0, 20.0, marker).unwrap();
+        assert_eq!((path.bounds().left(), path.bounds().right()), (20.0, 60.0));
+        let far = PathPart { points: vec![[0.0, 0.0], [1.5, 0.0]], closed: false, fill: None, stroke: None, width: 0.0 };
+        assert_eq!(marker_reach(Marker::Path(PathRef::new(PathShape { parts: vec![far] }).unwrap())), 1.5);
+        assert!((marker_reach(marker) - (0.5f32.hypot(0.5) + 0.05)).abs() < 1e-6, "{}", marker_reach(marker));
+    }
     #[test]
     fn worldview_detection_and_data() {
         use sample_data::Worldview::{China, Default};
@@ -5400,6 +5515,26 @@ mod tests {
         // A clause that doesn't read takes no feature.
         capitals(m.layer_mut(id).unwrap(), "gone = 1");
         assert_eq!(sizes(&mut m), both);
+    }
+
+    /// A class whose field is a template labels each feature with its fields' values.
+    #[test]
+    fn a_label_template_draws_both_fields() {
+        let mut m = Map::new("Map");
+        let fields = vec![Field::new("name", FieldType::Text), Field::new("pop", FieldType::Integer)];
+        let mut d = Dataset::new("pts", GeometryType::Point, fields);
+        d.push(Some(Geometry::Point(Coord::new(2.35, 48.85))), vec![Value::Text("Paris".into()), Value::Int(2000)]);
+        d.push(Some(Geometry::Point(Coord::new(4.83, 45.76))), vec![Value::Text("Lyon".into()), Value::Int(500)]);
+        let id = m.add_dataset(d);
+        if let Some(l) = m.layer_mut(id) {
+            l.labels.enabled = true;
+            l.labels.default.field = "{name} {pop}".into();
+        }
+        let camera = Camera { center: lonlat_to_merc(Coord::new(3.6, 47.3)), res: 5000.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        let mut texts: Vec<String> = render(&mut m, &view).unwrap().labels.into_iter().map(|l| l.text).collect();
+        texts.sort();
+        assert_eq!(texts, ["Lyon 500", "Paris 2000"]);
     }
 
     /// A point's label whose place another takes goes round the point when its class says so

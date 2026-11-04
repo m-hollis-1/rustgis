@@ -19,7 +19,7 @@ use super::frame::{self, Frames};
 use super::surround;
 use super::symbol::{self, base64_text, data_url};
 use super::units::page_unit_mm;
-use super::{Document, Report, flag, num, str_of};
+use super::{Document, Report, UNREADABLE_PICTURE, flag, num, str_of};
 use crate::Rgba;
 use crate::layout::{ElementKind, FontFamily, FrameStyle, Layout, LineHead, MAX_ELEMENTS, MAX_GROUP_DEPTH, line_at_angle};
 
@@ -323,6 +323,12 @@ pub fn read_layout(doc: &Document, report: &mut Report) -> Result<LayoutImport, 
         .get("layoutDefinition")
         .filter(|d| d.is_object())
         .ok_or("not an ArcGIS Pro layout: the document has no layoutDefinition")?;
+    read_layout_def(doc, def, report)
+}
+
+/// Reads the layout `def` (a `CIMLayout`, wherever the document found it): the page, then each
+/// element as a RustGIS element.
+pub fn read_layout_def(doc: &Document, def: &Value, report: &mut Report) -> Result<LayoutImport, String> {
     let name = str_of(def, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Layout").to_string();
     let page = def.get("page").unwrap_or(&NULL);
     let unit_mm = page_unit_mm(page).unwrap_or_else(|| {
@@ -653,11 +659,16 @@ impl Reader<'_> {
             self.report.skipped(name, "a data: URL that isn't base64, left out");
         }
         let path = url.filter(|_| !is_data);
-        let embedded = str_of(g, "referenceURI")
-            .and_then(|u| self.doc.binary(u))
-            .map(|d| data_url(d).map_or_else(|| base64_text(d), |(_, payload)| payload));
+        let reference = str_of(g, "referenceURI");
+        let embedded =
+            reference.and_then(|u| self.doc.binary(u)).map(|d| data_url(d).map_or_else(|| base64_text(d), |(_, payload)| payload));
         let image = embedded.or(inline).unwrap_or_default();
-        if image.is_empty() && path.is_none() {
+        // A picture the project's zip held, but that couldn't be read from it, says so.
+        let lost = reference.filter(|u| image.is_empty() && self.doc.unreadable(u));
+        if let Some(u) = lost {
+            self.report
+                .skipped(name, format!("its picture {} couldn't be read from the project ({UNREADABLE_PICTURE}), left empty", shown(u)));
+        } else if image.is_empty() && path.is_none() {
             self.report.skipped(name, "a picture with no image or file, left empty");
         }
         let id = self.add(e, b, name, ElementKind::Picture { image: String::new(), source: path.map(str::to_string) })?;

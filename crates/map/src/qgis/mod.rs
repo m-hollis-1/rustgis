@@ -51,6 +51,9 @@ pub struct Report {
     /// thousands of different notes, and a repeat is found without going through them all.
     #[serde(skip)]
     index: HashMap<(String, NoteKind, String), usize>,
+    /// How many new notes were dropped for [`MAX_NOTES`] (a repeat of a kept one is still counted).
+    #[serde(skip)]
+    dropped: usize,
 }
 
 /// One thing an import couldn't carry over as QGIS has it.
@@ -83,7 +86,15 @@ impl Report {
             self.index.insert(key.clone(), self.notes.len());
             let (layer, kind, text) = key;
             self.notes.push(Note { layer, kind, text, count: 1 });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
         }
+    }
+
+    /// How many notes were dropped, being new once [`MAX_NOTES`] were kept: a caller counting
+    /// its own notes against the report's can tell whether one was kept.
+    pub fn dropped(&self) -> usize {
+        self.dropped
     }
 
     pub fn approximated(&mut self, layer: &str, text: impl Into<String>) {
@@ -124,6 +135,18 @@ pub struct Style {
 impl Style {
     /// Gives `layer` this style's parts (those it sets).
     pub fn apply(&self, layer: &mut crate::Layer) {
+        self.apply_checked(layer, true);
+    }
+
+    /// `apply` without the geometry checks: for a layer whose geometry isn't known yet (a broken
+    /// one), which keeps every part for when it opens.
+    pub fn apply_all(&self, layer: &mut crate::Layer) {
+        self.apply_checked(layer, false);
+    }
+
+    /// Gives `layer` this style's parts; with `checked`, a polygon's fills and a point's marker
+    /// rotation only to a layer of that geometry.
+    fn apply_checked(&self, layer: &mut crate::Layer, checked: bool) {
         if let Some(t) = self.transparency {
             layer.transparency = t;
         }
@@ -151,7 +174,7 @@ impl Style {
             layer.line_strokes = s.clone();
         }
         // (Only a polygon layer's fills draw.)
-        if let Some(f) = self.fill_layers.as_ref().filter(|_| layer.geometry_type() == rustgis_data::GeometryType::Polygon) {
+        if let Some(f) = self.fill_layers.as_ref().filter(|_| !checked || layer.geometry_type() == rustgis_data::GeometryType::Polygon) {
             layer.fill_layers = f.clone();
         }
         if let Some(on) = self.stroke_levels {
@@ -159,7 +182,7 @@ impl Style {
         }
         // Only a point layer's markers turn.
         if let Some(r) = &self.marker_rotation {
-            layer.marker_rotation = r.clone().filter(|_| layer.geometry_type() == rustgis_data::GeometryType::Point);
+            layer.marker_rotation = r.clone().filter(|_| !checked || layer.geometry_type() == rustgis_data::GeometryType::Point);
         }
         if let Some(r) = self.reference_scale {
             layer.reference_scale = Some(r);

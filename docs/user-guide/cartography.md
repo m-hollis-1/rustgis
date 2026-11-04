@@ -53,7 +53,7 @@ layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
 
 A marker can also be a **picture**: a PNG or JPEG drawn in its own colours with its longer side
 the **Size**, as the picture markers of ArcGIS Pro symbols are, and PNG and JPEG
-ones come in from a `.pagx` layout's maps (a GIF or BMP marker in a layer's symbol is drawn as
+ones come in from ArcGIS Pro maps (a GIF or BMP marker in a layer's symbol is drawn as
 a circle, and noted). By command, `layer.marker` takes
 `image` (the picture as base64, at most 512 KB) or `imagePath` (a file, read by the app, not in
 the browser) in place of a shape or a character:
@@ -61,6 +61,15 @@ the browser) in place of a shape or a character:
 ```text
 layer.marker={"layer":"Peaks","imagePath":"C:/symbols/summit.png","size":18}
 ```
+
+A marker can be **Custom**: a shape drawn from paths, each filled and outlined in its own colours,
+with the **Size** as the square it is drawn in. It is what an ArcGIS Pro map brings in for a
+marker RustGIS has no shape for (a hand-drawn symbol, a marker that is turned or moved off its
+centre) and for a symbol of several marker layers drawn as one when every layer is a drawn shape
+(with a picture or a character among them, the first marker is used instead, and noted), and it
+draws on points and along lines. **Custom** shows as the **Shape** of such a layer; the drawing itself can't be edited
+or set by command, but **Size** changes it, and choosing another shape, a character or a picture
+replaces it (`layer.marker` with `shape`, `char` or `image`). A project keeps it.
 
 **Rotation** turns each point's marker by the angle in a number field, in degrees clockwise
 (**Counterclockwise** for angles as mathematics counts them), as wind arrows or the signs of a
@@ -366,6 +375,16 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
 - **Label field and text**: the field the labels show
   (`labels.field={"layer": "Cities", "field": "name"}`), and the text symbol's size (4–72 points),
   colour, halo, bold and italic (`labels.style={"layer": "Cities", "size": 12, "color": "#5A1E0A", "halo": true}`).
+- **Label expressions**: the Labeling pane › Content tab switches between **Field** (one field's
+  value) and **Expression**, a text with each field's name in braces standing for its value:
+  `{name} ({pop_max})` labels a city with its name and, in brackets, its population. **Insert field…** adds a field's
+  `{name}` at the end. The expression is set when the box is left. Each field must be one of the
+  layer's; a doubled brace is a brace (`{{` and `}}`), the text is at most 1,000 characters, and a
+  newline in it starts a new line. A feature whose fields are all empty gets no label, and a field
+  that is empty in one feature leaves just that part blank. A class labelled by an expression
+  opens on **Expression**. Labels from ArcGIS Pro expressions that join fields and text come in
+  this way. By command, `labels.field` takes the expression in place of a field's name
+  (`labels.field={"layer": "Cities", "field": "{name} ({pop_max})"}`).
 - **Halo and letter spacing**: a halo is white behind dark text and dark behind light, and thin,
   unless it is given a colour and a width of its own (Labeling pane › Symbol › **Halo color**,
   **Halo width**: how far it reaches beyond the letters, 0–10 points). The letters can be set

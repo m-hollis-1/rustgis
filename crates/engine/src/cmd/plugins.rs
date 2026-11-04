@@ -273,6 +273,8 @@ const NEVER: &[&str] = &[
     // A QGIS project names the files and web addresses its layers come from, and the import
     // adds them without each one passing a plugin's permissions.
     "project.importQgis",
+    // So does an ArcGIS Pro project, map or layer file.
+    "project.importArcgis",
     "project.importGeolibre",
     // Completion callbacks can finish project imports; plugins never supply their state.
     "layer.addDownload",
@@ -305,6 +307,10 @@ const WRITES_FILES: &[&str] = &["project.save", "project.saveAs"];
 
 /// Commands that read a file a layer names, not their parameters.
 const READS_FILES: &[&str] = &["gpkg.discardEdits"];
+
+/// Commands that open what a layer names, a file or a web service, not their parameters: Retry
+/// reopens a broken layer's file (or its web address) or adds its service again.
+const LAYER_SOURCES: &[&str] = &["layer.retry"];
 
 /// Parameter keys that name a file, folder or address. (`data` and `text` carry content, which
 /// plugins may pass: `layer.addDataBytes`, `map.import` from text.)
@@ -376,7 +382,7 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if super::tiles::NETWORK.contains(&spec.id) {
         return Some(Reach::Network);
     }
-    if DATABASES.contains(&spec.id) {
+    if DATABASES.contains(&spec.id) || LAYER_SOURCES.contains(&spec.id) {
         return Some(Reach::Files);
     }
     // Georeferencing and projecting write a file only when given a `path`; the rest of them stays
@@ -399,7 +405,9 @@ fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
         return Some(format!("plugins can't run '{}'", spec.id));
     }
     // An SQL query reads files and web addresses alike, and a database is a file or a server.
-    let database = DATABASES.contains(&spec.id) || (spec.id == "cube.open" && super::cube_catalog::opens_zarr(params));
+    let database = DATABASES.contains(&spec.id)
+        || LAYER_SOURCES.contains(&spec.id)
+        || (spec.id == "cube.open" && super::cube_catalog::opens_zarr(params));
     if database && !(m.has(Permission::Files) && m.has(Permission::Network)) {
         return Some(format!("{} needs the 'files' and 'network' permissions to run '{}'", m.name, spec.id));
     }

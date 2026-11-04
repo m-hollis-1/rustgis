@@ -5,6 +5,7 @@
 
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::qgis::{self, NoteKind, Report, Source};
+use rustgis_map::symbology::{LabelSource, template_fields};
 use serde_json::{Value, json};
 
 use super::{need_layer, ps};
@@ -238,10 +239,26 @@ pub(crate) fn check_fields(l: &mut rustgis_map::Layer, name: &str, report: &mut 
             report.skipped(name, format!("the label class \"{}\", whose clause `{w}` doesn't fit the layer ({e})", c.name));
             c.visible = false;
         }
-        // (A class with no field set labels nothing, and isn't noted.)
-        if c.visible && !c.field.is_empty() && l.dataset.field_index(&c.field).is_none() {
-            report.skipped(name, format!("labels from the field {}, which the layer hasn't", c.field));
-            c.visible = false;
+        // (A class with no field set labels nothing, and isn't noted.) A template draws without
+        // its fields the layer hasn't, while it has one of them.
+        if c.visible && !c.field.is_empty() {
+            if LabelSource::resolve(&c.field, &l.dataset).is_none() {
+                // A template's fields by name, as the layer has none of them.
+                let what = match template_fields(&c.field).as_slice() {
+                    [] => format!("the field {}", c.field),
+                    [one] => format!("the field {one}"),
+                    many => format!("the fields {}", many.join(", ")),
+                };
+                report.skipped(name, format!("labels from {what}, which the layer hasn't"));
+                c.visible = false;
+            } else {
+                for f in template_fields(&c.field).into_iter().filter(|f| l.dataset.field_index(f).is_none()) {
+                    report.approximated(
+                        name,
+                        format!("labels from the field {f}, which the layer hasn't; the rest of the expression is drawn"),
+                    );
+                }
+            }
         }
     }
     let field = match &l.renderer {
@@ -337,17 +354,17 @@ fn go_to_view(s: &mut Session, project: &qgis::Project, degrees: Option<Geograph
 
 /// A coordinate system in degrees (EPSG:4326, ETRS89, NAD83, …), which QGIS draws as plate carrée.
 #[derive(Clone, Copy, Debug)]
-struct Geographic {
+pub(crate) struct Geographic {
     /// On WGS 84, or a datum PROJ takes as the same (no shift to WGS 84).
-    wgs84: bool,
+    pub(crate) wgs84: bool,
     /// Longitudes from Greenwich (not from another prime meridian, such as Paris's).
-    greenwich: bool,
+    pub(crate) greenwich: bool,
 }
 
 impl Geographic {
     /// `None` for a coordinate system that isn't in degrees, or isn't known: an `EPSG:` code,
     /// `OGC:CRS84`, or a PROJ string (a project QGIS saved without an authority code).
-    fn of(crs: &str) -> Option<Geographic> {
+    pub(crate) fn of(crs: &str) -> Option<Geographic> {
         if crs.eq_ignore_ascii_case("OGC:CRS84") {
             return Some(Geographic { wgs84: true, greenwich: true });
         }

@@ -334,15 +334,16 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   indicators and the frames that follow another), its text and dynamic text, rectangles, lines,
   pictures, groups, borders and backgrounds, legends, scale bars, north arrows, table frames and
   map series. Each map the frames show is added to the project as a new map, with its layers
-  (shapefiles and file geodatabase feature classes, from the file's folder or `dir`), their
-  symbols, labels and visibility; running the import again reuses a map it added before. A frame
+  (from files in the file's folder or `dir`, and from services; a layer RustGIS can't open comes
+  in broken), their symbols, labels and visibility; running the import again reuses a map it added before. A frame
   that doesn't say which map it shows, when the project has more than one map, makes a dialog ask
   which, frame by frame, before anything is imported (`maps={"Main Map": "Overview"}` from a
   command); with one map, or in the browser, such a frame shows the active map at its current
   view. A notice counts what was drawn differently and what was left out, and the command's
-  `notes` list each by element; [ArcGIS Pro layouts](workspace.md#arcgis-pro-layouts) lists the
+  `notes` list each by element; [ArcGIS Pro projects, maps and layouts](workspace.md#arcgis-pro-projects-maps-and-layouts) lists the
   differences. `layout.inspect` answers, for a file, which map each frame shows, without
-  importing it.
+  importing it. The layouts of a Pro project (`.aprx`) are chosen in its picker, with their maps
+  (`project.importArcgis`).
 
 ## Reports
 

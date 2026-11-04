@@ -698,15 +698,14 @@ impl Project {
                 // bucket waits for [`crate::s3_connections::resolve_project_s3`], which opens it
                 // with the saved connection that is to read it (or, with none to choose, as
                 // before): reading a project fetches nothing with another session's keys.
-                if let Some(src) = &mut l.source {
+                if l.source.is_some() {
                     l.dataset.windowed = true;
-                    if !src.is_open()
-                        && src.error.is_none()
-                        && !src.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed)
-                        && let Err(e) = src.open()
-                    {
-                        log::warn!("{}: {e}", l.name);
-                    }
+                }
+                let closed = l.source.as_ref().is_some_and(|src| {
+                    !src.is_open() && src.error.is_none() && !src.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed)
+                });
+                if closed && let Err(e) = l.open_source() {
+                    log::warn!("{}: {e}", l.name);
                 }
                 l.normalize_selection();
                 let fields = l.dataset.fields.len();

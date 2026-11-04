@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use super::layout::{FrameBinding, PageBox, geometry_box, is_ellipse, is_four_corner_ring, part_points, shown};
 use super::surround::{PendingSeries, UNBOUND};
-use super::{Document, Report, num, path_key, str_of, symbol};
+use super::{Document, Report, bearing_of, num, path_key, str_of, symbol};
 use crate::Rgba;
 use crate::layout::{ElementKind, FrameLink, FrameShape, INDICATOR_COLOR, INDICATOR_WIDTH, Layout, LinkMode, MapSeries};
 
@@ -259,8 +259,9 @@ pub(crate) fn read(doc: &Document, e: &Value, name: &str, report: &mut Report) -
         _ => None,
     };
     let (center, scale) = def.map_or((Coord::new(0.0, 0.0), 0.0), |d| camera(d, e, cam, name, report));
-    // An unbound frame's camera belongs to some other project: its rotation is not believed either.
-    let bearing = def.and_then(|_| num(cam, "heading")).unwrap_or(0.0);
+    // The camera's heading is the frame's bearing (see `bearing_of` for the sign). An unbound
+    // frame's camera belongs to some other project: its rotation is not believed either.
+    let bearing = def.and_then(|_| bearing_of(cam, "heading", false, name, report)).unwrap_or(0.0);
     let (extent_color, extent_width, indicator) = indicators(e, name, report);
     // Graticules and measured grids aren't read yet: noted, so the frame's missing grid is told.
     if e.get("grids").and_then(Value::as_array).is_some_and(|g| !g.is_empty()) {
@@ -337,14 +338,29 @@ fn lonlat(wkid: Option<i64>, x: f64, y: f64) -> Option<Coord> {
     let c = match wkid? {
         4326 => Coord::new(x, y),
         3857 | 102100 => merc_to_lonlat(Coord::new(x, y)),
-        _ => return None,
+        w => match projector(w)? {
+            None => Coord::new(x, y),
+            Some(p) => p.inverse(Coord::new(x, y))?,
+        },
     };
     (c.x.is_finite() && c.y.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0).then_some(c)
 }
 
+/// The projection of system `wkid`, by its EPSG code or else Esri's (Pro writes Esri's own codes,
+/// a state plane in feet say, as the EPSG ones), when RustGIS knows it: `Some(None)` for one in
+/// degrees (NAD83's, say), whose points are read as longitude/latitude.
+fn projector(wkid: i64) -> Option<Option<crate::projection::Projector>> {
+    // (The projection lookup refuses a system in degrees, so they are found here first.)
+    let epsg = u16::try_from(wkid).ok().and_then(rustgis_data::raster::crs::epsg_proj4);
+    if epsg.is_some_and(|def| def.split_whitespace().any(|t| t == "+proj=longlat" || t == "+proj=latlong")) {
+        return Some(None);
+    }
+    ["EPSG", "ESRI"].iter().find_map(|authority| crate::projection::Projector::new(&format!("{authority}:{wkid}")).ok().map(Some))
+}
+
 /// Whether RustGIS converts system `wkid`.
 fn supported(wkid: Option<i64>) -> bool {
-    matches!(wkid, Some(4326 | 3857 | 102100))
+    matches!(wkid, Some(4326 | 3857 | 102100)) || wkid.and_then(projector).is_some()
 }
 
 /// A camera scale worth believing.

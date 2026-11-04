@@ -67,8 +67,11 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
                 }
                 let mut required: Vec<&str> = l.renderer.field().into_iter().collect();
                 if l.labels.enabled {
-                    required.push(&l.labels.default.field);
-                    required.extend(l.labels.classes.iter().map(|c| c.field.as_str()));
+                    // A template requires each of its fields.
+                    for c in l.labels.in_order() {
+                        let fields = rustgis_map::symbology::template_fields(&c.field);
+                        if fields.is_empty() { required.push(&c.field) } else { required.extend(fields) }
+                    }
                 }
                 if let Some(time) = &l.time {
                     required.push(&time.field);
@@ -86,7 +89,15 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
                     ));
                 }
             }
-            s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?.replace_source(new);
+            // A broken layer's query was kept unchecked while it had no fields to check it against.
+            let was_broken = src.is_broken();
+            let l = s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?;
+            l.replace_source(new);
+            let dropped = l.definition_query.take_if(|q| was_broken && rustgis_data::query::parse(q, &l.dataset).is_err());
+            if let Some(q) = dropped {
+                let name = l.name.clone();
+                s.notify(format!("{name}: its definition query ({q}) doesn't fit {full}'s fields, so it was cleared"), false);
+            }
         }
         Ok(json!({"layer": id, "path": full, "table": s.map().layer(id).and_then(|l| l.linked_table())}))
     }

@@ -543,6 +543,28 @@ pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
                         p.circle_stroke(c, rad, Stroke::new(s.stroke_width.clamp(1.0, 2.0), c32(s.stroke)));
                     }
                 },
+                // Paths, in their own colours, their size as a picture's (y up in the shape).
+                Marker::Path(shape) => {
+                    let side = s.size.clamp(8.0, 20.0).min(r.height());
+                    for part in &shape.shape().parts {
+                        let points: Vec<egui::Pos2> = part.points.iter().map(|[x, y]| c + vec2(x * side, -y * side)).collect();
+                        // egui fills only closed paths: an open part's fill closes it, as the map's does.
+                        if let Some(fill) = part.fill {
+                            p.add(egui::epaint::PathShape {
+                                fill: c32(fill),
+                                ..egui::epaint::PathShape::closed_line(points.clone(), Stroke::NONE)
+                            });
+                        }
+                        if let Some(stroke) = part.stroke {
+                            let stroke = Stroke::new((part.width * side).max(0.5), c32(stroke));
+                            p.add(if part.closed {
+                                egui::epaint::PathShape::closed_line(points, stroke)
+                            } else {
+                                egui::epaint::PathShape::line(points, stroke)
+                            });
+                        }
+                    }
+                }
                 _ => {
                     p.circle_filled(c, rad, c32(s.fill));
                     p.circle_stroke(c, rad, Stroke::new(s.stroke_width.min(2.0), c32(s.stroke)));
@@ -1855,6 +1877,23 @@ impl RowName {
     }
 }
 
+/// The side of the warning after a broken layer's name.
+const BROKEN_GLYPH: f32 = 16.0;
+
+/// The warning after a broken layer's name, in `rect`: where the layer came from and why it
+/// doesn't open, on hover and for screen readers.
+fn broken_glyph(ui: &Ui, l: &Layer, rect: Rect, t: &Tokens) {
+    icons::paint(ui.painter(), rect, "warning", t.icon, t.accent);
+    let resp = ui.interact(rect, egui::Id::unique(("broken", l.id)), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, tl!("Broken layer")));
+    let (origin, error) = match (&l.source, &l.raster) {
+        (Some(src), _) => (src.origin.as_deref().unwrap_or(""), src.why_broken().unwrap_or("")),
+        (None, Some(rl)) => (rl.path.as_deref().unwrap_or(""), rl.error.as_deref().unwrap_or("")),
+        (None, None) => ("", ""),
+    };
+    resp.on_hover_text(crate::i18n::fmt("Broken: {origin}\n{error}", &[("origin", origin), ("error", error)]));
+}
+
 /// A layer's row and, expanded, its legend; returns the rectangle of both. With `reorder` off
 /// (the list is filtered or children are sorted by name) the row can't be dragged.
 fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: bool, t: &Tokens) -> Rect {
@@ -1872,7 +1911,10 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
     // Every picked row looks alike; the active one has an outline (`active_outline`), not a
     // bolder name, which would read as the only one picked.
     let font = regular(12.5);
-    let room = ui.available_width() - NAME_X - badge.as_ref().map_or(8.0, |(_, w)| w + 18.0);
+    // A layer whose data can't be read: its name is red and a warning follows it.
+    let missing = l.raster.as_ref().is_some_and(|r| r.data.is_none()) || l.source.as_ref().is_some_and(|s| s.why_broken().is_some());
+    let room =
+        ui.available_width() - NAME_X - badge.as_ref().map_or(8.0, |(_, w)| w + 18.0) - if missing { BROKEN_GLYPH + 4.0 } else { 0.0 };
     let name = row_name(ui, shown.clone(), font, room);
     let sense = if reorder { Sense::click_and_drag() } else { Sense::click() };
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), name.row_h), sense);
@@ -1934,7 +1976,6 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
     x += 24.0;
     let out_of_range = !app.session.map().in_scale_range(l, scale);
     let group_hidden = !app.session.map().shows(l) && l.visible;
-    let missing = l.raster.as_ref().is_some_and(|r| r.data.is_none()) || l.source.as_ref().is_some_and(|s| s.error.is_some());
     let color = if missing {
         t.red
     } else if !l.visible || out_of_range || group_hidden {
@@ -1943,7 +1984,11 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
         t.text
     };
     let elided = name.elided;
+    let glyph_x = x + name.galley.size().x.min(name.room) + 4.0;
     name.paint(ui, r, x, color);
+    if missing {
+        broken_glyph(ui, l, Rect::from_min_size(pos2(glyph_x, cy - BROKEN_GLYPH / 2.0), vec2(BROKEN_GLYPH, BROKEN_GLYPH)), t);
+    }
     if let Some((badge, bw)) = badge {
         let br = Rect::from_center_size(pos2(r.max.x - 12.0 - bw / 2.0, cy), vec2(bw, 16.0));
         ui.painter().rect_filled(br, CornerRadius::same(8), egui::Color32::from_rgb(0x00, 0xA8, 0xC0));
@@ -1978,8 +2023,8 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
             ),
         },
         None => match &l.source {
-            Some(src) if src.error.is_some() => {
-                crate::i18n::fmt("The layer's file couldn't be read: {error}", &[("error", src.error.as_deref().unwrap_or(""))])
+            Some(src) if src.why_broken().is_some() => {
+                crate::i18n::fmt("The layer's file couldn't be read: {error}", &[("error", src.why_broken().unwrap_or(""))])
             }
             Some(src) => {
                 let format = src.info().map(|i| i.format).unwrap_or("");
@@ -2224,6 +2269,20 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
     }
     if l.is_streamed() && ui.button(tl!("Load All Features")).clicked() {
         let _ = app.run("layer.loadAll", json!({"layer": l.id}));
+        ui.close();
+    }
+    // A layer that came from a service, or a broken one with a file to read again: it can be
+    // opened again (a file that has turned up, a sign-in made since).
+    let retryable = l.source.as_ref().is_some_and(|s| s.service.is_some() || (s.is_broken() && s.path.is_some()));
+    if retryable && ui.button(tl!("Retry")).clicked() {
+        match app.run("layer.retry", json!({"layer": l.id})) {
+            Ok(r) => {
+                if let Some(e) = r.get("failed").and_then(|f| f.get(0)).and_then(|f| f.get("error")).and_then(Value::as_str) {
+                    app.session.notify(e.to_string(), true);
+                }
+            }
+            Err(e) => app.session.notify(e, true),
+        }
         ui.close();
     }
     if l.linked_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
@@ -2564,36 +2623,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             // A File Geodatabase's folder is data, listed and added like a file.
             (e.path().is_dir() && !rustgis_engine::data::source::is_gdb_name(&name), name, e.path())
         })
-        .filter(|(d, n, _)| {
-            !n.starts_with('.')
-                && (*d
-                    || [
-                        "geojson",
-                        "json",
-                        "csv",
-                        "tsv",
-                        "shp",
-                        "tif",
-                        "tiff",
-                        "asc",
-                        // A File Geodatabase's folder, listed as data above.
-                        "gdb",
-                        // Databases holding several layers, which ask which to add (#934).
-                        "gpkg",
-                        "duckdb",
-                        "ddb",
-                        "rgis",
-                        "rgisx",
-                        "rgispkg",
-                        "rgismap",
-                        "rgismpk",
-                        "rgislyr",
-                        "rgislayout",
-                        "pagx",
-                    ]
-                    .iter()
-                    .any(|x| n.to_lowercase().ends_with(&format!(".{x}"))))
-        })
+        .filter(|(d, n, _)| !n.starts_with('.') && (*d || BROWSER_EXTENSIONS.iter().any(|x| n.to_lowercase().ends_with(&format!(".{x}")))))
         .collect();
     entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
     for (is_dir, name, path) in entries.into_iter().take(300) {
@@ -2620,6 +2650,9 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     app.map.invalidate();
                 } else if name.ends_with(".rgislayout") || name.to_ascii_lowercase().ends_with(".pagx") {
                     let _ = app.import_layout_file(&path.display().to_string());
+                } else if crate::is_arcgis_pro_name(&name.to_ascii_lowercase()) {
+                    let _ = app.import_arcgis_file(&path.display().to_string());
+                    app.map.invalidate();
                 } else {
                     let _ = crate::layerchooser::add_file(app, &path.display().to_string());
                 }
@@ -2627,6 +2660,36 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         });
     }
 }
+
+/// The files the Browser pane lists (by extension), beside folders.
+pub(crate) const BROWSER_EXTENSIONS: &[&str] = &[
+    "geojson",
+    "json",
+    "csv",
+    "tsv",
+    "shp",
+    "tif",
+    "tiff",
+    "asc",
+    // A File Geodatabase's folder, listed as data rather than as a folder.
+    "gdb",
+    // Databases holding several layers, which ask which to add (#934).
+    "gpkg",
+    "duckdb",
+    "ddb",
+    "rgis",
+    "rgisx",
+    "rgispkg",
+    "rgismap",
+    "rgismpk",
+    "rgislyr",
+    "rgislayout",
+    "pagx",
+    // ArcGIS Pro projects, maps and layer files.
+    "aprx",
+    "mapx",
+    "lyrx",
+];
 
 /// `tools` grouped by the `depth`-th part of their toolbox (`GeoLibre › Raster › General`), one
 /// closed header per group and nested again below it; tools whose toolbox stops here are listed.
@@ -7038,5 +7101,79 @@ mod tests {
         let map = h.state().session.map();
         assert!(map.layer_by_name("Cities Annotation").is_some(), "no annotation layer");
         assert!(!map.layer_by_name("Cities").unwrap().labels.enabled, "the layer's own labels give way to it");
+    }
+
+    /// A broken layer (an `.aprx` map's layer whose source can't be opened) with a file to repair.
+    fn add_broken(
+        app: &mut RustGisApp,
+        name: &str,
+        path: Option<&str>,
+        service: Option<rustgis_engine::map::source::ServiceOrigin>,
+    ) -> u32 {
+        let origin = match (&service, path) {
+            (Some(s), _) => format!("a feature service at {}", s.url),
+            (None, Some(p)) => format!("a shapefile at {p}"),
+            (None, None) => "a source nobody knows".to_string(),
+        };
+        let src = rustgis_engine::map::source::SourceLayer::broken(
+            origin,
+            path.map(str::to_string),
+            None,
+            service,
+            "the file isn't there".into(),
+        );
+        app.session.map_mut().add_streamed(name, src)
+    }
+
+    fn layer_by_name(app: &RustGisApp, name: &str) -> rustgis_engine::map::Layer {
+        app.session.map().layers.iter().find(|l| l.name == name).cloned().unwrap()
+    }
+
+    /// A layer whose source couldn't be opened carries a warning glyph after its name, which says
+    /// where the layer came from and why it is broken; an open layer's row has none.
+    #[test]
+    fn a_broken_layer_shows_a_warning_with_its_origin() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        add_broken(&mut app, "Roads", Some("D:\\data\\roads.shp"), None);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        // One glyph: Roads' (Cities and the others are open).
+        assert_eq!(h.query_all_by_label("Broken layer").count(), 1);
+        h.get_by_label("Broken layer").hover();
+        h.run_steps(6);
+        assert!(h.query_by_label_contains("a shapefile at D:\\data\\roads.shp").is_some(), "the origin");
+        assert!(h.query_by_label_contains("the file isn't there").is_some(), "the reason");
+    }
+
+    /// Retry is offered for a layer that came from a service, or from a file that is broken; Repair
+    /// Data Source stays for a file; an open layer has neither Retry.
+    #[test]
+    fn retry_appears_for_service_origins_only() {
+        use egui_kittest::kittest::Queryable;
+        let service = rustgis_engine::map::source::ServiceOrigin {
+            url: "https://example.org/x/FeatureServer".into(),
+            kind: "arcgis".into(),
+            layer: "0".into(),
+        };
+        let menu = |name: &str| {
+            let mut app = RustGisApp::with_sample();
+            add_broken(&mut app, "Parcels", None, Some(service.clone()));
+            add_broken(&mut app, "Roads", Some("D:\\data\\roads.shp"), None);
+            let layer = layer_by_name(&app, name);
+            let mut h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| layer_menu(app, ui, &layer, true), app);
+            h.step();
+            (h.query_by_label("Retry").is_some(), h.query_by_label("Repair Data Source…").is_some())
+        };
+        assert_eq!(menu("Parcels"), (true, false), "a service: Retry only");
+        assert_eq!(menu("Roads"), (true, true), "a broken file: Retry and Repair");
+        assert!(!menu("Cities").0, "an open layer has no Retry");
     }
 }

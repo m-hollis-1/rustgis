@@ -160,8 +160,8 @@ Open questions rather than plans; discuss before building.
   which of them build for the web app.
 - Native NetCDF-4/HDF5 without GDAL ([#396](https://github.com/opengeos/RustGIS/issues/396)),
   kerchunk and Icechunk.
-- Broader QGIS project compatibility and opening ArcGIS Pro projects (supported QGIS projects
-  already open as maps).
+- Broader QGIS project compatibility and ArcGIS Pro style files (`.stylx`) (supported QGIS
+  projects, and ArcGIS Pro projects, maps, layer files and layouts, already open).
 - An in-app Python console; an R package.
 
 ## Done

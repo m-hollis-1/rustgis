@@ -319,6 +319,41 @@ over the network. Choose one in **Settings › Language › Worldview**, set `RU
 (`default` or `china`), or pass `--worldview` to `rustgis-cli`. An untouched sample project
 switches its countries at once; others keep the layer they have.
 
+## Broken layers
+
+A layer whose data can't be opened stays in the map as a **broken layer**, in its place, rather
+than being dropped. This is how an [ArcGIS Pro import](workspace.md#arcgis-pro-projects-maps-and-layouts)
+treats data RustGIS can't read (an enterprise geodatabase, say) or can't find (a moved file, a
+service that is down). A broken layer draws nothing and has no fields yet, but it keeps what the
+project said about it: its name, visibility, symbology, labels, scale range and definition query
+(kept unchecked, since there are no fields to check it against).
+
+A warning after the layer's name in the Layers pane marks it. Hover over it to read where the
+layer came from and why it didn't open: "Broken: …" with the place and the reason. A password,
+user name or token is never in that place.
+
+Right-click the layer to bring it back:
+
+- **Retry** opens its source again, from the file or the service it came from, once the file has
+  turned up or the service answers (or you have signed in). The layer keeps its place, symbology
+  and labels. It is offered for any layer that came from a service, and for a broken layer with a
+  file to read again; a layer whose data was in a database RustGIS can't read (or that its project
+  didn't define) has nothing to retry or repair, and can only be removed. When a service answers
+  with a web layer or a raster, that replaces the broken layer: it is added as a layer of its own
+  and the broken one is taken out (noted), so it doesn't keep the broken layer's slot. A service
+  that answers with something that isn't a layer of features (a table, say) leaves the layer
+  broken, and the table isn't kept. `layer.retry={"layer":
+  "Parcels"}` retries one layer, and `layer.retry={"all": true}` every broken layer of the map;
+  it answers how many it retried and opened, and why each failure failed.
+- **Repair Data Source…** points it at the file's new place, as for any
+  [moved file](index.md#repair-data-source). The replacement has to hold the same kind of
+  features and the fields the layer's symbology and labels use; a definition query that doesn't
+  fit the new fields is cleared, with a notice.
+
+Both are undoable. A saved project keeps a broken layer as it is (where it came from, why, its
+file or service and its look), so it can be retried or repaired after the project is opened
+again.
+
 ## Projections
 
 The flat map is drawn in Web Mercator by default. **View › Projection** switches it to another

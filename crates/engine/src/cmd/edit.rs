@@ -180,7 +180,11 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     // layer's first name-like field (keeping its name, clause and visibility). Another class on it
     // labels with Default's field instead. A class clause naming it no longer reads, and takes no
     // features, which go on to the next class: it is kept to edit, not dropped with its text symbol.
-    if l.labels.default.field.eq_ignore_ascii_case(&removed) {
+    // (A template goes with the last of its fields.)
+    let default = &l.labels.default;
+    if default.field.eq_ignore_ascii_case(&removed)
+        || (rustgis_map::symbology::is_template(&default.field) && !default.labels_from(&l.dataset))
+    {
         l.labels.restart_default(&l.dataset);
     }
     l.labels.repoint_missing_fields(&l.dataset);

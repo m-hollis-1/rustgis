@@ -33,6 +33,16 @@ pub struct Dialogs {
     pub layout_path: String,
     /// Import Layout: each frame the file leaves unbound, with the project map it will show.
     pub layout_frames: Vec<(String, String)>,
+    /// Import ArcGIS Pro Project: the `.aprx` being imported, by its path (the desktop) or, in
+    /// the browser, its name (its bytes are in `arcgis_data`).
+    pub arcgis_path: String,
+    /// Import ArcGIS Pro Project in the browser: the project's bytes, base64.
+    pub arcgis_data: Option<String>,
+    /// Import ArcGIS Pro Project: its maps (name, ticked, saved by ArcMap).
+    pub arcgis_maps: Vec<(String, bool, bool /* arcmap */)>,
+    /// Import ArcGIS Pro Project: its layouts (name, the maps its frames show, ticked, saved by
+    /// ArcMap).
+    pub arcgis_layouts: Vec<(String, Vec<String>, bool, bool)>,
     pub text: String,
     pub a: String,
     pub b: String,
@@ -85,6 +95,7 @@ impl Dialogs {
             "renameMap" => "renameMap",
             "renameLayout" => "renameLayout",
             "importLayoutFrames" => "importLayoutFrames",
+            "importArcgisPro" => "importArcgisPro",
             "renameServiceGroup" => "renameServiceGroup",
             "renameGroup" => "renameGroup",
             "coordinateSystem" => "coordinateSystem",
@@ -194,6 +205,32 @@ impl Dialogs {
         Ok(())
     }
 
+    /// Opens Import ArcGIS Pro Project on what `project.inspectArcgis` said the project at `path`
+    /// (or, in the browser, in `data`) holds: the first map whose pane was open when it was
+    /// saved is ticked, nothing else. A map or layout saved by ArcMap is listed but can't be
+    /// ticked.
+    pub fn open_arcgis(&mut self, s: &Session, path: &str, data: Option<String>, seen: &Value) -> Result<(), String> {
+        self.open("importArcgisPro", s)?;
+        self.arcgis_path = path.to_string();
+        self.arcgis_data = data;
+        let flag = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+        let list = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut ticked = false;
+        for m in list(seen, "maps") {
+            let Some(name) = m.get("name").and_then(Value::as_str) else { continue };
+            let arcmap = flag(&m, "arcmap");
+            let tick = !ticked && !arcmap && flag(&m, "open");
+            ticked |= tick;
+            self.arcgis_maps.push((name.to_string(), tick, arcmap));
+        }
+        for l in list(seen, "layouts") {
+            let Some(name) = l.get("name").and_then(Value::as_str) else { continue };
+            let shows: Vec<String> = list(&l, "maps").iter().filter_map(Value::as_str).map(str::to_string).collect();
+            self.arcgis_layouts.push((name.to_string(), shows, false, flag(&l, "arcmap")));
+        }
+        Ok(())
+    }
+
     fn gpkg_owner(&self, s: &Session) -> Result<(), String> {
         if !self
             .gpkg_map
@@ -276,6 +313,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "renameMap" => "Rename Map",
         "renameLayout" => "Rename Layout",
         "importLayoutFrames" => "Import Layout",
+        "importArcgisPro" => "Import ArcGIS Pro Project",
         "renameServiceGroup" => "Rename Service Group",
         "renameGroup" => "Rename Group",
         _ => "Rename Layer",
@@ -310,6 +348,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "coordinateSystem" | "zarr" => 660.0,
             "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
             "newConnection" | "editConnection" | "chooseConnection" | "s3Connections" => 520.0,
+            "importArcgisPro" => 480.0,
             _ => 440.0,
         });
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
@@ -520,6 +559,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
             }
             "importLayoutFrames" => close = import_layout_frames(app, ui),
+            "importArcgisPro" => close = import_arcgis_pro(app, ui),
             "renameServiceGroup" => {
                 let input_label = ui.label(tl!("Name"));
                 ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY)).labelled_by(input_label.id);
@@ -583,6 +623,75 @@ pub(crate) fn finish_layout_import(app: &mut RustGisApp) -> Result<(), String> {
     let maps: serde_json::Map<String, Value> = app.dialogs.layout_frames.iter().map(|(frame, map)| (frame.clone(), json!(map))).collect();
     let path = app.dialogs.layout_path.clone();
     app.run("layout.import", json!({"path": path, "maps": maps})).map(|_| ())
+}
+
+/// Import ArcGIS Pro Project: the project's maps and layouts, ticked to import. Ticking a layout
+/// ticks the maps its frames show (unticking it leaves them); one saved by ArcMap can't be
+/// ticked. Import waits until something is ticked.
+fn import_arcgis_pro(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("Choose the maps and layouts to import. A layout brings the maps it shows.")).weak());
+    let d = &mut app.dialogs;
+    ui.horizontal(|ui| {
+        if ui.link(tl!("All")).clicked() {
+            d.arcgis_maps.iter_mut().for_each(|m| m.1 = !m.2);
+            d.arcgis_layouts.iter_mut().for_each(|l| l.2 = !l.3);
+        }
+        if ui.link(tl!("None")).clicked() {
+            d.arcgis_maps.iter_mut().for_each(|m| m.1 = false);
+            d.arcgis_layouts.iter_mut().for_each(|l| l.2 = false);
+        }
+    });
+    let arcmap = tl!("saved by ArcMap; open it in Pro first");
+    let mut shown: Vec<String> = Vec::new();
+    egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+        if !d.arcgis_maps.is_empty() {
+            ui.label(egui::RichText::new(tl!("Maps")).font(semibold(13.0)));
+        }
+        for (name, ticked, old) in d.arcgis_maps.iter_mut() {
+            let r = ui.add_enabled(!*old, egui::Checkbox::new(ticked, name.as_str()));
+            if *old {
+                r.on_disabled_hover_text(arcmap);
+            }
+        }
+        if !d.arcgis_layouts.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(tl!("Layouts")).font(semibold(13.0)));
+        }
+        for (name, maps, ticked, old) in d.arcgis_layouts.iter_mut() {
+            let r = ui.add_enabled(!*old, egui::Checkbox::new(ticked, name.as_str()));
+            if r.changed() && *ticked {
+                shown.extend(maps.iter().cloned());
+            }
+            if *old {
+                r.on_disabled_hover_text(arcmap);
+            }
+        }
+    });
+    for m in d.arcgis_maps.iter_mut().filter(|m| !m.2 && shown.iter().any(|s| s.eq_ignore_ascii_case(&m.0))) {
+        m.1 = true;
+    }
+    let any = d.arcgis_maps.iter().any(|m| m.1 && !m.2) || d.arcgis_layouts.iter().any(|l| l.2 && !l.3);
+    buttons_if(app, ui, "Import", any, finish_arcgis_import)
+}
+
+/// What Import does in Import ArcGIS Pro Project: imports the maps and layouts ticked, from the
+/// file's path (the desktop) or its bytes (the browser).
+pub(crate) fn finish_arcgis_import(app: &mut RustGisApp) -> Result<(), String> {
+    let d = &app.dialogs;
+    let maps: Vec<&str> = d.arcgis_maps.iter().filter(|m| m.1 && !m.2).map(|m| m.0.as_str()).collect();
+    let layouts: Vec<&str> = d.arcgis_layouts.iter().filter(|l| l.2 && !l.3).map(|l| l.0.as_str()).collect();
+    if maps.is_empty() && layouts.is_empty() {
+        return Err(tl!("tick a map or a layout to import").into());
+    }
+    let mut p = match &d.arcgis_data {
+        Some(data) => json!({"data": data}),
+        None => json!({"path": d.arcgis_path}),
+    };
+    p["maps"] = json!(maps);
+    p["layouts"] = json!(layouts);
+    let r = app.run("project.importArcgis", p);
+    app.map.invalidate();
+    r.map(|_| ())
 }
 
 /// Save Project As in the browser, which has no save dialog: the file name to download the
@@ -1706,12 +1815,24 @@ pub(crate) fn text_box(text: &mut String) -> egui::TextEdit<'_> {
 
 /// OK/Cancel row; returns true when the dialog should close.
 pub(crate) fn buttons(app: &mut RustGisApp, ui: &mut egui::Ui, ok: &str, f: impl FnOnce(&mut RustGisApp) -> Result<(), String>) -> bool {
+    buttons_if(app, ui, ok, true, f)
+}
+
+/// [`buttons`], with the action button (and Enter) off unless `enabled`.
+fn buttons_if(
+    app: &mut RustGisApp,
+    ui: &mut egui::Ui,
+    ok: &str,
+    enabled: bool,
+    f: impl FnOnce(&mut RustGisApp) -> Result<(), String>,
+) -> bool {
     let mut close = false;
     ui.add_space(4.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         let t = Tokens::get(ui.ctx());
-        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-        if crate::widgets::dialog_button(ui, tl!(ok), Some(t.accent), vec2(84.0, 28.0)).clicked() || enter {
+        let enter = enabled && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+        let pressed = ui.add_enabled_ui(enabled, |ui| crate::widgets::dialog_button(ui, tl!(ok), Some(t.accent), vec2(84.0, 28.0))).inner;
+        if pressed.clicked() || enter {
             match f(app) {
                 Ok(()) => close = true,
                 Err(e) => app.dialogs.error = Some(e),

@@ -1035,6 +1035,12 @@ fn marker_symbols_of_several_layers_carry_over_as_marks_turned_by_their_field() 
     s.apply(&mut layer);
     assert_eq!(layer.marker_rotation.as_ref().map(|r| r.field.as_str()), Some("WINKEL"));
     assert_eq!(layer.line_strokes.len(), 2);
+    // A layer whose geometry isn't known yet (a broken one) keeps them only through apply_all.
+    let mut unknown = crate::Layer::new(2, rustgis_data::Dataset::new("signs", rustgis_data::GeometryType::None, vec![]));
+    s.apply(&mut unknown);
+    assert_eq!(unknown.marker_rotation, None);
+    s.apply_all(&mut unknown);
+    assert_eq!(unknown.marker_rotation.as_ref().map(|r| r.field.as_str()), Some("WINKEL"));
 
     // A square anchored at its top left, offset and at an angle: one mark, shifted by half its size.
     let qml = r#"<qgis version="3.40.0"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">

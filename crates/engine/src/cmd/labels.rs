@@ -2,7 +2,7 @@
 //! layer's label visibility range and placement, and its label classes (#618).
 
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
-use rustgis_map::symbology::{MAX_LABEL_CLASSES, label_class_name};
+use rustgis_map::symbology::{LabelSource, MAX_LABEL_CLASSES, label_class_name};
 use rustgis_map::{LabelBackground, LabelClass, LabelMatcher, LabelPlacement, Labeling, Renderer, Rgba, Symbol};
 use serde_json::{Value, json};
 
@@ -410,14 +410,14 @@ fn distance_range(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Converts a layer's labels into an annotation layer: one point per label, at the label point,
-/// carrying the label text and drawn with the same text symbol. Each class labelling a feature
-/// gives it a point (a hidden class none); with classes besides Default, a CLASS field keeps
-/// which, and the annotation has the same classes, each picking its points by it. The layer's
-/// own labels turn off.
+/// carrying the label text (a template's expanded) and drawn with the same text symbol. Each
+/// class labelling a feature gives it a point (a hidden class none); with classes besides
+/// Default, a CLASS field keeps which, and the annotation has the same classes, each picking its
+/// points by it. The layer's own labels turn off.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
-    let fields: Vec<Option<usize>> = l.labels.in_order().map(|c| l.dataset.field_index(&c.field)).collect();
+    let fields: Vec<Option<LabelSource>> = l.labels.in_order().map(|c| LabelSource::resolve(&c.field, &l.dataset)).collect();
     if fields.iter().all(Option::is_none) {
         return Err("the layer has no label field".into());
     }
@@ -439,12 +439,8 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         }
         let Some(at) = ft.geometry.as_ref().and_then(Geometry::label_point) else { continue };
         for (i, class) in matcher.classes_of(&l.dataset, row).filter(|(_, c)| c.visible) {
-            let Some(fi) = fields.get(i).copied().flatten() else { continue };
-            let v = l.dataset.value(row, fi);
-            if v.is_null() {
-                continue;
-            }
-            let mut attrs = vec![Attr::Text(v.to_string())];
+            let Some(text) = fields.get(i).and_then(Option::as_ref).and_then(|s| s.text(&l.dataset, row)) else { continue };
+            let mut attrs = vec![Attr::Text(text)];
             if classes {
                 attrs.push(Attr::Text(class.name.clone()));
             }

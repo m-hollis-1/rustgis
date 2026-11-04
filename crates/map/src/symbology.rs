@@ -23,10 +23,13 @@ pub enum Marker {
     Char(Glyph),
     /// A picture (a PNG), drawn at its own colours with its longer side the size.
     Image(ImageRef),
+    /// Paths drawn at their own colours ([`PathShape`]): a shape RustGIS hasn't, or several of a
+    /// file's marker layers stacked.
+    Path(PathRef),
 }
 
 impl Marker {
-    /// The shapes (every marker but [`Marker::Char`] and [`Marker::Image`]).
+    /// The shapes (every marker but [`Marker::Char`], [`Marker::Image`] and [`Marker::Path`]).
     pub const ALL: [Marker; 5] = [Marker::Circle, Marker::Square, Marker::Triangle, Marker::Diamond, Marker::Star];
     pub fn label(self) -> &'static str {
         match self {
@@ -37,12 +40,14 @@ impl Marker {
             Marker::Star => "Star",
             Marker::Char(_) => "Character",
             Marker::Image(_) => "Image",
+            Marker::Path(_) => "Custom",
         }
     }
 }
 
-/// [`Marker`] as a file holds it. Only the picture differs: a file is not trusted, so one that is
-/// not text, not a PNG or JPEG, too large, or past the pictures kept ([`ImageRef::new`]) reads as
+/// [`Marker`] as a file holds it. Only the picture and the paths differ: a file is not trusted, so
+/// a picture that is not text, not a PNG or JPEG, too large, or past the pictures kept
+/// ([`ImageRef::new`]), and paths that are not paths or leave no part ([`PathRef::new`]), read as
 /// a circle, and the rest of the file still reads.
 #[derive(Deserialize)]
 enum MarkerWire {
@@ -53,6 +58,15 @@ enum MarkerWire {
     Star,
     Char(Glyph),
     Image(WirePicture),
+    Path(WirePath),
+}
+
+/// A drawn marker's paths in a file, or anything else.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WirePath {
+    Shape(PathShape),
+    Other(serde::de::IgnoredAny),
 }
 
 /// A picture marker's text in a file, `None` when it is anything else or can't be kept.
@@ -74,6 +88,8 @@ impl From<MarkerWire> for Marker {
             MarkerWire::Char(g) => Marker::Char(g),
             MarkerWire::Image(WirePicture::Text(t)) => ImageRef::new(&t).map_or(Marker::Circle, Marker::Image),
             MarkerWire::Image(WirePicture::Other(_)) => Marker::Circle,
+            MarkerWire::Path(WirePath::Shape(p)) => PathRef::new(p).map_or(Marker::Circle, Marker::Path),
+            MarkerWire::Path(WirePath::Other(_)) => Marker::Circle,
         }
     }
 }
@@ -212,6 +228,150 @@ impl std::hash::Hash for ImageRef {
 impl Serialize for ImageRef {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.0)
+    }
+}
+
+/// The most parts a drawn marker keeps.
+pub const MAX_PATH_PARTS: usize = 64;
+/// The most points a drawn marker's part keeps.
+pub const MAX_PATH_POINTS: usize = 256;
+/// The most different drawn markers kept (each is kept for the rest of the run); one past them is refused.
+pub const MAX_PATHS: usize = 4096;
+/// How far a drawn marker's point may reach from its centre on either axis, in its sizes.
+const PATH_REACH: f32 = 2.0;
+
+/// A marker drawn from paths: a shape RustGIS hasn't, or several marker layers stacked. Unit space:
+/// the marker's size is the square from (−0.5, −0.5) to (0.5, 0.5), y up (as CIM's); parts may
+/// reach past it to ±2.0. Later parts draw over earlier ones.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathShape {
+    pub parts: Vec<PathPart>,
+}
+
+/// One path of a [`PathShape`], filled and stroked in its own colours (neither: drawn not at all).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathPart {
+    /// 2..=[`MAX_PATH_POINTS`] points in the shape's unit space.
+    pub points: Vec<[f32; 2]>,
+    /// Whether the last point joins the first (a ring); an open part is a line, which a fill
+    /// still closes.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Rgba>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<Rgba>,
+    /// The stroke's width as a fraction of the marker's size, 0..=0.5.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub width: f32,
+}
+
+impl PathShape {
+    /// The shape as [`PathRef::new`] keeps it: coordinates clamped to ±[`PATH_REACH`] (a
+    /// non-finite one 0), widths to 0..=0.5, parts of fewer than 2 points dropped, parts and
+    /// points cut to their limits. No value is −0, so equal shapes have equal [`PathShape::key`]s.
+    fn kept(self) -> PathShape {
+        let coord = |v: f32| if v.is_finite() { v.clamp(-PATH_REACH, PATH_REACH) + 0.0 } else { 0.0 };
+        let parts = self
+            .parts
+            .into_iter()
+            .filter(|p| p.points.len() >= 2)
+            .take(MAX_PATH_PARTS)
+            .map(|p| PathPart {
+                points: p.points.into_iter().take(MAX_PATH_POINTS).map(|[x, y]| [coord(x), coord(y)]).collect(),
+                width: if p.width.is_finite() { p.width.clamp(0.0, 0.5) + 0.0 } else { 0.0 },
+                ..p
+            })
+            .collect();
+        PathShape { parts }
+    }
+
+    /// How far it reaches from its centre, in its sizes: its farthest point plus half that part's
+    /// stroke, and at least 0.6 (as far as the built-in shapes reach).
+    fn reach(&self) -> f32 {
+        self.parts.iter().flat_map(|part| part.points.iter().map(|[x, y]| x.hypot(*y) + part.width / 2.0)).fold(0.6, f32::max)
+    }
+
+    /// The key a kept shape is found by: the bits of every value (floats aren't `Hash`).
+    fn key(&self) -> Vec<u32> {
+        let colour = |c: Option<Rgba>| c.map_or([0, 0], |c| [1, u32::from_le_bytes(c.0)]);
+        let mut key = Vec::new();
+        for p in &self.parts {
+            key.extend([p.points.len() as u32, p.closed as u32, p.width.to_bits()]);
+            key.extend(colour(p.fill).into_iter().chain(colour(p.stroke)));
+            key.extend(p.points.iter().flat_map(|[x, y]| [x.to_bits(), y.to_bits()]));
+        }
+        key
+    }
+}
+
+/// A drawn marker's paths, kept once for the rest of the run so a symbol holding them stays
+/// `Copy` (as [`ImageRef`] does a picture): equal shapes are one kept shape, so they compare and
+/// hash by address, and render caches may key on it.
+#[derive(Clone, Copy, Debug)]
+pub struct PathRef(&'static KeptPath);
+
+/// A kept shape and its reach, worked out once (renderers ask for it for every feature drawn).
+#[derive(Debug)]
+struct KeptPath {
+    shape: PathShape,
+    reach: f32,
+}
+
+impl PathRef {
+    /// Keeps `shape` with every coordinate clamped to ±2.0 (a non-finite one to 0), parts of fewer
+    /// than 2 points dropped, parts and points cut to [`MAX_PATH_PARTS`] and [`MAX_PATH_POINTS`],
+    /// and widths clamped to 0..=0.5; `None` when no part is left or [`MAX_PATHS`] shapes are kept.
+    pub fn new(shape: PathShape) -> Option<PathRef> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static PATHS: OnceLock<Mutex<HashMap<Vec<u32>, &'static KeptPath>>> = OnceLock::new();
+        let shape = shape.kept();
+        if shape.parts.is_empty() {
+            return None;
+        }
+        let key = shape.key();
+        let mut paths = PATHS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = paths.get(&key) {
+            return Some(PathRef(kept));
+        }
+        if paths.len() >= MAX_PATHS {
+            return None;
+        }
+        let reach = shape.reach();
+        let kept: &'static KeptPath = Box::leak(Box::new(KeptPath { shape, reach }));
+        paths.insert(key, kept);
+        Some(PathRef(kept))
+    }
+
+    pub fn shape(&self) -> &'static PathShape {
+        &self.0.shape
+    }
+
+    /// How far the shape reaches from its centre, in its sizes: its farthest point plus half that
+    /// part's stroke, and at least 0.6 (as far as the built-in shapes reach).
+    pub fn reach(&self) -> f32 {
+        self.0.reach
+    }
+}
+
+impl PartialEq for PathRef {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for PathRef {}
+
+impl std::hash::Hash for PathRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::from_ref(self.0).hash(state);
+    }
+}
+
+impl Serialize for PathRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.shape.serialize(s)
     }
 }
 
@@ -1619,10 +1779,10 @@ impl Renderer {
         }
     }
 
-    /// Whether any symbol is a character of a font or a picture ([`Marker::Char`], [`Marker::Image`]):
-    /// the markers with no shape template for the GPU.
+    /// Whether any symbol is a character of a font, a picture or paths ([`Marker::Char`],
+    /// [`Marker::Image`], [`Marker::Path`]): the markers with no shape template for the GPU.
     pub fn has_char_markers(&self) -> bool {
-        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_) | Marker::Image(_));
+        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_) | Marker::Image(_) | Marker::Path(_));
         match self {
             Renderer::Single(s) | Renderer::Proportional { base: s, .. } => char(s),
             Renderer::Unique { classes, other, .. } => char(other) || classes.iter().any(|c| char(&c.1)),
@@ -1934,6 +2094,8 @@ pub struct LabelClass {
     /// blank, takes every feature. One that no longer reads (a field since removed) takes none.
     #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
     pub where_: Option<String>,
+    /// The field it labels with, by name, or a template of them: text with each `{name}` a
+    /// field's value (`{{` and `}}` braces; see [`LabelSource`]).
     pub field: String,
     pub size: f32,
     pub color: Rgba,
@@ -2077,6 +2239,132 @@ pub fn wrapped(text: &str, wrap_char: Option<&str>, wrap_length: u32) -> String 
         out.push(current);
     }
     out.join("\n")
+}
+
+/// The longest [`LabelClass::field`] `labels.field` takes, in characters: a template's text.
+pub const MAX_TEMPLATE: usize = 1000;
+
+/// A part of a template as written: text, or a field's name between braces.
+pub enum TemplatePart<'a> {
+    Text(String),
+    Field(&'a str),
+}
+
+/// `field` read as a template: each `{name}` (a name with no brace in it) a field, `{{` and `}}`
+/// braces, everything else (an unclosed `{` too) text. Linear in its length, as a project file
+/// can hold any.
+pub fn template_parts(field: &str) -> Vec<TemplatePart<'_>> {
+    let (mut parts, mut text, mut rest) = (Vec::new(), String::new(), field);
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix("{{") {
+            text.push('{');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("}}") {
+            text.push('}');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('{')
+            && let Some((name, after)) = r.find(['{', '}']).and_then(|end| r.split_at_checked(end))
+            && let Some(after) = after.strip_prefix('}')
+            && !name.is_empty()
+        {
+            if !text.is_empty() {
+                parts.push(TemplatePart::Text(std::mem::take(&mut text)));
+            }
+            parts.push(TemplatePart::Field(name));
+            rest = after;
+        } else {
+            let mut chars = rest.chars();
+            text.extend(chars.next());
+            rest = chars.as_str();
+        }
+    }
+    if !text.is_empty() {
+        parts.push(TemplatePart::Text(text));
+    }
+    parts
+}
+
+/// Whether `field` is a template: holds a `{name}` (a `{{` is a literal brace).
+pub fn is_template(field: &str) -> bool {
+    template_parts(field).iter().any(|p| matches!(p, TemplatePart::Field(_)))
+}
+
+/// The field names a template refers to, in order, each once; empty for a plain field.
+pub fn template_fields(field: &str) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    for part in template_parts(field) {
+        if let TemplatePart::Field(name) = part
+            && !names.iter().any(|n| n.eq_ignore_ascii_case(name))
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// A piece of a template resolved against a dataset: text, or a field by its index.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Piece {
+    Text(String),
+    Field(usize),
+}
+
+/// Where a class's text comes from, resolved against a dataset once per frame.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LabelSource {
+    Field(usize),
+    Template(Vec<Piece>),
+}
+
+impl LabelSource {
+    /// `None` for a plain field the dataset lacks, or a template none of whose fields it has. A
+    /// template's missing field becomes empty text.
+    pub fn resolve(field: &str, ds: &Dataset) -> Option<LabelSource> {
+        let parts = template_parts(field);
+        if !parts.iter().any(|p| matches!(p, TemplatePart::Field(_))) {
+            return ds.field_index(field).map(LabelSource::Field);
+        }
+        let mut found = false;
+        let mut pieces = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part {
+                TemplatePart::Text(t) => pieces.push(Piece::Text(t)),
+                TemplatePart::Field(name) => {
+                    if let Some(i) = ds.field_index(name) {
+                        found = true;
+                        pieces.push(Piece::Field(i));
+                    }
+                }
+            }
+        }
+        found.then_some(LabelSource::Template(pieces))
+    }
+
+    /// The label's text for `row`: a null plain field is `None`; a template whose every field is
+    /// null is `None`; a null field inside a template is empty; `{{`/`}}` are braces; a newline in
+    /// the template is a line break.
+    pub fn text(&self, ds: &Dataset, row: usize) -> Option<String> {
+        match self {
+            LabelSource::Field(i) => Some(ds.value(row, *i)).filter(|v| !v.is_null()).map(ToString::to_string),
+            LabelSource::Template(pieces) => {
+                let mut any = false;
+                let mut out = String::new();
+                for piece in pieces {
+                    match piece {
+                        Piece::Text(t) => out.push_str(t),
+                        Piece::Field(i) => {
+                            let v = ds.value(row, *i);
+                            if !v.is_null() {
+                                any = true;
+                                out.push_str(&v.to_string());
+                            }
+                        }
+                    }
+                }
+                any.then_some(out)
+            }
+        }
+    }
 }
 
 /// How far a label's offset moves it each way (points).
@@ -2433,6 +2721,12 @@ impl LabelClass {
         }
     }
 
+    /// Whether it has text on `ds`: its field is one of `ds`'s, or a template naming one
+    /// ([`LabelSource::resolve`]).
+    pub fn labels_from(&self, ds: &Dataset) -> bool {
+        LabelSource::resolve(&self.field, ds).is_some()
+    }
+
     /// `text` broken into lines as this class wraps it ([`wrapped`]).
     pub fn wrap(&self, text: &str) -> String {
         wrapped(text, self.wrap_char.as_deref(), self.wrap_length)
@@ -2518,17 +2812,15 @@ impl Labeling {
         (self.default.name, self.default.visible, self.default.where_) = (old.name, old.visible, old.where_);
     }
 
-    /// Points every class on a field `ds` doesn't have at the Default class's field, or the first
-    /// name-like one when Default's is gone too (a field deleted, a style from another layer, a
-    /// service's fields changed). The class is kept, with its clause and text symbol.
+    /// Points every class on a field `ds` doesn't have (a template: none of its fields) at the
+    /// Default class's field, or the first name-like one when Default's is gone too (a field
+    /// deleted, a style from another layer, a service's fields changed). The class is kept, with
+    /// its clause and text symbol.
     pub fn repoint_missing_fields(&mut self, ds: &Dataset) {
         // Default's field, or (it is gone too, cleared by a refresh) the first name-like one, so
         // a class isn't left on no field.
-        let fallback = match ds.field_index(&self.default.field) {
-            Some(_) => self.default.field.clone(),
-            None => LabelClass::default_for(ds).field,
-        };
-        for c in self.classes.iter_mut().filter(|c| ds.field_index(&c.field).is_none()) {
+        let fallback = if self.default.labels_from(ds) { self.default.field.clone() } else { LabelClass::default_for(ds).field };
+        for c in self.classes.iter_mut().filter(|c| !c.labels_from(ds)) {
             c.field.clone_from(&fallback);
         }
     }
@@ -2545,6 +2837,70 @@ mod tests {
     use rustgis_data::{Field, Value};
     use serde_json::json;
 
+    fn path_part(points: &[[f32; 2]]) -> PathPart {
+        PathPart { points: points.to_vec(), closed: true, fill: Some(Rgba::rgb(200, 0, 0)), stroke: None, width: 0.0 }
+    }
+
+    #[test]
+    fn path_markers_intern_clamp_and_round_trip() {
+        let square = [[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]];
+        let a = PathRef::new(PathShape { parts: vec![path_part(&square)] }).unwrap();
+        let b = PathRef::new(PathShape { parts: vec![path_part(&square)] }).unwrap();
+        assert!(std::ptr::eq(a.shape(), b.shape()));
+        assert_eq!(Marker::Path(a), Marker::Path(b));
+        // A NaN is 0, and a coordinate past ±2.0 is cut to it; widths are cut to 0..=0.5.
+        let mut wild = path_part(&[[f32::NAN, 1e30], [-1e30, f32::INFINITY]]);
+        wild.width = 9.0;
+        let w = PathRef::new(PathShape { parts: vec![wild] }).unwrap();
+        let part = &w.shape().parts[0];
+        assert_eq!(part.points, vec![[0.0, 2.0], [-2.0, 0.0]]);
+        assert_eq!(part.width, 0.5);
+        // 1000 parts are cut to the most kept.
+        let many =
+            PathRef::new(PathShape { parts: (0..1000).map(|i| path_part(&[[0.0, 0.0], [i as f32 / 1000.0, 0.1]])).collect() }).unwrap();
+        assert_eq!(many.shape().parts.len(), MAX_PATH_PARTS);
+        // Through a symbol, as a project holds it.
+        let sym = Symbol { marker: Marker::Path(a), ..Symbol::default_for(GeometryType::Point, 0) };
+        let json = serde_json::to_string(&sym).unwrap();
+        // A closed part's `closed`, and a missing stroke and width, are not written.
+        let part = r#"{"points":[[-0.25,-0.25],[0.25,-0.25],[0.25,0.25],[-0.25,0.25]],"fill":[200,0,0,255]}"#;
+        assert!(json.ends_with(&format!(r#""marker":{{"Path":{{"parts":[{part}]}}}}}}"#)), "{json}");
+        assert_eq!(serde_json::from_str::<Symbol>(&json).unwrap(), sym);
+        assert_eq!(Marker::Path(a).label(), "Custom");
+        assert!(!Marker::ALL.contains(&Marker::Path(a)));
+    }
+
+    #[test]
+    fn a_kept_path_knows_its_reach() {
+        // Inside the unit square: the shapes' reach, 0.6.
+        let inside = PathRef::new(PathShape { parts: vec![path_part(&[[-0.3, -0.3], [0.3, 0.3]])] }).unwrap();
+        assert_eq!(inside.reach(), 0.6);
+        // Past it: the farthest point's distance, plus half its stroke.
+        let mut far = path_part(&[[0.0, 0.0], [1.2, 1.6]]);
+        far.width = 0.2;
+        assert!((PathRef::new(PathShape { parts: vec![far] }).unwrap().reach() - 2.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hostile_paths_are_clamped_or_refused() {
+        assert!(PathRef::new(PathShape { parts: vec![] }).is_none());
+        assert!(PathRef::new(PathShape { parts: vec![path_part(&[[0.0, 0.0]])] }).is_none());
+        let kept = PathRef::new(PathShape { parts: vec![path_part(&[[0.1, 0.1]]), path_part(&[[0.0, 0.0], [0.3, 0.3]])] }).unwrap();
+        assert_eq!(kept.shape().parts.len(), 1);
+        assert_eq!(kept.shape().parts[0].points.len(), 2);
+        let long: Vec<[f32; 2]> = (0..10_000).map(|i| [i as f32 / 10_000.0, 0.2]).collect();
+        let cut = PathRef::new(PathShape { parts: vec![path_part(&long)] }).unwrap();
+        assert_eq!(cut.shape().parts[0].points.len(), MAX_PATH_POINTS);
+        // A path a file holds that can't be kept reads as a circle, and the rest still reads.
+        for marker in [json!({"Path": {"parts": []}}), json!({"Path": 7}), json!({"Path": {"parts": [{"points": [[0, 0]]}]}})] {
+            let sym = json!({"fill": [1, 2, 3, 255], "stroke": [4, 5, 6, 255], "stroke_width": 1.5, "size": 9.0, "marker": marker});
+            let s: Symbol = serde_json::from_value(sym).unwrap_or_else(|e| panic!("{marker}: {e}"));
+            assert_eq!(s.marker, Marker::Circle, "{marker}");
+        }
+        let read: Marker = serde_json::from_value(json!({"Path": {"parts": [{"points": [[0, 0], [9, -9]], "closed": false}]}})).unwrap();
+        let Marker::Path(p) = read else { panic!("{read:?}") };
+        assert_eq!((p.shape().parts[0].points.clone(), p.shape().parts[0].closed), (vec![[0.0, 0.0], [2.0, -2.0]], false));
+    }
     #[test]
     fn image_markers_intern_and_round_trip() {
         let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
@@ -3544,5 +3900,42 @@ mod tests {
         let mut more = fresh.clone();
         more.carry_edits_from(&gold, g);
         assert_eq!(more, fresh, "another number of classes starts fresh");
+    }
+
+    fn cities() -> Dataset {
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("NAME", FieldType::Text), Field::new("TYPE", FieldType::Text)]);
+        ds.push(None, vec![Value::Text("Paris".into()), Value::Text("city".into())]);
+        ds.push(None, vec![Value::Null, Value::Null]);
+        ds
+    }
+
+    /// A template's `{name}`s are its fields' values, `{{`/`}}` braces, and its newlines line
+    /// breaks; a row whose every field is null has no label.
+    #[test]
+    fn templates_expand_fields_literals_braces_and_newlines() {
+        let ds = cities();
+        let text = |t: &str, row: usize| LabelSource::resolve(t, &ds).and_then(|s| s.text(&ds, row));
+        assert_eq!(text("{NAME}\n({TYPE})", 0).as_deref(), Some("Paris\n(city)"));
+        assert_eq!(text("{{{NAME}}}", 0).as_deref(), Some("{Paris}"));
+        assert_eq!(text("{NAME}\n({TYPE})", 1), None, "every field null");
+        assert_eq!(text("NAME", 0).as_deref(), Some("Paris"), "a plain field");
+        assert_eq!(text("NAME", 1), None);
+        assert!(!is_template("NAME"));
+        assert!(is_template("{NAME}") && !is_template("{{NAME}}") && !is_template("{NAME"));
+        assert_eq!(template_fields("{A} {B} {A}"), ["A", "B"]);
+        assert_eq!(template_fields("{{{NAME}}}"), ["NAME"]);
+        assert!(template_fields("NAME").is_empty() && template_fields("{oops").is_empty());
+        assert_eq!(text("{oops {NAME}", 0).as_deref(), Some("{oops Paris"), "an unclosed brace is text");
+    }
+
+    /// A template's field the layer lacks is empty text; one with none of its fields has no source.
+    #[test]
+    fn a_template_with_a_missing_field_still_labels() {
+        let ds = cities();
+        let source = LabelSource::resolve("{NAME} {GONE}", &ds);
+        assert!(matches!(source, Some(LabelSource::Template(_))));
+        assert_eq!(source.and_then(|s| s.text(&ds, 0)).as_deref(), Some("Paris "));
+        assert!(LabelSource::resolve("{GONE}", &ds).is_none());
+        assert!(LabelSource::resolve("GONE", &ds).is_none());
     }
 }

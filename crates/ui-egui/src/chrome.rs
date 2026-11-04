@@ -766,6 +766,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "style.importQgis" => OpenItem("qgisStyle"),
         "project.importGeolibre" => OpenItem("geolibreProject"),
         "project.importQgis" => OpenItem("qgisProject"),
+        "project.importArcgis" => OpenItem("arcgisProject"),
         "style.save" => SaveItem("styles"),
         "ramp.add" => OpenItem("ramps"),
         "ramp.save" => SaveItem("ramps"),
@@ -868,6 +869,10 @@ fn search_disabled(app: &RustGisApp, id: &str) -> Option<&'static str> {
     })
 }
 
+/// Commands Command Search doesn't list: steps of an entry point listed under another command
+/// (Import ArcGIS Pro Project inspects the file before it asks what to import).
+const SEARCH_HIDDEN: &[&str] = &["project.inspectArcgis"];
+
 /// Whether the query matches a registry command's search row.
 fn command_matches(c: &rustgis_engine::CommandSpec, ql: &str) -> bool {
     ql.is_empty() || c.label.to_lowercase().contains(ql) || c.id.to_lowercase().contains(ql) || c.location.to_lowercase().contains(ql)
@@ -943,7 +948,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         for c in &app.session.registry.commands {
-            if command_matches(c, &ql) {
+            if command_matches(c, &ql) && !SEARCH_HIDDEN.contains(&c.id) {
                 hits.push((c.id.to_string(), tl!(c.label).to_string(), crate::i18n::location(c.location)));
             }
         }

@@ -401,15 +401,279 @@ fn vector_markers_are_recognised_by_shape() {
     assert_eq!(symbol::vector_shape(&tilted), None);
     assert_eq!(symbol::vector_shape(&json!({"type": "CIMVectorMarker"})), None);
 
-    // point() takes the graphic's fill and stroke, and the size in 96ths; a shape it can't tell is a noted circle.
+    // point() takes the graphic's fill and stroke, and the size in 96ths; a shape it can't tell is drawn.
     let mut report = Report::default();
     let p = symbol::point(&json!({"type": "CIMPointSymbol", "symbolLayers": [square, seven]}), "Pin", &mut report);
-    assert_eq!(p.symbols.len(), 2);
+    assert_eq!((p.symbols.len(), p.paths.len()), (2, 2));
     let s = p.symbols[0];
     assert_eq!((s.marker, s.fill, s.stroke), (Marker::Square, Rgba::rgb(200, 0, 0), Rgba::rgb(0, 0, 0)));
     assert!((s.size - 8.0).abs() < 1e-5 && (s.stroke_width - 0.5 * 96.0 / 72.0).abs() < 1e-5);
-    assert_eq!(p.symbols[1].marker, Marker::Circle);
-    assert_eq!(notes(&report), vec!["Pin: a drawn marker shape, shown as a circle".to_string()]);
+    assert!(matches!(p.symbols[1].marker, Marker::Path(_)), "{:?}", p.symbols[1].marker);
+    assert!(p.paths.iter().all(Option::is_some));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+/// A vector marker of `size` points drawing `geometry` in a 10 × 10 frame, filled `fill`.
+fn vector_marker(size: f64, geometry: serde_json::Value, fill: serde_json::Value) -> serde_json::Value {
+    json!({"type": "CIMVectorMarker", "enable": true, "size": size, "frame": {"xmin": -5, "ymin": -5, "xmax": 5, "ymax": 5},
+        "markerGraphics": [{"type": "CIMMarkerGraphic", "geometry": geometry, "symbol": polygon_symbol(vec![solid_fill(fill)])}]})
+}
+
+fn square_ring() -> serde_json::Value {
+    json!({"rings": [[[-5.0, -5.0], [-5.0, 5.0], [5.0, 5.0], [5.0, -5.0], [-5.0, -5.0]]]})
+}
+
+fn circle_rings() -> serde_json::Value {
+    json!({"curveRings": [[[5.0, 0.0], {"a": [[5.0, 0.0], [0.0, 0.0], 0, 1]}]]})
+}
+
+fn path_of(m: crate::symbology::Marker) -> &'static crate::symbology::PathShape {
+    match m {
+        crate::symbology::Marker::Path(p) => p.shape(),
+        other => panic!("not a path: {other:?}"),
+    }
+}
+
+#[test]
+fn a_vector_marker_rustgis_lacks_becomes_a_path() {
+    let hexagon: Vec<[f64; 2]> = (0..=6)
+        .map(|i| {
+            let a = f64::from(i) * std::f64::consts::PI / 3.0;
+            [5.0 * a.cos(), 5.0 * a.sin()]
+        })
+        .collect();
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [vector_marker(8.0, json!({"rings": [hexagon]}), rgb(255, 0, 0))]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "Hex", &mut report);
+    let shape = path_of(p.symbols[0].marker);
+    assert_eq!(shape.parts.len(), 1);
+    let part = &shape.parts[0];
+    assert!(part.closed);
+    assert_eq!(part.points.len(), 7);
+    assert!(part.points.iter().all(|[x, y]| x.abs() <= 0.5 + 1e-6 && y.abs() <= 0.5 + 1e-6), "{:?}", part.points);
+    assert!((part.points[0][0] - 0.5).abs() < 1e-6 && part.points[0][1].abs() < 1e-6, "{:?}", part.points[0]);
+    assert_eq!((part.fill, part.stroke), (Some(Rgba::rgb(255, 0, 0)), None));
+    assert!((p.symbols[0].size - 8.0 * 96.0 / 72.0).abs() < 1e-5);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn a_rotated_square_becomes_a_turned_path() {
+    let mut square = vector_marker(8.0, square_ring(), rgb(0, 0, 255));
+    square["rotation"] = json!(30);
+    let mut report = Report::default();
+    let p = symbol::point(&json!({"type": "CIMPointSymbol", "symbolLayers": [square]}), "Turned", &mut report);
+    let part = &path_of(p.symbols[0].marker).parts[0];
+    assert_eq!(part.points.len(), 5);
+    // (−0.5, −0.5) turned 30 degrees anticlockwise: no longer on the square's axes.
+    let [x, y] = part.points[0];
+    let (s, c) = 30f32.to_radians().sin_cos();
+    assert!((x - (-0.5 * c + 0.5 * s)).abs() < 1e-5 && (y - (-0.5 * s - 0.5 * c)).abs() < 1e-5, "{x} {y}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn stacked_marker_layers_become_one_path_sized_by_the_largest() {
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [
+        vector_marker(12.0, circle_rings(), rgb(255, 255, 255)),
+        vector_marker(6.0, square_ring(), rgb(0, 0, 0)),
+    ]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "Stack", &mut report);
+    assert_eq!(p.symbols[0].marker, crate::symbology::Marker::Circle);
+    let layers: Vec<_> = p.symbols.iter().copied().zip(p.paths).collect();
+    let s = symbol::stacked(&layers, "Stack", &mut report);
+    assert!((s.size - 16.0).abs() < 1e-5, "{}", s.size);
+    let shape = path_of(s.marker);
+    assert_eq!(shape.parts.len(), 2);
+    let (circle, square) = (&shape.parts[0], &shape.parts[1]);
+    assert_eq!((circle.points.len(), circle.fill), (32, Some(Rgba::rgb(255, 255, 255))));
+    assert!(circle.points.iter().all(|[x, y]| (x.hypot(*y) - 0.5).abs() < 1e-5), "{:?}", circle.points);
+    assert_eq!(square.fill, Some(Rgba::rgb(0, 0, 0)));
+    assert!(square.points.iter().all(|[x, y]| x.abs() <= 0.25 + 1e-6 && y.abs() <= 0.25 + 1e-6), "{:?}", square.points);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // Through a layer's renderer, the same.
+    let marks =
+        feature_layer("Marks", standard_connection("Shapefile", "DATABASE=/d", "marks.shp"), json!({"renderer": simple_renderer(sym)}));
+    let (map, report) = read_new_detail_map(&map_document(&[marks], &["CIMPATH=new_detail_map/marks.json"]));
+    let Some(crate::symbology::Renderer::Single(w)) = &nth(&map, 0).style.renderer else { panic!() };
+    assert_eq!(path_of(w.marker).parts.len(), 2);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn a_stack_with_a_picture_keeps_its_first_marker_and_says_so() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let sym = json!({"type": "CIMPointSymbol", "symbolLayers": [
+        {"type": "CIMPictureMarker", "enable": true, "size": 10.0, "url": png},
+        vector_marker(6.0, square_ring(), rgb(0, 0, 0)),
+    ]});
+    let mut report = Report::default();
+    let p = symbol::point(&sym, "Pic", &mut report);
+    assert!(p.paths[0].is_none() && p.paths[1].is_some());
+    let layers: Vec<_> = p.symbols.iter().copied().zip(p.paths).collect();
+    let s = symbol::stacked(&layers, "Pic", &mut report);
+    assert!(matches!(s.marker, crate::symbology::Marker::Image(_)), "{:?}", s.marker);
+    let n = notes(&report);
+    assert!(n.len() == 1 && n[0].starts_with("Pic: ") && n[0].contains("first marker"), "{n:?}");
+}
+
+/// A line symbol of a 1 pt black stroke under a red square marker (outlined 0.5 pt black) placed by `placement`.
+fn marker_line(placement: serde_json::Value) -> serde_json::Value {
+    let mut marker = vector_marker(6.0, square_ring(), rgb(255, 0, 0));
+    marker["markerGraphics"][0]["symbol"] = polygon_symbol(vec![solid_stroke(rgb(0, 0, 0), 0.5), solid_fill(rgb(255, 0, 0))]);
+    marker["markerPlacement"] = placement;
+    json!({"type": "CIMLineSymbol", "symbolLayers": [solid_stroke(rgb(0, 0, 0), 1.0), marker]})
+}
+
+#[test]
+fn markers_along_a_line_become_line_markers() {
+    use crate::symbology::{LineMark, Marker, Placements};
+    let mut report = Report::default();
+    let end = symbol::line(
+        &marker_line(json!({"type": "CIMMarkerPlacementAtExtremities", "extremityPlacement": "JustEnd", "angleToLine": true, "offset": 3})),
+        "Flow",
+        &mut report,
+    );
+    assert_eq!(end.strokes.len(), 2);
+    // The line's own stroke stays the symbol's.
+    assert_eq!(end.stroke, Some((Rgba::rgb(0, 0, 0), 96.0 / 72.0)));
+    let st = &end.strokes[1];
+    let m = st.markers.unwrap();
+    assert_eq!((m.at, m.rotate, m.mark), (Placements::LAST, true, LineMark::Marker(Marker::Square)));
+    assert!((m.size - 8.0).abs() < 1e-5);
+    assert_eq!((st.color, m.outline), (Some(Rgba::rgb(255, 0, 0)), Some(Rgba::rgb(0, 0, 0))));
+    assert!((st.width.unwrap() - 0.5 * 96.0 / 72.0).abs() < 1e-5 && (st.offset - 4.0).abs() < 1e-5);
+    let both = symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementAtExtremities"})), "Flow", &mut report);
+    assert_eq!(both.strokes[1].markers.unwrap().at, Placements::FIRST.with(Placements::LAST));
+    let middle =
+        symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementAtRatioPositions", "positionArray": [0.5]})), "Flow", &mut report);
+    assert_eq!(middle.strokes[1].markers.unwrap().at, Placements::MIDDLE);
+    let along = symbol::line(
+        &marker_line(json!({"type": "CIMMarkerPlacementAlongLineSameSize", "placementTemplate": [20], "angleToLine": false})),
+        "Flow",
+        &mut report,
+    );
+    let m = along.strokes[1].markers.unwrap();
+    assert_eq!((m.at, m.rotate), (Placements::INTERVAL, false));
+    assert!((m.interval - 26.67).abs() < 1e-2, "{}", m.interval);
+    let vertices = symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementOnVertices"})), "Flow", &mut report);
+    assert_eq!(vertices.strokes[1].markers.unwrap().at, Placements::VERTICES);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // Ratios other than the middle are at intervals, noted.
+    let ratios =
+        symbol::line(&marker_line(json!({"type": "CIMMarkerPlacementAtRatioPositions", "positionArray": [0.25]})), "Flow", &mut report);
+    assert_eq!(ratios.strokes[1].markers.unwrap().at, Placements::INTERVAL);
+    assert_eq!(report.notes.len(), 1, "{:?}", notes(&report));
+
+    // Through a layer's renderer, the markers are among its strokes.
+    let flow = feature_layer(
+        "Flow",
+        standard_connection("Shapefile", "DATABASE=/d", "flow.shp"),
+        json!({"renderer": simple_renderer(marker_line(
+            json!({"type": "CIMMarkerPlacementAtExtremities", "extremityPlacement": "JustEnd", "angleToLine": true})
+        ))}),
+    );
+    let (map, _) = read_new_detail_map(&map_document(&[flow], &["CIMPATH=new_detail_map/flow.json"]));
+    let strokes = nth(&map, 0).style.line_strokes.as_ref().unwrap();
+    assert_eq!(strokes.len(), 2);
+    assert_eq!(strokes[1].markers.unwrap().at, Placements::LAST);
+}
+
+#[test]
+fn dots_inside_polygons_become_a_dots_fill() {
+    use crate::fills::FillPattern;
+    use crate::symbology::Marker;
+    let mut marker = vector_marker(4.0, circle_rings(), rgb(0, 128, 0));
+    marker["markerPlacement"] = json!({"type": "CIMMarkerPlacementInsidePolygon", "stepX": 10, "stepY": 10, "gridType": "Fixed"});
+    let sym = polygon_symbol(vec![solid_fill(rgb(255, 255, 255)), marker]);
+    let mut report = Report::default();
+    let p = symbol::polygon(&sym, "Park", &mut report);
+    assert_eq!(p.fills.len(), 2);
+    assert_eq!(p.fills[1].color, Some(Rgba::rgb(0, 128, 0)));
+    let FillPattern::Dots { marker, size, spacing, .. } = p.fills[1].pattern else { panic!("{:?}", p.fills[1]) };
+    assert_eq!(marker, Marker::Circle);
+    assert!((size - 4.0 * 96.0 / 72.0).abs() < 1e-5);
+    assert!(spacing.iter().all(|s| (s - 13.33).abs() < 1e-2), "{spacing:?}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+}
+
+#[test]
+fn hostile_marker_graphics_are_bounded() {
+    use crate::symbology::{LineMark, MAX_PATH_PARTS, MAX_PATH_POINTS, Marker, PathShape};
+    let long: Vec<[f64; 2]> = (0..5000).map(|i| [f64::from(i % 97) - 48.0, f64::from(i % 89) - 44.0]).collect();
+    let graphic = |geometry: serde_json::Value| json!({"type": "CIMMarkerGraphic", "geometry": geometry, "symbol": polygon_symbol(vec![solid_fill(rgb(1, 2, 3))])});
+    // (JSON has no NaN: serde_json writes one as null, which is what a damaged file holds.)
+    let mut graphics = vec![
+        graphic(json!({"rings": [long]})),
+        graphic(json!({"rings": [[[f64::NAN, f64::NAN], [f64::NAN, 1.0], [2.0, f64::NAN]]]})),
+        graphic(json!({"curveRings": [[[0, 0], {"a": "x"}, {"b": [[1, 1]]}, {"c": null}, [1e308, -1e308]]]})),
+        graphic(json!({"paths": 5})),
+        graphic(json!({"rings": [[[1, 2], [3]], "x", [[0, 0], [0, 0]]]})),
+    ];
+    graphics.extend((0..200).map(|i| graphic(json!({"paths": [[[0, 0], [i, 1]]]}))));
+    let hostile = [
+        json!({"type": "CIMVectorMarker", "size": 10, "rotation": 1e308, "offsetX": "x",
+            "frame": {"xmin": -50, "ymin": -50, "xmax": 50, "ymax": 50}, "markerGraphics": graphics}),
+        json!({"type": "CIMVectorMarker", "size": 0, "frame": {"xmin": 0, "ymin": 0, "xmax": 0, "ymax": 0}, "markerGraphics": graphics}),
+        json!({"type": "CIMVectorMarker", "size": -3, "markerGraphics": [graphic(json!({"rings": [[[0, 0], [0, 0], [0, 0]]]}))]}),
+        json!({"type": "CIMVectorMarker", "markerGraphics": "x"}),
+    ];
+    let bounded = |shape: &PathShape| {
+        assert!(shape.parts.len() <= MAX_PATH_PARTS);
+        for part in &shape.parts {
+            assert!(part.points.len() <= MAX_PATH_POINTS);
+            assert!(part.points.iter().flatten().all(|v| v.is_finite()), "{:?}", part.points);
+        }
+    };
+    let check = |m: Marker| {
+        if let Marker::Path(p) = m {
+            bounded(p.shape());
+        }
+    };
+    // The long ring is cut to the most points kept, and the graphics to the most parts (two of the first
+    // 64 draw nothing), noted.
+    let mut report = Report::default();
+    let shape = symbol::path_marker(&hostile[0], 10.0, "H", &mut report).unwrap();
+    assert_eq!((shape.parts.len(), shape.parts[0].points.len()), (MAX_PATH_PARTS - 2, MAX_PATH_POINTS));
+    bounded(&shape);
+    assert!(notes(&report).iter().any(|n| n.contains("cut short")), "{:?}", notes(&report));
+    for marker in &hostile {
+        let mut report = Report::default();
+        if let Some(shape) = symbol::path_marker(marker, 10.0, "H", &mut report) {
+            bounded(&shape);
+        }
+        let point = json!({"type": "CIMPointSymbol", "symbolLayers": [marker, marker, {"type": "CIMCharacterMarker"}]});
+        let p = symbol::point(&point, "H", &mut report);
+        p.symbols.iter().for_each(|s| check(s.marker));
+        let layers: Vec<_> = p.symbols.iter().copied().zip(p.paths).collect();
+        if !layers.is_empty() {
+            check(symbol::stacked(&layers, "H", &mut report).marker);
+        }
+        for placement in [
+            json!({"type": "CIMMarkerPlacementAlongLineSameSize", "placementTemplate": "x"}),
+            json!({"type": "CIMMarkerPlacementAtRatioPositions", "positionArray": [f64::NAN]}),
+            json!({"type": "CIMMarkerPlacementInsidePolygon", "stepX": -1, "stepY": 1e308, "offsetX": "x"}),
+            json!({"type": "CIMMarkerPlacementSomethingNew"}),
+            json!(7),
+        ] {
+            let mut m = marker.clone();
+            m["markerPlacement"] = placement;
+            let line = symbol::line(&json!({"type": "CIMLineSymbol", "symbolLayers": [m]}), "H", &mut report);
+            for s in line.strokes.iter().filter_map(|s| s.markers) {
+                if let LineMark::Marker(m) = s.mark {
+                    check(m);
+                }
+            }
+            let poly = symbol::polygon(&json!({"type": "CIMPolygonSymbol", "symbolLayers": [m]}), "H", &mut report);
+            for f in &poly.fills {
+                if let crate::fills::FillPattern::Dots { marker, .. } = f.pattern {
+                    check(marker);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -623,8 +887,8 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
         json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint", "graphic": g})
     };
     let (imp, report) = read(&[
-        picture("COMPANY LOGO", json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Company Logo.png"})),
-        picture("FILE", json!({"sourceURL": r"G:\LOGOS\Other.png"})),
+        picture("COMPANY LOGO", json!({"referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"D:\logos\Company Logo.png"})),
+        picture("FILE", json!({"sourceURL": r"D:\logos\Other.png"})),
         picture("INLINE", json!({"sourceURL": "data:image/png;base64,AAAA"})),
     ]);
     // A data: URL that isn't base64 is neither a picture nor a file.
@@ -638,15 +902,15 @@ fn pictures_resolve_embedded_binaries_or_remember_their_path() {
     // Every picture is left for the engine to check and convert, embedded ones included: the
     // elements are empty until it does.
     assert!(
-        matches!(&els[0].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Company Logo.png"))
+        matches!(&els[0].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"D:\logos\Company Logo.png"))
     );
-    assert!(matches!(&els[1].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"G:\LOGOS\Other.png")));
+    assert!(matches!(&els[1].kind, Picture { image, source } if image.is_empty() && source.as_deref() == Some(r"D:\logos\Other.png")));
     assert!(matches!(&els[2].kind, Picture { image, source } if image.is_empty() && source.is_none()));
     assert_eq!(
         imp.pictures,
         vec![
             (els[0].id, PictureSource::Embedded("iVBORw0KGgo=".into())),
-            (els[1].id, PictureSource::Path(r"G:\LOGOS\Other.png".into())),
+            (els[1].id, PictureSource::Path(r"D:\logos\Other.png".into())),
             (els[2].id, PictureSource::Embedded("AAAA".into())),
         ]
     );
@@ -997,8 +1261,9 @@ fn an_embedded_frames_camera_converts_from_degrees_or_web_mercator() {
 fn a_camera_in_another_system_falls_back_to_the_auto_extent_then_the_default_extent() {
     let ext = |x0: f64, y0: f64, x1: f64, y1: f64, wkid: u32| json!({"type": "CIMEnvelope", "xmin": x0, "ymin": y0, "xmax": x1, "ymax": y1, "spatialReference": {"wkid": wkid}});
     let maps = [
-        embedded_map("CIMPATH=map/sp.json", 2272, json!({"defaultExtent": ext(-80.0, 40.0, -78.0, 42.0, 4326)})),
-        embedded_map("CIMPATH=map/none.json", 2272, json!({})),
+        // (A system RustGIS doesn't know: no such code.)
+        embedded_map("CIMPATH=map/sp.json", 999_999, json!({"defaultExtent": ext(-80.0, 40.0, -78.0, 42.0, 4326)})),
+        embedded_map("CIMPATH=map/none.json", 999_999, json!({})),
     ];
     let mut auto = map_frame_element("AUTO", (1.0, 1.0, 5.0, 5.0), camera(2_000_000.0, 300_000.0, 12_000.0));
     auto["uRI"] = json!("CIMPATH=map/sp.json");
@@ -1019,7 +1284,27 @@ fn a_camera_in_another_system_falls_back_to_the_auto_extent_then_the_default_ext
     // Nothing usable: the map's view, and the system said.
     let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "LOST") else { panic!() };
     assert!(center.x == 0.0 && center.y == 0.0 && scale == 0.0);
-    assert_eq!(notes(&report), ["LOST: frame camera in an unsupported coordinate system (2272); the map's view is used"]);
+    assert_eq!(notes(&report), ["LOST: frame camera in an unsupported coordinate system (999999); the map's view is used"]);
+}
+
+#[test]
+fn a_camera_in_a_projected_system_is_converted() {
+    // A Lambert conformal conic state plane in US survey feet (EPSG:2263), its false origin
+    // 300 000 m (984 250 US ft) east of its central meridian, 74°W, on its latitude of origin,
+    // 40°10'N: the camera's feet are read as feet. An extent in NAD83 degrees is read as degrees.
+    let ext = json!({"type": "CIMEnvelope", "xmin": -80.0, "ymin": 38.0, "xmax": -78.0, "ymax": 40.0, "spatialReference": {"wkid": 4269}});
+    let maps =
+        [embedded_map("CIMPATH=map/sp.json", 2263, json!({})), embedded_map("CIMPATH=map/nad.json", 4269, json!({"defaultExtent": ext}))];
+    let mut sp = map_frame_element("SP", (1.0, 1.0, 5.0, 5.0), camera(984_250.0, 0.0, 24_000.0));
+    sp["uRI"] = json!("CIMPATH=map/sp.json");
+    let mut nad = map_frame_element("NAD", (6.0, 1.0, 9.0, 5.0), json!({}));
+    nad["uRI"] = json!("CIMPATH=map/nad.json");
+    let (imp, report) = read_with_maps(&maps, &[sp, nad]);
+    let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "SP") else { panic!() };
+    assert!(near(center.x, -74.0, 1e-4) && near(center.y, 40.0 + 1.0 / 6.0, 1e-4) && scale == 24_000.0, "{center:?} {scale}");
+    let (_, ElementKind::MapFrame { center, .. }) = frame_of(&imp, "NAD") else { panic!() };
+    assert!(near(center.x, -79.0, 1e-3) && near(center.y, 39.0, 1e-3), "{center:?}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
 }
 
 #[test]
@@ -1612,7 +1897,7 @@ fn group_element(name: &str, children: Vec<serde_json::Value>, extra: serde_json
 
 fn picture_element(name: &str) -> serde_json::Value {
     json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint",
-        "graphic": {"type": "CIMPictureGraphic", "referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"G:\LOGOS\Logo.png",
+        "graphic": {"type": "CIMPictureGraphic", "referenceURI": "CIMPATH=Pictures/logo.png", "sourceURL": r"D:\logos\Logo.png",
             "box": {"xmin": 0.76, "ymin": 9.0, "xmax": 1.83, "ymax": 9.41}}})
 }
 
@@ -1867,7 +2152,7 @@ fn hostile_layouts_never_panic() {
 
 // ---- embedded maps ----
 
-const LANDGRID: &str = r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN";
+const LANDGRID: &str = r"D:\data\landgrid";
 
 fn standard_connection(factory: &str, connection: &str, dataset: &str) -> serde_json::Value {
     json!({"type": "CIMStandardDataConnection", "workspaceConnectionString": connection, "workspaceFactory": factory,
@@ -1893,11 +2178,50 @@ fn symbol_ref(symbol: serde_json::Value) -> serde_json::Value {
 
 /// A document embedding `layers` and a map "NEW DETAIL MAP" that lists the ones named in `listed`.
 fn map_document(layers: &[serde_json::Value], listed: &[&str]) -> Document {
-    let doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0", "layerDefinitions": layers,
-        "mapDefinitions": [{"type": "CIMMap", "name": "NEW DETAIL MAP", "uRI": "CIMPATH=map/new_detail_map.json", "layers": listed,
-            "spatialReference": {"wkid": 4326, "latestWkid": 4326},
-            "defaultExtent": {"xmin": -125.0, "ymin": 24.0, "xmax": -66.0, "ymax": 50.0, "spatialReference": {"wkid": 4326}}}]});
+    map_document_with(layers, listed, json!({}), json!({}))
+}
+
+/// `map_document`, with `map` added to the map's keys and `root` to the document's.
+fn map_document_with(layers: &[serde_json::Value], listed: &[&str], map: serde_json::Value, root: serde_json::Value) -> Document {
+    let mut m = json!({"type": "CIMMap", "name": "NEW DETAIL MAP", "uRI": "CIMPATH=map/new_detail_map.json", "layers": listed,
+        "spatialReference": {"wkid": 4326, "latestWkid": 4326},
+        "defaultExtent": {"xmin": -125.0, "ymin": 24.0, "xmax": -66.0, "ymax": 50.0, "spatialReference": {"wkid": 4326}}});
+    if let (Some(o), Some(e)) = (m.as_object_mut(), map.as_object()) {
+        o.extend(e.clone());
+    }
+    let mut doc = json!({"type": "CIMLayoutDocument", "version": "3.7.0", "layerDefinitions": layers, "mapDefinitions": [m]});
+    if let (Some(o), Some(e)) = (doc.as_object_mut(), root.as_object()) {
+        o.extend(e.clone());
+    }
     Document::from_json(&doc.to_string()).unwrap()
+}
+
+/// A map's layers, its groups opened up, top first.
+fn flat(map: &MapImport) -> Vec<&LayerImport> {
+    fn walk<'a>(entries: &'a [Entry], out: &mut Vec<&'a LayerImport>) {
+        for e in entries {
+            match e {
+                Entry::Layer(l) => out.push(l),
+                Entry::Group(g) => walk(&g.children, out),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&map.entries, &mut out);
+    out
+}
+
+/// The `i`th of a map's layers, its groups opened up.
+fn nth(map: &MapImport, i: usize) -> &LayerImport {
+    flat(map)[i]
+}
+
+/// A layer's file and table, when it reads from a file.
+fn file_of(l: &LayerImport) -> (Option<&str>, Option<&str>) {
+    match &l.source {
+        LayerSource::File { path, table } => (Some(path.as_str()), table.as_deref()),
+        _ => (None, None),
+    }
 }
 
 fn read_new_detail_map(doc: &Document) -> (MapImport, Report) {
@@ -1917,8 +2241,8 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     let label_symbol = symbol_ref(text_symbol(json!({"fontFamilyName": "Yu Gothic UI", "fontStyleName": "Regular", "height": 10,
         "haloSize": 1, "haloSymbol": halo})));
     let states = feature_layer(
-        "TAA_US_States",
-        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "TAA_US_States.shp"),
+        "Sample_US_States",
+        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "Sample_US_States.shp"),
         json!({"transparency": 30, "renderer": simple_renderer(states_symbol), "labelVisibility": true,
             "labelClasses": [{"type": "CIMLabelClass", "expression": "$feature.STATE_NAME", "expressionEngine": "Arcade",
                 "visibility": true, "textSymbol": label_symbol, "name": "Class 1"}]}),
@@ -1928,21 +2252,26 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
         standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "Counties.shp"),
         json!({"visibility": false, "minScale": 5000000.0, "renderer": simple_renderer(polygon_symbol(vec![solid_fill(rgb(200, 100, 0))]))}),
     );
-    let doc = map_document(&[states, counties], &["CIMPATH=new_detail_map/taa_us_states.json", "CIMPATH=new_detail_map/counties.json"]);
+    let doc = map_document(&[states, counties], &["CIMPATH=new_detail_map/sample_us_states.json", "CIMPATH=new_detail_map/counties.json"]);
     let (map, report) = read_new_detail_map(&doc);
     assert!(report.notes.is_empty(), "{:?}", notes(&report));
 
     assert_eq!(map.name, "NEW DETAIL MAP");
     assert_eq!(map.wkid, Some(4326));
     assert_eq!(map.extent, Some([-125.0, 24.0, -66.0, 50.0]));
-    let names: Vec<&str> = map.layers.iter().map(|l| l.name.as_str()).collect();
-    assert_eq!(names, ["TAA_US_States", "Counties"]);
-    assert_eq!(map.layers.iter().map(|l| l.visible).collect::<Vec<_>>(), [true, false]);
+    let names: Vec<&str> = flat(&map).into_iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Sample_US_States", "Counties"]);
+    assert_eq!(flat(&map).into_iter().map(|l| l.visible).collect::<Vec<_>>(), [true, false]);
 
-    let s = &map.layers[0];
-    assert_eq!(s.path.as_deref(), Some(r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN\TAA_US_States.shp"));
-    assert_eq!(s.table, None);
-    assert_eq!(s.origin, r"Shapefile TAA_US_States.shp in G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN");
+    assert!(map.entries.iter().all(|e| matches!(e, Entry::Layer(_))));
+    assert!(map.tables.is_empty());
+    assert_eq!(map.reference_scale, None);
+
+    let s = nth(&map, 0);
+    assert_eq!(s.source, LayerSource::File { path: r"D:\data\landgrid\Sample_US_States.shp".into(), table: None });
+    assert_eq!(s.origin, r"Shapefile Sample_US_States.shp in D:\data\landgrid");
+    assert_eq!((s.kind, s.expanded, s.scale_symbols, s.definition_query.as_deref()), (LayerKind::Feature, false, true, None));
+    assert_eq!(s.style.blend, None);
     let Some(Renderer::Single(sym)) = &s.style.renderer else { panic!("{:?}", s.style.renderer) };
     assert_eq!(sym.stroke, Rgba::rgb(52, 52, 52));
     assert!((sym.stroke_width - 1.333).abs() < 1e-3, "{}", sym.stroke_width);
@@ -1957,12 +2286,12 @@ fn an_embedded_shapefile_map_reads_its_layers_and_styles() {
     assert_eq!((c.color, c.visible, c.bold, c.italic), (Rgba::rgb(10, 20, 30), true, false, false));
     assert!(c.halo);
     assert_eq!(c.halo_color, Some(Rgba::rgb(255, 255, 255)));
-    assert!((c.halo_width.unwrap() - 1.333).abs() < 1e-3);
+    assert_eq!(c.halo_width, Some(1.0), "points, as RustGIS keeps them");
     // Only what the file sets is set.
     assert_eq!((s.style.min_scale, s.style.max_scale), (None, None));
 
-    let c = &map.layers[1];
-    assert_eq!(c.path.as_deref(), Some(r"G:\JERICHO_SHAPEFILES\OTLS-PLSS\LANDGRID TOBIN\Counties.shp"));
+    let c = nth(&map, 1);
+    assert_eq!(file_of(c), (Some(r"D:\data\landgrid\Counties.shp"), None));
     assert_eq!(c.style.transparency, None);
     // Pro's scales are at 96 dpi, as QGIS's are.
     let min = c.style.min_scale.flatten().unwrap();
@@ -1995,7 +2324,7 @@ fn file_paths_follow_the_connections_folder_and_factory() {
         ],
     );
     let (map, report) = read_new_detail_map(&doc);
-    let got: Vec<(Option<&str>, Option<&str>)> = map.layers.iter().map(|l| (l.path.as_deref(), l.table.as_deref())).collect();
+    let got: Vec<(Option<&str>, Option<&str>)> = flat(&map).into_iter().map(file_of).collect();
     assert_eq!(
         got,
         [
@@ -2006,7 +2335,7 @@ fn file_paths_follow_the_connections_folder_and_factory() {
             (None, None),
         ]
     );
-    assert_eq!(map.layers[1].origin, r"FileGDB Parcels in C:\data\parcels.gdb");
+    assert_eq!(nth(&map, 1).origin, r"FileGDB Parcels in C:\data\parcels.gdb");
     let n = notes(&report);
     assert!(n.iter().any(|t| t.starts_with("D: ") && t.contains("SDE")), "{n:?}");
     assert!(n.iter().any(|t| t.starts_with("E: ")), "{n:?}");
@@ -2074,9 +2403,9 @@ fn unique_value_renderers_read_their_classes() {
     let (map, report) = read_new_detail_map(&map_document(&[zones, two, roads], &uris));
 
     let Some(Renderer::Unique { field, classes, other, other_label, class_labels, class_strokes, class_fills, .. }) =
-        &map.layers[0].style.renderer
+        &nth(&map, 0).style.renderer
     else {
-        panic!("{:?}", map.layers[0].style.renderer)
+        panic!("{:?}", nth(&map, 0).style.renderer)
     };
     assert_eq!(field, "ZONE");
     let values: Vec<&str> = classes.iter().map(|(v, _)| v.as_str()).collect();
@@ -2093,14 +2422,14 @@ fn unique_value_renderers_read_their_classes() {
     assert!(!class_labels.contains_key("C"));
     assert!(class_strokes.is_empty() && class_fills.is_empty());
 
-    let Some(Renderer::Unique { field, other, other_label, .. }) = &map.layers[1].style.renderer else { panic!() };
+    let Some(Renderer::Unique { field, other, other_label, .. }) = &nth(&map, 1).style.renderer else { panic!() };
     assert_eq!(field, "A");
     assert_eq!(*other_label, None, "the usual label is not kept");
     assert_eq!(other.fill.a(), 0);
     assert_eq!(other.stroke.a(), 0);
     assert!(notes(&report).iter().any(|n| n.starts_with("Two: ") && n.contains("2 fields")), "{:?}", notes(&report));
 
-    let r = &map.layers[2].style;
+    let r = &nth(&map, 2).style;
     let Some(Renderer::Unique { class_strokes, .. }) = &r.renderer else { panic!() };
     assert_eq!(class_strokes.get("H").map(Vec::len), Some(2));
     assert!(!class_strokes.contains_key("S"), "a plain stroke is the symbol's own");
@@ -2123,7 +2452,7 @@ fn label_classes_read_their_expressions_text_and_ranges() {
         label(json!("[POP]"), json!({"minimumScale": 100000.0, "maximumScale": 5000.0})),
         label(json!("!CODE!"), json!({"visibility": false})),
         label(json!("ID"), json!({})),
-        label(json!("$feature.FIRST + \" \" + $feature.SECOND"), json!({})),
+        label(json!("Upper($feature.FIRST) + \" \" + $feature.SECOND"), json!({})),
         label(json!("\"no field here\""), json!({})),
     ];
     let layer = feature_layer(
@@ -2132,7 +2461,7 @@ fn label_classes_read_their_expressions_text_and_ranges() {
         json!({"labelVisibility": false, "labelClasses": classes}),
     );
     let (map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/places.json"]));
-    let labels = map.layers[0].style.labels.as_ref().unwrap();
+    let labels = nth(&map, 0).style.labels.as_ref().unwrap();
     assert!(!labels.enabled);
     let fields: Vec<&str> = labels.classes.iter().map(|c| c.field.as_str()).collect();
     assert_eq!(fields, ["NAME", "POP", "CODE", "ID", "FIRST"]);
@@ -2146,7 +2475,7 @@ fn label_classes_read_their_expressions_text_and_ranges() {
     assert_eq!((labels.default.name.as_str(), labels.default.visible, labels.default.field.as_str()), ("Default", false, "NAME"));
     assert!(!labels.classes[0].halo);
     let n = notes(&report);
-    assert!(n.iter().any(|t| t.contains("label expression $feature.FIRST") && t.contains("drawn as FIRST")), "{n:?}");
+    assert!(n.iter().any(|t| t.contains("label expression Upper($feature.FIRST)") && t.contains("drawn as FIRST")), "{n:?}");
     assert!(n.iter().any(|t| t.starts_with("Places: ") && t.contains("no field here")), "{n:?}");
 }
 
@@ -2161,7 +2490,7 @@ fn unsupported_layers_are_noted() {
     let classed = feature_layer(
         "Classed",
         standard_connection("Shapefile", "DATABASE=/d", "classed.shp"),
-        json!({"renderer": {"type": "CIMClassBreaksRenderer", "field": "X"}}),
+        json!({"renderer": {"type": "CIMDotDensityRenderer", "attributes": []}}),
     );
     let sql = feature_layer(
         "Query",
@@ -2180,32 +2509,45 @@ fn unsupported_layers_are_noted() {
         ],
     );
     let (map, report) = read_new_detail_map(&doc);
-    let got: Vec<(&str, bool, bool)> = map.layers.iter().map(|l| (l.name.as_str(), l.visible, l.path.is_some())).collect();
+    // The group is kept, hidden on its own: its layers keep their own visibility.
+    let [Entry::Group(g), ..] = map.entries.as_slice() else { panic!("{:?}", map.entries) };
+    assert_eq!((g.name.as_str(), g.visible, g.children.len()), ("Boundaries", false, 2));
+    let opens = |l: &LayerImport| !matches!(l.source, LayerSource::Unopenable | LayerSource::Missing(_));
+    let got: Vec<(&str, bool, bool, LayerKind)> = flat(&map).into_iter().map(|l| (l.name.as_str(), l.visible, opens(l), l.kind)).collect();
     assert_eq!(
         got,
         [
-            ("Child", false, true), // a group's layers are listed one by one, hidden with it
-            ("gone", false, false),
-            ("Imagery", true, false),
-            ("Ground", true, false),
-            ("Classed", true, true),
-            ("Query", true, false),
-            ("missing", true, false),
+            ("Child", true, true, LayerKind::Feature),
+            ("gone", true, false, LayerKind::Other),
+            ("Imagery", true, false, LayerKind::Raster), // a raster with no data connection
+            ("Ground", true, false, LayerKind::Other),
+            ("Classed", true, true, LayerKind::Feature),
+            ("Query", true, false, LayerKind::Feature),
+            ("missing", true, false, LayerKind::Other),
         ]
     );
-    assert!(matches!(map.layers[4].style.renderer, Some(Renderer::Single(_))));
+    assert!(matches!(nth(&map, 4).style.renderer, Some(Renderer::Single(_))));
     let n = notes(&report);
     for expected in [
-        "Boundaries: group Boundaries, its layers listed one by one",
-        "Imagery: CIMRasterLayer layers, left out",
-        "Ground: CIMElevationSurfaceLayer layers, left out",
-        "Classed: CIMClassBreaksRenderer renderers, drawn with a default symbol",
+        "Imagery: a layer with no data connection, nothing to open",
+        "Ground: CIMElevationSurfaceLayer layers, which RustGIS doesn't draw",
+        "Classed: CIMDotDensityRenderer renderers, drawn with a default symbol",
+        "Query: SQL query layers, which RustGIS can't open",
     ] {
-        assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
+        assert!(
+            n.iter().any(|t| t == expected),
+            "{expected}
+{n:?}"
+        );
     }
-    assert!(n.iter().any(|t| t.starts_with("Query: ") && t.contains("CIMSqlQueryDataConnection")), "{n:?}");
-    assert!(n.iter().any(|t| t.contains("missing.json")), "{n:?}");
-    assert!(n.iter().any(|t| t.contains("gone.json")), "{n:?}");
+    assert!(!n.iter().any(|t| t.contains("one by one")), "{n:?}");
+    // A layer the document lists but doesn't define comes in broken, and the note says so.
+    let said = "missing: the layer CIMPATH=new_detail_map/missing.json isn't defined in this document, added broken";
+    assert!(n.iter().any(|t| t == said), "{n:?}");
+    assert!(n.iter().any(|t| t.contains("gone.json") && t.ends_with("added broken")), "{n:?}");
+    let missing = nth(&map, 6);
+    assert_eq!(missing.source, LayerSource::Missing("the project doesn't define this layer".into()));
+    assert_eq!(missing.origin, "a layer the project doesn't define (CIMPATH=new_detail_map/missing.json)");
 
     // Not a map: an error, and no map at all.
     let mut report = Report::default();
@@ -2231,22 +2573,22 @@ fn point_and_line_symbols_become_symbols() {
     );
     let (map, report) =
         read_new_detail_map(&map_document(&[wells, pipes], &["CIMPATH=new_detail_map/wells.json", "CIMPATH=new_detail_map/pipes.json"]));
-    let Some(Renderer::Single(w)) = &map.layers[0].style.renderer else { panic!() };
+    let Some(Renderer::Single(w)) = &nth(&map, 0).style.renderer else { panic!() };
     // The first marker (the picture, a circle for now); the second is noted.
     assert_eq!((w.marker, w.size), (Marker::Circle, 8.0 * 96.0 / 72.0));
     let n = notes(&report);
     assert!(n.iter().any(|t| t == "Wells: a GIF or BMP marker, drawn as a circle"), "{n:?}");
     assert!(n.iter().any(|t| t.starts_with("Wells: ") && t.contains("first marker")), "{n:?}");
-    let Some(Renderer::Single(p)) = &map.layers[1].style.renderer else { panic!() };
+    let Some(Renderer::Single(p)) = &nth(&map, 1).style.renderer else { panic!() };
     assert_eq!((p.stroke, p.fill, p.stroke_width, p.size), (Rgba::rgb(1, 2, 3), Rgba::rgb(1, 2, 3), 2.0 * 96.0 / 72.0, 0.0));
-    assert_eq!(map.layers[1].style.line_strokes, Some(Vec::new()), "a single plain stroke is the symbol's own");
+    assert_eq!(nth(&map, 1).style.line_strokes, Some(Vec::new()), "a single plain stroke is the symbol's own");
 }
 
 fn hostile_map_base() -> serde_json::Value {
     let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]));
     let states = feature_layer(
-        "TAA_US_States",
-        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "TAA_US_States.shp"),
+        "Sample_US_States",
+        standard_connection("Shapefile", &format!("DATABASE={LANDGRID}"), "Sample_US_States.shp"),
         json!({"transparency": 30, "minScale": 1e7, "maxScale": 1e3, "labelVisibility": true,
             "renderer": simple_renderer(polygon_symbol(vec![solid_stroke(rgb(52, 52, 52), 1.0), solid_fill(rgb(1, 2, 3))])),
             "labelClasses": [{"type": "CIMLabelClass", "expression": "$feature.STATE_NAME", "visibility": true, "minimumScale": 5e6,
@@ -2259,16 +2601,61 @@ fn hostile_map_base() -> serde_json::Value {
             &["ZONE"],
             vec![unique_class("Residential", &["R"], polygon_symbol(vec![solid_fill(rgb(255, 0, 0))]))],
             Some(polygon_symbol(vec![solid_fill(rgb(9, 9, 9))])),
-        )}),
+        ),
+        "blendingMode": "Multiply", "expanded": true, "scaleSymbols": false, "enableDisplayFilters": true,
+        "displayFilters": [{"type": "CIMDisplayFilter", "name": "f"}], "layerMasks": ["CIMPATH=new_detail_map/g.json"],
+        "featureReduction": {"type": "CIMFeatureReductionCluster"}, "symbolLayerDrawing": {"useSymbolLayerDrawing": true},
+        "charts": [{"type": "CIMChart"}], "popupInfo": {"type": "CIMPopupInfo"}, "timeFilter": {"type": "CIMTimeFilter"},
+        "selectionSymbol": symbol_ref(polygon_symbol(vec![solid_fill(rgb(0, 255, 255))]))}),
     );
+    let mut zones = zones;
+    if let Some(t) = zones.pointer_mut("/featureTable") {
+        t["definitionExpression"] = json!("ZONE = 'R'");
+    }
+    let gdb = r"DATABASE=..\data\z.gdb";
+    let joined = feature_layer(
+        "Joined",
+        json!({"type": "CIMRelQueryTableDataConnection", "sourceTable": standard_connection("FileGDB", gdb, "parcels"),
+            "destinationTable": standard_connection("FileGDB", gdb, "owners"), "primaryKey": "PID", "foreignKey": "PID"}),
+        json!({}),
+    );
+    let sde = feature_layer(
+        "Sde",
+        standard_connection("SDE", "ENCRYPTED_PASSWORD=00ff;SERVER=s;DATABASE=d;USER=u;PASSWORD=p", "d.dbo.t"),
+        json!({}),
+    );
+    let raster = json!({"type": "CIMRasterLayer", "name": "Photo", "uRI": "CIMPATH=new_detail_map/photo.json",
+        "dataConnection": standard_connection("Raster", r"DATABASE=.\IMG", "photo.tif")});
+    let tiles = json!({"type": "CIMTiledServiceLayer", "name": "Base", "uRI": "CIMPATH=new_detail_map/base.json",
+        "serviceConnection": {"type": "CIMAGSServiceConnection", "objectType": "MapServer",
+            "url": "https://example.org/arcgis/rest/services/Base/MapServer"}});
+    let wms = json!({"type": "CIMWMSLayer", "name": "Wms", "uRI": "CIMPATH=new_detail_map/wms.json",
+        "serviceConnection": {"type": "CIMWMSServiceConnection",
+            "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+        "subLayers": [{"type": "CIMWMSSubLayer", "name": "roads", "visibility": true}]});
+    let vector = json!({"type": "CIMVectorTileLayer", "name": "Streets", "uRI": "CIMPATH=new_detail_map/streets.json",
+        "dataConnection": {"type": "CIMVectorTileDataConnection", "uRI": "https://example.org/arcgis/rest/services/Streets/VectorTileServer"}});
+    let annotation = json!({"type": "CIMAnnotationLayer", "name": "Notes", "uRI": "CIMPATH=new_detail_map/notes.json"});
     // (A group that lists itself must not loop.)
-    let group = json!({"type": "CIMGroupLayer", "name": "G", "uRI": "CIMPATH=new_detail_map/g.json",
-        "layers": ["CIMPATH=new_detail_map/zones.json", "CIMPATH=new_detail_map/g.json"]});
-    json!({"type": "CIMLayoutDocument", "version": "3.7.0", "layerDefinitions": [states, zones, group],
-        "mapDefinitions": [{"type": "CIMMap", "name": "M", "uRI": "CIMPATH=map/m.json",
-            "layers": ["CIMPATH=new_detail_map/taa_us_states.json", "CIMPATH=new_detail_map/g.json"],
+    let group = json!({"type": "CIMGroupLayer", "name": "G", "uRI": "CIMPATH=new_detail_map/g.json", "visibility": false, "expanded": true,
+        "transparency": 20, "minScale": 1e6, "maxScale": 100,
+        "layers": ["CIMPATH=new_detail_map/zones.json", "CIMPATH=new_detail_map/g.json", "CIMPATH=new_detail_map/joined.json"]});
+    let table = json!({"type": "CIMStandaloneTable", "name": "Owners", "uRI": "CIMPATH=new_detail_map/owners.json",
+        "dataConnection": standard_connection("FileGDB", gdb, "owners")});
+    json!({"type": "CIMLayoutDocument", "version": "3.7.0",
+        "layerDefinitions": [states, zones, group, joined, sde, raster, tiles, wms, vector, annotation], "tableDefinitions": [table],
+        "mapDefinitions": [{"type": "CIMMap", "name": "M", "uRI": "CIMPATH=map/m.json", "referenceScale": 24000,
+            "layers": ["CIMPATH=new_detail_map/sample_us_states.json", "CIMPATH=new_detail_map/g.json", "CIMPATH=new_detail_map/sde.json",
+                "CIMPATH=new_detail_map/photo.json", "CIMPATH=new_detail_map/base.json", "CIMPATH=new_detail_map/wms.json",
+                "CIMPATH=new_detail_map/streets.json", "CIMPATH=new_detail_map/notes.json"],
+            "standaloneTables": ["CIMPATH=new_detail_map/owners.json"],
             "spatialReference": {"wkid": 4326, "latestWkid": 4326},
             "defaultExtent": {"xmin": -125.0, "ymin": 24.0, "xmax": -66.0, "ymax": 50.0}}]})
+}
+
+/// How many groups deep `entries` go.
+fn group_depth(entries: &[Entry]) -> usize {
+    entries.iter().map(|e| if let Entry::Group(g) = e { 1 + group_depth(&g.children) } else { 0 }).max().unwrap_or(0)
 }
 
 /// Reads `doc`'s map; when that works, what it carries must serialise (which refuses NaN and infinities).
@@ -2276,12 +2663,19 @@ fn read_map_and_check(doc: &serde_json::Value) {
     let Ok(doc) = Document::from_json(&doc.to_string()) else { return };
     let mut report = Report::default();
     if let Ok(map) = read_map(&doc, "CIMPATH=map/m.json", &mut report) {
-        assert!(map.layers.len() <= 500);
-        for l in &map.layers {
+        assert!(flat(&map).len() <= 500);
+        assert!(group_depth(&map.entries) <= 8);
+        assert!(map.tables.len() <= 500);
+        assert!(map.reference_scale.is_none_or(f64::is_finite));
+        for l in flat(&map) {
             let json = serde_json::to_string(&l.style.renderer);
             assert!(json.is_ok(), "{:?}", json.err());
             let json = serde_json::to_string(&l.style.labels);
             assert!(json.is_ok(), "{:?}", json.err());
+            assert!(!l.origin.contains("PASSWORD") && !l.origin.contains("USER"), "{}", l.origin);
+        }
+        for t in &map.tables {
+            assert!(!t.origin.contains("PASSWORD") && !t.origin.contains("USER"), "{}", t.origin);
         }
     }
 }
@@ -2292,9 +2686,14 @@ fn hostile_maps_never_panic() {
     let mut report = Report::default();
     let doc = Document::from_json(&base.to_string()).unwrap();
     let map = read_map(&doc, "CIMPATH=map/m.json", &mut report).unwrap();
-    // The fixture reads whole: its layer, then the group's one (the group's own loop is cut).
-    assert_eq!(map.layers.first().map(|l| l.name.as_str()), Some("TAA_US_States"));
-    assert!(map.layers.iter().any(|l| l.name == "Zones"));
+    // The fixture reads whole: its layer, then the group's (the group's own loop is cut), then the rest.
+    assert_eq!(flat(&map).first().map(|l| l.name.as_str()), Some("Sample_US_States"));
+    for name in ["Zones", "Joined", "Sde", "Photo", "Base", "Wms", "Streets", "Notes"] {
+        assert!(flat(&map).into_iter().any(|l| l.name == name), "{name}");
+    }
+    assert!(matches!(map.entries.get(1), Some(Entry::Group(g)) if g.name == "G" && !g.visible));
+    assert_eq!(map.tables.len(), 1);
+    assert!(map.reference_scale.is_some());
     read_map_and_check(&base);
 
     let mut paths = Vec::new();
@@ -2323,7 +2722,7 @@ fn maps_and_groups_are_bounded() {
     let uris: Vec<String> = (0..600).map(|i| format!("CIMPATH=new_detail_map/l{i}.json")).collect();
     let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
     let (map, report) = read_new_detail_map(&map_document(&layers, &uris));
-    assert_eq!(map.layers.len(), 500);
+    assert_eq!(flat(&map).len(), 500);
     assert!(notes(&report).iter().any(|n| n.contains("500")), "{:?}", notes(&report));
     let past: Vec<_> = report.notes.iter().filter(|n| n.text.contains("layers past")).collect();
     assert_eq!(past.iter().map(|n| n.count).collect::<Vec<_>>(), [1], "noted once, not per layer");
@@ -2335,8 +2734,11 @@ fn maps_and_groups_are_bounded() {
                 "layers": [format!("CIMPATH=new_detail_map/g{}.json", i + 1)]})
         })
         .collect();
-    let (map, _) = read_new_detail_map(&map_document(&groups, &["CIMPATH=new_detail_map/g0.json"]));
-    assert!(map.layers.len() <= 500);
+    let (map, report) = read_new_detail_map(&map_document(&groups, &["CIMPATH=new_detail_map/g0.json"]));
+    assert!(flat(&map).is_empty());
+    // Kept nested, as deep as groups are followed; the one past that is noted and left out.
+    assert_eq!(group_depth(&map.entries), 8);
+    assert!(notes(&report).iter().any(|n| n == "G8: groups inside groups past 8 levels"), "{:?}", notes(&report));
 }
 
 #[test]
@@ -2352,10 +2754,10 @@ fn unreadable_symbols_empty_renderers_and_odd_datasets_are_noted() {
     let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
     let (map, report) = read_new_detail_map(&map_document(&[no_symbol, typeless, empty, up, deep], &uris));
     // A symbol that can't be read still leaves a layer that draws.
-    assert!(matches!(map.layers[0].style.renderer, Some(Renderer::Single(_))));
-    assert!(matches!(map.layers[1].style.renderer, Some(Renderer::Single(_))));
-    assert!(matches!(map.layers[2].style.renderer, Some(Renderer::Unique { .. })));
-    assert_eq!((map.layers[3].path.as_deref(), map.layers[4].path.as_deref()), (None, None));
+    assert!(matches!(nth(&map, 0).style.renderer, Some(Renderer::Single(_))));
+    assert!(matches!(nth(&map, 1).style.renderer, Some(Renderer::Single(_))));
+    assert!(matches!(nth(&map, 2).style.renderer, Some(Renderer::Unique { .. })));
+    assert_eq!((&nth(&map, 3).source, &nth(&map, 4).source), (&LayerSource::Unopenable, &LayerSource::Unopenable));
     let n = notes(&report);
     for expected in [
         "NoSymbol: simple renderers with no symbol, drawn with a default symbol",
@@ -2498,4 +2900,1499 @@ fn path_keys_ignore_the_case_of_the_cimpath_prefix() {
         Document::from_json(r#"{"type":"CIMLayoutDocument","mapDefinitions":[{"type":"CIMMap","name":"M","uRI":"cimpath=map/m.json"}]}"#)
             .unwrap();
     assert_eq!(d.resolve("CIMPATH=Map/M.json").unwrap()["name"], "M");
+}
+
+#[test]
+fn a_project_lists_its_maps_layouts_open_views_and_pictures() {
+    use base64::Engine;
+    let project = json!({
+        "type": "CIMGISProject",
+        "projectItems": [
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "First", "catalogPath": "CIMPATH=first/first.json"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Second", "catalogPath": "CIMPATH=second/second.json"},
+            {"type": "CIMProjectItem", "itemType": "Layout", "name": "Sheet", "catalogPath": "CIMPATH=sheet/sheet.json"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Old", "catalogPath": "CIMPATH=old/old.xml"},
+            {"type": "CIMProjectItem", "itemType": "Folder", "name": "Data", "catalogPath": "CIMPATH=data"},
+        ],
+        "views": [
+            {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=second/second.json", "camera": {"x": 1.0, "y": 2.0, "scale": 5000.0, "heading": 0.0}},
+            {"type": "CIMLayoutView", "viewableObjectPath": "CIMPATH=sheet/sheet.json"},
+            {"type": "CIMMapTableView", "viewableObjectPath": "CIMPATH=first/first.json"},
+        ],
+    });
+    let png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let zip =
+        rustgis_data::zip::write(&[("GISProject.json".into(), project.to_string().into_bytes()), ("Pictures/a.png".into(), png.clone())])
+            .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+
+    let items = d.items();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["First", "Second", "Sheet", "Old"]);
+    assert_eq!(items.iter().map(|i| i.kind.clone()).collect::<Vec<_>>(), [ItemKind::Map, ItemKind::Map, ItemKind::Layout, ItemKind::Map]);
+    assert_eq!(items.iter().map(|i| i.arcmap).collect::<Vec<_>>(), [false, false, false, true]);
+    assert_eq!(items.get(1).map(|i| i.uri.as_str()), Some("CIMPATH=second/second.json"));
+
+    assert_eq!(d.open_maps(), ["CIMPATH=second/second.json"]);
+    assert_eq!(d.view_camera("CIMPATH=second/second.json"), Some((1.0, 2.0, 5000.0)));
+    assert_eq!(d.view_camera("CIMPATH=first/first.json"), None);
+
+    let want = base64::engine::general_purpose::STANDARD.encode(&png);
+    assert_eq!(d.binary("CIMPATH=Pictures/A.PNG"), Some(want.as_str()));
+    assert_eq!(d.binary("CIMPATH=Pictures/b.png"), None);
+}
+
+#[test]
+fn xml_named_entries_that_hold_json_are_read_and_are_not_arcmap() {
+    // Pro keeps the `.xml` name of a map, layout or layer that came over from ArcMap after it
+    // has rewritten it as CIM JSON; one that is still XML can't be read.
+    let project = json!({
+        "type": "CIMGISProject",
+        "projectItems": [
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Converted", "catalogPath": "CIMPATH=conv/conv.xml"},
+            {"type": "CIMProjectItem", "itemType": "Layout", "name": "Converted Sheet", "catalogPath": "CIMPATH=layout/sheet.xml"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Still Xml", "catalogPath": "CIMPATH=old/old.xml"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Missing", "catalogPath": "CIMPATH=gone/gone.xml"},
+        ],
+    });
+    let map = json!({"type": "CIMMap", "name": "Converted", "uRI": "CIMPATH=conv/conv.xml", "layers": ["CIMPATH=conv/roads.xml"]});
+    let layer = json!({"type": "CIMFeatureLayer", "name": "Roads", "uRI": "CIMPATH=conv/roads.xml"});
+    let sheet = json!({"type": "CIMLayout", "name": "Converted Sheet", "uRI": "CIMPATH=layout/sheet.xml"});
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project.to_string().into_bytes()),
+        ("conv/conv.xml".into(), map.to_string().into_bytes()),
+        ("conv/roads.xml".into(), layer.to_string().into_bytes()),
+        ("layout/sheet.xml".into(), sheet.to_string().into_bytes()),
+        ("old/old.xml".into(), b"<?xml version=\"1.0\"?><CIMMap/>".to_vec()),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+    let items = d.items();
+    assert_eq!(
+        items.iter().map(|i| (i.name.as_str(), i.arcmap)).collect::<Vec<_>>(),
+        [("Converted", false), ("Converted Sheet", false), ("Still Xml", true), ("Missing", true)]
+    );
+    assert_eq!(d.resolve("CIMPATH=conv/conv.xml").unwrap()["name"], "Converted");
+    assert_eq!(d.resolve("CIMPATH=CONV/Roads.xml").unwrap()["name"], "Roads");
+    assert!(d.resolve("CIMPATH=old/old.xml").is_none());
+}
+
+#[test]
+fn an_xml_entry_too_large_to_read_leaves_the_project_open_and_the_item_arcmap() {
+    // A genuine ArcMap document, or metadata, can be large: past the cap on an `.xml` entry (here
+    // past the whole JSON budget too) it is skipped, and the JSON beside it is read as before.
+    let project = json!({
+        "type": "CIMGISProject",
+        "projectItems": [
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Main", "catalogPath": "CIMPATH=main/main.json"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Huge", "catalogPath": "CIMPATH=huge/huge.xml"},
+        ],
+    });
+    let map = json!({"type": "CIMMap", "name": "Main", "uRI": "CIMPATH=main/main.json", "layers": []});
+    let mut huge = b"<?xml version=\"1.0\"?><CIMMap>".to_vec();
+    huge.resize(MAX_XML_ENTRY.max(MAX_JSON) + 1, b' ');
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project.to_string().into_bytes()),
+        ("huge/huge.xml".into(), huge),
+        ("main/main.json".into(), map.to_string().into_bytes()),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+    assert_eq!(d.items().iter().map(|i| (i.name.as_str(), i.arcmap)).collect::<Vec<_>>(), [("Main", false), ("Huge", true)]);
+    assert_eq!(d.resolve("CIMPATH=main/main.json").unwrap()["name"], "Main");
+}
+
+#[test]
+fn a_document_that_is_not_a_project_has_no_items_or_views() {
+    let d = Document::from_json(r#"{"type":"CIMLayoutDocument"}"#).unwrap();
+    assert!(d.items().is_empty());
+    assert!(d.open_maps().is_empty());
+    assert_eq!(d.view_camera("CIMPATH=x.json"), None);
+}
+
+#[test]
+fn project_items_are_bounded() {
+    let items: Vec<_> = (0..MAX_ITEMS + 50)
+        .map(|i| json!({"itemType": "Map", "name": format!("M{i}"), "catalogPath": format!("CIMPATH=m{i}/m{i}.json")}))
+        .collect();
+    let d = Document::from_json(&json!({"type": "CIMGISProject", "projectItems": items}).to_string()).unwrap();
+    assert_eq!(d.items().len(), MAX_ITEMS);
+}
+
+#[test]
+fn a_mapx_and_a_lyrx_expose_their_definitions() {
+    let mapx =
+        Document::from_json(r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"M","layers":[]},"layerDefinitions":[]}"#)
+            .unwrap();
+    assert_eq!(mapx.map_definition().and_then(|m| m.get("name")).and_then(|n| n.as_str()), Some("M"));
+    assert!(mapx.layer_uris().is_empty());
+
+    let lyrx = Document::from_json(r#"{"type":"CIMLayerDocument","layers":["CIMPATH=a/a.json","CIMPATH=b/b.json"],"layerDefinitions":[]}"#)
+        .unwrap();
+    assert_eq!(lyrx.layer_uris(), ["CIMPATH=a/a.json", "CIMPATH=b/b.json"]);
+    assert!(lyrx.map_definition().is_none());
+
+    let pagx = Document::from_json(r#"{"type":"CIMLayoutDocument","layoutDefinition":{"type":"CIMLayout"}}"#).unwrap();
+    assert!(pagx.map_definition().is_none());
+    assert!(pagx.layer_uris().is_empty());
+}
+
+#[test]
+fn oversize_picture_entries_are_left_out() {
+    let project = br#"{"type":"CIMGISProject"}"#.to_vec();
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project),
+        ("Pictures/big.png".into(), vec![7u8; 17 << 20]),
+        ("Pictures/small.jpg".into(), vec![1, 2, 3]),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+    assert_eq!(d.binary("CIMPATH=Pictures/big.png"), None);
+    assert_eq!(d.binary("CIMPATH=Pictures/small.jpg"), Some("AQID"));
+}
+
+/// `zip` with the stored bytes of entry `name` damaged, so its checksum fails.
+fn damaged(mut zip: Vec<u8>, name: &str) -> Vec<u8> {
+    let at = zip.windows(name.len()).position(|w| w == name.as_bytes()).unwrap() + name.len();
+    zip[at] ^= 0xFF;
+    zip
+}
+
+#[test]
+fn a_bad_or_oversize_picture_skips_only_itself_and_is_noted_where_the_layout_uses_it() {
+    let picture = |name: &str, uri: &str| {
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint",
+            "graphic": {"type": "CIMPictureGraphic", "referenceURI": uri, "box": {"xmin": 1.0, "ymin": 1.0, "xmax": 2.0, "ymax": 2.0}}})
+    };
+    let sheet = json!({"type": "CIMLayout", "name": "Sheet", "uRI": "CIMPATH=sheet/sheet.json",
+        "page": {"type": "CIMPage", "width": 11, "height": 8.5, "units": {"uwkid": 109008}},
+        "elements": [picture("BIG", "CIMPATH=Pictures/big.png"), picture("BAD", "CIMPATH=Pictures/bad.png"),
+            picture("SMALL", "CIMPATH=Pictures/small.jpg")]});
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), br#"{"type":"CIMGISProject"}"#.to_vec()),
+        ("sheet/sheet.json".into(), sheet.to_string().into_bytes()),
+        ("Pictures/big.png".into(), vec![7u8; MAX_PICTURE_ENTRY + 1]),
+        ("Pictures/bad.png".into(), vec![9, 9, 9]),
+        ("Pictures/small.jpg".into(), vec![1, 2, 3]),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&damaged(zip, "Pictures/bad.png")).unwrap();
+    // The damaged one used to lose every picture of the project.
+    assert_eq!(d.binary("CIMPATH=Pictures/small.jpg"), Some("AQID"));
+    assert_eq!((d.binary("CIMPATH=Pictures/big.png"), d.binary("CIMPATH=Pictures/bad.png")), (None, None));
+    assert!(d.unreadable("CIMPATH=Pictures/BIG.png") && d.unreadable("CIMPATH=Pictures/bad.png"));
+    assert!(!d.unreadable("CIMPATH=Pictures/small.jpg") && !d.unreadable("CIMPATH=Pictures/none.png"));
+    let mut report = Report::default();
+    let imp = read_layout_def(&d, d.resolve("CIMPATH=sheet/sheet.json").unwrap(), &mut report).unwrap();
+    assert_eq!(imp.pictures.len(), 1);
+    assert_eq!(imp.pictures[0].1, PictureSource::Embedded("AQID".into()));
+    assert_eq!(
+        notes(&report),
+        [
+            "BIG: its picture CIMPATH=Pictures/big.png couldn't be read from the project (damaged, or larger than 16 MB), left empty",
+            "BAD: its picture CIMPATH=Pictures/bad.png couldn't be read from the project (damaged, or larger than 16 MB), left empty",
+        ]
+    );
+}
+
+#[test]
+fn a_damaged_json_entry_leaves_the_project_open_and_the_rest_readable() {
+    let project = json!({"type": "CIMGISProject", "projectItems": [
+        {"type": "CIMProjectItem", "itemType": "Map", "name": "Main", "catalogPath": "CIMPATH=main/main.json"},
+        {"type": "CIMProjectItem", "itemType": "Map", "name": "Broken", "catalogPath": "CIMPATH=broken/broken.json"}]});
+    let map = |name: &str, uri: &str, layers: &[&str]| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers});
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project.to_string().into_bytes()),
+        ("broken/broken.json".into(), map("Broken", "CIMPATH=broken/broken.json", &[]).to_string().into_bytes()),
+        ("main/roads.json".into(), json!({"type": "CIMFeatureLayer", "name": "Roads"}).to_string().into_bytes()),
+        ("main/main.json".into(), map("Main", "CIMPATH=main/main.json", &["CIMPATH=main/roads.json"]).to_string().into_bytes()),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&damaged(damaged(zip, "broken/broken.json"), "main/roads.json")).unwrap();
+    assert_eq!(d.items().len(), 2);
+    assert!(d.resolve("CIMPATH=broken/broken.json").is_none());
+    assert!(d.unreadable("CIMPATH=broken/broken.json"));
+    // The good map reads; its layer whose entry is damaged comes in broken, saying why.
+    let mut report = Report::default();
+    let m = read_map(&d, "CIMPATH=main/main.json", &mut report).unwrap();
+    let roads = nth(&m, 0);
+    assert_eq!(roads.origin, "a layer the project couldn't read (CIMPATH=main/roads.json)");
+    assert_eq!(roads.source, LayerSource::Missing("its definition in the project couldn't be read (damaged, or larger than 32 MB)".into()));
+    assert_eq!(
+        notes(&report),
+        ["roads: the layer CIMPATH=main/roads.json couldn't be read from the project (damaged, or larger than 32 MB), added broken"]
+    );
+    // The project's own file is still read strictly: damaged, there is no project.
+    let zip = rustgis_data::zip::write(&[("GISProject.json".into(), project.to_string().into_bytes())]).unwrap();
+    assert!(Document::from_zip(&damaged(zip, "GISProject.json")).is_err());
+}
+
+#[test]
+fn a_view_heading_and_a_default_rotation_become_a_bearing() {
+    let view = |uri: &str, heading: serde_json::Value| json!({"type": "CIMMapView", "viewableObjectPath": uri, "camera": {"x": 1.0, "y": 2.0, "scale": 5000.0, "heading": heading}});
+    let project = json!({"type": "CIMGISProject", "views": [view("CIMPATH=a/a.json", json!(13.8)), view("CIMPATH=b/b.json", json!(350.0)),
+        view("CIMPATH=c/c.json", json!(1e30)), view("CIMPATH=d/d.json", json!("east")),
+        {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=e/e.json", "camera": {"x": 1.0, "y": 2.0, "scale": 5000.0}}]});
+    let d = Document::from_json(&project.to_string()).unwrap();
+    let mut report = Report::default();
+    // Pro's heading is the compass direction the top of the view faces: RustGIS's bearing.
+    assert_eq!(d.view_bearing("CIMPATH=A/A.json", "A", &mut report), Some(13.8));
+    assert!(near(d.view_bearing("CIMPATH=b/b.json", "B", &mut report).unwrap(), -10.0, 1e-9));
+    assert_eq!(d.view_bearing("CIMPATH=c/c.json", "C", &mut report), None);
+    assert_eq!(d.view_bearing("CIMPATH=d/d.json", "D", &mut report), None);
+    assert_eq!(d.view_bearing("CIMPATH=e/e.json", "E", &mut report), None);
+    assert_eq!(d.view_bearing("CIMPATH=none.json", "N", &mut report), None);
+    assert_eq!(
+        notes(&report),
+        [
+            "C: its rotation (1e+30), which isn't an angle, drawn north up",
+            "D: its rotation (\"east\"), which isn't an angle, drawn north up",
+        ]
+    );
+    // A map's defaultRotation turns the other way: Pro writes -13.8 where its view's heading is 13.8.
+    let m = Document::from_json(
+        r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"M","defaultRotation":-13.8,"layers":[]}}"#,
+    )
+    .unwrap();
+    let imp = read_map_def(&m, m.map_definition().unwrap(), &mut Report::default()).unwrap();
+    assert_eq!(imp.bearing, Some(13.8));
+    let m = Document::from_json(r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"M","layers":[]}}"#).unwrap();
+    assert_eq!(read_map_def(&m, m.map_definition().unwrap(), &mut Report::default()).unwrap().bearing, None);
+}
+
+#[test]
+fn a_frame_heading_that_isnt_an_angle_is_drawn_north_up_and_noted() {
+    let mut turned = map_frame_element("TURNED", (1.0, 1.0, 5.0, 5.0), camera(0.0, 0.0, 5000.0));
+    turned["view"]["camera"]["heading"] = json!(-13.8);
+    turned["uRI"] = json!("CIMPATH=map/detail.json");
+    let mut wild = map_frame_element("WILD", (6.0, 1.0, 9.0, 5.0), camera(0.0, 0.0, 5000.0));
+    wild["view"]["camera"]["heading"] = json!(-1e300);
+    wild["uRI"] = json!("CIMPATH=map/detail.json");
+    let (imp, report) = read_with_maps(&[embedded_map("CIMPATH=map/detail.json", 4326, json!({}))], &[turned, wild]);
+    let (_, ElementKind::MapFrame { bearing, .. }) = frame_of(&imp, "TURNED") else { panic!() };
+    assert!(near(bearing, -13.8, 1e-9), "{bearing}");
+    let (_, ElementKind::MapFrame { bearing, .. }) = frame_of(&imp, "WILD") else { panic!() };
+    assert_eq!(bearing, 0.0);
+    assert_eq!(notes(&report), ["WILD: its rotation (-1e+300), which isn't an angle, drawn north up"]);
+}
+
+#[test]
+fn a_layout_definition_and_a_map_definition_read_like_their_documents() {
+    let text = r#"{"type":"CIMLayoutDocument","layoutDefinition":{"type":"CIMLayout","name":"P",
+      "page":{"type":"CIMPage","width":11,"height":8.5,"units":{"uwkid":109008}},"elements":[]}}"#;
+    let d = Document::from_json(text).unwrap();
+    let by_doc = read_layout(&d, &mut Report::default()).unwrap();
+    let def = d.root().get("layoutDefinition").unwrap();
+    let by_def = read_layout_def(&d, def, &mut Report::default()).unwrap();
+    assert_eq!(by_doc.layout.name, by_def.layout.name);
+
+    let m = Document::from_json(r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"Solo","layers":[]}}"#).unwrap();
+    let imp = read_map_def(&m, m.map_definition().unwrap(), &mut Report::default()).unwrap();
+    assert_eq!(imp.name, "Solo");
+}
+
+// ---- renderers: class breaks, proportional, the rest ----
+
+fn class_break(upper: f64, label: Option<&str>, symbol: serde_json::Value) -> serde_json::Value {
+    let mut b = json!({"type": "CIMClassBreak", "upperBound": upper, "symbol": symbol_ref(symbol)});
+    if let (Some(o), Some(l)) = (b.as_object_mut(), label) {
+        o.insert("label".into(), json!(l));
+    }
+    b
+}
+
+fn class_breaks_renderer(field: &str, breaks: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({"type": "CIMClassBreaksRenderer", "field": field, "classificationMethod": "NaturalBreaks", "minimumBreak": 0.0,
+        "normalizationType": "Nothing", "classBreakType": "GraduatedColor", "breaks": breaks})
+}
+
+/// A point symbol of one character marker, `size` points across.
+fn point_symbol(size: f64) -> serde_json::Value {
+    json!({"type": "CIMPointSymbol", "symbolLayers": [
+        {"type": "CIMCharacterMarker", "enable": true, "size": size, "characterIndex": 33, "fontFamilyName": "ESRI Default Marker",
+         "fontStyleName": "Regular", "symbol": polygon_symbol(vec![solid_fill(rgb(0, 128, 0))])}]})
+}
+
+fn size_variable(expression: &str) -> serde_json::Value {
+    json!({"type": "CIMSizeVisualVariable", "valueExpressionInfo": {"type": "CIMExpressionInfo", "expression": expression},
+        "minSize": 4.0, "maxSize": 20.0, "minValue": 0.0, "maxValue": 1000.0})
+}
+
+/// A layer of `renderer`, read back as the only layer of its map.
+fn layer_with_renderer(renderer: serde_json::Value) -> (crate::qgis::Style, Report) {
+    let layer = feature_layer("L", standard_connection("Shapefile", "DATABASE=/d", "l.shp"), json!({"renderer": renderer}));
+    let (map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/l.json"]));
+    (nth(&map, 0).style.clone(), report)
+}
+
+#[test]
+fn class_breaks_read_as_graduated() {
+    use crate::symbology::{ClassMethod, Renderer};
+    let fill = |r, g, b| polygon_symbol(vec![solid_fill(rgb(r, g, b))]);
+    // Listed out of order: they are sorted by their upper bounds, each keeping its own symbol.
+    let (style, report) = layer_with_renderer(class_breaks_renderer(
+        "POP",
+        vec![
+            class_break(30.0, Some("20 to 30"), fill(0, 0, 255)),
+            class_break(10.0, Some("0 to 10"), fill(255, 0, 0)),
+            class_break(20.0, None, fill(0, 255, 0)),
+        ],
+    ));
+    let Some(Renderer::Graduated { field, breaks, symbols, method, min, classes, class_labels, class_strokes, class_fills, .. }) =
+        &style.renderer
+    else {
+        panic!("{:?}", style.renderer)
+    };
+    assert_eq!(field, "POP");
+    assert_eq!(breaks, &[10.0, 20.0, 30.0]);
+    assert_eq!(*method, ClassMethod::NaturalBreaks);
+    assert_eq!((*min, *classes), (0.0, 3));
+    let fills: Vec<_> = symbols.iter().map(|s| s.fill).collect();
+    assert_eq!(fills, [Rgba::rgb(255, 0, 0), Rgba::rgb(0, 255, 0), Rgba::rgb(0, 0, 255)]);
+    assert_eq!(class_labels.get(&0).map(String::as_str), Some("0 to 10"));
+    assert_eq!(class_labels.get(&2).map(String::as_str), Some("20 to 30"));
+    assert!(!class_labels.contains_key(&1));
+    assert!(class_strokes.is_empty() && class_fills.is_empty());
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // No field, or no break to read: a default symbol and a note.
+    let (style, report) = layer_with_renderer(json!({"type": "CIMClassBreaksRenderer", "breaks": []}));
+    assert!(matches!(style.renderer, Some(Renderer::Single(_))), "{:?}", style.renderer);
+    assert!(notes(&report).iter().any(|n| n.starts_with("L: ") && n.contains("class breaks")), "{:?}", notes(&report));
+    let (style, _) = layer_with_renderer(class_breaks_renderer("POP", vec![json!({"type": "CIMClassBreak", "upperBound": 5.0})]));
+    assert!(matches!(style.renderer, Some(Renderer::Single(_))), "{:?}", style.renderer);
+}
+
+#[test]
+fn unclassed_colour_is_graduated_and_noted() {
+    use crate::symbology::{ClassMethod, Renderer};
+    let fill = |r| polygon_symbol(vec![solid_fill(rgb(r, 0, 0))]);
+    let mut r = class_breaks_renderer("DENSITY", vec![class_break(50.0, None, fill(10)), class_break(100.0, None, fill(200))]);
+    r["classBreakType"] = json!("UnclassedColor");
+    r["normalizationType"] = json!("Field");
+    r["normalizationField"] = json!("AREA");
+    r["classificationMethod"] = json!("Something New");
+    r.as_object_mut().unwrap().remove("minimumBreak");
+    let (style, report) = layer_with_renderer(r);
+    let Some(Renderer::Graduated { breaks, method, min, classes, .. }) = &style.renderer else { panic!("{:?}", style.renderer) };
+    assert_eq!(breaks, &[50.0, 100.0]);
+    assert_eq!(*method, ClassMethod::Manual);
+    assert_eq!((*min, *classes), (50.0, 2), "without a minimum, the first bound");
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("unclassed colour ramp, drawn as its classes")), "{n:?}");
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("normalized")), "{n:?}");
+}
+
+#[test]
+fn proportional_and_size_variables_read() {
+    use crate::symbology::Renderer;
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+
+    let proportional = json!({"type": "CIMProportionalRenderer", "field": "TOTAL", "minDataValue": 0.0, "maxDataValue": 500.0,
+        "minSymbol": symbol_ref(point_symbol(4.0)), "maxSymbol": symbol_ref(point_symbol(20.0)), "symbol": symbol_ref(point_symbol(8.0))});
+    let (style, report) = layer_with_renderer(proportional);
+    let Some(Renderer::Proportional { field, base, min_size, max_size, min, max }) = &style.renderer else {
+        panic!("{:?}", style.renderer)
+    };
+    assert_eq!(field, "TOTAL");
+    assert!(near(*min_size, 5.33) && near(*max_size, 26.67), "{min_size} {max_size}");
+    assert!(near(base.size, 10.67), "{}", base.size);
+    assert_eq!((*min, *max), (0.0, 500.0));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    let mut by_field = simple_renderer(point_symbol(8.0));
+    by_field["visualVariables"] = json!([{"type": "CIMColorVisualVariable", "expression": "POP"}, size_variable("$feature.POP")]);
+    let (style, report) = layer_with_renderer(by_field);
+    let Some(Renderer::Proportional { field, base, min_size, max_size, min, max }) = &style.renderer else {
+        panic!("{:?}", style.renderer)
+    };
+    assert_eq!(field, "POP");
+    assert!(near(*min_size, 5.33) && near(*max_size, 26.67), "{min_size} {max_size}");
+    assert!(near(base.size, 10.67), "{}", base.size);
+    assert_eq!((*min, *max), (0.0, 1000.0));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // By the map scale: drawn at one size, noted.
+    let mut by_scale = simple_renderer(point_symbol(8.0));
+    by_scale["visualVariables"] = json!([size_variable("$view.scale")]);
+    let (style, report) = layer_with_renderer(by_scale);
+    let Some(Renderer::Single(s)) = &style.renderer else { panic!("{:?}", style.renderer) };
+    assert!(near(s.size, 10.67), "{}", s.size);
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("symbol sizes that change") && t.contains("drawn at one size")), "{n:?}");
+
+    // On another renderer: the same note, the renderer as it was.
+    let mut on_classes = class_breaks_renderer("POP", vec![class_break(10.0, None, point_symbol(6.0))]);
+    on_classes["visualVariables"] = json!([size_variable("$feature.POP")]);
+    let (style, report) = layer_with_renderer(on_classes);
+    assert!(matches!(style.renderer, Some(Renderer::Graduated { .. })), "{:?}", style.renderer);
+    assert!(notes(&report).iter().any(|t| t.contains("symbol sizes that change")), "{:?}", notes(&report));
+}
+
+#[test]
+fn other_renderers_draw_their_first_symbol() {
+    use crate::symbology::Renderer;
+    // The symbol is found anywhere in the renderer, past things that are not symbols.
+    let heat = json!({"type": "CIMHeatMapRenderer", "colorRamp": {"type": "CIMMultipartColorRamp", "colorRamps": []}, "radius": 10,
+        "dots": {"layers": [{"deep": [symbol_ref(polygon_symbol(vec![solid_fill(rgb(1, 2, 3))])), symbol_ref(point_symbol(9.0))]}]}});
+    let (style, report) = layer_with_renderer(heat);
+    let Some(Renderer::Single(s)) = &style.renderer else { panic!("{:?}", style.renderer) };
+    assert_eq!(s.fill, Rgba::rgb(1, 2, 3));
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t.starts_with("L: ") && t.contains("CIMHeatMapRenderer renderers, drawn with its first symbol")), "{n:?}");
+
+    // Nothing to draw with: the default symbol.
+    let (style, report) = layer_with_renderer(json!({"type": "CIMDotDensityRenderer", "attributes": []}));
+    assert!(matches!(style.renderer, Some(Renderer::Single(_))), "{:?}", style.renderer);
+    assert!(notes(&report).iter().any(|t| t.contains("CIMDotDensityRenderer")), "{:?}", notes(&report));
+}
+
+// ---- label expressions ------------------------------------------------------------------------
+
+/// `expression` in `engine` as `(template, exact, fields)`.
+fn translated(expression: &str, engine: &str) -> Option<(String, bool, Vec<String>)> {
+    expr::template(expression, engine).map(|t| (t.template, t.exact, t.fields))
+}
+
+fn exact(template: &str, fields: &[&str]) -> Option<(String, bool, Vec<String>)> {
+    Some((template.to_string(), true, fields.iter().map(|f| f.to_string()).collect()))
+}
+
+fn inexact(field: &str) -> Option<(String, bool, Vec<String>)> {
+    Some((field.to_string(), false, vec![field.to_string()]))
+}
+
+#[test]
+fn arcade_concatenations_become_templates() {
+    assert_eq!(translated("$feature.A + \"\\n \" + $feature.B", "Arcade"), exact("{A}\n {B}", &["A", "B"]));
+    assert_eq!(translated("\"SEC. \"+$feature.SECT_NO", "Arcade"), exact("SEC. {SECT_NO}", &["SECT_NO"]));
+    // A field of a join keeps the part after the last dot; alone it is a plain field.
+    let t = expr::template("$feature['T.Name']", "Arcade").unwrap();
+    assert_eq!((t.template.as_str(), t.exact, t.fields.as_slice()), ("Name", true, &["Name".to_string()][..]));
+    assert_eq!(t.joins, [("T.Name".to_string(), "Name".to_string())]);
+    assert_eq!(translated("\"(\" + $feature[\"T.Name\"] + \")\"", "Arcade"), exact("({Name})", &["Name"]));
+    // One field alone stays a plain field name, as do a bare name and a leading return.
+    assert_eq!(translated("$feature.A", "Arcade"), exact("A", &["A"]));
+    assert_eq!(translated(" return $feature.A; ", "Arcade"), exact("A", &["A"]));
+    assert_eq!(translated("RETURN \"x\" + $feature.A;", "Arcade"), exact("x{A}", &["A"]));
+    assert_eq!(translated("StreetName", "Arcade"), exact("StreetName", &["StreetName"]));
+    // A bare dotted name and a dotted `$feature.` name are fields of a join.
+    let t = expr::template("BM_Parcel.StreetName", "Arcade").unwrap();
+    assert_eq!((t.template.as_str(), t.exact), ("StreetName", true));
+    assert_eq!(t.joins, [("BM_Parcel.StreetName".to_string(), "StreetName".to_string())]);
+    assert_eq!(translated("$feature.T.Name", "Arcade"), exact("Name", &["Name"]));
+    assert_eq!(translated("$feature.T.Name + \" \" + $feature.A", "Arcade"), exact("{Name} {A}", &["Name", "A"]));
+    // A quoted name can hold any character but its quote: alone it is the field; in a template
+    // only a plain name fits a placeholder, so the expression falls back to its first field.
+    assert_eq!(translated("$feature[\"Lot Number\"]", "Arcade"), exact("Lot Number", &["Lot Number"]));
+    assert_eq!(translated("$feature['A-B']", "Arcade"), exact("A-B", &["A-B"]));
+    assert_eq!(translated("\"Lot \" + $feature[\"Lot Number\"]", "Arcade"), inexact("Lot Number"));
+    assert_eq!(translated("$feature.A + \" \" + $feature['A-B']", "Arcade"), inexact("A"));
+    // Newlines, each field once in order, escapes and a literal holding a `+`.
+    assert_eq!(
+        translated("$feature.A + TextFormatting.NewLine + $feature.B + \"\\r\\n\" + $feature.A", "Arcade"),
+        exact("{A}\n{B}\n{A}", &["A", "B"])
+    );
+    assert_eq!(translated("'it\\'s ' + $feature.A + \" a+b \\\"q\\\" \\\\\"", "Arcade"), exact("it's {A} a+b \"q\" \\", &["A"]));
+    assert_eq!(translated("$feature.A + \"<br>\" + $feature.B + \"<BR>x\\ry\"", "Arcade"), exact("{A}\n{B}\nx\ny", &["A", "B"]));
+}
+
+#[test]
+fn vbscript_and_python_concatenations_become_templates() {
+    assert_eq!(translated("\"BLK \" & [BLOCK]", "VBScript"), exact("BLK {BLOCK}", &["BLOCK"]));
+    assert_eq!(translated("[rods]&\" RD\"", "VBScript"), exact("{rods} RD", &["rods"]));
+    assert_eq!(translated("\"A: \" + !A! + vbNewLine + !B!", "Python"), exact("A: {A}\n{B}", &["A", "B"]));
+    assert_eq!(translated("\"%s\" % !X!", "Python"), inexact("X"));
+    // VBScript doubles a quote, keeps a backslash, and has its own newlines.
+    assert_eq!(
+        translated("\"say \"\"hi\"\" C:\\n\" & [A] & vbCrLf & [B] & vbLf & [A]", "VBScript"),
+        exact("say \"hi\" C:\\n{A}\n{B}\n{A}", &["A", "B"])
+    );
+    assert_eq!(
+        translated("[A] & chr(13) & chr(10) & [B] & CHR(10) & [OWNER]", "VBScript"),
+        exact("{A}\n{B}\n{OWNER}", &["A", "B", "OWNER"])
+    );
+    assert_eq!(translated("[A]", "VBScript"), exact("A", &["A"]));
+    assert_eq!(translated("!A!", "Python"), exact("A", &["A"]));
+    assert_eq!(translated("[A] + \" \" + [B]", "JScript"), exact("{A} {B}", &["A", "B"]));
+}
+
+#[test]
+fn function_calls_fall_back_to_the_first_field() {
+    assert_eq!(translated("Split($feature.OWNER, ' ')[0]", "Arcade"), inexact("OWNER"));
+    assert_eq!(translated("Return Concatenate([$feature.a, $feature.b], ' ')", "Arcade"), inexact("a"));
+    assert_eq!(translated("1 + 2", "Arcade"), None);
+    assert_eq!(translated("IIf([A] > 0, [A], [B])", "VBScript"), inexact("A"));
+    assert_eq!(translated("$feature.A * 2", "Arcade"), inexact("A"));
+    assert_eq!(translated("$feature.A $feature.B", "Arcade"), inexact("A"), "two fields with nothing joining them");
+    assert_eq!(translated("$feature.A +", "Arcade"), inexact("A"));
+    assert_eq!(translated("\"unterminated + $feature.A", "Arcade"), inexact("A"));
+    // Nothing but text has no field to draw.
+    assert_eq!(translated("\"no field here\"", "Arcade"), None);
+    assert_eq!(translated("", "Arcade"), None);
+    assert_eq!(translated("return", "Arcade"), None);
+    assert_eq!(translated("return;", "Arcade"), None);
+    assert_eq!(translated("$feature.", "Arcade"), None);
+    assert_eq!(translated("[ ]", "VBScript"), None);
+}
+
+#[test]
+fn formatting_tags_and_braces() {
+    let t = expr::template("\"<BOL>\" + $feature.X + \"</BOL>\"", "Arcade").unwrap();
+    assert_eq!((t.template.as_str(), t.exact, t.tags_dropped), ("{X}", true, true));
+    assert_eq!(
+        translated("\"<CLR red='255'><ITA>\" + $feature.X + \"</ITA></CLR> <UND>u</UND><FNT name='A' size='9'>f</FNT>\"", "Arcade"),
+        exact("{X} uf", &["X"])
+    );
+    // Not a tag: kept as text.
+    assert_eq!(translated("\"a < b <i> <CLR\" + $feature.X", "Arcade"), exact("a < b <i> <CLR{X}", &["X"]));
+    assert!(!expr::template("\"a < b\" + $feature.X", "Arcade").unwrap().tags_dropped);
+    // Braces in text are doubled, so they stay text.
+    assert_eq!(translated("\"{x}\" + [A] + \"}\"", "VBScript"), exact("{{x}}{A}}}", &["A"]));
+    let t = expr::template("\"{x}\" + [A]", "VBScript").unwrap().template;
+    assert_eq!(crate::symbology::template_fields(&t), ["A"]);
+}
+
+#[test]
+fn hostile_expressions_are_bounded() {
+    let long = "x".repeat(100_000);
+    let expressions = [
+        format!("\"{long}"),
+        format!("'{long}"),
+        "[".repeat(100_000),
+        "!".repeat(100_000),
+        "$feature[\"".repeat(10_000),
+        "<CLR".repeat(25_000),
+        format!("\"{}\"", "<CLR".repeat(25_000)),
+        "[[[[$feature.A]]]]".repeat(5_000),
+        format!("$feature.A + \"{long}\""),
+        "$feature.A + ".repeat(8_000) + "$feature.A",
+        format!("\"{}\" + $feature.A", "{".repeat(100_000)),
+        "\"\\".repeat(50_000),
+        "chr(".repeat(25_000),
+        // Thousands of different field names.
+        (0..8_000).map(|i| format!("$feature.f{i}")).collect::<Vec<_>>().join(" + "),
+        (0..8_000).map(|i| format!("[f{i}]")).collect::<Vec<_>>().join("&"),
+    ];
+    for e in &expressions {
+        for engine in ["Arcade", "VBScript", "Python", "JScript"] {
+            // The best of five runs, so a busy machine doesn't fail it.
+            let took = (0..5)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(expr::template(e, engine));
+                    start.elapsed()
+                })
+                .min()
+                .unwrap();
+            assert!(took.as_millis() < 20, "{} chars took {took:?}", e.len());
+            if let Some(t) = expr::template(e, engine) {
+                assert!(t.template.chars().count() <= crate::symbology::MAX_TEMPLATE);
+                assert!(!t.fields.is_empty());
+            }
+        }
+    }
+    // Too long a template falls back to the first field.
+    assert_eq!(translated(&format!("$feature.A + \"{long}\""), "Arcade"), inexact("A"));
+    let many = (0..8_000).map(|i| format!("$feature.f{i}")).collect::<Vec<_>>().join(" + ");
+    assert_eq!(translated(&many, "Arcade"), inexact("f0"));
+    // No field's name is longer than a template can be.
+    let name = "N".repeat(2_000);
+    assert_eq!(translated(&name, "Arcade"), None);
+    assert_eq!(translated(&format!("[{name}]"), "VBScript"), None);
+    assert_eq!(translated(&format!("\"a\" + [{name}]"), "VBScript"), None);
+    assert_eq!(translated(&format!("Upper($feature.{name})"), "Arcade"), None);
+}
+
+#[test]
+fn label_expressions_come_through_as_templates() {
+    let class = |expression: &str, engine: &str| {
+        json!({"type": "CIMLabelClass", "expression": expression, "expressionEngine": engine,
+            "textSymbol": symbol_ref(text_symbol(json!({"height": 10})))})
+    };
+    let classes = vec![
+        class("\"SEC. \" + $feature.SECT_NO + TextFormatting.NewLine + $feature['T.BLOCK']", "Arcade"),
+        class("$feature.OWNER", "Arcade"),
+        class("\"<BOL>\" & [StreetName] & \"</BOL>\"", "VBScript"),
+    ];
+    let layer = feature_layer("Lots", standard_connection("Shapefile", "DATABASE=/d", "l.shp"), json!({"labelClasses": classes}));
+    let (map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/lots.json"]));
+    let labels = nth(&map, 0).style.labels.as_ref().unwrap();
+    let fields: Vec<&str> = labels.classes.iter().map(|c| c.field.as_str()).collect();
+    assert_eq!(fields, ["SEC. {SECT_NO}\n{BLOCK}", "OWNER", "{StreetName}"]);
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t == "Lots: field T.BLOCK of a join, read as BLOCK"), "{n:?}");
+    assert_eq!(n.iter().filter(|t| t.contains("text formatting tags, left out")).count(), 1, "{n:?}");
+    assert!(!n.iter().any(|t| t.contains("drawn as")), "{n:?}");
+}
+
+// ---- label placement, callouts and stacking ---------------------------------------------------
+
+/// The default label class and the report of a layer "Roads" with one label class: `class` is merged
+/// into the class, `text` into its text symbol.
+fn read_class(class: serde_json::Value, text: serde_json::Value) -> (crate::symbology::LabelClass, Report) {
+    let mut c = json!({"type": "CIMLabelClass", "expression": "$feature.NAME", "visibility": true,
+        "textSymbol": symbol_ref(text_symbol(text))});
+    if let (Some(o), Some(e)) = (c.as_object_mut(), class.as_object()) {
+        o.extend(e.clone());
+    }
+    let layer = feature_layer("Roads", standard_connection("Shapefile", "DATABASE=/d", "r.shp"), json!({"labelClasses": [c]}));
+    let (map, report) = read_new_detail_map(&map_document(&[layer], &["CIMPATH=new_detail_map/roads.json"]));
+    (nth(&map, 0).style.labels.clone().unwrap().default, report)
+}
+
+fn maplex(props: serde_json::Value) -> serde_json::Value {
+    let mut p = json!({"type": "CIMMaplexLabelPlacementProperties"});
+    if let (Some(o), Some(e)) = (p.as_object_mut(), props.as_object()) {
+        o.extend(e.clone());
+    }
+    json!({"maplexLabelPlacementProperties": p})
+}
+
+fn standard(props: serde_json::Value) -> serde_json::Value {
+    let mut p = json!({"type": "CIMStandardLabelPlacementProperties"});
+    if let (Some(o), Some(e)) = (p.as_object_mut(), props.as_object()) {
+        o.extend(e.clone());
+    }
+    json!({"standardLabelPlacementProperties": p})
+}
+
+#[test]
+fn maplex_placements_map_by_feature_type() {
+    use crate::symbology::LabelPlacement::{self as P, *};
+    let rows: [(&str, &str, &str, P); 25] = [
+        ("Point", "pointPlacementMethod", "AroundPoint", Auto),
+        ("Point", "pointPlacementMethod", "CenteredOnPoint", Center),
+        ("Point", "pointPlacementMethod", "NorthOfPoint", Above),
+        ("Point", "pointPlacementMethod", "SouthOfPoint", Below),
+        ("Point", "pointPlacementMethod", "EastOfPoint", Right),
+        ("Point", "pointPlacementMethod", "WestOfPoint", Left),
+        ("Point", "pointPlacementMethod", "NorthEastOfPoint", AboveRight),
+        ("Point", "pointPlacementMethod", "NorthWestOfPoint", AboveLeft),
+        ("Point", "pointPlacementMethod", "SouthEastOfPoint", BelowRight),
+        ("Point", "pointPlacementMethod", "SouthWestOfPoint", BelowLeft),
+        ("Point", "pointPlacementMethod", "RotationField", Auto),
+        ("Line", "linePlacementMethod", "OffsetStraightFromLine", Parallel),
+        ("Line", "linePlacementMethod", "CenteredStraightOnLine", Parallel),
+        ("Line", "linePlacementMethod", "CenteredHorizontalOnLine", Parallel),
+        ("Line", "linePlacementMethod", "OffsetHorizontalFromLine", Parallel),
+        ("Line", "linePlacementMethod", "OffsetCurvedFromLine", Curved),
+        ("Line", "linePlacementMethod", "CenteredCurvedOnLine", Curved),
+        ("Polygon", "polygonPlacementMethod", "HorizontalInPolygon", Center),
+        ("Polygon", "polygonPlacementMethod", "AlwaysHorizontal", Center),
+        ("Polygon", "polygonPlacementMethod", "BoundaryPlacement", Center),
+        ("Polygon", "polygonPlacementMethod", "StraightInPolygon", Parallel),
+        ("Polygon", "polygonPlacementMethod", "CurvedInPolygon", Curved),
+        ("Polygon", "polygonPlacementMethod", "RepeatAlongBoundary", Curved),
+        // A method this reader does not know is Auto, noted.
+        ("Polygon", "polygonPlacementMethod", "SpiralInPolygon", Auto),
+        // A method of another feature type is none of this one's.
+        ("Line", "pointPlacementMethod", "NorthOfPoint", Auto),
+    ];
+    for (feature, key, method, want) in rows {
+        let mut props = json!({"featureType": feature, "primaryOffset": 0});
+        props[key] = json!(method);
+        let (c, report) = read_class(maplex(props), json!({}));
+        assert_eq!(c.placement, want, "{feature} {method}");
+        assert_eq!(c.repeat, None, "{feature} {method}");
+        let n = notes(&report);
+        let odd = matches!(method, "RotationField" | "SpiralInPolygon");
+        assert_eq!(n.len(), usize::from(odd), "{method}: {n:?}");
+        if odd {
+            assert_eq!(n[0], format!("Roads: label placement {method}, drawn as Auto"));
+        }
+    }
+}
+
+#[test]
+fn maplex_offsets_repeats_and_missing_feature_types() {
+    use crate::symbology::LabelPlacement::*;
+    let point = |method: &str, offset: f64| {
+        let (c, _) =
+            read_class(maplex(json!({"featureType": "Point", "pointPlacementMethod": method, "primaryOffset": offset})), json!({}));
+        (c.placement, c.offset)
+    };
+    // Points, above up and below down; around a point is above.
+    assert_eq!(point("NorthOfPoint", 4.0), (Above, [0.0, -4.0]));
+    assert_eq!(point("NorthWestOfPoint", 4.0), (AboveLeft, [0.0, -4.0]));
+    assert_eq!(point("SouthOfPoint", 4.0), (Below, [0.0, 4.0]));
+    assert_eq!(point("SouthEastOfPoint", 2.5), (BelowRight, [0.0, 2.5]));
+    assert_eq!(point("AroundPoint", 3.0), (Auto, [0.0, -3.0]));
+    assert_eq!(point("EastOfPoint", 3.0), (Right, [3.0, 0.0]));
+    assert_eq!(point("WestOfPoint", 3.0), (Left, [-3.0, 0.0]));
+    assert_eq!(point("CenteredOnPoint", 3.0), (Center, [0.0, 0.0]));
+    assert_eq!(point("NorthOfPoint", 500.0), (Above, [0.0, -200.0]));
+    assert_eq!(point("SouthOfPoint", 1e300).1, [0.0, 200.0]);
+    assert_eq!(point("NorthOfPoint", -4.0), (Above, [0.0, 0.0]), "a negative distance is none");
+
+    // Repeat along a boundary: points, within 10 to 10,000; none for a size that is not positive.
+    let boundary = |interval: serde_json::Value| {
+        let (c, _) = read_class(
+            maplex(json!({"featureType": "Polygon", "polygonPlacementMethod": "RepeatAlongBoundary", "repetitionInterval": interval})),
+            json!({}),
+        );
+        (c.placement, c.repeat)
+    };
+    assert_eq!(boundary(json!(120)), (Curved, Some(120.0)));
+    assert_eq!(boundary(json!(2)), (Curved, Some(10.0)));
+    assert_eq!(boundary(json!(1e9)), (Curved, Some(10_000.0)));
+    assert_eq!(boundary(json!(0)), (Curved, None));
+    assert_eq!(boundary(json!(-5)), (Curved, None));
+    assert_eq!(boundary(json!("far")), (Curved, None));
+    // The repeat belongs to that method alone.
+    let (c, _) = read_class(
+        maplex(json!({"featureType": "Polygon", "polygonPlacementMethod": "AlwaysHorizontal", "repetitionInterval": 50})),
+        json!({}),
+    );
+    assert_eq!((c.placement, c.repeat), (Center, None));
+
+    // Without a feature type, the method the block has is the one read.
+    let (c, report) = read_class(maplex(json!({"linePlacementMethod": "CenteredCurvedOnLine"})), json!({}));
+    assert_eq!(c.placement, Curved);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // No placement properties at all is Auto, unnoted; so is an empty block.
+    let (c, report) = read_class(json!({}), json!({}));
+    assert_eq!((c.placement, c.offset, c.repeat), (Auto, [0.0; 2], None));
+    assert!(report.notes.is_empty());
+    let (c, _) = read_class(maplex(json!({})), json!({}));
+    assert_eq!(c.placement, Auto);
+}
+
+#[test]
+fn maplex_settings_without_a_counterpart_are_noted() {
+    let (_, report) = read_class(
+        maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine",
+            "canOverrunFeature": true, "labelPriority": 3, "featureWeight": 5, "keyNumberMethod": "GetUniqueNumbers",
+            "polygonInternalZonePriorities": {"center": 1}, "pointPlacementPriorities": {"aboveLeft": 2},
+            "offsetAlongLineProperties": {"placementMethod": "OffsetFromStart", "distance": 0}, "thinDuplicateLabels": true,
+            "removeDuplicates": "ByLabel"})),
+        json!({}),
+    );
+    let n = notes(&report);
+    assert_eq!(n.len(), 6, "{n:?}");
+    assert!(!n.iter().any(|t| t.contains("zone")), "zone priorities are never noted: {n:?}");
+    // Nor is overrunning a feature: Pro sets it on most classes, and RustGIS's labels may overrun.
+    assert!(!n.iter().any(|t| t.contains("overrun")), "{n:?}");
+    assert!(n.iter().all(|t| t.starts_with("Roads: ") && t.ends_with(", left out")), "{n:?}");
+    // The defaults are not worth saying.
+    let (_, report) = read_class(
+        maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine",
+            "canOverrunFeature": false, "labelPriority": -1, "featureWeight": 0, "keyNumberMethod": "NoKey",
+            "polygonInternalZonePriorities": {}, "offsetAlongLineProperties": {}, "thinDuplicateLabels": false,
+            "removeDuplicates": "None"})),
+        json!({}),
+    );
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // Populated but default, as Pro writes them on every class: priorities for the zones, and an
+    // offset along a line that stays at the best position, no distance.
+    let (_, report) = read_class(
+        maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine",
+            "pointPlacementPriorities": {"aboveLeft": 2, "aboveCenter": 1}, "polygonInternalZonePriorities": {"center": 1},
+            "polygonExternalZonePriorities": {"aboveLeft": 1},
+            "offsetAlongLineProperties": {"placementMethod": "BestPositionAlongLine", "distance": 0, "distanceUnit": "Percentage"}})),
+        json!({}),
+    );
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    // A distance along the line moves the label; so does a place other than the best one.
+    for offset in [json!({"placementMethod": "BestPositionAlongLine", "distance": 15}), json!({"placementMethod": "OffsetFromEnd"})] {
+        let (_, report) = read_class(
+            maplex(json!({"featureType": "Line", "linePlacementMethod": "CenteredStraightOnLine", "offsetAlongLineProperties": offset})),
+            json!({}),
+        );
+        assert_eq!(notes(&report), ["Roads: label offsets along a line, left out"]);
+    }
+}
+
+#[test]
+fn standard_placements_map_too() {
+    use crate::symbology::LabelPlacement::{self as P, *};
+    let rows: Vec<(serde_json::Value, P)> = vec![
+        (json!({"featureType": "Point", "pointPlacementMethod": "AroundPoint"}), Auto),
+        (json!({"featureType": "Point", "pointPlacementMethod": "NorthEastOfPoint"}), AboveRight),
+        (json!({"featureType": "Point", "pointPlacementMethod": "WestOfPoint"}), Left),
+        (json!({"featureType": "Point", "pointPlacementMethod": "CenteredOnPoint"}), Center),
+        (json!({"featureType": "Line", "lineLabelPosition": {"parallel": true, "above": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"horizontal": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"perpendicular": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"below": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"online": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"inLine": true}}), Parallel),
+        (json!({"featureType": "Line", "lineLabelPosition": {"parallel": true}, "produceCurvedLabels": true}), Curved),
+        (json!({"featureType": "Line", "lineLabelPosition": {"parallel": false}}), Auto),
+        (json!({"featureType": "Line"}), Auto),
+        (json!({"featureType": "Polygon", "polygonPlacementMethod": "AlwaysHorizontal"}), Center),
+        (json!({"featureType": "Polygon", "polygonPlacementMethod": "MixedStrategy"}), Center),
+        (json!({"featureType": "Polygon", "polygonPlacementMethod": "AlwaysStraight"}), Parallel),
+        // No feature type: the method the block has.
+        (json!({"polygonPlacementMethod": "AlwaysStraight"}), Parallel),
+        (json!({"lineLabelPosition": {"parallel": true}, "produceCurvedLabels": true}), Curved),
+        // A line setting on a point block is none of its business.
+        (json!({"featureType": "Point", "lineLabelPosition": {"parallel": true}}), Auto),
+    ];
+    for (props, want) in rows {
+        let (c, report) = read_class(standard(props.clone()), json!({}));
+        assert_eq!(c.placement, want, "{props}");
+        assert!(report.notes.is_empty(), "{props}: {:?}", notes(&report));
+    }
+    let (c, report) = read_class(standard(json!({"featureType": "Polygon", "polygonPlacementMethod": "Whirl"})), json!({}));
+    assert_eq!(c.placement, Auto);
+    assert_eq!(notes(&report), ["Roads: label placement Whirl, drawn as Auto"]);
+
+    // Maplex wins when both are there.
+    let mut both = standard(json!({"featureType": "Point", "pointPlacementMethod": "NorthOfPoint"}));
+    both["maplexLabelPlacementProperties"] = json!({"featureType": "Point", "pointPlacementMethod": "SouthOfPoint"});
+    let (c, _) = read_class(both, json!({}));
+    assert_eq!(c.placement, crate::symbology::LabelPlacement::Below);
+}
+
+fn background_callout(extra: serde_json::Value) -> serde_json::Value {
+    let mut c = json!({"type": "CIMBackgroundCallout",
+        "backgroundSymbol": polygon_symbol(vec![solid_stroke(rgb(128, 128, 128), 0.5), solid_fill(rgb(255, 255, 255))]),
+        "margin": {"left": 2, "right": 2, "top": 1, "bottom": 1}, "cornerRadius": 1});
+    if let (Some(o), Some(e)) = (c.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    c
+}
+
+#[test]
+fn background_callouts_become_label_backgrounds() {
+    let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 0))]));
+    let (c, report) = read_class(json!({}), json!({"callout": background_callout(json!({})), "haloSize": 1, "haloSymbol": halo.clone()}));
+    let b = c.background.expect("a background");
+    assert_eq!((b.fill, b.stroke), (Some(Rgba::rgb(255, 255, 255)), Some(Rgba::rgb(128, 128, 128))));
+    // Points, as they are.
+    assert!((b.stroke_width - 0.5).abs() < 1e-4, "{}", b.stroke_width);
+    assert_eq!((b.padding, b.radius), ([2.0, 1.0], 1.0));
+    // The background stands where the halo would: the halo is not kept.
+    assert!(!c.halo);
+    assert_eq!((c.halo_color, c.halo_width), (None, None));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+
+    // The wider margin of each pair; margins that are missing are 0; huge ones are kept within range.
+    let wide = background_callout(json!({"margin": {"left": 3, "right": 1, "top": 0.5, "bottom": 2}}));
+    let (c, _) = read_class(json!({}), json!({"callout": wide}));
+    assert_eq!(c.background.unwrap().padding, [3.0, 2.0]);
+    let (c, _) = read_class(json!({}), json!({"callout": background_callout(json!({"margin": null, "cornerRadius": null}))}));
+    let b = c.background.unwrap();
+    assert_eq!((b.padding, b.radius), ([0.0, 0.0], 0.0));
+    let huge = background_callout(json!({"margin": {"left": 9999, "top": -4}, "cornerRadius": 1e9}));
+    let (c, _) = read_class(json!({}), json!({"callout": huge}));
+    let b = c.background.unwrap();
+    assert_eq!((b.padding, b.radius), ([50.0, 0.0], 50.0));
+    // A fill alone has no outline.
+    let only_fill = polygon_symbol(vec![solid_fill(rgb(0, 0, 0))]);
+    let (c, _) = read_class(json!({}), json!({"callout": background_callout(json!({"backgroundSymbol": only_fill}))}));
+    let b = c.background.unwrap();
+    assert_eq!((b.fill, b.stroke, b.stroke_width), (Some(Rgba::rgb(0, 0, 0)), None, 0.0));
+    // An outline of no width is no outline, not a hairline.
+    let hairline = polygon_symbol(vec![solid_stroke(rgb(128, 128, 128), 0.0), solid_fill(rgb(255, 255, 255))]);
+    let (c, _) = read_class(json!({}), json!({"callout": background_callout(json!({"backgroundSymbol": hairline}))}));
+    let b = c.background.unwrap();
+    assert_eq!((b.fill, b.stroke, b.stroke_width), (Some(Rgba::rgb(255, 255, 255)), None, 0.0));
+
+    // Nothing to draw (no symbol, or one that draws nothing) is no background, and the halo stays.
+    for callout in [
+        json!({"type": "CIMBackgroundCallout", "margin": {"left": 2}}),
+        json!({"type": "CIMBackgroundCallout", "backgroundSymbol": polygon_symbol(vec![])}),
+    ] {
+        let (c, _) = read_class(json!({}), json!({"callout": callout, "haloSize": 1, "haloSymbol": halo.clone()}));
+        assert_eq!(c.background, None);
+        assert!(c.halo);
+        assert_eq!(c.halo_width, Some(1.0));
+    }
+}
+
+#[test]
+fn line_callouts_and_shadows_are_noted() {
+    let halo = symbol_ref(polygon_symbol(vec![solid_fill(rgb(255, 255, 255))]));
+    let leader = json!({"type": "CIMSimpleLineCallout", "leaderLineSymbol": {"type": "CIMLineSymbol", "symbolLayers": []}});
+    let (c, report) = read_class(json!({}), json!({"callout": leader, "haloSize": 1, "haloSymbol": halo}));
+    assert_eq!(c.background, None);
+    assert!(c.halo, "a leader line leaves the halo");
+    assert_eq!(notes(&report), ["Roads: a leader line, left out"]);
+
+    let composite = json!({"type": "CIMCompositeCallout", "callouts": [{"type": "CIMSimpleLineCallout"}]});
+    let (c, report) = read_class(json!({}), json!({"callout": composite}));
+    assert_eq!(c.background, None);
+    assert_eq!(notes(&report), ["Roads: a leader line, left out"]);
+
+    let (_, report) = read_class(json!({}), json!({"callout": {"type": "CIMFancyCallout"}}));
+    assert_eq!(notes(&report), ["Roads: callouts of type CIMFancyCallout, left out"]);
+
+    // A shadow shows when it is offset (`shadowOffsetX`/`Y`, as Pro writes them) in a colour that
+    // shows (black when none is given). Pro writes an opaque black `shadowColor` on most text
+    // symbols with no offset: no shadow, nothing to note.
+    let shadow = |extra: serde_json::Value| notes(&read_class(json!({}), extra).1);
+    let black = json!({"type": "CIMRGBColor", "values": [0, 0, 0, 100]});
+    let clear = json!({"type": "CIMRGBColor", "values": [0, 0, 0, 0]});
+    assert!(shadow(json!({"shadowColor": black})).is_empty(), "Pro's default: a colour and no offset");
+    assert_eq!(shadow(json!({"shadowColor": black, "shadowOffsetX": 1, "shadowOffsetY": -1})), ["Roads: a text shadow, left out"]);
+    assert_eq!(shadow(json!({"shadowOffsetX": 1.5})), ["Roads: a text shadow, left out"]);
+    assert_eq!(shadow(json!({"shadowOffsetY": -1})), ["Roads: a text shadow, left out"]);
+    assert!(shadow(json!({"shadowColor": clear, "shadowOffsetX": 2})).is_empty(), "a clear shadow doesn't show");
+    assert!(shadow(json!({"shadowColor": black, "shadowOffsetX": 0, "shadowOffsetY": 0})).is_empty());
+    assert!(shadow(json!({})).is_empty());
+}
+
+#[test]
+fn a_hidden_stacking_separator_becomes_the_wrap_character() {
+    let separators = json!([{"separator": " ", "splitAfter": true}, {"separator": ",", "visible": true, "splitAfter": true}]);
+    // On the class, and inside the Maplex block (where Pro writes them).
+    let (c, report) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": separators}}), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some(" "));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    let (c, _) = read_class(maplex(json!({"canStackLabel": true, "labelStackingProperties": {"separators": separators}})), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some(" "));
+
+    // One that stays visible comes first: noted, and the next hidden one is the one.
+    let ordered = json!([{"separator": ",", "visible": true}, {"separator": ";", "visible": false}]);
+    let (c, report) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": ordered}}), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some(";"));
+    assert_eq!(notes(&report), ["Roads: stacking at , keeping it, drawn without"]);
+    // Only visible ones: no wrap character.
+    let visible = json!([{"separator": ",", "visible": true}]);
+    let (c, report) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": visible}}), json!({}));
+    assert_eq!(c.wrap_char, None);
+    assert_eq!(notes(&report), ["Roads: stacking at , keeping it, drawn without"]);
+
+    // No stacking: nothing, nothing noted.
+    for class in [
+        json!({"canStackLabel": false, "labelStackingProperties": {"separators": separators}}),
+        json!({"labelStackingProperties": {"separators": separators}}),
+        json!({"canStackLabel": true}),
+    ] {
+        let (c, report) = read_class(class, json!({}));
+        assert_eq!(c.wrap_char, None);
+        assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    }
+    // An empty separator is no character to break at; a long one is cut; a line break is no character.
+    let odd = json!([{"separator": ""}, {"separator": "\n"}, {"separator": 5}, {"separator": "0123456789"}]);
+    let (c, _) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": odd}}), json!({}));
+    assert_eq!(c.wrap_char.as_deref(), Some("01234567"));
+    // Cut by characters, not bytes: ten of a three-byte character leave eight whole ones.
+    let wide = json!([{"separator": "\u{2192}".repeat(10)}]);
+    let (c, _) = read_class(json!({"canStackLabel": true, "labelStackingProperties": {"separators": wide}}), json!({}));
+    assert_eq!(c.wrap_char, Some("\u{2192}".repeat(8)));
+}
+
+#[test]
+fn a_label_whose_expression_fills_the_stacking_lines_is_not_stacked_further() {
+    // Pro stacks a label into at most `maximumNumberOfLines` lines, its own line breaks
+    // counted: an expression that already makes that many lines is not broken at a separator.
+    let stacking = |max: serde_json::Value| {
+        maplex(json!({"canStackLabel": true, "labelStackingProperties": {"maximumNumberOfLines": max,
+            "separators": [{"separator": " ", "splitAfter": true}, {"separator": ",", "visible": true, "splitAfter": true}]}}))
+    };
+    let class = |expression: &str, max: serde_json::Value| {
+        let mut c = stacking(max);
+        if let Some(o) = c.as_object_mut() {
+            o.insert("expression".into(), json!(expression));
+        }
+        read_class(c, json!({})).0
+    };
+    let three = "$feature.A + TextFormatting.NewLine + $feature.B + \" \" + $feature.C + TextFormatting.NewLine + $feature.D";
+    assert_eq!(class(three, json!(3)).wrap_char, None, "three lines of three: nothing to stack");
+    assert_eq!(class(three, json!(2)).wrap_char, None, "more lines than the limit");
+    assert_eq!(class(three, json!(4)).wrap_char.as_deref(), Some(" "), "room for one more line");
+    assert_eq!(class("$feature.A + \" \" + $feature.B", json!(3)).wrap_char.as_deref(), Some(" "));
+    // No limit written: stacked as before.
+    let mut c = maplex(json!({"canStackLabel": true, "labelStackingProperties": {"separators": [{"separator": " "}]}}));
+    if let Some(o) = c.as_object_mut() {
+        o.insert("expression".into(), json!(three));
+    }
+    assert_eq!(read_class(c, json!({})).0.wrap_char.as_deref(), Some(" "));
+}
+
+// ---- the layer tree, sources and layer properties ----
+
+const CITY_GDB: &str = r"D:\data\city.gdb";
+
+/// A layer definition of `ty` named `name`, at `CIMPATH=new_detail_map/<name>.json`, with `extra` keys.
+fn layer_of(ty: &str, name: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut l = json!({"type": ty, "name": name, "uRI": format!("CIMPATH=new_detail_map/{}.json", name.to_lowercase())});
+    if let (Some(o), Some(e)) = (l.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    l
+}
+
+/// The `CIMPATH=…` of the layers `layer_of` and `feature_layer` name `names`.
+fn uris_of(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| format!("CIMPATH=new_detail_map/{}.json", n.to_lowercase())).collect()
+}
+
+/// A map listing `layers` (all of them, in order).
+fn read_listed(layers: &[serde_json::Value]) -> (MapImport, Report) {
+    let names: Vec<&str> = layers.iter().filter_map(|l| l["name"].as_str()).collect();
+    let uris = uris_of(&names);
+    let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+    read_new_detail_map(&map_document(layers, &uris))
+}
+
+#[test]
+fn groups_nest_with_their_own_visibility_and_settings() {
+    let shp = |name: &str| feature_layer(name, standard_connection("Shapefile", r"DATABASE=D:\data", &format!("{name}.shp")), json!({}));
+    let roads = shp("roads");
+    let parcels = shp("parcels");
+    let inner = layer_of("CIMGroupLayer", "Inner", json!({"visibility": true, "layers": ["CIMPATH=new_detail_map/parcels.json"]}));
+    let outer = layer_of(
+        "CIMGroupLayer",
+        "Outer",
+        json!({"visibility": false, "expanded": true, "transparency": 20, "minScale": 1e6, "maxScale": 1000,
+            "layers": ["CIMPATH=new_detail_map/roads.json", "CIMPATH=new_detail_map/inner.json"]}),
+    );
+    let (map, report) = read_new_detail_map(&map_document(&[outer, inner, roads, parcels], &["CIMPATH=new_detail_map/outer.json"]));
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    let [Entry::Group(g)] = map.entries.as_slice() else { panic!("{:?}", map.entries) };
+    assert_eq!((g.name.as_str(), g.visible, g.expanded, g.transparency), ("Outer", false, true, Some(20.0)));
+    let scale = crate::qgis::QGIS_SCALE;
+    assert!(g.min_scale.is_some_and(|s| (s - 1e6 * scale).abs() < 1e-6), "{:?}", g.min_scale);
+    assert!(g.max_scale.is_some_and(|s| (s - 1000.0 * scale).abs() < 1e-6), "{:?}", g.max_scale);
+    let [Entry::Layer(l), Entry::Group(sub)] = g.children.as_slice() else { panic!("{:?}", g.children) };
+    // A layer's visibility is its own: the hidden group hides it, it isn't hidden itself.
+    assert_eq!((l.name.as_str(), l.visible), ("roads", true));
+    assert_eq!((sub.name.as_str(), sub.visible, sub.expanded, sub.transparency, sub.min_scale), ("Inner", true, false, None, None));
+    let [Entry::Layer(p)] = sub.children.as_slice() else { panic!("{:?}", sub.children) };
+    assert_eq!(p.name, "parcels");
+}
+
+#[test]
+fn every_connection_kind_has_a_source_and_an_origin() {
+    use LayerSource::*;
+    let fl = |name: &str, c: serde_json::Value| feature_layer(name, c, json!({}));
+    let gdb = format!("DATABASE={CITY_GDB}");
+    let cases: Vec<(serde_json::Value, LayerSource, &str, LayerKind)> = vec![
+        (
+            fl("Shp", standard_connection("Shapefile", r"DATABASE=D:\data", "roads.shp")),
+            File { path: r"D:\data\roads.shp".into(), table: None },
+            r"Shapefile roads.shp in D:\data",
+            LayerKind::Feature,
+        ),
+        (
+            fl("Gdb", standard_connection("FileGDB", &gdb, "parcels")),
+            File { path: CITY_GDB.into(), table: Some("parcels".into()) },
+            r"FileGDB parcels in D:\data\city.gdb",
+            LayerKind::Feature,
+        ),
+        (
+            fl(
+                "InDataset",
+                json!({"type": "CIMFeatureDatasetDataConnection", "workspaceConnectionString": gdb, "workspaceFactory": "FileGDB",
+                    "featureDataset": "transport", "dataset": "rails", "datasetType": "esriDTFeatureClass"}),
+            ),
+            File { path: CITY_GDB.into(), table: Some("rails".into()) },
+            r"FileGDB rails in D:\data\city.gdb",
+            LayerKind::Feature,
+        ),
+        (
+            layer_of("CIMRasterLayer", "Photo", json!({"dataConnection": standard_connection("Raster", r"DATABASE=.\IMG", "photo.tif")})),
+            File { path: r".\IMG\photo.tif".into(), table: None },
+            r"Raster photo.tif in .\IMG",
+            LayerKind::Raster,
+        ),
+        (
+            fl(
+                "Cad",
+                json!({"type": "CIMFeatureDatasetDataConnection", "workspaceConnectionString": r"DATABASE=D:\data\cad", "workspaceFactory": "Cad",
+                    "featureDataset": "site.dwg", "dataset": "Polyline", "datasetType": "esriDTFeatureClass"}),
+            ),
+            File { path: r"D:\data\cad\site.dwg".into(), table: Some("Polyline".into()) },
+            r"Cad site.dwg:Polyline in D:\data\cad",
+            LayerKind::Feature,
+        ),
+        (
+            layer_of("CIMKMLLayer", "Sites", json!({"dataConnection": {"type": "CIMKMLDataConnection", "uRI": r"D:\data\sites.kmz"}})),
+            File { path: r"D:\data\sites.kmz".into(), table: None },
+            r"KML D:\data\sites.kmz",
+            LayerKind::Feature,
+        ),
+        (
+            fl("Service", standard_connection("FeatureService", "URL=https://example.org/arcgis/rest/services/Parcels/FeatureServer", "0")),
+            FeatureService { url: "https://example.org/arcgis/rest/services/Parcels/FeatureServer".into(), layer: "0".into() },
+            "ArcGIS feature service https://example.org/arcgis/rest/services/Parcels/FeatureServer layer 0",
+            LayerKind::Feature,
+        ),
+        (
+            layer_of(
+                "CIMTiledServiceLayer",
+                "Base",
+                json!({"serviceConnection": {"type": "CIMAGSServiceConnection", "objectName": "Base", "objectType": "MapServer",
+                    "url": "https://example.org/arcgis/rest/services/Base/MapServer"}}),
+            ),
+            MapService { url: "https://example.org/arcgis/rest/services/Base/MapServer".into() },
+            "ArcGIS map service https://example.org/arcgis/rest/services/Base/MapServer",
+            LayerKind::Tiles,
+        ),
+        (
+            // A dynamic map service layer: the service's whole map, as a tiled one's.
+            layer_of(
+                "CIMMapImageLayer",
+                "Dynamic",
+                json!({"serviceConnection": {"type": "CIMAGSServiceConnection", "objectName": "Dynamic", "objectType": "MapServer",
+                        "url": "https://example.org/arcgis/rest/services/Dynamic/MapServer",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/arcgis/rest/services"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "Roads", "visibility": true}]}),
+            ),
+            MapService { url: "https://example.org/arcgis/rest/services/Dynamic/MapServer".into() },
+            "ArcGIS map service https://example.org/arcgis/rest/services/Dynamic/MapServer",
+            LayerKind::Tiles,
+        ),
+        (
+            layer_of(
+                "CIMImageServiceLayer",
+                "Elevation",
+                json!({"serviceConnection": {"type": "CIMAGSServiceConnection", "objectName": "Elevation", "objectType": "ImageServer",
+                    "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/arcgis/rest/services/"}}}),
+            ),
+            MapService { url: "https://example.org/arcgis/rest/services/Elevation/ImageServer".into() },
+            "ArcGIS image service https://example.org/arcgis/rest/services/Elevation/ImageServer",
+            LayerKind::Tiles,
+        ),
+        (
+            layer_of(
+                "CIMWMSLayer",
+                "Wms",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMWMSSubLayer", "name": "hidden", "visibility": false},
+                        {"type": "CIMWMSSubLayer", "name": "roads", "visibility": true}]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "roads".into() },
+            "WMS https://example.org/wms layer roads",
+            LayerKind::Tiles,
+        ),
+        (
+            // A root with no name holds the layers: the first that shows is looked for inside it.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsNested",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMWMSSubLayer", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "off", "visibility": false},
+                        {"type": "CIMWMSSubLayer", "name": "rivers", "visibility": true}]}]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "rivers".into() },
+            "WMS https://example.org/wms layer rivers",
+            LayerKind::Tiles,
+        ),
+        (
+            // As Pro writes it: a named composite sublayer (the service's root, not a layer the
+            // server draws) holding the sublayers, each with its title as `name` and the WMS
+            // layer name as `subLayerID`.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsPro",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection", "version": "1.3.0",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "anonymous": true, "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "service_root", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "Hidden Title", "subLayerID": "0", "visibility": false},
+                        {"type": "CIMWMSSubLayer", "name": "Parcels Title", "subLayerID": "1", "visibility": true}]}]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "1".into() },
+            "WMS https://example.org/wms layer 1",
+            LayerKind::Tiles,
+        ),
+        (
+            // A named WMS sublayer holding only hidden ones: it is the one drawn.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsParent",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "service_root", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "Parent Title", "subLayerID": "parent", "visibility": true, "subLayers": [
+                            {"type": "CIMWMSSubLayer", "name": "off", "visibility": false}]}]}]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "parent".into() },
+            "WMS https://example.org/wms layer parent",
+            LayerKind::Tiles,
+        ),
+        (
+            // Pro's composite root is never the layer asked for, though nothing in it shows.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsRootOnly",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "service_root", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "off", "visibility": false}]}]}),
+            ),
+            Unopenable,
+            "WMS https://example.org/wms",
+            LayerKind::Tiles,
+        ),
+        (
+            // Named sublayers nested past the depth looked into: the deepest one looked at.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsDeep",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                    "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                "subLayers": [(0..12).rev().fold(json!({"type": "CIMWMSSubLayer", "name": "leaf"}), |inner, i| {
+                    json!({"type": "CIMWMSSubLayer", "name": format!("level{i}"), "subLayers": [inner]})
+                })]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "level7".into() },
+            "WMS https://example.org/wms layer level7",
+            LayerKind::Tiles,
+        ),
+        (
+            layer_of(
+                "CIMWMSLayer",
+                "WmsHidden",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMWMSSubLayer", "name": "off", "visibility": false},
+                        {"type": "CIMWMSSubLayer", "visibility": false, "subLayers": [{"type": "CIMWMSSubLayer", "name": "in"}]}]}),
+            ),
+            Unopenable,
+            "WMS https://example.org/wms",
+            LayerKind::Tiles,
+        ),
+        (
+            layer_of(
+                "CIMVectorTileLayer",
+                "Streets",
+                json!({"dataConnection": {"type": "CIMVectorTileDataConnection",
+                    "uRI": "https://example.org/arcgis/rest/services/Streets/VectorTileServer"}}),
+            ),
+            VectorTiles { url: "https://example.org/arcgis/rest/services/Streets/VectorTileServer".into() },
+            "vector tiles https://example.org/arcgis/rest/services/Streets/VectorTileServer",
+            LayerKind::Tiles,
+        ),
+        (
+            fl("Sde", standard_connection("SDE", "SERVER=s;INSTANCE=sde:sqlserver:s;DATABASE=d;VERSION=sde.DEFAULT", "d.dbo.parcels")),
+            Unopenable,
+            "an SDE geodatabase on s, database d, table d.dbo.parcels",
+            LayerKind::Feature,
+        ),
+        (
+            fl("Excel", standard_connection("Excel", r"DATABASE=D:\data\book.xlsx", "Sheet1$")),
+            Unopenable,
+            r"Excel Sheet1$ in D:\data\book.xlsx",
+            LayerKind::Feature,
+        ),
+        (
+            fl(
+                "Sql",
+                json!({"type": "CIMSqlQueryDataConnection", "workspaceFactory": "SDE", "workspaceConnectionString": "SERVER=s;DATABASE=d",
+                    "dataset": "d.dbo.q", "sqlQuery": "select * from t"}),
+            ),
+            Unopenable,
+            "SQL query d.dbo.q on an SDE geodatabase on s, database d",
+            LayerKind::Feature,
+        ),
+        (
+            fl(
+                "Joined",
+                json!({"type": "CIMRelQueryTableDataConnection", "sourceTable": standard_connection("FileGDB", &gdb, "parcels"),
+                    "destinationTable": standard_connection("FileGDB", &gdb, "owners"), "primaryKey": "PID", "foreignKey": "PID"}),
+            ),
+            File { path: CITY_GDB.into(), table: Some("parcels".into()) },
+            r"FileGDB parcels in D:\data\city.gdb",
+            LayerKind::Feature,
+        ),
+    ];
+    let layers: Vec<serde_json::Value> = cases.iter().map(|c| c.0.clone()).collect();
+    let (map, report) = read_listed(&layers);
+    let got = flat(&map);
+    assert_eq!(got.len(), cases.len());
+    for (l, (_, source, origin, kind)) in got.into_iter().zip(&cases) {
+        assert_eq!((&l.source, l.origin.as_str(), l.kind), (source, *origin, *kind), "{}", l.name);
+    }
+    let n = notes(&report);
+    for expected in [
+        "Sde: data in SDE workspaces, which RustGIS can't open",
+        "Excel: data in Excel workspaces, which RustGIS can't open",
+        "Sql: SQL query layers, which RustGIS can't open",
+        "Joined: a join to owners, drawn without it",
+        "WmsHidden: a WMS layer that names no visible sublayer, nothing to draw",
+        "WmsRootOnly: a WMS layer that names no visible sublayer, nothing to draw",
+    ] {
+        assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
+    }
+    // Each of the others opens as it is, without a word.
+    assert_eq!(n.len(), 6, "{n:?}");
+}
+
+#[test]
+fn origins_never_carry_passwords() {
+    let hex = "00022e684d4a6b5a4e6a4d4f6f3d2a";
+    let secret = format!(
+        "ENCRYPTED_PASSWORD_UTF8={hex};ENCRYPTED_PASSWORD={hex};SERVER=s;INSTANCE=sde:sqlserver:s;DATABASE=d;USER=sa;VERSION=sde.DEFAULT"
+    );
+    let scrubbed = map::scrub_connection(&format!("{secret};PASSWORD=pw;TOKEN=tk;password=lower"));
+    assert_eq!(scrubbed, "SERVER=s;INSTANCE=sde:sqlserver:s;DATABASE=d;VERSION=sde.DEFAULT");
+
+    let sde = feature_layer("Sde", standard_connection("SDE", &secret, "d.dbo.parcels"), json!({}));
+    let sql = feature_layer(
+        "Sql",
+        json!({"type": "CIMSqlQueryDataConnection", "workspaceFactory": "SDE", "workspaceConnectionString": secret, "dataset": "d.dbo.q",
+            "sqlQuery": "select 1"}),
+        json!({}),
+    );
+    let service = feature_layer(
+        "Service",
+        standard_connection(
+            "FeatureService",
+            "URL=https://example.org/arcgis/rest/services/P/FeatureServer?token=tk123&f=json;TOKEN=tk123",
+            "3",
+        ),
+        json!({}),
+    );
+    let kml = layer_of(
+        "CIMKMLLayer",
+        "Kml",
+        json!({"dataConnection": {"type": "CIMKMLDataConnection", "uRI": "https://example.org/sites.kmz?token=tk123"}}),
+    );
+    let (map, report) = read_listed(&[sde, sql, service, kml]);
+    let layers = flat(&map);
+    let origin = &layers[0].origin;
+    for part in ["s", "d", "d.dbo.parcels"] {
+        assert!(origin.contains(part), "{origin}");
+    }
+    let n = notes(&report);
+    for text in layers.iter().map(|l| &l.origin).chain(&n) {
+        for leak in ["PASSWORD", "USER", "sa", hex, "tk123"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+    }
+    let url = "https://example.org/arcgis/rest/services/P/FeatureServer?f=json";
+    assert_eq!(layers[2].source, LayerSource::FeatureService { url: url.into(), layer: "3".into() });
+    assert_eq!(layers[3].source, LayerSource::File { path: "https://example.org/sites.kmz".into(), table: None });
+}
+
+#[test]
+fn layer_properties_and_the_map_reference_scale_carry_over() {
+    use crate::effects::Blend;
+    let shp = |name: &str| standard_connection("Shapefile", r"DATABASE=D:\data", &format!("{name}.shp"));
+    let mut roads = feature_layer("roads", shp("roads"), json!({"blendingMode": "Multiply", "expanded": false, "scaleSymbols": false}));
+    roads["featureTable"]["definitionExpression"] = json!("LANES > 2");
+    let plain = feature_layer("plain", shp("plain"), json!({"blendingMode": "Alpha", "expanded": true}));
+    let burnt = feature_layer("burnt", shp("burnt"), json!({"blendingMode": "ColorBurn"}));
+    let busy = feature_layer(
+        "busy",
+        shp("busy"),
+        json!({"enableDisplayFilters": true, "displayFilters": [{"type": "CIMDisplayFilter", "name": "f"}],
+            "layerMasks": ["CIMPATH=new_detail_map/roads.json"], "featureReduction": {"type": "CIMFeatureReductionCluster"},
+            "symbolLayerDrawing": {"type": "CIMSymbolLayerDrawing", "useSymbolLayerDrawing": true}, "charts": [{"type": "CIMChart"}],
+            "popupInfo": {"type": "CIMPopupInfo"}, "timeFilter": {"type": "CIMTimeFilter"},
+            "selectionSymbol": symbol_ref(polygon_symbol(vec![solid_fill(rgb(0, 255, 255))]))}),
+    );
+    // Display filters that are off, an empty list and a symbol layer drawing that isn't used say nothing.
+    let quiet = feature_layer(
+        "quiet",
+        shp("quiet"),
+        json!({"displayFilters": [{"type": "CIMDisplayFilter", "name": "f"}], "layerMasks": [],
+            "symbolLayerDrawing": {"type": "CIMSymbolLayerDrawing", "useSymbolLayerDrawing": false}}),
+    );
+    let layers = [roads, plain, burnt, busy, quiet];
+    let uris = uris_of(&["roads", "plain", "burnt", "busy", "quiet"]);
+    let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+    let (map, report) = read_new_detail_map(&map_document_with(&layers, &uris, json!({"referenceScale": 24000}), json!({})));
+    assert_eq!(map.reference_scale, Some(24000.0 * crate::qgis::QGIS_SCALE));
+    let l = flat(&map);
+    assert_eq!(
+        (l[0].style.blend, l[0].definition_query.as_deref(), l[0].expanded, l[0].scale_symbols),
+        (Some(Blend::Multiply), Some("LANES > 2"), false, false)
+    );
+    assert_eq!(
+        (l[1].style.blend, l[1].definition_query.as_deref(), l[1].expanded, l[1].scale_symbols),
+        (Some(Blend::Normal), None, true, true)
+    );
+    assert_eq!(l[2].style.blend, None);
+    let n = notes(&report);
+    assert!(n.iter().any(|t| t == "burnt: its blending mode ColorBurn, drawn as normal"), "{n:?}");
+    let busy: Vec<&crate::qgis::Note> = report.notes.iter().filter(|n| n.layer == "busy").collect();
+    assert_eq!(busy.len(), 8, "{n:?}");
+    assert!(busy.iter().all(|n| n.count == 1), "{n:?}");
+    for part in [
+        "display filters",
+        "layer masks",
+        "feature reduction",
+        "symbol layer drawing",
+        "charts",
+        "pop-up",
+        "time filter",
+        "selection symbol",
+    ] {
+        assert!(busy.iter().any(|n| n.text.contains(part)), "{part}\n{n:?}");
+    }
+    assert!(!n.iter().any(|t| t.starts_with("quiet: ") || t.starts_with("roads: ") || t.starts_with("plain: ")), "{n:?}");
+}
+
+#[test]
+fn other_layer_types_and_tables_are_read() {
+    let gdb = format!("DATABASE={CITY_GDB}");
+    let annotation = layer_of(
+        "CIMAnnotationLayer",
+        "Notes",
+        json!({"featureTable": {"type": "CIMAnnotationTable", "dataConnection": standard_connection("FileGDB", &gdb, "notes_anno")},
+            "popupInfo": {"type": "CIMPopupInfo"}, "blendingMode": "ColorBurn"}),
+    );
+    let dimension = layer_of("CIMDimensionLayer", "Dims", json!({}));
+    let graph = layer_of("CIMKnowledgeGraphLayer", "Graph", json!({}));
+    let owners = json!({"type": "CIMStandaloneTable", "name": "Owners", "uRI": "CIMPATH=new_detail_map/owners.json",
+        "dataConnection": standard_connection("FileGDB", &gdb, "owners")});
+    let layers = [annotation, dimension, graph];
+    let uris = uris_of(&["Notes", "Dims", "Graph"]);
+    let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+    let doc = map_document_with(
+        &layers,
+        &uris,
+        json!({"standaloneTables": ["CIMPATH=new_detail_map/owners.json", "CIMPATH=new_detail_map/gone.json"]}),
+        json!({"tableDefinitions": [owners]}),
+    );
+    let (map, report) = read_new_detail_map(&doc);
+    let l = flat(&map);
+    assert_eq!(l.len(), 3);
+    assert!(l.iter().all(|l| l.source == LayerSource::Unopenable && l.kind == LayerKind::Other));
+    assert_eq!(l[0].origin, r"FileGDB notes_anno in D:\data\city.gdb", "where it was, for people");
+    assert_eq!(l[1].origin, "CIMDimensionLayer");
+    let n = notes(&report);
+    for expected in [
+        "Notes: CIMAnnotationLayer layers, which RustGIS doesn't draw",
+        "Dims: CIMDimensionLayer layers, which RustGIS doesn't draw",
+        "Graph: CIMKnowledgeGraphLayer layers, which RustGIS doesn't draw",
+    ] {
+        assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
+    }
+    assert_eq!(
+        map.tables,
+        [TableImport {
+            name: "Owners".into(),
+            source: LayerSource::File { path: CITY_GDB.into(), table: Some("owners".into()) },
+            origin: r"FileGDB owners in D:\data\city.gdb".into(),
+        }]
+    );
+    assert!(n.iter().any(|t| t.contains("gone.json")), "{n:?}");
+    // A layer RustGIS doesn't draw has its one note, nothing about its pop-up or blending.
+    assert_eq!(n.iter().filter(|t| t.starts_with("Notes: ")).count(), 1, "{n:?}");
+}
+
+#[test]
+fn a_lyrx_reads_its_layers() {
+    let shp = |name: &str| {
+        let mut l = feature_layer(name, standard_connection("Shapefile", r"DATABASE=D:\data", &format!("{name}.shp")), json!({}));
+        l["uRI"] = json!(format!("CIMPATH=lyr/{name}.json"));
+        l
+    };
+    let group = json!({"type": "CIMGroupLayer", "name": "Transport", "uRI": "CIMPATH=lyr/transport.json", "visibility": true,
+        "layers": ["CIMPATH=lyr/roads.json", "CIMPATH=lyr/rails.json"]});
+    let text = json!({"type": "CIMLayerDocument", "version": "3.7.0", "layers": ["CIMPATH=lyr/transport.json"],
+        "layerDefinitions": [group, shp("roads"), shp("rails")]})
+    .to_string();
+    let doc = Document::from_json(&text).unwrap();
+    let mut report = Report::default();
+    let map = read_layers(&doc, &doc.layer_uris(), &mut report);
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
+    assert_eq!((map.name.as_str(), map.wkid, map.extent, map.reference_scale), ("", None, None, None));
+    assert!(map.tables.is_empty());
+    let [Entry::Group(g)] = map.entries.as_slice() else { panic!("{:?}", map.entries) };
+    assert_eq!(g.name, "Transport");
+    let names: Vec<&str> = g.children.iter().filter_map(|e| if let Entry::Layer(l) = e { Some(l.name.as_str()) } else { None }).collect();
+    assert_eq!(names, ["roads", "rails"]);
+    assert_eq!(file_of(nth(&map, 1)), (Some(r"D:\data\rails.shp"), None));
 }

@@ -36,7 +36,7 @@ pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
     ClassMethod, FontName, Glyph, ImageRef, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap,
-    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
+    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, PathPart, PathRef, PathShape, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -331,6 +331,10 @@ impl Layer {
         if let Some(info) = src.info() {
             self.dataset.fields = info.fields.clone();
             self.dataset.crs = info.coordinate_system();
+            // A broken layer learns its geometry when its source first opens.
+            if self.dataset.geometry_type == GeometryType::None {
+                self.dataset.geometry_type = info.geometry_type;
+            }
         }
         self.dataset.source = src.linked_file().map(String::from);
         self.source = Some(src);
@@ -443,7 +447,10 @@ impl Layer {
     /// place and waits (for exports). Returns whether a read is still running.
     pub fn sync_source(&mut self, view: &Extent, block: bool) -> bool {
         let Some(src) = &mut self.source else { return false };
+        // A broken layer that opens on its own (its file is back) settles as Retry would.
+        let mut settle = false;
         if !src.is_open() {
+            settle = src.origin.is_some();
             // Opened once after a project loads; a failure is kept, not retried every frame.
             if src.error.is_some() || src.open().is_err() {
                 return false;
@@ -463,6 +470,9 @@ impl Layer {
             && let Some(info) = self.source.as_ref().and_then(|s| s.info())
         {
             self.dataset.fields = info.fields.clone();
+        }
+        if settle {
+            self.settle_opened();
         }
         let Some(src) = &mut self.source else { return false };
         src.window_fields = Some(self.dataset.fields.len());
@@ -485,6 +495,36 @@ impl Layer {
             }
         }
         self.source.as_ref().is_some_and(|s| s.is_pending())
+    }
+
+    /// Opens its streamed source (after a project loads); a broken layer that opens settles as
+    /// Retry would (see [`Layer::settle_opened`]).
+    pub fn open_source(&mut self) -> Result<(), String> {
+        let src = self.source.as_mut().ok_or("the layer has no source")?;
+        let broken = src.origin.is_some();
+        src.open()?;
+        if broken && src.is_open() {
+            self.settle_opened();
+        }
+        Ok(())
+    }
+
+    /// A broken layer whose source has just opened: it learns its geometry and coordinate system,
+    /// and its definition query, kept unchecked while there were no fields, is dropped when it
+    /// doesn't fit the source's.
+    fn settle_opened(&mut self) {
+        if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
+            if self.dataset.fields.is_empty() {
+                self.dataset.fields = info.fields.clone();
+            }
+            if self.dataset.geometry_type == GeometryType::None {
+                self.dataset.geometry_type = info.geometry_type;
+            }
+            if self.dataset.crs.is_none() {
+                self.dataset.crs = info.coordinate_system();
+            }
+        }
+        self.definition_query = self.definition_query.take().filter(|q| rustgis_data::query::parse(q, &self.dataset).is_ok());
     }
 
     /// Replaces a streamed layer's features, keeping the selection (by feature id).

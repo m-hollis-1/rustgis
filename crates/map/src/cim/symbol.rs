@@ -1,8 +1,10 @@
 //! ArcGIS Pro's symbols (stacks of symbol layers, bottom to top) as RustGIS's [`Symbol`],
-//! [`LineStroke`], [`FillLayer`] and [`Marker`], and a text symbol as a [`Text`] style. A symbol
-//! layer RustGIS has no match for is drawn as near as it can (a drawn marker shape as a circle,
-//! a gradient by its two ends) or left out, and noted in the [`Report`] under the name of the
-//! element it belongs to.
+//! [`LineStroke`], [`FillLayer`] and [`Marker`], and a text symbol as a [`Text`] style. A vector
+//! marker RustGIS has no shape for is drawn from its paths ([`Marker::Path`]), and so is a stack
+//! of marker layers; a marker layer of a line symbol becomes markers along the line, and one of a
+//! polygon symbol placed inside it a grid of dots. A symbol layer RustGIS has no match for is drawn
+//! as near as it can (a gradient by its two ends) or left out, and noted in the [`Report`] under the
+//! name of the element it belongs to.
 //!
 //! CIM counts widths, sizes and offsets in 1/72 inch points, which are scaled to the 96ths the
 //! symbol model counts in ([`pt96`]); a text height is in true points ([`text_pt`]). Every list
@@ -17,7 +19,10 @@ use super::{Report, flag, num, str_of};
 use crate::Rgba;
 use crate::fills::{FillLayer, FillPattern, GradientPoint, GradientShape, MAX_FILLS, MAX_STOPS, Spread, Stop, Stops};
 use crate::layout::{TextAlign, TextCase, VAlign};
-use crate::symbology::{Dash, Glyph, ImageRef, LineCap, LineJoin, LineStroke, MAX_DASH_STEPS, MAX_STROKES, Marker, Symbol, font_name};
+use crate::symbology::{
+    Dash, Glyph, ImageRef, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_DASH_STEPS, MAX_PATH_PARTS, MAX_PATH_POINTS,
+    MAX_STROKES, Marker, PathPart, PathRef, PathShape, Placements, Symbol, font_name,
+};
 
 /// The most symbol layers, effects and marker graphics read from one symbol.
 const MAX_ITEMS: usize = 64;
@@ -32,6 +37,14 @@ const DEFAULT_TEXT_PT: f64 = 10.0;
 const DEFAULT_MARKER_PT: f64 = 6.0;
 /// A hatch fill's spacing in points when it gives none.
 const DEFAULT_HATCH_PT: f64 = 8.0;
+/// The spacing of markers inside a polygon, in points, when it gives none (Pro's default).
+const DEFAULT_STEP_PT: f64 = 16.0;
+/// The points a circle of a marker's drawing is drawn with.
+const CIRCLE_POINTS: usize = 32;
+/// How far from one circle, as a fraction of its radius, a ring of arcs may stray to be that circle.
+const CIRCLE_TOLERANCE: f64 = 1e-3;
+/// How far a drawn marker's point may reach from its centre, in its sizes (as [`PathRef`] keeps it).
+const PATH_REACH: f64 = 2.0;
 
 const NULL: Value = Value::Null;
 
@@ -89,23 +102,42 @@ pub(crate) struct Paint {
     pub fills: Vec<FillLayer>,
 }
 
-/// A polygon symbol: its solid, hatch and gradient fills and its strokes.
+/// A polygon symbol: its solid, hatch and gradient fills, its markers placed inside it (as dots),
+/// and its strokes.
 pub(crate) fn polygon(sym: &Value, what: &str, report: &mut Report) -> Paint {
-    read(sym, true, what, report)
+    read(sym, true, true, what, report)
 }
 
-/// A line symbol: its strokes (its other layers are left out and noted).
+/// A line symbol: its strokes and its markers along the line (its other layers are left out and
+/// noted).
 pub(crate) fn line(sym: &Value, what: &str, report: &mut Report) -> Paint {
-    read(sym, false, what, report)
+    read(sym, false, true, what, report)
 }
 
-fn read(sym: &Value, with_fills: bool, what: &str, report: &mut Report) -> Paint {
+/// The symbol a marker's graphic (or a character marker's character) is painted with: a polygon
+/// symbol whose own marker layers are left out (noted), so a marker can't hold itself.
+fn graphic_paint(sym: &Value, what: &str, report: &mut Report) -> Paint {
+    read(sym, true, false, what, report)
+}
+
+const MARKER_LAYERS: [&str; 3] = ["CIMVectorMarker", "CIMPictureMarker", "CIMCharacterMarker"];
+
+fn read(sym: &Value, with_fills: bool, with_markers: bool, what: &str, report: &mut Report) -> Paint {
     let mut fill = None;
     let mut strokes = Vec::new();
     let mut fills = Vec::new();
     for l in layers(sym) {
         match str_of(l, "type") {
             Some("CIMSolidStroke") => strokes.extend(stroke(l, what, report)),
+            Some(m) if with_markers && MARKER_LAYERS.contains(&m) => {
+                if !with_fills {
+                    strokes.extend(line_markers(l, what, report));
+                } else if l.get("markerPlacement").and_then(|p| str_of(p, "type")) == Some("CIMMarkerPlacementInsidePolygon") {
+                    fills.extend(inside_polygon(l, what, report));
+                } else {
+                    report.skipped(what, "markers along polygon outlines, left out");
+                }
+            }
             Some("CIMSolidFill") if with_fills => {
                 if let Some(c) = ink(l, what, report) {
                     fill = Some(c);
@@ -131,7 +163,8 @@ fn read(sym: &Value, with_fills: bool, what: &str, report: &mut Report) -> Paint
     if fills.len() <= 1 && fills.iter().all(|f| f.pattern == FillPattern::Solid) {
         fills.clear();
     }
-    let stroke = strokes.last().and_then(|s| Some((s.color?, s.width?)));
+    // The top line drawn as a line, else the top markers' colour.
+    let stroke = strokes.iter().rev().find(|s| s.markers.is_none()).or(strokes.last()).and_then(|s| Some((s.color?, s.width?)));
     Paint { fill, stroke, strokes, fills }
 }
 
@@ -248,36 +281,54 @@ fn ramp(r: &Value) -> Option<(Rgba, Rgba, Stops)> {
 // ---- point symbols ----------------------------------------------------------------------------
 
 /// The markers of a point symbol, bottom first, one for each enabled marker layer.
-/// `pending_pictures` are the pictures RustGIS can't keep as they are (GIF and BMP, which the
-/// engine converts to PNG): each is its index in `symbols` (drawn as a circle meanwhile) and its
-/// `data:` URL.
+/// `paths` holds each marker's drawing as paths beside it (`None` for a picture or a character),
+/// so the layers can be drawn as one marker ([`stacked`]). `pending_pictures` are the pictures
+/// RustGIS can't keep as they are (GIF and BMP, which the engine converts to PNG): each is its
+/// index in `symbols` (drawn as a circle meanwhile) and its `data:` URL.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PointSymbol {
     pub symbols: Vec<Symbol>,
+    pub paths: Vec<Option<PathShape>>,
     pub pending_pictures: Vec<(usize, String)>,
 }
 
-/// A point symbol's markers: vector (a shape), picture and character markers.
+/// A point symbol's markers: vector (a shape, or drawn), picture and character markers.
 pub(crate) fn point(sym: &Value, what: &str, report: &mut Report) -> PointSymbol {
-    let mut out = PointSymbol { symbols: Vec::new(), pending_pictures: Vec::new() };
+    let mut out = PointSymbol { symbols: Vec::new(), paths: Vec::new(), pending_pictures: Vec::new() };
     for l in layers(sym) {
-        if num(l, "rotation").is_some_and(|r| r != 0.0) {
-            report.approximated(what, "marker rotation, left out");
+        if let Some((symbol, path)) = marker_layer(l, out.symbols.len(), &mut out.pending_pictures, what, report) {
+            out.symbols.push(symbol);
+            out.paths.push(path);
         }
-        let size = pt96(num(l, "size").unwrap_or(DEFAULT_MARKER_PT));
-        let made = match str_of(l, "type") {
-            Some("CIMVectorMarker") => Some(vector_marker(l, size, what, report)),
-            Some("CIMPictureMarker") => picture_marker(l, size, out.symbols.len(), &mut out.pending_pictures, what, report),
-            Some("CIMCharacterMarker") => character_marker(l, size, what, report),
-            Some(other) => {
-                report.skipped(what, format!("{} symbol layers, left out", shown(other)));
-                None
-            }
-            None => None,
-        };
-        out.symbols.extend(made);
     }
     out
+}
+
+/// One marker layer as a marker and, for a vector marker, its drawing as paths. A picture that
+/// must be converted goes into `pending` as the `index`th marker.
+fn marker_layer(
+    l: &Value,
+    index: usize,
+    pending: &mut Vec<(usize, String)>,
+    what: &str,
+    report: &mut Report,
+) -> Option<(Symbol, Option<PathShape>)> {
+    let size_pt = num(l, "size").unwrap_or(DEFAULT_MARKER_PT);
+    let size = pt96(size_pt);
+    let ty = str_of(l, "type");
+    if matches!(ty, Some("CIMPictureMarker" | "CIMCharacterMarker")) && num(l, "rotation").is_some_and(|r| r != 0.0) {
+        report.approximated(what, "marker rotation, left out");
+    }
+    match ty {
+        Some("CIMVectorMarker") => Some(vector_marker(l, size_pt, what, report)),
+        Some("CIMPictureMarker") => picture_marker(l, size, index, pending, what, report).map(|s| (s, None)),
+        Some("CIMCharacterMarker") => character_marker(l, size, what, report).map(|s| (s, None)),
+        Some(other) => {
+            report.skipped(what, format!("{} symbol layers, left out", shown(other)));
+            None
+        }
+        None => None,
+    }
 }
 
 /// A marker symbol of `marker` painted as `paint` says.
@@ -286,16 +337,312 @@ fn marker_symbol(marker: Marker, size: f32, paint: &Paint) -> Symbol {
     Symbol { fill: paint.fill.unwrap_or(CLEAR), stroke, stroke_width, size, marker }
 }
 
-/// A `CIMVectorMarker`: its shape if it is one RustGIS has, painted as its graphic's symbol.
-fn vector_marker(l: &Value, size: f32, what: &str, report: &mut Report) -> Symbol {
+/// A `CIMVectorMarker` of `size_pt` points: its shape if it is one RustGIS has and it isn't turned
+/// or moved, else its drawing as paths, painted as its first graphic's symbol; and its drawing.
+fn vector_marker(l: &Value, size_pt: f64, what: &str, report: &mut Report) -> (Symbol, Option<PathShape>) {
     let graphic = l.get("markerGraphics").and_then(Value::as_array).into_iter().flatten().take(MAX_ITEMS).find_map(|g| g.get("symbol"));
-    let paint =
-        graphic.map(|s| polygon(s, what, report)).unwrap_or(Paint { fill: None, stroke: None, strokes: Vec::new(), fills: Vec::new() });
-    let shape = vector_shape(l).unwrap_or_else(|| {
-        report.approximated(what, "a drawn marker shape, shown as a circle");
-        Marker::Circle
+    // (Its notes come from `path_marker`, which reads every graphic.)
+    let paint = graphic.map(|s| graphic_paint(s, what, &mut Report::default())).unwrap_or(Paint {
+        fill: None,
+        stroke: None,
+        strokes: Vec::new(),
+        fills: Vec::new(),
     });
-    marker_symbol(shape, size, &paint)
+    let path = path_marker(l, size_pt, what, report);
+    let placed = ["rotation", "offsetX", "offsetY"].iter().any(|k| num(l, k).is_some_and(|v| v != 0.0));
+    let marker = match vector_shape(l).filter(|_| !placed) {
+        Some(shape) => shape,
+        None => path.clone().and_then(PathRef::new).map(Marker::Path).unwrap_or_else(|| {
+            report.approximated(what, "a drawn marker shape, shown as a circle");
+            Marker::Circle
+        }),
+    };
+    (marker_symbol(marker, pt96(size_pt), &paint), path)
+}
+
+/// A `CIMVectorMarker`'s graphics as paths in unit space: each graphic's `rings`, `paths` and
+/// `curveRings` (a ring of arcs round one centre is a circle of [`CIRCLE_POINTS`]; other curves
+/// are drawn through their control points, noted), scaled so the height of the marker's `frame`
+/// (else of its graphics' box) is 1 (Pro sizes a marker by its frame's height), centred on the
+/// frame's centre, turned by `rotation` (anticlockwise, as Pro) and moved by `offsetX`/`offsetY`
+/// (points, as a fraction of `size_pt`). Each part is filled with its graphic's top solid fill and
+/// stroked with its top stroke; a graphic with neither is left out. `None` for a marker with no
+/// drawable graphic. At most [`MAX_PATH_PARTS`] parts of [`MAX_PATH_POINTS`] points are read.
+pub(crate) fn path_marker(l: &Value, size_pt: f64, what: &str, report: &mut Report) -> Option<PathShape> {
+    struct Raw {
+        points: Vec<[f64; 2]>,
+        closed: bool,
+        fill: Option<Rgba>,
+        stroke: Option<(Rgba, f32)>,
+    }
+    let graphics = l.get("markerGraphics")?.as_array()?;
+    let (mut raw, mut cut, mut curved) = (Vec::new(), graphics.len() > MAX_PATH_PARTS, false);
+    'graphics: for g in graphics.iter().take(MAX_PATH_PARTS) {
+        let Some(p) = g.get("symbol").map(|s| graphic_paint(s, what, report)) else { continue };
+        if p.fill.is_none() && p.stroke.is_none() {
+            continue;
+        }
+        let geometry = g.get("geometry").unwrap_or(&NULL);
+        for (key, closed) in [("rings", true), ("paths", false), ("curveRings", true)] {
+            for part in geometry.get(key).and_then(Value::as_array).into_iter().flatten().take(MAX_PATH_PARTS) {
+                if raw.len() >= MAX_PATH_PARTS {
+                    cut = true;
+                    break 'graphics;
+                }
+                let mut points = if key == "curveRings" {
+                    let (points, approximated) = curve_ring(part);
+                    curved |= approximated;
+                    points
+                } else {
+                    part.as_array().into_iter().flatten().take(MAX_PATH_POINTS + 1).filter_map(xy).collect()
+                };
+                cut |= points.len() > MAX_PATH_POINTS;
+                points.truncate(MAX_PATH_POINTS);
+                if points.len() >= 2 {
+                    raw.push(Raw { points, closed, fill: p.fill, stroke: p.stroke });
+                }
+            }
+        }
+    }
+    if cut {
+        report.approximated(what, format!("marker drawings past {MAX_PATH_PARTS} parts of {MAX_PATH_POINTS} points, cut short"));
+    }
+    if curved {
+        report.approximated(what, "curves in marker drawings, drawn through their control points");
+    }
+    // The frame, else the box round the drawing.
+    let frame = l.get("frame").and_then(|f| Some([num(f, "xmin")?, num(f, "ymin")?, num(f, "xmax")?, num(f, "ymax")?]));
+    let [x0, y0, x1, y1] = frame.filter(|[x0, y0, x1, y1]| x1 > x0 || y1 > y0).or_else(|| {
+        raw.iter().flat_map(|r| r.points.iter()).fold(None, |b: Option<[f64; 4]>, &[x, y]| {
+            Some(b.map_or([x, y, x, y], |[a, b, c, d]| [a.min(x), b.min(y), c.max(x), d.max(y)]))
+        })
+    })?;
+    let unit = if y1 > y0 { y1 - y0 } else { x1 - x0 };
+    if !(unit.is_finite() && unit > 0.0) {
+        return None;
+    }
+    let (cx, cy) = (x0 / 2.0 + x1 / 2.0, y0 / 2.0 + y1 / 2.0);
+    let (sin, cos) = num(l, "rotation").unwrap_or(0.0).to_radians().sin_cos();
+    let along = |k: &str| if size_pt > 0.0 { num(l, k).unwrap_or(0.0) / size_pt } else { 0.0 };
+    let (dx, dy) = (along("offsetX"), along("offsetY"));
+    let size96 = pt96(size_pt);
+    let parts = raw
+        .into_iter()
+        .map(|r| {
+            let points = r
+                .points
+                .iter()
+                .map(|&[x, y]| {
+                    let (ux, uy) = ((x - cx) / unit, (y - cy) / unit);
+                    let fit = |v: f64| if v.is_finite() { v.clamp(-PATH_REACH, PATH_REACH) as f32 } else { 0.0 };
+                    [fit(ux * cos - uy * sin + dx), fit(ux * sin + uy * cos + dy)]
+                })
+                .collect();
+            let (stroke, width) = match r.stroke {
+                Some((c, w)) if size96 > 0.0 => (Some(c), (w / size96).clamp(0.0, 0.5)),
+                Some((c, _)) => (Some(c), 0.0),
+                None => (None, 0.0),
+            };
+            PathPart { points, closed: r.closed, fill: r.fill, stroke, width }
+        })
+        .collect();
+    Some(PathShape { parts })
+}
+
+/// A point `[x, y, …]` whose coordinates are finite numbers.
+fn xy(p: &Value) -> Option<[f64; 2]> {
+    let p = p.as_array()?;
+    let [x, y] = [p.first()?.as_f64()?, p.get(1)?.as_f64()?];
+    (x.is_finite() && y.is_finite()).then_some([x, y])
+}
+
+/// A `curveRings` ring's points: a ring of arcs round one centre (as Pro writes a circle) as a
+/// circle of [`CIRCLE_POINTS`] points; any other as its points with the curves' control points,
+/// and `true` when a curve was drawn that way.
+fn curve_ring(ring: &Value) -> (Vec<[f64; 2]>, bool) {
+    let mut points: Vec<[f64; 2]> = Vec::new();
+    let mut centres = Vec::new();
+    // Whether anything but arcs follows the start, and whether any curve is read.
+    let (mut lines, mut curved) = (false, false);
+    for s in ring.as_array().into_iter().flatten().take(MAX_PATH_POINTS) {
+        let curve = |k: &str| s.get(k).and_then(Value::as_array);
+        if let Some(p) = xy(s) {
+            lines |= !points.is_empty();
+            points.push(p);
+        } else if let Some(a) = curve("a") {
+            // An elliptic arc: its end, then its centre.
+            curved = true;
+            match (a.first().and_then(xy), a.get(1).and_then(xy)) {
+                (Some(end), Some(centre)) => {
+                    centres.push(centre);
+                    points.push(end);
+                }
+                (end, _) => {
+                    lines = true;
+                    points.extend(end);
+                }
+            }
+        } else if let Some(b) = curve("b") {
+            // A Bézier curve: its end, then its two control points.
+            (curved, lines) = (true, true);
+            points.extend(b.get(1..).into_iter().flatten().filter_map(xy).chain(b.first().and_then(xy)));
+        } else if let Some(c) = curve("c") {
+            // A circular arc: its end, then a point it passes through.
+            (curved, lines) = (true, true);
+            points.extend(c.get(1).and_then(xy).into_iter().chain(c.first().and_then(xy)));
+        }
+    }
+    if let (false, Some(&[sx, sy]), Some(&[cx, cy])) = (lines, points.first(), centres.first()) {
+        let r = (sx - cx).hypot(sy - cy);
+        let near = |[x, y]: [f64; 2], to: f64| ((x - cx).hypot(y - cy) - to).abs() <= r * CIRCLE_TOLERANCE;
+        if r.is_finite() && r > 0.0 && centres.iter().all(|c| near(*c, 0.0)) && points.iter().all(|p| near(*p, r)) {
+            let step = std::f64::consts::TAU / CIRCLE_POINTS as f64;
+            return ((0..CIRCLE_POINTS).map(|i| [cx + r * (i as f64 * step).cos(), cy + r * (i as f64 * step).sin()]).collect(), false);
+        }
+    }
+    (points, curved)
+}
+
+/// Several marker layers (bottom first, each with its drawing) as one marker: each layer's paths
+/// scaled by its size over the largest, the marker the largest size and painted as the top layer
+/// (for the legend). One layer is itself. When a layer has no drawing (a picture, a character, or
+/// a vector marker with nothing to draw) or the paths can't be kept, the first marker, noted.
+pub(crate) fn stacked(symbols: &[(Symbol, Option<PathShape>)], what: &str, report: &mut Report) -> Symbol {
+    let none = Paint { fill: None, stroke: None, strokes: Vec::new(), fills: Vec::new() };
+    let first = symbols.first().map_or_else(|| marker_symbol(Marker::Circle, 0.0, &none), |(s, _)| *s);
+    let (Some((top, _)), true) = (symbols.last(), symbols.len() > 1) else { return first };
+    if symbols.iter().any(|(_, p)| p.is_none()) {
+        let why = "a picture, a character or a marker with nothing to draw among them";
+        report.approximated(what, format!("point symbols of several marker layers with {why}, drawn as the first marker"));
+        return first;
+    }
+    let largest = symbols.iter().map(|(s, _)| s.size).fold(0.0, f32::max);
+    let parts: Vec<PathPart> = symbols
+        .iter()
+        .filter_map(|(s, p)| Some((if largest > 0.0 { s.size / largest } else { 1.0 }, p.as_ref()?)))
+        .flat_map(|(k, p)| {
+            p.parts.iter().map(move |part| PathPart {
+                points: part.points.iter().map(|[x, y]| [x * k, y * k]).collect(),
+                width: part.width * k,
+                ..part.clone()
+            })
+        })
+        .collect();
+    if parts.len() > MAX_PATH_PARTS {
+        report.approximated(what, format!("stacked markers of more than {MAX_PATH_PARTS} parts, the parts past them left out"));
+    }
+    match PathRef::new(PathShape { parts }) {
+        Some(p) => Symbol { size: largest, marker: Marker::Path(p), ..*top },
+        None => {
+            report.approximated(what, "point symbols of several marker layers, drawn as the first marker");
+            first
+        }
+    }
+}
+
+/// A line symbol's marker layer as a stroke of markers along the line, in the marker's fill with
+/// its outline. `CIMMarkerPlacementAlongLineSameSize`/`AlongLineVariableSize` place them at every
+/// interval (`placementTemplate`'s first step, points); `AtExtremities` at the first and last
+/// vertices (`extremityPlacement`); `AtRatioPositions` halfway along (`[0.5]`; any other ratios at
+/// every interval, noted); `AtMeasuredUnits` at every interval (noted); `OnVertices` on the
+/// vertices. `angleToLine` turns them with the line, and `offset` (points) moves them sideways.
+/// `None` for a placement RustGIS has no match for (noted) or a marker it can't read.
+fn line_markers(l: &Value, what: &str, report: &mut Report) -> Option<LineStroke> {
+    let p = l.get("markerPlacement").unwrap_or(&NULL);
+    let mut interval = None;
+    let at = match str_of(p, "type") {
+        Some(ty @ ("CIMMarkerPlacementAlongLineSameSize" | "CIMMarkerPlacementAlongLineVariableSize")) => {
+            let template = p.get("placementTemplate").and_then(Value::as_array);
+            interval = template.and_then(|t| t.first()).and_then(Value::as_f64).filter(|v| *v > 0.0).map(pt96);
+            if template.is_some_and(|t| t.len() > 1) {
+                report.approximated(what, "markers along lines spaced unevenly, spaced evenly");
+            }
+            if ty == "CIMMarkerPlacementAlongLineVariableSize" {
+                report.approximated(what, "markers along lines that vary in size, drawn at one size");
+            }
+            Placements::INTERVAL
+        }
+        Some("CIMMarkerPlacementAtExtremities") => match str_of(p, "extremityPlacement") {
+            Some("JustBegin") => Placements::FIRST,
+            Some("JustEnd") => Placements::LAST,
+            Some("None") => return None,
+            _ => Placements::FIRST.with(Placements::LAST),
+        },
+        Some("CIMMarkerPlacementAtRatioPositions") => {
+            let ratios = p.get("positionArray").and_then(Value::as_array).map(Vec::as_slice);
+            if matches!(ratios, Some([r]) if r.as_f64() == Some(0.5)) {
+                Placements::MIDDLE
+            } else {
+                report.approximated(what, "markers at ratio positions along lines, drawn at intervals");
+                Placements::INTERVAL
+            }
+        }
+        Some("CIMMarkerPlacementAtMeasuredUnits") => {
+            report.approximated(what, "markers at measured units along lines, drawn at intervals");
+            Placements::INTERVAL
+        }
+        Some("CIMMarkerPlacementOnVertices") => Placements::VERTICES,
+        Some(other) => {
+            report.skipped(what, format!("markers along lines placed by {}, left out", shown(other)));
+            return None;
+        }
+        None => {
+            report.skipped(what, "markers along lines with no placement, left out");
+            return None;
+        }
+    };
+    let mut pending = Vec::new();
+    let (symbol, _) = marker_layer(l, 0, &mut pending, what, report)?;
+    if !pending.is_empty() {
+        report.approximated(what, "GIF or BMP markers along lines, drawn as circles");
+    }
+    let markers = LineMarkers {
+        mark: LineMark::Marker(symbol.marker),
+        size: symbol.size,
+        at,
+        interval: interval.unwrap_or(LineMarkers::default().interval),
+        rotate: flag(p, "angleToLine", false),
+        outline: Some(symbol.stroke).filter(|c| c.a() > 0 && symbol.stroke_width > 0.0),
+        ..LineMarkers::default()
+    };
+    let offset = signed_pt96(num(p, "offset").unwrap_or(0.0));
+    Some(
+        LineStroke { color: Some(symbol.fill), width: Some(symbol.stroke_width), offset, markers: Some(markers), ..LineStroke::default() }
+            .clamped(),
+    )
+}
+
+/// A polygon symbol's marker layer placed by `CIMMarkerPlacementInsidePolygon` as a fill of
+/// markers on a grid `stepX` by `stepY` points (every other row shifted half a step across with
+/// `shiftOddRows`), shifted `offsetX`/`offsetY` points; a turned grid (`gridAngle`) or one placed
+/// at random is drawn square and fixed, noted. `None` for a marker it can't read.
+fn inside_polygon(l: &Value, what: &str, report: &mut Report) -> Option<FillLayer> {
+    let p = l.get("markerPlacement").unwrap_or(&NULL);
+    let mut pending = Vec::new();
+    let (symbol, _) = marker_layer(l, 0, &mut pending, what, report)?;
+    if !pending.is_empty() {
+        report.approximated(what, "GIF or BMP markers in polygons, drawn as circles");
+    }
+    if num(p, "gridAngle").is_some_and(|a| a.rem_euclid(360.0) != 0.0) {
+        report.approximated(what, "turned grids of markers in polygons, drawn square");
+    }
+    if str_of(p, "gridType").is_some_and(|t| t != "Fixed") {
+        report.approximated(what, "markers scattered in polygons, drawn on a grid");
+    }
+    let step = |k: &str| pt96(num(p, k).filter(|v| *v > 0.0).unwrap_or(DEFAULT_STEP_PT));
+    let [step_x, step_y] = [step("stepX"), step("stepY")];
+    let shift = if flag(p, "shiftOddRows", false) { step_x / 2.0 } else { 0.0 };
+    let pattern = FillPattern::Dots {
+        marker: symbol.marker,
+        size: symbol.size,
+        outline: Some(symbol.stroke).filter(|c| c.a() > 0 && symbol.stroke_width > 0.0),
+        outline_width: symbol.stroke_width,
+        spacing: [step_x, step_y],
+        displacement: [shift, 0.0],
+        // (Pro's y runs up, the grid's down.)
+        offset: [signed_pt96(num(p, "offsetX").unwrap_or(0.0)), -signed_pt96(num(p, "offsetY").unwrap_or(0.0))],
+    };
+    Some(FillLayer { color: Some(symbol.fill), pattern }.clamped())
 }
 
 /// The shape a `CIMVectorMarker`'s drawing stands for: a single graphic whose geometry is a
@@ -412,7 +759,7 @@ fn character_marker(l: &Value, size: f32, what: &str, report: &mut Report) -> Op
         return None;
     };
     let paint = match l.get("symbol") {
-        Some(s) => polygon(s, what, report),
+        Some(s) => graphic_paint(s, what, report),
         None => Paint { fill: Some(Rgba::rgb(0, 0, 0)), stroke: None, strokes: Vec::new(), fills: Vec::new() },
     };
     let glyph = Glyph::new(ch, str_of(l, "fontFamilyName").unwrap_or_default());

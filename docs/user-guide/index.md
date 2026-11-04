@@ -180,7 +180,8 @@ the saved style.
 If a tile archive is removed or reordered out of its captured slot while the dialog is open,
 the dialog closes rather than applying the replacement to another archive.
 It does not change embedded data, databases or web links. The web app cannot link to files
-on your computer: add the file again with **Add Data**.
+on your computer: add the file again with **Add Data**. The same repairs a [broken
+layer](maps.md#broken-layers) from an ArcGIS Pro import whose file has moved.
 
 CLI and Python use the same commands: `layer.repairSource` with
 `{"layer":"Cities","path":"/data/towns.fgb"}` (and optional `"table"`), or `map.repairTiles`

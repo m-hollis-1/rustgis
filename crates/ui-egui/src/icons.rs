@@ -388,6 +388,14 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.circle(12.0, 7.5, 1.4, Some(Color32::WHITE), None);
             p.line(&[(12.0, 10.5), (12.0, 17.0)], 2.2, Color32::WHITE);
         }
+        // An amber triangle with a dark exclamation mark: something is wrong here (a broken layer).
+        "warning" => {
+            let dark = Color32::from_rgb(0x2B, 0x20, 0x08);
+            p.fill(&[(12.0, 2.5), (22.0, 20.5), (2.0, 20.5)], amber);
+            p.closed(&[(12.0, 2.5), (22.0, 20.5), (2.0, 20.5)], 1.2, dark);
+            p.line(&[(12.0, 8.5), (12.0, 14.5)], 2.2, dark);
+            p.circle(12.0, 17.6, 1.3, Some(dark), None);
+        }
         "help" => {
             p.circle(12.0, 12.0, 9.0, Some(accent), None);
             p.text(12.0, 12.3, "?", 12.0, Color32::WHITE);
@@ -1194,6 +1202,7 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
 
 /// Every icon name, for the gallery test.
 pub const ALL: &[&str] = &[
+    "warning",
     "directions",
     "maneuver_straight",
     "maneuver_slight_right",
@@ -1347,3 +1356,30 @@ pub const ALL: &[&str] = &[
     "contrast",
     "gamma",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many shapes icon `name` draws into a 24-unit square.
+    fn shapes_of(name: &str) -> usize {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            paint(&painter, Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(24.0, 24.0)), name, Color32::BLACK, Color32::BLUE);
+        });
+        out.textures_delta.clear();
+        out.shapes.len()
+    }
+
+    /// Every listed icon draws something; the broken-layer warning is listed and has its own
+    /// drawing (a triangle, a stroke and a dot), not the plain square an unknown name gets.
+    #[test]
+    fn every_listed_icon_is_drawn() {
+        for name in ALL {
+            assert!(shapes_of(name) > 0, "{name}");
+        }
+        assert!(ALL.contains(&"warning"));
+        assert!(shapes_of("warning") > shapes_of("no such icon"));
+    }
+}

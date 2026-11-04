@@ -1969,6 +1969,31 @@ fn a_picture_is_a_marker_on_points() {
     assert_eq!((s.undo_depth(), symbol(&s).marker), (depth, Marker::Image(img)));
 }
 
+/// A drawn marker (an import's) keeps its paths when only its size changes; "Custom" is not a shape
+/// a command sets.
+#[test]
+fn a_drawn_marker_survives_a_new_size() {
+    use rustgis_map::{Marker, PathPart, PathRef, PathShape, Rgba};
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let part = PathPart {
+        points: vec![[0.0, 0.5], [0.5, -0.5], [-0.5, -0.5]],
+        closed: true,
+        fill: Some(Rgba::rgb(9, 9, 9)),
+        stroke: None,
+        width: 0.0,
+    };
+    let path = Marker::Path(PathRef::new(PathShape { parts: vec![part] }).unwrap());
+    let single = rustgis_map::Renderer::Single(rustgis_map::Symbol { marker: path, ..s.map().layer(id).unwrap().symbol(0) });
+    s.map_mut().layer_mut(id).unwrap().renderer = single;
+    let symbol = |s: &Session| s.map().layer_by_name("Cities").unwrap().symbol(0);
+    s.run("layer.marker", &json!({"layer": "Cities", "size": 12})).unwrap();
+    assert_eq!((symbol(&s).marker, symbol(&s).size), (path, 12.0));
+    let err = s.run("layer.marker", &json!({"layer": "Cities", "shape": "custom"})).unwrap_err();
+    assert!(err.contains("unknown marker shape"), "{err}");
+    assert_eq!(symbol(&s).marker, path);
+}
+
 /// A layout picture added from a file remembers it, and `path` relinks it to another.
 #[test]
 fn pictures_keep_their_path_and_relink() {
@@ -2136,6 +2161,15 @@ fn hostile_params_never_panic() {
         json!({"maps": {"a": null}}),
         json!({"text": "{\"type\":\"CIMLayoutDocument\"}"}),
         json!({"text": "{\"type\":\"CIMLayoutDocument\",\"layoutDefinition\":{\"page\":{\"width\":1e308,\"height\":-1},\"elements\":[{\"type\":\"CIMMapFrame\",\"uRI\":7}]}}", "dir": 7}),
+        // ArcGIS Pro projects, maps and layer files: a missing file, a zip header alone, a project
+        // with nothing in it, a map whose definition isn't one, and junk lists of names.
+        json!({"path": "/nonexistent/x.aprx"}),
+        json!({"data": "UEsDBAo="}),
+        json!({"text": "{\"type\":\"CIMGISProject\"}"}),
+        json!({"text": "{\"type\":\"CIMMapDocument\",\"mapDefinition\":7}"}),
+        json!({"maps": 7}),
+        json!({"maps": [null, 1e308, ""]}),
+        json!({"layouts": {"a": 1}}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);
@@ -2848,6 +2882,135 @@ fn label_classes_convert_and_outlive_a_deleted_field() {
         "the other classes are kept, on its new field"
     );
     assert_eq!((l.default.name.as_str(), l.default.visible, l.default.where_.as_deref()), ("Rest", false, Some("name <> 'x'")));
+}
+
+/// `labels.field` takes a `{Field}` template whose fields the layer has, and refuses one naming a
+/// field it hasn't, one with no field, and one too long.
+#[test]
+fn labels_field_accepts_a_template_and_refuses_a_missing_field() {
+    let mut s = world();
+    let field = |s: &Session| s.map().layer_by_name("Cities").unwrap().labels.default.field.clone();
+    s.run("labels.field", &json!({"layer": "Cities", "field": "{name} ({pop_max})"})).unwrap();
+    assert_eq!(field(&s), "{name} ({pop_max})");
+    assert!(s.map().layer_by_name("Cities").unwrap().labels.enabled);
+    let e = s.run("labels.field", &json!({"layer": "Cities", "field": "{name} {gone}"})).unwrap_err();
+    assert_eq!(e, "no field named 'gone'");
+    assert!(s.run("labels.field", &json!({"layer": "Cities", "field": "{}"})).is_err(), "a template of no field");
+    let long = format!("{{name}}{}", "x".repeat(rustgis_map::symbology::MAX_TEMPLATE));
+    assert!(s.run("labels.field", &json!({"layer": "Cities", "field": long})).is_err(), "too long");
+    assert_eq!(field(&s), "{name} ({pop_max})", "a refused template leaves the field");
+    // A plain field still takes the layer's own spelling.
+    s.run("labels.field", &json!({"layer": "Cities", "field": "NAME"})).unwrap();
+    assert_eq!(field(&s), "name");
+}
+
+/// An imported class labelled by a template stays on while the layer has one of its fields, and
+/// each field it lacks is noted; one with none of them is turned off.
+#[test]
+fn an_imported_template_missing_a_field_is_noted_and_drawn() {
+    use rustgis_map::qgis::{NoteKind, Report};
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let l = s.map_mut().layer_mut(id).unwrap();
+    l.labels.default.field = "{name} {gone}".into();
+    let mut report = Report::default();
+    crate::cmd::qgis::check_fields(l, "Cities", &mut report);
+    assert!(l.labels.default.visible);
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.kind, n.text.as_str())).collect();
+    assert_eq!(
+        notes,
+        [(NoteKind::Approximated, "labels from the field gone, which the layer hasn't; the rest of the expression is drawn")]
+    );
+    l.labels.default.field = "{gone} {lost}".into();
+    let mut report = Report::default();
+    crate::cmd::qgis::check_fields(l, "Cities", &mut report);
+    assert!(!l.labels.default.visible, "a template of no field the layer has labels nothing");
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.kind, n.text.as_str())).collect();
+    assert_eq!(notes, [(NoteKind::Skipped, "labels from the fields gone, lost, which the layer hasn't")]);
+}
+
+/// A Cities class labelled by `{name} {pop_max}`, and Default by a template too.
+fn cities_with_template_classes() -> (Session, u32) {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    s.run("layer.select", &json!({"layer": id})).unwrap();
+    s.run("labels.class.add", &json!({"name": "Both"})).unwrap();
+    s.run("labels.field", &json!({"class": "Both", "field": "{name} {pop_max}"})).unwrap();
+    s.run("labels.field", &json!({"field": "{name} ({pop_max})"})).unwrap();
+    (s, id)
+}
+
+/// Deleting a field a template doesn't name leaves it as it was, Default's too.
+#[test]
+fn deleting_an_unrelated_field_keeps_a_label_template() {
+    let (mut s, id) = cities_with_template_classes();
+    s.run("edit.deleteField", &json!({"layer": id, "field": "adm0name"})).unwrap();
+    let l = &s.map().layer(id).unwrap().labels;
+    assert_eq!(l.classes[0].field, "{name} {pop_max}");
+    assert_eq!(l.default.field, "{name} ({pop_max})");
+    assert!(l.enabled);
+    // A template missing one of its fields still labels, and stays.
+    s.run("edit.deleteField", &json!({"layer": id, "field": "pop_max"})).unwrap();
+    let l = &s.map().layer(id).unwrap().labels;
+    assert_eq!(l.classes[0].field, "{name} {pop_max}");
+    assert_eq!(l.default.field, "{name} ({pop_max})");
+    assert!(l.enabled);
+}
+
+/// A template none of whose fields is left is repointed as a missing plain field is: Default
+/// starts again on a name-like field (labels off), and the other class takes its field.
+#[test]
+fn deleting_every_template_field_repoints_the_class() {
+    let (mut s, id) = cities_with_template_classes();
+    s.run("edit.deleteField", &json!({"layer": id, "field": "name"})).unwrap();
+    s.run("edit.deleteField", &json!({"layer": id, "field": "pop_max"})).unwrap();
+    let l = &s.map().layer(id).unwrap();
+    let labels = &l.labels;
+    assert!(!labels.enabled, "Default's text going turns the labels off");
+    assert_eq!(labels.default.field, rustgis_map::LabelClass::default_for(&l.dataset).field);
+    assert!(l.dataset.field_index(&labels.default.field).is_some());
+    assert_eq!(labels.classes[0].field, labels.default.field, "the class takes Default's field");
+}
+
+/// A MapLibre style labels by a template as a concatenation of its text and fields, empty when
+/// every field is null (as the map draws none); a plain field as before.
+#[test]
+fn web_style_labels_by_a_template() {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let text_field = |s: &Session| {
+        let style = crate::cmd::sharing::web_style(s.map().layer(id).unwrap());
+        let label = style["layers"].as_array().unwrap().iter().find(|l| l["type"] == "symbol").cloned().unwrap();
+        label["layout"]["text-field"].clone()
+    };
+    s.run("labels.field", &json!({"layer": id, "field": "name"})).unwrap();
+    assert_eq!(text_field(&s), json!(["to-string", ["get", "name"]]));
+    s.run("labels.field", &json!({"layer": id, "field": "{NAME} ({pop_max}) {{x}}"})).unwrap();
+    assert_eq!(
+        text_field(&s),
+        json!([
+            "case",
+            ["all", ["==", ["get", "name"], null], ["==", ["get", "pop_max"], null]],
+            "",
+            ["concat", ["to-string", ["get", "name"]], " (", ["to-string", ["get", "pop_max"]], ") {x}"]
+        ])
+    );
+}
+
+/// Converting labels drawn from a template gives each point the template's text.
+#[test]
+fn convert_to_annotation_uses_the_template() {
+    let mut s = world();
+    s.run("labels.field", &json!({"layer": "Cities", "field": "{name}: {pop_max}"})).unwrap();
+    let cities = s.map().layer_by_name("Cities").unwrap();
+    let (ni, pi) = (cities.dataset.field_index("name").unwrap(), cities.dataset.field_index("pop_max").unwrap());
+    let row = (0..cities.dataset.features.len()).find(|&r| cities.visible_rows().get(r) == Some(&true)).unwrap();
+    let want = format!("{}: {}", cities.dataset.value(row, ni), cities.dataset.value(row, pi));
+    let r = s.run("labels.convert", &json!({"layer": "Cities"})).unwrap();
+    let a = s.map().layer(u32::try_from(r["layer"].as_u64().unwrap()).unwrap()).unwrap();
+    let texts: Vec<String> = (0..a.dataset.features.len()).map(|r| a.dataset.value(r, 0).to_string()).collect();
+    assert!(texts.contains(&want), "{want} not among {:?}", texts.get(..3));
+    assert!(texts.iter().all(|t| t.contains(": ")));
 }
 
 #[test]
@@ -7385,6 +7548,19 @@ fn plugin_data_cubes_need_files_and_network() {
         assert!(e.contains("'files' and 'network' permissions"), "{id}: {e}");
     }
     rustgis_plugins::unload("eng-cube-files");
+}
+
+/// Retry reopens a broken layer's file or adds its service again: a plugin needs both `files`
+/// and `network` to run it.
+#[test]
+fn plugin_layer_retry_needs_files_and_network() {
+    let mut s = world();
+    for (name, permissions) in [("eng-retry-files", ["edit", "files"]), ("eng-retry-network", ["edit", "network"])] {
+        plugin(name, &permissions);
+        let e = forward(&mut s, name, "layer.retry", json!({"all": true})).unwrap_err();
+        assert!(e.contains("'files' and 'network' permissions"), "{name}: {e}");
+        rustgis_plugins::unload(name);
+    }
 }
 
 #[test]
@@ -22553,6 +22729,9 @@ fn geolibre_remote_plain_tiff_folder_opacity_is_not_baked_twice() {
                 }
                 Err(_) => break,
             };
+            // An accepted socket can inherit the listener's nonblocking mode (Windows): a read
+            // would find nothing yet and the request be answered empty, aborting the client's.
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
             let mut input = [0; 8192];
             let n = stream.read(&mut input).unwrap_or(0);
@@ -23093,7 +23272,9 @@ fn a_pagx_whose_data_is_missing_still_reuses_its_map() {
     let maps = s.project.maps.len();
     let params = json!({"text": text, "maps": {"MAIN MAP": "World"}});
     let first = s.run("layout.import", &params).unwrap();
-    assert!(first["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "Gone" && n["kind"] == "skipped"), "{}", first["notes"]);
+    // In the map broken, so said, but not as left out.
+    let gone = |kind: &str| first["notes"].as_array().unwrap().iter().any(|n| n["layer"] == "Gone" && n["kind"] == kind);
+    assert!(gone("approximated") && !gone("skipped"), "{}", first["notes"]);
     s.run("layout.import", &params).unwrap();
     assert_eq!(s.project.maps.len(), maps + 1);
     // Another map of the embedded map's name: the import's own map, numbered, is still found.
@@ -23269,4 +23450,959 @@ fn rgislayout_files_still_import() {
     assert_eq!(s.project.layouts.len(), layouts + 3);
     assert!(s.run("layout.import", &json!({"text": "{}"})).is_err());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A broken layer named Borders: the sample Countries' unique-value symbology and labels and a
+/// definition query, on a shapefile at `path` that isn't there (yet).
+fn broken_countries(s: &mut Session, path: &std::path::Path) -> u32 {
+    let mut w = world();
+    w.run("layer.symbology", &json!({"layer": "Countries", "type": "unique", "field": "continent"})).unwrap();
+    w.run("labels.field", &json!({"layer": "Countries", "field": "name"})).unwrap();
+    let countries = w.map().layer_by_name("Countries").unwrap();
+    assert!(countries.labels.enabled);
+    let src = rustgis_map::source::SourceLayer::broken(
+        "ArcGIS Pro read it from a shapefile".into(),
+        Some(path.display().to_string()),
+        None,
+        None,
+        "the file isn't there".into(),
+    );
+    let id = s.map_mut().add_streamed("Borders", src);
+    let l = s.map_mut().layer_mut(id).unwrap();
+    l.renderer = countries.renderer.clone();
+    l.labels = countries.labels.clone();
+    l.definition_query = Some("pop_est > 1000".into());
+    id
+}
+
+/// A broken layer named Parcels on a feature service nobody answers at.
+fn broken_service(s: &mut Session) -> u32 {
+    let url = "https://127.0.0.1:9/x/FeatureServer";
+    let service = rustgis_map::source::ServiceOrigin { url: url.into(), kind: "arcgis".into(), layer: "0".into() };
+    let src = rustgis_map::source::SourceLayer::broken(
+        format!("ArcGIS Pro read it from {url}"),
+        None,
+        None,
+        Some(service),
+        "it needs a sign-in".into(),
+    );
+    s.map_mut().add_streamed("Parcels", src)
+}
+
+/// The sample's Countries written as a shapefile at `path`: the file a broken layer waited for.
+fn countries_shapefile(path: &std::path::Path) {
+    let mut w = world();
+    w.run("share.exportLayer", &json!({"layer": "Countries", "path": path.display().to_string()})).unwrap();
+}
+
+fn broken_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("rustgis-broken-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    dir
+}
+
+#[test]
+fn a_broken_layer_round_trips_and_repairs() {
+    let dir = broken_dir("repair");
+    let shp = dir.join("data").join("countries.shp");
+    let mut s = Session::new(Project::default());
+    let id = broken_countries(&mut s, &shp);
+    let service = broken_service(&mut s);
+    s.run("group.add", &json!({"name": "Boundaries", "layers": [id]})).unwrap();
+    let style = |s: &Session| {
+        let l = s.map().layer(id).unwrap();
+        (serde_json::to_value(&l.renderer).unwrap(), serde_json::to_value(&l.labels).unwrap(), l.definition_query.clone())
+    };
+    let before = style(&s);
+    let project = dir.join("broken.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    let l = t.map().layer(id).unwrap();
+    assert_eq!(l.name, "Borders");
+    assert_eq!(t.map().group_of(id).map(|g| g.name.as_str()), Some("Boundaries"));
+    assert_eq!(style(&t), before);
+    let src = l.source.as_ref().unwrap();
+    assert_eq!(src.origin.as_deref(), Some("ArcGIS Pro read it from a shapefile"));
+    assert_eq!(src.path.as_deref().map(std::path::Path::new), Some(shp.as_path()));
+    assert!(src.is_broken());
+    // Why each didn't open is kept, as the importer said it, before anything draws. (Loading
+    // tried the file again: its own error comes first.)
+    assert_eq!(src.reason.as_deref(), Some("the file isn't there"));
+    assert!(src.why_broken().is_some());
+    let src = t.map().layer(service).unwrap().source.as_ref().unwrap();
+    assert_eq!((src.reason.as_deref(), src.why_broken()), (Some("it needs a sign-in"), Some("it needs a sign-in")));
+    assert!(src.is_broken());
+    // Drawn, it is still broken and says why.
+    t.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 64, "height": 64})).unwrap();
+    let src = t.map().layer(id).unwrap().source.as_ref().unwrap();
+    assert!(src.error.is_some());
+    assert!(src.is_broken());
+
+    // The file turns up; Repair opens it, and the style stays.
+    countries_shapefile(&shp);
+    t.run("layer.repairSource", &json!({"layer": id, "path": shp.display().to_string()})).unwrap();
+    assert_eq!(style(&t), before);
+    let l = t.map().layer(id).unwrap();
+    assert_eq!(l.geometry_type(), rustgis_data::GeometryType::Polygon);
+    let src = l.source.as_ref().unwrap();
+    assert!(src.is_open());
+    assert_eq!((&src.origin, &src.reason), (&None, &None));
+    assert!(!src.is_broken());
+    assert_eq!(t.map().group_of(id).map(|g| g.name.as_str()), Some("Boundaries"));
+    // The service layer still says why it is broken after the map drew.
+    let src = t.map().layer(service).unwrap().source.as_ref().unwrap();
+    assert_eq!(src.why_broken(), Some("it needs a sign-in"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A broken layer whose file is back when the project opens again opens on its own, settling as
+/// Retry would: no origin or reason left, its geometry learnt, a query that doesn't fit dropped.
+#[test]
+fn a_broken_layer_whose_file_is_back_opens_on_its_own() {
+    let dir = broken_dir("reload");
+    let shp = dir.join("data").join("countries.shp");
+    let mut s = Session::new(Project::default());
+    let fits = broken_countries(&mut s, &shp);
+    let misfit = broken_countries(&mut s, &shp);
+    s.map_mut().layer_mut(misfit).unwrap().definition_query = Some("nope = 1".into());
+    let project = dir.join("broken.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+    countries_shapefile(&shp);
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    t.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 64, "height": 64})).unwrap();
+    for id in [fits, misfit] {
+        let l = t.map().layer(id).unwrap();
+        let src = l.source.as_ref().unwrap();
+        assert!(src.is_open() && !src.is_broken());
+        assert_eq!((&src.origin, &src.reason), (&None, &None));
+        assert_eq!(l.geometry_type(), rustgis_data::GeometryType::Polygon);
+    }
+    assert_eq!(t.map().layer(fits).unwrap().definition_query.as_deref(), Some("pop_est > 1000"));
+    assert_eq!(t.map().layer(misfit).unwrap().definition_query, None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn layer_retry_reopens_a_file_and_reports_a_service_it_cannot_reach() {
+    let dir = broken_dir("retry");
+    let shp = dir.join("data").join("countries.shp");
+    let mut s = Session::new(Project::default());
+    let file = broken_countries(&mut s, &shp);
+    let service = broken_service(&mut s);
+    let renderer = serde_json::to_value(&s.map().layer(file).unwrap().renderer).unwrap();
+    // Neither layer nor all: there's nothing to retry.
+    assert!(s.run("layer.retry", &json!({})).is_err());
+    // Nothing is there yet: both fail, and both stay.
+    let r = s.run("layer.retry", &json!({"all": true})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["opened"].as_u64()), (Some(2), Some(0)), "{r}");
+    assert_eq!(r["failed"].as_array().map(Vec::len), Some(2), "{r}");
+
+    // The file turns up: it opens; the service still can't be reached.
+    countries_shapefile(&shp);
+    let r = s.run("layer.retry", &json!({"all": true})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["opened"].as_u64()), (Some(2), Some(1)), "{r}");
+    let failed = r["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{r}");
+    assert_eq!(failed[0]["layer"], "Parcels");
+    assert!(failed[0]["error"].as_str().is_some_and(|e| !e.is_empty()), "{r}");
+    let l = s.map().layer(file).unwrap();
+    assert_eq!(l.geometry_type(), rustgis_data::GeometryType::Polygon);
+    assert!(l.dataset.fields.iter().any(|f| f.name.eq_ignore_ascii_case("continent")));
+    assert_eq!(serde_json::to_value(&l.renderer).unwrap(), renderer);
+    assert_eq!(l.definition_query.as_deref(), Some("pop_est > 1000"));
+    let src = l.source.as_ref().unwrap();
+    assert!(src.is_open() && !src.is_broken() && src.origin.is_none());
+    let l = s.map().layer(service).unwrap();
+    assert!(l.source.as_ref().is_some_and(|src| src.is_broken() && src.service.is_some()));
+
+    // One layer by name; one that isn't broken is neither retried nor failed.
+    let r = s.run("layer.retry", &json!({"layer": "Borders"})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["opened"].as_u64(), r["failed"].as_array().map(Vec::len)), (Some(0), Some(0), Some(0)), "{r}");
+    let r = s.run("layer.retry", &json!({"layer": service})).unwrap();
+    assert_eq!((r["retried"].as_u64(), r["failed"][0]["layer"].as_str()), (Some(1), Some("Parcels")), "{r}");
+    // A query its opened data's fields don't fit is cleared, and said so.
+    let misfit = broken_countries(&mut s, &shp);
+    s.map_mut().layer_mut(misfit).unwrap().definition_query = Some("nope = 1".into());
+    let r = s.run("layer.retry", &json!({"layer": misfit})).unwrap();
+    assert_eq!(r["opened"].as_u64(), Some(1), "{r}");
+    assert_eq!(s.map().layer(misfit).unwrap().definition_query, None);
+    assert!(s.notices.iter().any(|n| n.text.contains("nope = 1")), "{:?}", s.notices);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A retried service that answers with a table, not a layer of features: the table isn't kept,
+/// so retrying again doesn't add another copy; the layer stays broken.
+#[test]
+fn a_retried_service_that_answers_a_table_leaves_no_table_behind() {
+    use ogc_server::{Route, Server, arcgis_layer};
+    let rows = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "id": 1, "properties": {"OBJECTID": 1, "code": "A"}, "geometry": null}]}"#;
+    let server = Server::new(vec![
+        Route::new("/arcgis/rest/services/T/FeatureServer", r#"{"currentVersion": 11.5, "layers": [{"id": 0, "name": "Lookup"}]}"#),
+        Route::new("/arcgis/rest/services/T/FeatureServer/0/query", rows),
+        Route::new("/arcgis/rest/services/T/FeatureServer/0", &arcgis_layer(1000, false)),
+    ]);
+    let url = format!("{}/arcgis/rest/services/T/FeatureServer", server.base);
+    let mut s = Session::new(Project::default());
+    let service = rustgis_map::source::ServiceOrigin { url: url.clone(), kind: "arcgis".into(), layer: "Lookup".into() };
+    let src = rustgis_map::source::SourceLayer::broken(
+        "ArcGIS Pro read it from a service".into(),
+        None,
+        None,
+        Some(service),
+        "it needs a sign-in".into(),
+    );
+    let id = s.map_mut().add_streamed("Lookup", src);
+    let tables = s.project.tables.len();
+    for _ in 0..2 {
+        let r = s.run("layer.retry", &json!({"layer": id})).unwrap();
+        let error = r["failed"][0]["error"].as_str().unwrap_or_default();
+        assert!(error.contains("came back as a table"), "{r}");
+        assert_eq!(s.project.tables.len(), tables, "{r}");
+    }
+    assert!(s.map().layer(id).and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken()));
+}
+
+/// A broken layer with no file or service to read again can't be retried or repaired: removing
+/// it is all there is to offer.
+#[test]
+fn retrying_a_layer_with_nothing_to_read_offers_only_removing_it() {
+    let mut s = Session::new(Project::default());
+    let src = rustgis_map::source::SourceLayer::broken(
+        "an SDE geodatabase".into(),
+        None,
+        None,
+        None,
+        "RustGIS can't open this kind of data".into(),
+    );
+    let id = s.map_mut().add_streamed("Mains", src);
+    let r = s.run("layer.retry", &json!({"layer": id})).unwrap();
+    assert_eq!(r["failed"][0]["error"], "there's no file or service to read it from again: remove it", "{r}");
+}
+
+#[test]
+fn a_broken_layer_draws_nothing_and_is_not_a_table() {
+    let dir = broken_dir("draw");
+    let mut s = Session::new(Project::default());
+    let tables: Vec<String> = s.project.tables.iter().map(|t| t.name.clone()).collect();
+    let png = |s: &mut Session, name: &str| {
+        let path = dir.join(name);
+        s.run("share.exportMap", &json!({"path": path.display().to_string(), "width": 160, "height": 100})).unwrap();
+        std::fs::read(path).unwrap()
+    };
+    let empty = png(&mut s, "empty.png");
+    broken_countries(&mut s, &dir.join("data").join("missing.shp"));
+    broken_service(&mut s);
+    assert_eq!(png(&mut s, "broken.png"), empty);
+    assert_eq!(s.project.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), tables);
+    assert_eq!(s.map().layers.len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- ArcGIS Pro maps (.mapx) ----
+
+/// The sample's Countries as a shapefile, written once for every test that uses it.
+fn pro_map_shapefile() -> std::path::PathBuf {
+    static SHP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    SHP.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("rustgis-pro-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shp = dir.join("countries.shp");
+        countries_shapefile(&shp);
+        shp
+    })
+    .clone()
+}
+
+/// A `CIMMapDocument` "Site Plan" in Web Mercator: a hidden, folded group "Boundaries" holding
+/// the sample shapefile twice (one with a definition query and a label template that fit it, or
+/// half fit it; one with neither fitting), a feature service nobody answers at, an SDE layer with
+/// a password in its connection, vector tiles, a raster whose file isn't there, and a standalone
+/// table whose file isn't there either.
+fn pro_mapx() -> String {
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    let conn = |factory: &str, connection: &str, dataset: &str| {
+        json!({"type": "CIMStandardDataConnection", "workspaceConnectionString": connection, "workspaceFactory": factory,
+            "dataset": dataset, "datasetType": "esriDTFeatureClass"})
+    };
+    let label = |expression: &str| {
+        json!({"labelVisibility": true, "labelClasses": [{"type": "CIMLabelClass", "name": "Class 1", "expression": expression,
+            "expressionEngine": "Arcade", "visibility": true,
+            "textSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 10}}}]})
+    };
+    let feature = |name: &str, uri: &str, connection: Value, query: Option<&str>, extra: Value| {
+        let mut table = json!({"type": "CIMFeatureTable", "dataConnection": connection});
+        if let Some(q) = query {
+            table["definitionExpression"] = json!(q);
+        }
+        let mut l = json!({"type": "CIMFeatureLayer", "name": name, "uRI": uri, "visibility": true, "featureTable": table});
+        l.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        l
+    };
+    let shp_conn = conn("Shapefile", &format!("DATABASE={folder}"), &file);
+    let inside = feature(
+        "Countries Inside",
+        "CIMPATH=site_plan/countries_inside.json",
+        shp_conn.clone(),
+        Some("pop_est > 1000"),
+        label(r#"$feature.name + " " + $feature.GONE"#),
+    );
+    let misfit = feature("Countries Misfit", "CIMPATH=site_plan/countries_misfit.json", shp_conn, Some("nope = 1"), label("$feature.GONE"));
+    let group = json!({"type": "CIMGroupLayer", "name": "Boundaries", "uRI": "CIMPATH=site_plan/boundaries.json", "visibility": false,
+        "expanded": false, "layers": ["CIMPATH=site_plan/countries_inside.json", "CIMPATH=site_plan/countries_misfit.json"]});
+    let parcels = feature(
+        "Parcels",
+        "CIMPATH=site_plan/parcels.json",
+        conn("FeatureService", "URL=https://127.0.0.1:9/arcgis/rest/services/P/FeatureServer", "0"),
+        None,
+        json!({}),
+    );
+    let mains = feature(
+        "Mains",
+        "CIMPATH=site_plan/mains.json",
+        conn(
+            "SDE",
+            "ENCRYPTED_PASSWORD=00ff;SERVER=gis-db;INSTANCE=sde:sqlserver:gis-db;DATABASE=utility;USER=editor;PASSWORD=swordfish",
+            "utility.dbo.mains",
+        ),
+        None,
+        json!({}),
+    );
+    let streets = json!({"type": "CIMVectorTileLayer", "name": "Streets", "uRI": "CIMPATH=site_plan/streets.json", "visibility": true,
+        "dataConnection": {"type": "CIMVectorTileDataConnection", "uRI": "https://127.0.0.1:9/arcgis/rest/services/Streets/VectorTileServer"}});
+    let elevation = json!({"type": "CIMRasterLayer", "name": "Elevation", "uRI": "CIMPATH=site_plan/elevation.json", "visibility": true,
+        "dataConnection": conn("Raster", &format!("DATABASE={folder}"), "rustgis-no-such-dem.tif")});
+    let owners = json!({"type": "CIMStandaloneTable", "name": "Owners", "uRI": "CIMPATH=site_plan/owners.json",
+        "dataConnection": conn("Shapefile", &format!("DATABASE={folder}"), "rustgis-no-such-owners.dbf")});
+    let doc = json!({"type": "CIMMapDocument", "version": "3.7.0",
+        "mapDefinition": {"type": "CIMMap", "name": "Site Plan", "uRI": "CIMPATH=map/site_plan.json",
+            "layers": ["CIMPATH=site_plan/boundaries.json", "CIMPATH=site_plan/parcels.json", "CIMPATH=site_plan/mains.json",
+                "CIMPATH=site_plan/streets.json", "CIMPATH=site_plan/elevation.json"],
+            "standaloneTables": ["CIMPATH=site_plan/owners.json"],
+            "referenceScale": 50000,
+            "spatialReference": {"wkid": 102100, "latestWkid": 3857},
+            "defaultExtent": {"xmin": -2e6, "ymin": -1e6, "xmax": 2e6, "ymax": 1e6, "spatialReference": {"wkid": 102100}}},
+        "layerDefinitions": [group, inside, misfit, parcels, mains, streets, elevation],
+        "tableDefinitions": [owners]});
+    type_first(doc)
+}
+
+/// Adds `text`'s map (a `CIMMapDocument`) to `s` as `project.importArcgis` will, with the
+/// shapefile's folder for its relative paths: what was added, and the notes as `"layer: text"`.
+fn add_pro_map(s: &mut Session, text: &str, camera: Option<(f64, f64, f64)>) -> (crate::cmd::arcgis_pro::Added, Vec<String>) {
+    let dir = pro_map_shapefile().parent().unwrap().display().to_string();
+    add_pro_map_in(s, text, Some(&dir), camera)
+}
+
+/// `add_pro_map`, with `dir` for the folder relative paths start from.
+fn add_pro_map_in(
+    s: &mut Session,
+    text: &str,
+    dir: Option<&str>,
+    camera: Option<(f64, f64, f64)>,
+) -> (crate::cmd::arcgis_pro::Added, Vec<String>) {
+    use rustgis_map::cim::{self, Document, Report};
+    let doc = Document::from_json(text).unwrap();
+    let mut report = Report::default();
+    let m = cim::read_map_def(&doc, doc.map_definition().unwrap(), &mut report).unwrap();
+    let added = crate::cmd::arcgis_pro::add_map(s, &m, dir, camera, m.bearing, &mut report).unwrap();
+    (added, report.notes.iter().map(|n| format!("{}: {}", n.layer, n.text)).collect())
+}
+
+#[test]
+fn a_pro_map_adds_its_groups_layers_and_broken_layers() {
+    use rustgis_map::qgis::QGIS_SCALE;
+    let mut s = world();
+    let tables: Vec<String> = s.project.tables.iter().map(|t| t.name.clone()).collect();
+    let (added, notes) = add_pro_map(&mut s, &pro_mapx(), None);
+    let m = s.map();
+    assert_eq!((m.name.as_str(), added.name.as_str()), ("Site Plan", "Site Plan"));
+    assert_eq!(m.basemap, rustgis_map::Basemap::Blank);
+    assert_eq!((added.layers, added.broken), (6, 3), "{notes:?}");
+    let id = |name: &str| m.layer_by_name(name).unwrap_or_else(|| panic!("no layer {name}")).id;
+    // The group, hidden and folded as Pro had it, holding both shapefile layers in their order.
+    let g = &m.groups[0];
+    assert_eq!(g.name, "Boundaries");
+    assert!(!g.visible && !g.expanded);
+    assert_eq!(m.group_layers(g.id), vec![id("Countries Inside"), id("Countries Misfit")]);
+    // Top to bottom as Pro lists them (the tiles aside).
+    let order: Vec<&str> = m.layers.iter().filter(|l| !l.graphics).map(|l| l.name.as_str()).collect();
+    assert_eq!(order, ["Countries Inside", "Countries Misfit", "Parcels", "Mains", "Elevation"]);
+    // The service nobody answers at: broken, with the service to retry.
+    let src = m.layer(id("Parcels")).unwrap().source.as_ref().unwrap();
+    assert!(src.is_broken());
+    let service = src.service.as_ref().unwrap();
+    assert!(service.url.ends_with("/FeatureServer") && service.kind == "arcgis" && service.layer == "0", "{service:?}");
+    assert!(src.origin.as_deref().unwrap().contains("https://127.0.0.1:9/arcgis/rest/services/P/FeatureServer"), "{:?}", src.origin);
+    assert!(notes.iter().any(|n| n.starts_with("Parcels: ")), "{notes:?}");
+    // The SDE layer: broken, its origin naming server, database and table, and no secret.
+    let src = m.layer(id("Mains")).unwrap().source.as_ref().unwrap();
+    assert!(src.is_broken());
+    let origin = src.origin.as_deref().unwrap();
+    for part in ["gis-db", "utility", "utility.dbo.mains"] {
+        assert!(origin.contains(part), "{origin}");
+    }
+    for secret in ["PASSWORD", "USER", "swordfish", "editor", "00ff"] {
+        assert!(!origin.contains(secret) && !src.why_broken().unwrap_or_default().contains(secret), "{origin}");
+        assert!(!notes.iter().any(|n| n.contains(secret)), "{notes:?}");
+    }
+    // The raster whose file isn't there: broken, with its file kept for Repair.
+    let src = m.layer(id("Elevation")).unwrap().source.as_ref().unwrap();
+    assert!(src.is_broken() && src.path.as_deref().is_some_and(|p| p.ends_with("rustgis-no-such-dem.tif")), "{src:?}");
+    // The vector tiles: a style tile layer.
+    assert!(m.tiles.iter().any(|t| t.name == "Streets" && t.kind == rustgis_map::tiles::TileKind::Style), "{:?}", m.tiles);
+    // The map's reference scale on the layers whose symbols take it.
+    for name in ["Countries Inside", "Countries Misfit"] {
+        assert_eq!(m.layer(id(name)).unwrap().reference_scale, Some(50000.0 * QGIS_SCALE), "{name}");
+    }
+    // The query that fits is kept; the one that doesn't is said and dropped.
+    assert_eq!(m.layer(id("Countries Inside")).unwrap().definition_query.as_deref(), Some("pop_est > 1000"));
+    assert_eq!(m.layer(id("Countries Misfit")).unwrap().definition_query, None);
+    assert!(notes.iter().any(|n| n.starts_with("Countries Misfit: ") && n.contains("nope = 1")), "{notes:?}");
+    // The table that isn't there: said, and the project's tables as they were.
+    assert_eq!(s.project.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), tables);
+    assert!(notes.iter().any(|n| n.starts_with("Owners: ")), "{notes:?}");
+}
+
+#[test]
+fn a_pro_map_opens_at_its_saved_camera() {
+    use rustgis_geom::{Coord, lonlat_to_merc};
+    let at = lonlat_to_merc(Coord::new(-97.0, 38.0));
+    let mut s = world();
+    let (_, notes) = add_pro_map(&mut s, &pro_mapx(), Some((at.x, at.y, 100_000.0)));
+    let c = s.map().center_lonlat();
+    assert!((c.x + 97.0).abs() < 1e-6 && (c.y - 38.0).abs() < 1e-6, "{c:?} {notes:?}");
+    let scale = s.map().scale();
+    let want = 100_000.0 * rustgis_map::qgis::QGIS_SCALE;
+    assert!((scale - want).abs() < 1e-6 * want, "{scale} vs {want}");
+}
+
+#[test]
+fn a_label_template_with_a_missing_field_is_noted_not_dropped() {
+    let mut s = world();
+    let (_, notes) = add_pro_map(&mut s, &pro_mapx(), None);
+    let classes = |name: &str| {
+        let l = s.map().layer_by_name(name).unwrap();
+        std::iter::once(&l.labels.default).chain(l.labels.classes.iter()).cloned().collect::<Vec<_>>()
+    };
+    // A template that has one of its fields draws, without the one it hasn't.
+    assert!(classes("Countries Inside").iter().any(|c| c.field == "{name} {GONE}" && c.visible), "{:?}", classes("Countries Inside"));
+    assert!(notes.iter().any(|n| n.starts_with("Countries Inside: ") && n.contains("GONE")), "{notes:?}");
+    // One with none of its fields labels nothing: switched off, and said.
+    let misfit = classes("Countries Misfit");
+    assert!(misfit.iter().any(|c| c.field == "GONE") && misfit.iter().filter(|c| c.field == "GONE").all(|c| !c.visible), "{misfit:?}");
+    assert!(notes.iter().any(|n| n.starts_with("Countries Misfit: ") && n.contains("GONE")), "{notes:?}");
+}
+
+#[test]
+fn the_layout_path_now_keeps_groups() {
+    // The embedded map's layer in a group, beside one whose file isn't there, with a query that
+    // doesn't fit it.
+    let mut doc: Value = serde_json::from_str(&pagx()).unwrap();
+    doc["layerDefinitions"][0]["featureTable"]["definitionExpression"] = json!("nope = 1");
+    let mut gone = doc["layerDefinitions"][0].clone();
+    gone["name"] = json!("Gone");
+    gone["uRI"] = json!("CIMPATH=new_detail_map/gone.json");
+    gone["featureTable"]["dataConnection"]["dataset"] = json!("rustgis-no-such-file.shp");
+    let group = json!({"type": "CIMGroupLayer", "name": "Points Group", "uRI": "CIMPATH=new_detail_map/points_group.json",
+        "visibility": true, "expanded": true, "layers": ["CIMPATH=new_detail_map/detail_points.json", "CIMPATH=new_detail_map/gone.json"]});
+    doc["layerDefinitions"].as_array_mut().unwrap().extend([gone, group]);
+    doc["mapDefinitions"][0]["layers"] = json!(["CIMPATH=new_detail_map/points_group.json"]);
+    let text = type_first(doc);
+    let mut s = world();
+    let maps = s.project.maps.len();
+    let params = json!({"text": text, "maps": {"MAIN MAP": "World"}});
+    let r = s.run("layout.import", &params).unwrap();
+    let notes = r["notes"].as_array().unwrap();
+    let m = s.project.maps.iter().find(|m| m.name == "NEW DETAIL MAP").unwrap();
+    let g = m.groups.first().unwrap();
+    assert_eq!(g.name, "Points Group");
+    let id = |name: &str| m.layer_by_name(name).unwrap().id;
+    assert_eq!(m.group_layers(g.id), vec![id("Detail Points"), id("Gone")]);
+    // Nothing disappears unsaid: the layer whose file isn't there comes in broken, and said; the
+    // query that doesn't fit is said.
+    assert!(m.layer(id("Gone")).unwrap().source.as_ref().is_some_and(|src| src.is_broken()));
+    let gone = |kind: &str| notes.iter().any(|n| n["layer"] == "Gone" && n["kind"] == kind);
+    assert!(gone("approximated") && !gone("skipped"), "{notes:?}");
+    assert!(notes.iter().any(|n| n["layer"] == "Gone" && n["text"].as_str().unwrap().starts_with("added broken: ")), "{notes:?}");
+    assert!(notes.iter().any(|n| n["layer"] == "Detail Points" && n["text"].as_str().unwrap().contains("nope = 1")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n["text"].as_str().unwrap().contains("one by one")), "{notes:?}");
+    // Imported again, the map is reused.
+    s.run("layout.import", &params).unwrap();
+    assert_eq!(s.project.maps.len(), maps + 1);
+}
+
+/// A `CIMMapDocument` "Small" listing `listed` (top first), with `defs` its layer definitions.
+fn small_mapx(defs: Vec<Value>, listed: &[&str]) -> String {
+    type_first(json!({"type": "CIMMapDocument", "version": "3.7.0",
+        "mapDefinition": {"type": "CIMMap", "name": "Small", "layers": listed, "spatialReference": {"wkid": 3857}},
+        "layerDefinitions": defs}))
+}
+
+/// A shapefile layer `name` at `CIMPATH=small/<name>.json`, its file in `folder` (relative or not).
+fn small_layer(name: &str, folder: &str, file: &str) -> Value {
+    json!({"type": "CIMFeatureLayer", "name": name, "uRI": format!("CIMPATH=small/{name}.json"), "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": format!("DATABASE={folder}"), "workspaceFactory": "Shapefile", "dataset": file,
+            "datasetType": "esriDTFeatureClass"}}})
+}
+
+#[test]
+fn pro_map_nested_group_order() {
+    use rustgis_map::Outline;
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    let inner = json!({"type": "CIMGroupLayer", "name": "Inner", "uRI": "CIMPATH=small/inner.json", "layers": ["CIMPATH=small/mid.json"]});
+    let outer = json!({"type": "CIMGroupLayer", "name": "Outer", "uRI": "CIMPATH=small/outer.json",
+        "layers": ["CIMPATH=small/top.json", "CIMPATH=small/inner.json", "CIMPATH=small/bottom.json"]});
+    let defs = vec![
+        outer,
+        inner,
+        small_layer("top", &folder, &file),
+        small_layer("mid", &folder, &file),
+        small_layer("bottom", &folder, &file),
+        small_layer("below", &folder, &file),
+    ];
+    let text = small_mapx(defs, &["CIMPATH=small/outer.json", "CIMPATH=small/below.json"]);
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &text, None);
+    assert_eq!((added.layers, added.broken), (4, 0), "{notes:?}");
+    let m = s.map();
+    let id = |name: &str| m.layer_by_name(name).unwrap().id;
+    let group = |name: &str| m.groups.iter().find(|g| g.name == name).unwrap().id;
+    let order: Vec<&str> = m.layers.iter().filter(|l| !l.graphics).map(|l| l.name.as_str()).collect();
+    assert_eq!(order, ["top", "mid", "bottom", "below"]);
+    assert_eq!(m.group(group("Inner")).unwrap().parent, Some(group("Outer")));
+    assert_eq!(m.outline(None), vec![Outline::Group(group("Outer")), Outline::Layer(id("below"))]);
+    assert_eq!(
+        m.outline(Some(group("Outer"))),
+        vec![Outline::Layer(id("top")), Outline::Group(group("Inner")), Outline::Layer(id("bottom"))]
+    );
+    assert_eq!(m.outline(Some(group("Inner"))), vec![Outline::Layer(id("mid"))]);
+}
+
+#[test]
+fn pro_map_relative_path_without_dir_is_broken() {
+    let text = small_mapx(vec![small_layer("Roads", "data", "roads.shp")], &["CIMPATH=small/Roads.json"]);
+    let mut s = world();
+    let (added, notes) = add_pro_map_in(&mut s, &text, None, None);
+    assert_eq!((added.layers, added.broken), (1, 1), "{notes:?}");
+    let src = s.map().layer_by_name("Roads").unwrap().source.as_ref().unwrap();
+    assert!(src.is_broken());
+    assert_eq!(src.why_broken(), Some("a relative path, and no folder to find it from"));
+    assert!(src.path.as_deref().is_some_and(|p| p.ends_with("roads.shp")), "{src:?}");
+    assert!(
+        notes.iter().any(|n| n == "Roads: added broken: a relative path, and no folder to find it from (repair or retry it)"),
+        "{notes:?}"
+    );
+}
+
+// ---- ArcGIS Pro projects (.aprx), maps (.mapx) and layer files (.lyrx) ----
+
+/// A feature layer `name` at `uri` on the sample's Countries shapefile.
+fn aprx_countries_layer(name: &str, uri: &str) -> Value {
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    json!({"type": "CIMFeatureLayer", "name": name, "uRI": uri, "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": format!("DATABASE={folder}"), "workspaceFactory": "Shapefile", "dataset": file,
+            "datasetType": "esriDTFeatureClass"}}})
+}
+
+/// A zip of `entries` (path, JSON), and the 2×2 PNG at `Pictures/p.png`.
+fn aprx_zip(entries: Vec<(&str, Value)>) -> Vec<u8> {
+    let mut files: Vec<(String, Vec<u8>)> = entries.into_iter().map(|(path, v)| (path.to_string(), v.to_string().into_bytes())).collect();
+    files.push(("Pictures/p.png".to_string(), picture_bytes(2, 2, image::ImageFormat::Png)));
+    rustgis_data::zip::write(&files).unwrap()
+}
+
+/// The project's root: maps Main, Detail, a layout Sheet and an ArcMap map Old; Detail's pane open.
+fn aprx_root() -> Value {
+    let item = |ty: &str, name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": ty, "name": name, "catalogPath": path});
+    json!({"type": "CIMGISProject", "version": "3.7.0",
+        "projectItems": [item("Map", "Main", "CIMPATH=main/main.json"), item("Map", "Detail", "CIMPATH=detail/detail.json"),
+            item("Layout", "Sheet", "CIMPATH=layout/sheet.json"), item("Map", "Old", "CIMPATH=old/old.xml")],
+        "views": [{"type": "CIMMapView", "viewableObjectPath": "CIMPATH=detail/detail.json"}]})
+}
+
+/// The layout Sheet: a frame on Main and a picture from the project's Pictures.
+fn aprx_sheet() -> Value {
+    let ring = |x0: f64, y0: f64, x1: f64, y1: f64| json!({"rings": [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]]});
+    json!({"type": "CIMLayout", "name": "Sheet", "uRI": "CIMPATH=layout/sheet.json",
+        "page": {"type": "CIMPage", "width": 11, "height": 8.5, "units": {"uwkid": 109008}},
+        "elements": [
+            {"type": "CIMMapFrame", "name": "Main Frame", "anchor": "BottomLeftCorner", "visible": true,
+                "frame": ring(0.5, 0.5, 8.0, 8.0), "uRI": "CIMPATH=main/main.json"},
+            {"type": "CIMGraphicElement", "name": "Logo", "anchor": "BottomLeftCorner", "visible": true,
+                "graphic": {"type": "CIMPictureGraphic", "box": {"xmin": 9.0, "ymin": 7.0, "xmax": 10.0, "ymax": 8.0},
+                    "referenceURI": "CIMPATH=Pictures/p.png"}}]})
+}
+
+/// The synthetic project: Main (the sample's shapefile and an SDE layer that comes in broken),
+/// Detail (the shapefile), the layout Sheet, and Old, saved by ArcMap.
+fn aprx() -> Vec<u8> {
+    let map = |name: &str, uri: &str, layers: Vec<&str>| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers, "spatialReference": {"wkid": 4326, "latestWkid": 4326}});
+    let sde = json!({"type": "CIMFeatureLayer", "name": "Mains", "uRI": "CIMPATH=main/mains.json", "visibility": true,
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": "SERVER=gis-db;DATABASE=utility;USER=editor;PASSWORD=swordfish", "workspaceFactory": "SDE",
+            "dataset": "utility.dbo.mains", "datasetType": "esriDTFeatureClass"}}});
+    aprx_zip(vec![
+        ("GISProject.json", aprx_root()),
+        ("main/main.json", map("Main", "CIMPATH=main/main.json", vec!["CIMPATH=main/countries.json", "CIMPATH=main/mains.json"])),
+        ("main/countries.json", aprx_countries_layer("Countries", "CIMPATH=main/countries.json")),
+        ("main/mains.json", sde),
+        ("detail/detail.json", map("Detail", "CIMPATH=detail/detail.json", vec!["CIMPATH=detail/countries.json"])),
+        ("detail/countries.json", aprx_countries_layer("Detail Countries", "CIMPATH=detail/countries.json")),
+        ("layout/sheet.json", aprx_sheet()),
+    ])
+}
+
+#[test]
+fn inspecting_a_project_lists_maps_layouts_and_the_open_map() {
+    let mut s = world();
+    let r = s.run("project.inspectArcgis", &json!({"data": b64(&aprx())})).unwrap();
+    assert_eq!(r["kind"], "project");
+    let maps = r["maps"].as_array().unwrap();
+    assert_eq!(maps.len(), 3, "{r}");
+    let map = |name: &str| maps.iter().find(|m| m["name"] == name).unwrap_or_else(|| panic!("no map {name}: {r}"));
+    assert_eq!((map("Detail")["open"].clone(), map("Main")["open"].clone()), (json!(true), json!(false)));
+    assert_eq!((map("Old")["arcmap"].clone(), map("Main")["arcmap"].clone()), (json!(true), json!(false)));
+    assert_eq!(r["layouts"][0]["name"], "Sheet");
+    assert_eq!(r["layouts"][0]["maps"], json!(["Main"]));
+    assert_eq!(r["layouts"][0]["arcmap"], false);
+}
+
+#[test]
+fn importing_chosen_maps_and_a_layout_binds_the_frames() {
+    use rustgis_map::layout::ElementKind;
+    let mut s = world();
+    let mark = s.notice_mark();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&aprx()), "maps": ["detail"], "layouts": ["Sheet"]})).unwrap();
+    // Main comes in with the layout that shows it.
+    assert_eq!(r["maps"], json!(["Detail", "Main"]), "{r}");
+    assert_eq!(r["layouts"], json!(["Sheet"]));
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(3), Some(1)), "{r}");
+    // The first imported map and layout are the active ones.
+    assert_eq!(s.map().name, "Detail");
+    let l = &s.project.layouts[s.active_layout.unwrap()];
+    assert_eq!(l.name, "Sheet");
+    let shows: Vec<&str> =
+        l.elements.iter().filter_map(|e| if let ElementKind::MapFrame { map, .. } = &e.kind { Some(map.as_str()) } else { None }).collect();
+    assert_eq!(shows, ["Main"]);
+    let picture = l.elements.iter().find_map(|e| if let ElementKind::Picture { image, .. } = &e.kind { Some(image) } else { None });
+    assert!(picture.is_some_and(|i| !i.is_empty()), "{r}");
+    // The SDE layer: in the map broken, and no secret in what the import says.
+    let main = s.project.maps.iter().find(|m| m.name == "Main").unwrap();
+    assert!(main.layer_by_name("Mains").and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken()));
+    for secret in ["swordfish", "editor", "PASSWORD"] {
+        assert!(!r.to_string().contains(secret), "{r}");
+    }
+    // The notice: the SDE layer is the one broken, and its reader's note isn't left out again.
+    let notes = r["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n["layer"] == "Mains" && n["kind"] == "skipped"), "{r}");
+    assert_eq!(aprx_notice(&s, mark), "Imported 2 maps and 1 layouts: 3 layers, 1 broken; 0 things drawn differently, 0 left out", "{r}");
+}
+
+/// The import's notice, the one notice given since `mark`.
+fn aprx_notice(s: &Session, mark: u64) -> String {
+    let given: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.starts_with("Imported ")).collect();
+    assert_eq!(given.len(), 1, "{given:?}");
+    given.into_iter().next().unwrap()
+}
+
+/// `zip` with the stored bytes of entry `name` damaged, so its checksum fails.
+fn damaged_entry(mut zip: Vec<u8>, name: &str) -> Vec<u8> {
+    let at = zip.windows(name.len()).position(|w| w == name.as_bytes()).unwrap() + name.len();
+    zip[at] ^= 0xFF;
+    zip
+}
+
+/// A damaged map entry leaves the project open: the good map imports, the damaged one is noted
+/// and left out; a layer the map lists but the project doesn't define comes in broken, saying so,
+/// and is counted broken, not left out.
+#[test]
+fn a_damaged_entry_and_an_undefined_layer_leave_the_rest_of_the_project_importing() {
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, layers: Vec<&str>| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers, "spatialReference": {"wkid": 4326}});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("Main", "CIMPATH=main/main.json"), item("Broken", "CIMPATH=broken/broken.json")]}),
+        ),
+        ("broken/broken.json", map("Broken", "CIMPATH=broken/broken.json", vec![])),
+        ("main/main.json", map("Main", "CIMPATH=main/main.json", vec!["CIMPATH=main/countries.json", "CIMPATH=main/gone.json"])),
+        ("main/countries.json", aprx_countries_layer("Countries", "CIMPATH=main/countries.json")),
+    ]);
+    let zip = damaged_entry(zip, "broken/broken.json");
+    let mut s = world();
+    let r = s.run("project.inspectArcgis", &json!({"data": b64(&zip)})).unwrap();
+    assert_eq!(r["maps"].as_array().map(Vec::len), Some(2), "{r}");
+    let mark = s.notice_mark();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["Main", "Broken"]})).unwrap();
+    assert_eq!(r["maps"], json!(["Main"]), "{r}");
+    let notes: Vec<String> = r["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| format!("{}: {}", n["layer"].as_str().unwrap(), n["text"].as_str().unwrap()))
+        .collect();
+    assert!(
+        notes.iter().any(|n| n == "Broken: its definition couldn't be read from the project (damaged, or larger than 32 MB), left out"),
+        "{notes:?}"
+    );
+    assert!(notes.iter().any(|n| n == "gone: the layer CIMPATH=main/gone.json isn't defined in this document, added broken"), "{notes:?}");
+    let src = s.map().layer_by_name("gone").and_then(|l| l.source.as_ref()).unwrap();
+    assert!(src.is_broken());
+    assert_eq!(src.origin.as_deref(), Some("a layer the project doesn't define (CIMPATH=main/gone.json)"));
+    assert_eq!(src.why_broken(), Some("the project doesn't define this layer"));
+    assert_eq!(aprx_notice(&s, mark), "Imported 1 maps and 0 layouts: 2 layers, 1 broken; 0 things drawn differently, 1 left out", "{r}");
+}
+
+/// A map's saved view keeps its rotation: Pro's camera heading is RustGIS's bearing; a map with
+/// no saved view takes its defaultRotation, turned the other way.
+#[test]
+fn an_imported_map_view_keeps_its_rotation() {
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, rotation: f64| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": [], "spatialReference": {"wkid": 4326}, "defaultRotation": rotation});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("Viewed", "CIMPATH=v/v.json"), item("Unviewed", "CIMPATH=u/u.json"), item("Wild", "CIMPATH=w/w.json")],
+                "views": [
+                    {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=v/v.json", "camera": {"type": "CIMViewCamera", "x": 10.0, "y": 50.0, "scale": 50000.0, "heading": 13.8}},
+                    {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=w/w.json", "camera": {"type": "CIMViewCamera", "x": 10.0, "y": 50.0, "scale": 50000.0, "heading": 1e9}}]}),
+        ),
+        ("v/v.json", map("Viewed", "CIMPATH=v/v.json", -13.8)),
+        ("u/u.json", map("Unviewed", "CIMPATH=u/u.json", -20.0)),
+        ("w/w.json", map("Wild", "CIMPATH=w/w.json", 0.0)),
+    ]);
+    let mut s = world();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["Viewed", "Unviewed", "Wild"]})).unwrap();
+    let bearing = |s: &Session, name: &str| s.project.maps.iter().find(|m| m.name == name).unwrap().camera.bearing;
+    assert!((bearing(&s, "Viewed") - 13.8).abs() < 1e-9, "{}", bearing(&s, "Viewed"));
+    assert!((bearing(&s, "Unviewed") - 20.0).abs() < 1e-9, "{}", bearing(&s, "Unviewed"));
+    assert_eq!(bearing(&s, "Wild"), 0.0);
+    assert!(
+        r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["layer"] == "Wild" && n["text"] == "its rotation (1000000000.0), which isn't an angle, drawn north up"),
+        "{r}"
+    );
+}
+
+/// A georeferenced JPEG or PNG (a world file beside it) comes in broken, saying world files
+/// aren't read yet, rather than that it has no EXIF.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_jpeg_raster_with_a_world_file_comes_in_broken_saying_why() {
+    let dir = std::env::temp_dir().join(format!("rustgis-pro-worldfile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("scan.jpg"), [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+    std::fs::write(dir.join("scan.jgw"), "1\n0\n0\n-1\n500000\n4000000\n").unwrap();
+    std::fs::write(dir.join("plan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    std::fs::write(dir.join("plan.png.aux.xml"), "<PAMDataset/>").unwrap();
+    let raster = |name: &str, file: &str| {
+        json!({"type": "CIMRasterLayer", "name": name, "uRI": format!("CIMPATH=m/{name}.json"), "visibility": true,
+            "dataConnection": {"type": "CIMStandardDataConnection", "workspaceConnectionString": format!("DATABASE={}", dir.display()),
+                "workspaceFactory": "Raster", "dataset": file, "datasetType": "esriDTRasterDataset"}})
+    };
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [{"type": "CIMProjectItem", "itemType": "Map", "name": "M", "catalogPath": "CIMPATH=m/m.json"}]}),
+        ),
+        (
+            "m/m.json",
+            json!({"type": "CIMMap", "name": "M", "uRI": "CIMPATH=m/m.json", "layers": ["CIMPATH=m/Scan.json", "CIMPATH=m/Plan.json"], "spatialReference": {"wkid": 4326}}),
+        ),
+        ("m/Scan.json", raster("Scan", "scan.jpg")),
+        ("m/Plan.json", raster("Plan", "plan.png")),
+    ]);
+    let mut s = world();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["M"]})).unwrap();
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(2), Some(2)), "{r}");
+    for name in ["Scan", "Plan"] {
+        let src = s.map().layer_by_name(name).and_then(|l| l.source.as_ref()).unwrap();
+        assert_eq!(src.why_broken(), Some("a georeferenced JPEG or PNG: world files aren't read yet"), "{name}");
+        assert!(src.path.is_some(), "{name}: kept to repair");
+    }
+    assert!(!r.to_string().contains("EXIF"), "{r}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_layer_named_as_a_broken_one_keeps_its_notes_counted() {
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    // Map A's Roads: a file that isn't there, so it comes in broken. Map B's Roads: the sample's
+    // shapefile, labelled from a template with a field it hasn't (drawn differently).
+    let mut gone = aprx_countries_layer("Roads", "CIMPATH=a/roads.json");
+    gone["featureTable"]["dataConnection"]["dataset"] = json!("rustgis-no-such-roads.shp");
+    gone["featureTable"]["dataConnection"]["workspaceConnectionString"] = json!(format!("DATABASE={folder}"));
+    let mut labelled = aprx_countries_layer("Roads", "CIMPATH=b/roads.json");
+    labelled["labelVisibility"] = json!(true);
+    labelled["labelClasses"] = json!([{"type": "CIMLabelClass", "name": "Class 1", "expression": "$feature.name + \" \" + $feature.GONE",
+        "expressionEngine": "Arcade", "visibility": true, "textSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 10}}}]);
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, layer: &str| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": [layer], "spatialReference": {"wkid": 4326}});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("A", "CIMPATH=a/a.json"), item("B", "CIMPATH=b/b.json")]}),
+        ),
+        ("a/a.json", map("A", "CIMPATH=a/a.json", "CIMPATH=a/roads.json")),
+        ("a/roads.json", gone),
+        ("b/b.json", map("B", "CIMPATH=b/b.json", "CIMPATH=b/roads.json")),
+        ("b/roads.json", labelled),
+    ]);
+    let mut s = world();
+    let mark = s.notice_mark();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["A", "B"]})).unwrap();
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(2), Some(1)), "{r}");
+    let notes = r["notes"].as_array().unwrap();
+    let roads = |start: &str| {
+        notes.iter().any(|n| n["layer"] == "Roads" && n["kind"] == "approximated" && n["text"].as_str().unwrap().starts_with(start))
+    };
+    assert!(roads("added broken: ") && roads("labels from the field GONE"), "{r}");
+    // The working Roads' note counts, though a broken layer has its name.
+    assert_eq!(aprx_notice(&s, mark), "Imported 2 maps and 0 layouts: 2 layers, 1 broken; 1 things drawn differently, 0 left out", "{r}");
+}
+
+#[test]
+fn the_same_broken_layer_in_two_maps_counts_twice() {
+    // Maps X and Y each hold the same SDE layer (one note, come up twice); X also a shapefile
+    // layer whose definition query doesn't fit it (one note, left out).
+    let sde = |uri: &str| {
+        json!({"type": "CIMFeatureLayer", "name": "Mains", "uRI": uri, "visibility": true,
+            "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+                "workspaceConnectionString": "SERVER=gis-db;DATABASE=utility", "workspaceFactory": "SDE",
+                "dataset": "utility.dbo.mains", "datasetType": "esriDTFeatureClass"}}})
+    };
+    let mut misfit = aprx_countries_layer("Countries", "CIMPATH=x/countries.json");
+    misfit["featureTable"]["definitionExpression"] = json!("nope = 1");
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, layers: Vec<&str>| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers, "spatialReference": {"wkid": 4326}});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("X", "CIMPATH=x/x.json"), item("Y", "CIMPATH=y/y.json")]}),
+        ),
+        ("x/x.json", map("X", "CIMPATH=x/x.json", vec!["CIMPATH=x/countries.json", "CIMPATH=x/mains.json"])),
+        ("x/countries.json", misfit),
+        ("x/mains.json", sde("CIMPATH=x/mains.json")),
+        ("y/y.json", map("Y", "CIMPATH=y/y.json", vec!["CIMPATH=y/mains.json"])),
+        ("y/mains.json", sde("CIMPATH=y/mains.json")),
+    ]);
+    let mut s = world();
+    let mark = s.notice_mark();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["X", "Y"]})).unwrap();
+    let notes = r["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n["layer"] == "Mains" && n["kind"] == "skipped" && n["count"] == 2), "{r}");
+    assert_eq!(aprx_notice(&s, mark), "Imported 2 maps and 0 layouts: 3 layers, 2 broken; 0 things drawn differently, 1 left out", "{r}");
+}
+
+#[test]
+fn a_map_asked_for_and_shown_by_a_layout_comes_in_once() {
+    let mut s = world();
+    let maps = s.project.maps.len();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&aprx()), "maps": ["Main"], "layouts": ["Sheet"]})).unwrap();
+    assert_eq!(r["maps"], json!(["Main"]), "{r}");
+    assert_eq!(s.project.maps.len(), maps + 1);
+}
+
+#[test]
+fn importing_nothing_lists_the_holdings() {
+    let mut s = world();
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let r = s.run("project.importArcgis", &json!({"data": b64(&aprx())})).unwrap();
+    assert_eq!((r["maps"].clone(), r["layouts"].clone()), (json!([]), json!([])), "{r}");
+    assert_eq!(r["holds"]["kind"], "project");
+    assert_eq!(r["holds"]["maps"].as_array().map(Vec::len), Some(3), "{r}");
+    assert_eq!(r["holds"]["layouts"][0]["maps"], json!(["Main"]));
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+}
+
+#[test]
+fn an_arcmap_item_is_refused_before_the_project_changes() {
+    let mut s = world();
+    let (maps, layouts) = (s.project.maps.len(), s.project.layouts.len());
+    let data = b64(&aprx());
+    let e = s.run("project.importArcgis", &json!({"data": data, "maps": ["Main", "OLD"]})).unwrap_err();
+    assert_eq!(e, "Old was saved by ArcMap; open it in ArcGIS Pro first");
+    let e = s.run("project.importArcgis", &json!({"data": data, "maps": ["Main"], "layouts": ["Nowhere"]})).unwrap_err();
+    assert!(e.contains("Nowhere"), "{e}");
+    let e = s.run("project.importArcgis", &json!({"data": data, "maps": ["Nowhere"]})).unwrap_err();
+    assert_eq!(e, "no map named Nowhere");
+    assert!(s.run("project.importArcgis", &json!({"data": data, "maps": ["Main", 7]})).is_err());
+    assert!(s.run("project.importArcgis", &json!({"data": data, "maps": vec!["Main"; 501]})).is_err());
+    // A layout document is none of the kinds this imports.
+    let e = s.run("project.importArcgis", &json!({"text": pagx()})).unwrap_err();
+    assert_eq!(e, "not an ArcGIS Pro project, map or layer file");
+    assert_eq!((s.project.maps.len(), s.project.layouts.len()), (maps, layouts));
+}
+
+#[test]
+fn a_mapx_imports_one_map_and_a_lyrx_adds_to_the_active_map() {
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    let file = shp.file_name().unwrap().to_string_lossy().to_string();
+    let mut s = world();
+    let maps = s.project.maps.len();
+    // `maps` means nothing to a .mapx: its one map comes in.
+    let mapx = small_mapx(vec![small_layer("roads", &folder, &file)], &["CIMPATH=small/roads.json"]);
+    let r = s.run("project.importArcgis", &json!({"text": mapx, "maps": ["Other"]})).unwrap();
+    assert_eq!(r["maps"], json!(["Small"]), "{r}");
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(1), Some(0)), "{r}");
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!(s.run("project.inspectArcgis", &json!({"text": small_mapx(vec![], &[])})).unwrap()["kind"], "map");
+    // A layer file: added to the active map, no map made.
+    s.run("map.activate", &json!({"name": "World"})).unwrap();
+    let lyrx = type_first(json!({"type": "CIMLayerDocument", "version": "3.7.0", "layers": ["CIMPATH=small/rivers.json"],
+        "layerDefinitions": [small_layer("rivers", &folder, &file)]}));
+    assert_eq!(s.run("project.inspectArcgis", &json!({"text": lyrx})).unwrap()["kind"], "layers");
+    let r = s.run("project.importArcgis", &json!({"text": lyrx})).unwrap();
+    assert_eq!(r["maps"], json!([]), "{r}");
+    assert_eq!(r["layers"].as_u64(), Some(1), "{r}");
+    assert_eq!(s.project.maps.len(), maps + 1);
+    assert_eq!(s.map().name, "World");
+    assert!(s.map().layer_by_name("rivers").is_some());
+}
+
+#[test]
+fn hostile_project_files_never_panic() {
+    let mut long = aprx_root();
+    long["projectItems"][0]["catalogPath"] = json!(format!("CIMPATH={}.json", "a".repeat(10_000)));
+    let mut views = aprx_root();
+    views["views"] = Value::Array(vec![json!({"type": "CIMMapView", "viewableObjectPath": "CIMPATH=detail/detail.json"}); 10_000]);
+    let mut sheet = aprx_sheet();
+    sheet["elements"] = json!(7);
+    let zips = [
+        aprx_zip(vec![("a.json", json!({}))]),
+        aprx_zip(vec![("GISProject.json", json!([]))]),
+        aprx_zip(vec![("GISProject.json", long)]),
+        aprx_zip(vec![("GISProject.json", views)]),
+        aprx_zip(vec![("GISProject.json", aprx_root()), ("layout/sheet.json", sheet)]),
+    ];
+    let mut s = world();
+    for zip in &zips {
+        let data = b64(zip);
+        let _ = s.run("project.inspectArcgis", &json!({"data": data}));
+        for ask in [json!({}), json!({"maps": ["Main"]}), json!({"layouts": ["Sheet"]}), json!({"maps": ["Detail"], "layouts": ["Sheet"]})]
+        {
+            let mut p = ask.clone();
+            p["data"] = json!(data);
+            let _ = s.run("project.importArcgis", &p);
+        }
+    }
+    // The session is still usable.
+    assert!(s.run("project.inspectArcgis", &json!({"data": b64(&aprx())})).is_ok());
 }

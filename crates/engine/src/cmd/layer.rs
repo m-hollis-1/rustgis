@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use rustgis_data::{GeometryType, photo};
-use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES};
+use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES, MAX_TEMPLATE, is_template, template_fields};
 use rustgis_map::{
     ClassMethod, Glyph, ImageRef, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, Placements, Ramp, Renderer, Rgba,
 };
@@ -362,14 +362,26 @@ pub fn commands() -> Vec<C> {
         C::new("labels.field", "Label Field", "Labeling › Label Class", |s, p| {
             let name = s_req(p, "field")?.to_string();
             let id = s.layer_id(p)?;
-            let fname = s.map().layer(id).and_then(|l| l.dataset.field_index(&name).and_then(|i| l.dataset.fields.get(i)).map(|f| f.name.clone()));
-            let fname = fname.ok_or_else(|| format!("no field named '{name}'"))?;
+            let ds = &s.map().layer(id).ok_or("no such layer")?.dataset;
+            let has = |f: &str| ds.field_index(f).and_then(|i| ds.fields.get(i)).map(|f| f.name.clone());
+            if name.chars().count() > MAX_TEMPLATE {
+                return Err(format!("a label expression is at most {MAX_TEMPLATE} characters"));
+            }
+            // A template (it names a field in braces) is kept as typed, once each field is the layer's.
+            let fname = if is_template(&name) {
+                if let Some(gone) = template_fields(&name).into_iter().find(|f| has(f).is_none()) {
+                    return Err(format!("no field named '{gone}'"));
+                }
+                name.clone()
+            } else {
+                has(&name).ok_or_else(|| format!("no field named '{name}'"))?
+            };
             super::labels::with_labels(s, p, |labels| {
                 super::labels::class_in(labels, p)?.field = fname;
                 labels.enabled = true;
                 Ok(())
             })
-        }).params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "field": name}"#)
+        }).params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "field": name (or a template: text with each field's name in braces, a brace doubled ({{ or }}) for a literal one)}"#)
         .when(need_feature_layer),
         C::new("labels.style", "Text Symbol", "Labeling › Text Symbol", |s, p| {
             let size = f(p, "size").map(|v| v.clamp(*LABEL_SIZE.start(), *LABEL_SIZE.end()) as f32);
@@ -3033,7 +3045,7 @@ pub(crate) fn drop_layers(s: &mut Session, ids: &[u32]) {
     }
 }
 
-fn remove(s: &mut Session, p: &Value) -> CmdResult {
+pub(super) fn remove(s: &mut Session, p: &Value) -> CmdResult {
     let ids = layer_ids(s, p)?;
     let m = s.map_mut();
     // The layer that takes the place of the topmost one removed becomes the active layer.

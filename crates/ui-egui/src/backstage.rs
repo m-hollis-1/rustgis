@@ -132,6 +132,10 @@ fn start(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let _ = app.run("ui.openItem", json!({"kind": "qgisProject"}));
             app.ui.backstage = false;
         }
+        if card(ui, t, "ArcGIS Pro Project…", "An .aprx project's maps and layouts, or a .mapx or .lyrx", "open") {
+            let _ = app.run("ui.openItem", json!({"kind": "arcgisProject"}));
+            app.ui.backstage = false;
+        }
     });
     ui.add_space(28.0);
     ui.label(egui::RichText::new(tl!("Current Project")).font(semibold(15.0)));

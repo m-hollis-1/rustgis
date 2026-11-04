@@ -953,6 +953,9 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 )
             } else if purpose == "qgisProject" {
                 rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("QGIS project"), &["qgs", "qgz"])
+            } else if purpose == "arcgisProject" {
+                rfd::AsyncFileDialog::new()
+                    .add_filter(rustgis_ui_egui::tl!("ArcGIS Pro project, map or layer file"), &["aprx", "mapx", "lyrx"])
             } else if purpose == "item" {
                 rfd::AsyncFileDialog::new().add_filter(
                     "RustGIS items",

@@ -284,7 +284,7 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             if changed_type || invalid_renderer {
                 layer.renderer = rustgis_map::Renderer::Single(rustgis_map::Symbol::default_for(layer.geometry_type(), layer.id));
             }
-            if layer.dataset.field_index(&layer.labels.default.field).is_none() {
+            if !layer.labels.default.labels_from(&layer.dataset) {
                 layer.labels.enabled = false;
                 layer.labels.default.field.clear();
             }

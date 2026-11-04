@@ -1013,6 +1013,9 @@ RustGIS saves pieces of a project as files you can share and reuse:
 | Task (guided command steps) | `.rgistask` | Analyze › Task, Publish › Save As › Task Item | Analyze › Task › Import Task |
 | Bookmarks (as longitude, latitude and scale) | `.rgisbookmarks` | Home › Navigate › Bookmarks › Export Bookmarks | Home › Navigate › Bookmarks › Import Bookmarks |
 | Layout | `.rgislayout` (Import Layout also reads ArcGIS Pro `.pagx`) | Publish › Save Layout File | Home › New Layout › Import Layout |
+| [ArcGIS Pro project](workspace.md#arcgis-pro-projects-maps-and-layouts) | `.aprx` (read only) | ArcGIS Pro | The **ArcGIS Pro Project…** card on the backstage's Start page (it asks which maps and layouts to import), the Browser pane, or drop it on the window (`project.importArcgis`) |
+| ArcGIS Pro map | `.mapx` (read only) | ArcGIS Pro | As an `.aprx`; the map is added at once |
+| ArcGIS Pro layer file | `.lyrx` (read only) | ArcGIS Pro | As an `.aprx`; its layers are added to the active map at once |
 
 Packages are zip files. Project and map packages can newly embed a combined 512 MiB of linked
 raster files on the desktop (128 MiB in the web app); a raster that doesn't fit stays linked.

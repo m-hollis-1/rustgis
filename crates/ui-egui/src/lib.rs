@@ -1406,6 +1406,11 @@ impl RustGisApp {
         // in at once.
         if is_arcgis_pro_name(&lower) {
             use base64::Engine;
+            use rustgis_engine::cmd::arcgis_pro::{MAX_PROJECT, too_large};
+            // Refused before it is encoded, which would take a third more again.
+            if bytes.len() > MAX_PROJECT {
+                return Err(too_large(name));
+            }
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             return self.import_arcgis(name, json!({"data": data}));
         }
@@ -4793,6 +4798,17 @@ mod aprx_tests {
         app.open_bytes_with("rivers.lyrx", LYRX.as_bytes(), None).unwrap();
         assert!(app.dialogs.open.is_none());
         assert_eq!(app.session.map().layers.len(), layers + 1);
+    }
+
+    /// On the web, a Pro file larger than the engine reads is refused before it is encoded.
+    #[test]
+    fn a_pro_file_too_large_is_refused_before_it_is_encoded() {
+        use rustgis_engine::cmd::arcgis_pro::{MAX_PROJECT, too_large};
+        let mut app = RustGisApp::with_sample();
+        // (Zeroed and never touched: the pages aren't really allocated.)
+        let big = vec![0u8; MAX_PROJECT + 1];
+        assert_eq!(app.open_bytes_with("big.aprx", &big, None).unwrap_err(), too_large("big.aprx"));
+        assert!(app.dialogs.open.is_none());
     }
 
     #[test]

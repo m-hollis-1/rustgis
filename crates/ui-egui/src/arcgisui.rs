@@ -83,6 +83,11 @@ pub fn section(app: &mut RustGisApp, ui: &mut egui::Ui) {
 /// A sign-in has just completed: the layers that couldn't open (a secured service, say) are
 /// opened again, once, and the notice says how many came back. Nothing is said when none was broken.
 fn retry_broken_layers(app: &mut RustGisApp) {
+    // With none broken, the command would change nothing and still leave an undo step.
+    let broken = app.session.map().layers.iter().any(|l| l.source.as_ref().is_some_and(|s| s.is_broken()));
+    if !broken {
+        return;
+    }
     let Ok(r) = app.run("layer.retry", json!({"all": true})) else { return };
     if r.get("retried").and_then(serde_json::Value::as_u64).unwrap_or(0) == 0 {
         return;
@@ -292,5 +297,14 @@ mod tests {
         retry_broken_layers(&mut app);
         let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(said, ["Signed in: 0 layers opened"]);
+    }
+
+    /// A sign-in with no broken layer in the map changes nothing, so it leaves no undo step.
+    #[test]
+    fn signing_in_with_nothing_broken_leaves_no_undo_step() {
+        let mut app = RustGisApp::with_sample();
+        let before = (app.session.can_undo(), app.session.undo_label());
+        retry_broken_layers(&mut app);
+        assert_eq!((app.session.can_undo(), app.session.undo_label()), before);
     }
 }

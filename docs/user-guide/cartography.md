@@ -65,8 +65,9 @@ layer.marker={"layer":"Peaks","imagePath":"C:/symbols/summit.png","size":18}
 A marker can be **Custom**: a shape drawn from paths, each filled and outlined in its own colours,
 with the **Size** as the square it is drawn in. It is what an ArcGIS Pro map brings in for a
 marker RustGIS has no shape for (a hand-drawn symbol, a marker that is turned or moved off its
-centre) and for a symbol of several marker layers drawn as one, and it draws on points and
-along lines. **Custom** shows as the **Shape** of such a layer; the drawing itself can't be edited
+centre) and for a symbol of several marker layers drawn as one when every layer is a drawn shape
+(with a picture or a character among them, the first marker is used instead, and noted), and it
+draws on points and along lines. **Custom** shows as the **Shape** of such a layer; the drawing itself can't be edited
 or set by command, but **Size** changes it, and choosing another shape, a character or a picture
 replaces it (`layer.marker` with `shape`, `char` or `image`). A project keeps it.
 

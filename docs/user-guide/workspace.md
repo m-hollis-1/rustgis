@@ -223,8 +223,12 @@ The picker lists the project's maps, then its layouts, each with a tick box.
 
 The import is a single undo step. Each map comes in as a new map with the coordinate system it
 had in Pro (one RustGIS can't project is noted, and the map stays in Web Mercator), no basemap
-and no graticule, as Pro draws it, and at the view Pro saved. The first map imported is the
-active one. Relative paths in the project start from the file's folder, or from `dir`.
+and no graticule, as Pro draws it, and at the view Pro saved, turned as Pro turned it: the saved
+view's camera heading is the map's bearing (the compass direction the top of the view faces),
+and a map with no saved view takes its own rotation (Pro's `defaultRotation`, which turns the
+other way, so -13.8 is a bearing of 13.8). A rotation that isn't an angle is drawn north up, with
+a note. The first map imported is the active one. Relative paths in the project start from the
+file's folder, or from `dir`.
 
 By command, `project.inspectArcgis` lists what a file holds, as the picker does. With no `maps`
 and no `layouts`, `project.importArcgis` imports nothing and answers the same list as `holds`;
@@ -234,7 +238,12 @@ name the maps (and `layouts`, each with the maps its frames show) to import:
 rustgis-cli run --cmd 'project.importArcgis={"path": "…/Site.aprx", "maps": ["Main Map"]}'
 ```
 
-A project, map or layer file can be at most 512 MB.
+A project, map or layer file can be at most 512 MB (the web app refuses a larger one before
+reading it). Inside a project, `GISProject.json` must be readable, or it isn't a project; any
+other entry that is damaged or too large (a definition over 32 MB, a picture over 16 MB, or
+past 64 MB of definitions or of pictures in all) is skipped on its own, and what needed it says
+so: a map or layout whose definition couldn't be read is left out with a note while the rest
+import, a layer becomes a broken layer, and a layout picture stays empty with a note.
 
 #### What a map brings
 
@@ -254,6 +263,8 @@ equivalent, each noted. What is added depends on where the layer's data is:
 | A table on a file | A project table. A table on a service, or one RustGIS can't open, is left out. |
 | Data RustGIS can't open: an SDE (enterprise) geodatabase or another database, a spreadsheet, a query layer; and the kinds of layer RustGIS doesn't draw (annotation, dimensions, elevation surfaces) | A **broken layer** (below). |
 | A file that is missing, or a service that can't be reached | A broken layer, noted "added broken: … (repair or retry it)". |
+| A JPEG or PNG raster placed by a world file (`.jgw`, `.jgwx`, `.pgw`, `.pgwx`) or an `.aux.xml` beside it | A broken layer: "a georeferenced JPEG or PNG: world files aren't read yet". |
+| A layer the map lists that the project doesn't define (or whose definition couldn't be read) | A broken layer whose origin reads "a layer the project doesn't define (CIMPATH=…)", noted "… added broken"; it has nothing to retry or repair, and can be removed. |
 
 A web layer is drawn from tiles, so one that was in a group is listed outside it (noted), and
 its scale range is not kept: it draws at every scale.
@@ -277,8 +288,8 @@ differences to expect on a map:
 
 - **Label placement**: a Maplex or standard placement method RustGIS has no placement for is
   drawn as Auto, and the Maplex settings that choose between candidate places (label priorities,
-  feature weights, overrunning features, key numbering, thinning or removing duplicates, offsets
-  along a line) are left out.
+  feature weights, key numbering, thinning or removing duplicates, offsets along a line) are left
+  out. Letting labels overrun their features isn't noted: RustGIS's labels may overrun anyway.
 - **Label expressions**: an expression of field names, text and concatenation (`+` or `&`, in
   Arcade, VBScript, Python or JScript) comes in exactly, as a label template
   ([Labeling](cartography.md#labeling)). Anything beyond that (a function, arithmetic, a
@@ -293,8 +304,10 @@ differences to expect on a map:
   are left out: every feature is drawn at every scale. Other blending modes are drawn as normal,
   and a selection is drawn as RustGIS draws selections.
 - **Picture fills** are left out. Dashed polygon outlines are drawn solid. A marker RustGIS has no
-  shape for, or a symbol of several marker layers, is drawn from its paths as a
-  [Custom marker](cartography.md#symbology); a GIF or BMP marker is drawn as a circle.
+  shape for is drawn from its paths as a [Custom marker](cartography.md#symbology). A symbol of
+  several marker layers becomes one Custom marker only when every layer is a drawn shape;
+  otherwise (a picture or a character among them) its first marker is used, and noted. A GIF or
+  BMP marker is drawn as a circle.
 - **Leader lines** of label callouts and **text shadows** are left out. A background callout is
   drawn as the label's background.
 - **Tile layers outside groups**: see above.
@@ -331,7 +344,9 @@ What RustGIS draws differently from Pro in a layout:
   file is read from the layout's folder (or `dir`) when the layout is imported; a relative path
   in layout text given without `dir` isn't read. One that can't be read (the browser can't read
   files beside a layout, nor convert a GIF or BMP) keeps its place, empty, with a note, and
-  **Relink…** picks it again.
+  **Relink…** picks it again. A picture a project keeps in its `Pictures` folder that is damaged
+  or larger than 16 MB is skipped alone: the others still come in.
+- **Map frame rotation**: a frame's camera heading is its bearing, as a map view's is (above).
 - **Map grids** in a frame (graticules, measured grids) are left out, with a note.
 
 ## Panes and command search

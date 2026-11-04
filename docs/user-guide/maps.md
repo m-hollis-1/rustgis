@@ -336,10 +336,13 @@ Right-click the layer to bring it back:
 
 - **Retry** opens its source again, from the file or the service it came from, once the file has
   turned up or the service answers (or you have signed in). The layer keeps its place, symbology
-  and labels. It is offered for a layer that came from a file or a service; a layer whose data was
-  in a database RustGIS can't read has nothing to retry, and can be removed. When a service
-  answers with a web layer or a raster, that stays in the broken layer's place (noted); one that
-  isn't a layer of features (a table, say) leaves the layer broken. `layer.retry={"layer":
+  and labels. It is offered for any layer that came from a service, and for a broken layer with a
+  file to read again; a layer whose data was in a database RustGIS can't read (or that its project
+  didn't define) has nothing to retry or repair, and can only be removed. When a service answers
+  with a web layer or a raster, that replaces the broken layer: it is added as a layer of its own
+  and the broken one is taken out (noted), so it doesn't keep the broken layer's slot. A service
+  that answers with something that isn't a layer of features (a table, say) leaves the layer
+  broken, and the table isn't kept. `layer.retry={"layer":
   "Parcels"}` retries one layer, and `layer.retry={"all": true}` every broken layer of the map;
   it answers how many it retried and opened, and why each failure failed.
 - **Repair Data Source…** points it at the file's new place, as for any

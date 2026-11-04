@@ -19,6 +19,8 @@ const MAX_STRINGS: usize = 20_000;
 const MAX_GROUPS: usize = 8;
 const MAX_LARGE_GROUP_ITEMS: usize = 16;
 const MAX_SMALL_GROUP_ITEMS: usize = 48;
+/// The most buttons a plugin may add to the Edit tab (one column of small buttons).
+pub const MAX_EDIT_TAB_ITEMS: usize = 3;
 const MAX_MENU_ITEMS: usize = 32;
 const MAX_MENU_DEPTH: usize = 4;
 const MAX_TAB_ITEMS: usize = 16_384;
@@ -333,6 +335,10 @@ pub struct Manifest {
     /// A ribbon tab of its own (optional): its commands and tools in groups and menus.
     #[serde(default)]
     pub tab: Option<TabDecl>,
+    /// Buttons on RustGIS's Edit tab (optional): up to three commands, tools (`tool:<id>`) or
+    /// `panel`, shown as a column of small buttons in its Manage Edits group.
+    #[serde(default)]
+    pub edit_tab: Vec<String>,
     /// A panel of its own (optional): a pane of widgets bound to its commands (see
     /// [`crate::panel`]).
     #[serde(default)]
@@ -497,6 +503,7 @@ impl Manifest {
                 if !self.commands.is_empty()
                     || !self.tools.is_empty()
                     || self.tab.is_some()
+                    || !self.edit_tab.is_empty()
                     || self.panel.is_some()
                     || !self.permissions.is_empty()
                 {
@@ -604,6 +611,16 @@ impl Manifest {
         }
         if let Some(tab) = &self.tab {
             self.validate_tab(tab)?;
+        }
+        if self.edit_tab.len() > MAX_EDIT_TAB_ITEMS {
+            return Err(format!("plugin.json: 'editTab' has at most {MAX_EDIT_TAB_ITEMS} items"));
+        }
+        for e in &self.edit_tab {
+            if self.entry(e).is_none() {
+                return Err(format!(
+                    "plugin.json: 'editTab' names '{e}', which isn't one of the plugin's commands, tools (tool:<id>) or its panel (panel)"
+                ));
+            }
         }
         if self.i18n.len() > MAX_LANGS || self.i18n.values().map(BTreeMap::len).sum::<usize>() > MAX_STRINGS {
             return Err("plugin.json: too many translations".into());

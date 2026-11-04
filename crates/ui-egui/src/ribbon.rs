@@ -2455,6 +2455,7 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 );
             });
         }
+        plugin_edit_buttons(app, ui);
         col(ui, |ui| {
             small(ui, app, "settings", "Settings", "Editing settings.", "ui.pane.editing", Value::Null, pane);
             small(
@@ -3406,6 +3407,23 @@ fn plugin_ribbon_item(
                 }
             }
         }
+    }
+}
+
+/// Enabled plugins' buttons on the Edit tab (their manifests' `editTab`): a column of small
+/// buttons per plugin.
+fn plugin_edit_buttons(app: &mut RustGisApp, ui: &mut Ui) {
+    use rustgis_engine::plugins::{ItemDecl, Layout};
+    let lang = app.lang().code();
+    for p in rustgis_engine::plugins::list().into_iter().filter(|p| p.enabled && !p.manifest.edit_tab.is_empty()) {
+        let m = &p.manifest;
+        ui.push_id(("plugin-edit", m.id.as_str()), |ui| {
+            col(ui, |ui| {
+                for (index, e) in m.edit_tab.iter().enumerate() {
+                    ui.push_id(index, |ui| plugin_ribbon_item(app, ui, m, lang, &ItemDecl::Entry(e.clone()), Layout::Small));
+                }
+            });
+        });
     }
 }
 

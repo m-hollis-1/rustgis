@@ -225,10 +225,12 @@ storymaps.md_
 - [ ] **Embed API**: a `postMessage` protocol, an npm client, viewer-only and map-only modes, deep
   links. Partial: the web app embeddable with `?embed`, exchanging the project through
   `postMessage` (`apps/rustgis-web/src/embed.rs`); no npm client.
-- [ ] **Import QGIS (`.qgs/.qgz`) and ArcGIS Pro (`.aprx/.mapx`) projects**. Partial: supported
-  QGIS projects open as maps (`project.importQgis`), and ArcGIS Pro layouts (`.pagx`) open as
-  layouts with the maps their frames show (`layout.import`). Missing: ArcGIS Pro maps and
-  projects (`.mapx`, `.aprx`; _Exploratory_).
+- [x] **Import QGIS (`.qgs/.qgz`) and ArcGIS Pro (`.aprx/.mapx`) projects**: supported QGIS
+  projects open as maps (`project.importQgis`); ArcGIS Pro projects (`.aprx`), maps (`.mapx`) and
+  layer files (`.lyrx`) import their maps, layouts and layers (`project.importArcgis`), a layer
+  RustGIS can't open coming in broken, to retry or repair, and ArcGIS Pro layouts (`.pagx`) open
+  as layouts with the maps their frames show (`layout.import`). Not read yet: ArcGIS Pro style
+  files (`.stylx`).
 - [ ] **Autosave, project history, crash recovery, snapshot compare**. Partial: undo, per-layer
   archive restore, and autosave with crash recovery in the desktop app
   ([#873](https://github.com/opengeos/RustGIS/issues/873)); the browser has neither yet.

@@ -190,23 +190,128 @@ RustGIS works out a map's scale with the OGC's 0.28 mm screen pixel, QGIS at 96 
 inch, so the same view is a larger scale in QGIS; scales from QGIS (reference scales, visibility
 ranges) are multiplied by 0.945 on the way in, so a layer shows at the same zoom in both.
 
-### ArcGIS Pro layouts
+### ArcGIS Pro projects, maps and layouts
+
+RustGIS reads four kinds of ArcGIS Pro file:
+
+| Pro file | What RustGIS does |
+| --- | --- |
+| Project (`.aprx`) | Asks which of its maps and layouts to import, then adds each map as a new map of the current project and each layout as a new layout. |
+| Map file (`.mapx`) | Adds its one map as a new map, at once. |
+| Layer file (`.lyrx`) | Adds its layers (and groups) to the active map, at once. |
+| Layout (`.pagx`) | Adds a new layout with the maps its frames show; see [Layouts from ArcGIS Pro](#layouts-from-arcgis-pro). |
+
+Choose the **ArcGIS Pro Project…** card on the backstage's **Start** or **New** page (the
+**Project** button), or find **Import ArcGIS Pro Project** in Command Search. A `.aprx`, `.mapx`
+or `.lyrx` also opens when you double-click it in the Browser pane or drop it on the window. A
+`.mapx` or `.lyrx` goes in without a question; a `.aprx` opens a picker first, and nothing is
+imported until you press **Import**.
+
+#### The picker
+
+The picker lists the project's maps, then its layouts, each with a tick box.
+
+- The first map whose pane was open when the project was saved is ticked; nothing else is. A
+  project saved with no map open starts with nothing ticked.
+- Ticking a layout ticks the maps its frames show, since a layout needs them. Unticking the
+  layout leaves them ticked.
+- **All** ticks everything, **None** clears it.
+- A map or layout that ArcMap saved (its older format) is greyed out and
+  can't be ticked; hover to read "saved by ArcMap; open it in Pro first". Open the project in
+  ArcGIS Pro, save it, and import again.
+- **Import** stays disabled until a map or a layout is ticked.
+
+The import is a single undo step. Each map comes in as a new map with the coordinate system it
+had in Pro (one RustGIS can't project is noted, and the map stays in Web Mercator), no basemap
+and no graticule, as Pro draws it, and at the view Pro saved. The first map imported is the
+active one. Relative paths in the project start from the file's folder, or from `dir`.
+
+By command, `project.inspectArcgis` lists what a file holds, as the picker does. With no `maps`
+and no `layouts`, `project.importArcgis` imports nothing and answers the same list as `holds`;
+name the maps (and `layouts`, each with the maps its frames show) to import:
+
+```text
+rustgis-cli run --cmd 'project.importArcgis={"path": "…/Site.aprx", "maps": ["Main Map"]}'
+```
+
+A project, map or layer file can be at most 512 MB.
+
+#### What a map brings
+
+A map's layers come in with the order and groups of Pro's Contents pane, and each layer with its
+visibility, transparency, scale range, symbols, renderers, labels and definition query (and the
+map's reference scale, for symbols that scale with it), approximated where RustGIS has no
+equivalent, each noted. What is added depends on where the layer's data is:
+
+| The layer's data | What RustGIS adds |
+| --- | --- |
+| A shapefile, a file geodatabase feature class or raster (also inside a feature dataset), a raster file, a CAD drawing's layer or a KML file | The layer, opened from its file. |
+| An ArcGIS feature service layer | The layer, as **Add From Service** adds it. |
+| An ArcGIS map service | The service's whole map, as a web layer. |
+| An ArcGIS image service (`…/ImageServer`) | The service's picture, as a web layer. |
+| A WMS layer | The service's first visible named sublayer, as a web layer. |
+| A vector tile service | A vector tile layer drawn with the service's default style (`…/VectorTileServer/resources/styles/root.json`). An address that is already a style is used as it is. |
+| A table on a file | A project table. A table on a service, or one RustGIS can't open, is left out. |
+| Data RustGIS can't open: an SDE (enterprise) geodatabase or another database, a spreadsheet, a query layer; and the kinds of layer RustGIS doesn't draw (annotation, dimensions, elevation surfaces) | A **broken layer** (below). |
+| A file that is missing, or a service that can't be reached | A broken layer, noted "added broken: … (repair or retry it)". |
+
+A web layer is drawn from tiles, so one that was in a group is listed outside it (noted), and
+its scale range is not kept: it draws at every scale.
+
+A **broken layer** is a placeholder in the layer's place. It keeps the layer's name, visibility,
+symbology, labels and definition query, draws nothing, and has a warning after its name in the
+Layers pane; hover over it to read where Pro read the data from and why it didn't open. Once the
+file has turned up or the service answers, right-click the layer and choose **Retry**, or **Repair
+Data Source…** to point it at the file's new place; see [Broken layers](maps.md#broken-layers). A
+password, user name or token in a connection never reaches a layer's origin, a note or a saved
+project: they are removed from connection strings and service addresses as the layer is read.
+
+A notice counts the import: "Imported 1 maps and 1 layouts: 14 layers, 2 broken; 9 things drawn
+differently, 3 left out". A broken layer counts as broken only, not again as a thing left out.
+The command's `notes` name each thing, layer by layer.
+
+#### What RustGIS draws differently
+
+What Pro does that RustGIS doesn't is drawn as near as it can be, or left out, and noted. The
+differences to expect on a map:
+
+- **Label placement**: a Maplex or standard placement method RustGIS has no placement for is
+  drawn as Auto, and the Maplex settings that choose between candidate places (label priorities,
+  feature weights, overrunning features, key numbering, thinning or removing duplicates, offsets
+  along a line) are left out.
+- **Label expressions**: an expression of field names, text and concatenation (`+` or `&`, in
+  Arcade, VBScript, Python or JScript) comes in exactly, as a label template
+  ([Labeling](cartography.md#labeling)). Anything beyond that (a function, arithmetic, a
+  comparison) is drawn as the first field it names, and a class whose expression names no field
+  is left out. Pro's text formatting tags (bold and colour runs) are stripped.
+- **Symbol size by scale**: a size that follows the map's scale, an expression, or a field on any
+  renderer but a simple one is drawn at one size. Sizes that follow a field on a simple renderer,
+  and Pro's proportional symbols renderer, come in as Proportional Symbols.
+- **Joins**: a layer drawn from a join is drawn without it, and a label field from the joined
+  table is read by its plain name.
+- **Display filters** (and layer masks, clustering and binning, charts, pop-ups and time filters)
+  are left out: every feature is drawn at every scale. Other blending modes are drawn as normal,
+  and a selection is drawn as RustGIS draws selections.
+- **Picture fills** are left out. Dashed polygon outlines are drawn solid. A marker RustGIS has no
+  shape for, or a symbol of several marker layers, is drawn from its paths as a
+  [Custom marker](cartography.md#symbology); a GIF or BMP marker is drawn as a circle.
+- **Leader lines** of label callouts and **text shadows** are left out. A background callout is
+  drawn as the label's background.
+- **Tile layers outside groups**: see above.
+
+#### Layouts from ArcGIS Pro
 
 An ArcGIS Pro layout (`.pagx`) opens as a new layout of the current project, with the maps its
 frames show added as maps: **Home › New Layout › Import Layout…**, a double-click in the Browser
-pane, or `layout.import={"path": "…/Site plan.pagx"}`. What it brings, and how a frame is bound to
-a map, is under [Layouts](layouts.md#layouts). A notice counts what was drawn differently and
-what was left out; the command's `notes` name each, element by element. Pro projects (`.aprx`)
-and map files (`.mapx`) are not imported yet: that is a later part. A layer in a layout's map
-that RustGIS can't open is left out, and said.
+pane, or `layout.import={"path": "…/Site plan.pagx"}`. (A layout in a `.aprx` comes in through the
+picker above.) What it brings, and how a frame is bound to a map, is under
+[Layouts](layouts.md#layouts). A notice counts what was drawn differently and what was left out;
+the command's `notes` name each, element by element.
 
-The layers of a layout's embedded maps come in with their symbols, renderers and labels
-approximated where RustGIS has no equivalent, each noted: a definition query is dropped, dashed
-polygon outlines are drawn solid, several marker layers are reduced to the first, a renderer
-RustGIS lacks is drawn with a default symbol, a label expression is drawn as the field it names (or
-its class left out), and label halos and justified text are simplified.
+The layers of those maps are read as a `.aprx` map's are, so the sources, broken layers and
+differences above apply to them too.
 
-What RustGIS draws differently from Pro:
+What RustGIS draws differently from Pro in a layout:
 
 - **Text**: Pro's formatting tags (bold, italic and colour runs inside a text) are stripped, a
   date in a format of Pro's is drawn as RustGIS's date, and small caps are shown as upper case.
@@ -221,9 +326,6 @@ What RustGIS draws differently from Pro:
   RustGIS has no match for as Manual.
 - **Scale bars**: the heights and frequency of the marks are drawn as RustGIS draws them, and a
   hollow or single-fill bar is drawn as an alternating bar.
-- **Layer symbols**: a GIF or BMP picture marker in a layer's point symbol is drawn as a circle
-  (PNG and JPEG markers come in as image markers, see
-  [Symbology](cartography.md#symbology)).
 - **Pictures**: a GIF or BMP is converted to PNG (up to 4096 pixels each way), whether the
   layout embeds it or keeps it beside it, and a picture larger than 16 MB is left out. A picture
   file is read from the layout's folder (or `dir`) when the layout is imported; a relative path

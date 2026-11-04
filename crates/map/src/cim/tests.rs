@@ -1261,8 +1261,9 @@ fn an_embedded_frames_camera_converts_from_degrees_or_web_mercator() {
 fn a_camera_in_another_system_falls_back_to_the_auto_extent_then_the_default_extent() {
     let ext = |x0: f64, y0: f64, x1: f64, y1: f64, wkid: u32| json!({"type": "CIMEnvelope", "xmin": x0, "ymin": y0, "xmax": x1, "ymax": y1, "spatialReference": {"wkid": wkid}});
     let maps = [
-        embedded_map("CIMPATH=map/sp.json", 2272, json!({"defaultExtent": ext(-80.0, 40.0, -78.0, 42.0, 4326)})),
-        embedded_map("CIMPATH=map/none.json", 2272, json!({})),
+        // (A system RustGIS doesn't know: no such code.)
+        embedded_map("CIMPATH=map/sp.json", 999_999, json!({"defaultExtent": ext(-80.0, 40.0, -78.0, 42.0, 4326)})),
+        embedded_map("CIMPATH=map/none.json", 999_999, json!({})),
     ];
     let mut auto = map_frame_element("AUTO", (1.0, 1.0, 5.0, 5.0), camera(2_000_000.0, 300_000.0, 12_000.0));
     auto["uRI"] = json!("CIMPATH=map/sp.json");
@@ -1283,7 +1284,25 @@ fn a_camera_in_another_system_falls_back_to_the_auto_extent_then_the_default_ext
     // Nothing usable: the map's view, and the system said.
     let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "LOST") else { panic!() };
     assert!(center.x == 0.0 && center.y == 0.0 && scale == 0.0);
-    assert_eq!(notes(&report), ["LOST: frame camera in an unsupported coordinate system (2272); the map's view is used"]);
+    assert_eq!(notes(&report), ["LOST: frame camera in an unsupported coordinate system (999999); the map's view is used"]);
+}
+
+#[test]
+fn a_camera_in_a_projected_system_is_converted() {
+    // A state plane in US feet (NAD83 Texas Central): its false origin is its centre of
+    // projection, 100°20'W 29°40'N. An extent in NAD83 degrees is read as degrees.
+    let ext = json!({"type": "CIMEnvelope", "xmin": -98.0, "ymin": 31.0, "xmax": -96.0, "ymax": 33.0, "spatialReference": {"wkid": 4269}});
+    let maps = [embedded_map("CIMPATH=map/sp.json", 2277, json!({})), embedded_map("CIMPATH=map/nad.json", 4269, json!({"defaultExtent": ext}))];
+    let mut sp = map_frame_element("SP", (1.0, 1.0, 5.0, 5.0), camera(2_296_583.333, 9_842_500.0, 13_000.0));
+    sp["uRI"] = json!("CIMPATH=map/sp.json");
+    let mut nad = map_frame_element("NAD", (6.0, 1.0, 9.0, 5.0), json!({}));
+    nad["uRI"] = json!("CIMPATH=map/nad.json");
+    let (imp, report) = read_with_maps(&maps, &[sp, nad]);
+    let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "SP") else { panic!() };
+    assert!(near(center.x, -100.0 - 1.0 / 3.0, 1e-4) && near(center.y, 29.0 + 2.0 / 3.0, 1e-4) && scale == 13_000.0, "{center:?} {scale}");
+    let (_, ElementKind::MapFrame { center, .. }) = frame_of(&imp, "NAD") else { panic!() };
+    assert!(near(center.x, -97.0, 1e-3) && near(center.y, 32.0, 1e-3), "{center:?}");
+    assert!(report.notes.is_empty(), "{:?}", notes(&report));
 }
 
 #[test]

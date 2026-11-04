@@ -337,14 +337,29 @@ fn lonlat(wkid: Option<i64>, x: f64, y: f64) -> Option<Coord> {
     let c = match wkid? {
         4326 => Coord::new(x, y),
         3857 | 102100 => merc_to_lonlat(Coord::new(x, y)),
-        _ => return None,
+        w => match projector(w)? {
+            None => Coord::new(x, y),
+            Some(p) => p.inverse(Coord::new(x, y))?,
+        },
     };
     (c.x.is_finite() && c.y.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0).then_some(c)
 }
 
+/// The projection of system `wkid`, by its EPSG code or else Esri's (Pro writes Esri's own codes,
+/// a state plane in feet say, as the EPSG ones), when RustGIS knows it: `Some(None)` for one in
+/// degrees (NAD83's, say), whose points are read as longitude/latitude.
+fn projector(wkid: i64) -> Option<Option<crate::projection::Projector>> {
+    // (The projection lookup refuses a system in degrees, so they are found here first.)
+    let epsg = u16::try_from(wkid).ok().and_then(rustgis_data::raster::crs::epsg_proj4);
+    if epsg.is_some_and(|def| def.split_whitespace().any(|t| t == "+proj=longlat" || t == "+proj=latlong")) {
+        return Some(None);
+    }
+    ["EPSG", "ESRI"].iter().find_map(|authority| crate::projection::Projector::new(&format!("{authority}:{wkid}")).ok().map(Some))
+}
+
 /// Whether RustGIS converts system `wkid`.
 fn supported(wkid: Option<i64>) -> bool {
-    matches!(wkid, Some(4326 | 3857 | 102100))
+    matches!(wkid, Some(4326 | 3857 | 102100)) || wkid.and_then(projector).is_some()
 }
 
 /// A camera scale worth believing.

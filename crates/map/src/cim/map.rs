@@ -556,35 +556,40 @@ fn source_at(c: &Value, owner: &Value, what: &str, report: &mut Report, joins: u
 /// The first sublayer of a WMS layer that shows, depth first, by its WMS name: Pro writes that as
 /// `subLayerID` (its `name` is the title people see), and `name` is read when there's none. A
 /// sublayer holding others (Pro's `CIMServiceCompositeSubLayer`, the service's root) is looked
-/// into, as is one with no name. A hidden sublayer hides the ones in it. At most [`MAX_LAYERS`]
-/// sublayers are looked at, [`MAX_GROUP_DEPTH`] deep.
+/// into; when nothing in it shows (or it is [`MAX_GROUP_DEPTH`] deep) it is taken itself if it
+/// has a name. A hidden sublayer hides the ones in it. At most [`MAX_LAYERS`] sublayers are looked
+/// at.
 fn wms_layer(owner: &Value) -> Option<String> {
-    fn subs(v: &Value) -> &[Value] {
-        v.get("subLayers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
-    }
-    // Each level's sublayers still to look at, top of the stack first.
-    let mut stack = vec![subs(owner).iter()];
     let mut seen = 0;
-    while let Some(level) = stack.last_mut() {
-        let Some(s) = level.next() else {
-            stack.pop();
-            continue;
-        };
-        seen += 1;
-        if seen > MAX_LAYERS {
+    wms_in(subs(owner), 1, &mut seen)
+}
+
+/// A WMS layer's or sublayer's `subLayers`.
+fn subs(v: &Value) -> &[Value] {
+    v.get("subLayers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
+}
+
+/// [`wms_layer`] among `list`, `depth` levels down; `seen` counts the sublayers looked at.
+fn wms_in(list: &[Value], depth: usize, seen: &mut usize) -> Option<String> {
+    for s in list {
+        *seen += 1;
+        if *seen > MAX_LAYERS {
             return None;
         }
         if !flag(s, "visibility", true) {
             continue;
         }
         let named = |k: &str| str_of(s, k).map(str::trim).filter(|n| !n.is_empty());
-        if subs(s).is_empty()
-            && let Some(name) = named("subLayerID").or_else(|| named("name"))
+        let own = named("subLayerID").or_else(|| named("name")).map(str::to_string);
+        let inner = subs(s);
+        if !inner.is_empty()
+            && depth < MAX_GROUP_DEPTH
+            && let Some(found) = wms_in(inner, depth + 1, seen)
         {
-            return Some(name.to_string());
+            return Some(found);
         }
-        if stack.len() < MAX_GROUP_DEPTH {
-            stack.push(subs(s).iter());
+        if own.is_some() {
+            return own;
         }
     }
     None

@@ -34,7 +34,7 @@ The checks were run with `rustgis-cli`, the CLI build of the importer at this br
     brought in all 251 layers.
 - [x] **Step 4: import a layout with its maps.** Run as `project.importArcgis` with `layouts: [an open layout]`. It brings
   in the layout and its 2 maps (60 layers). Exported with `layout.export`: the main frame shows the subject section at
-  the saved 1:13,000, and the overview frame, the logo picture, north arrow, scale bar, legend and title texts all come in.
+  its saved scale, and the overview frame, the logo picture, north arrow, scale bar, legend and title texts all come in.
 - [x] **Step 5: headless check.** `rustgis-cli run --cmd 'project.importArcgis={"path": "<the .aprx>", "maps": ["<the main map>"]}' --cmd 'share.exportMap={"path": "out.png"}'`
   exports the map at Pro's saved centre and scale. The imagery basemap is at Pro's 50% transparency. The land-survey
   polygons draw with three-line labels and no garbage text.
@@ -99,8 +99,8 @@ The checks were run with `rustgis-cli`, the CLI build of the importer at this br
 3. **Maplex `canOverrunFeature: true`** is on 86% of the project's label classes and produces the most frequent note
    (46 on the main map, 206 on the second). RustGIS already lets a line label run about a letter past the line's ends.
    Should `true` be treated as the default and left unnoted?
-4. **Map and frame rotation.** Pro's saved camera has `heading` 13.8 (the map's `defaultRotation` is -13.8), and its
-   layout frames have `heading` 13.72. The import drops both silently. Should the import apply them as the camera
+4. **Map and frame rotation.** Pro's saved camera has a `heading` of about 14° (the map's `defaultRotation` is its
+   negative), and its layout frames have about the same `heading`. The import drops both silently. Should the import apply them as the camera
    bearing (the sign needs checking against a Pro screenshot), or note them?
 5. **Saved project size.** Saving the imported main map writes a project of about 2.9 GB, because non-streamed file layers are
    saved inline. The largest are FileGDB layers of up to about 1.1 GB. This is RustGIS's general save behaviour, not

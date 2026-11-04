@@ -1289,20 +1289,21 @@ fn a_camera_in_another_system_falls_back_to_the_auto_extent_then_the_default_ext
 
 #[test]
 fn a_camera_in_a_projected_system_is_converted() {
-    // A state plane in US feet (NAD83 Texas Central): its false origin is its centre of
-    // projection, 100°20'W 29°40'N. An extent in NAD83 degrees is read as degrees.
-    let ext = json!({"type": "CIMEnvelope", "xmin": -98.0, "ymin": 31.0, "xmax": -96.0, "ymax": 33.0, "spatialReference": {"wkid": 4269}});
+    // A Lambert conformal conic state plane in US survey feet (EPSG:2263), its false origin
+    // 300 000 m (984 250 US ft) east of its central meridian, 74°W, on its latitude of origin,
+    // 40°10'N: the camera's feet are read as feet. An extent in NAD83 degrees is read as degrees.
+    let ext = json!({"type": "CIMEnvelope", "xmin": -80.0, "ymin": 38.0, "xmax": -78.0, "ymax": 40.0, "spatialReference": {"wkid": 4269}});
     let maps =
-        [embedded_map("CIMPATH=map/sp.json", 2277, json!({})), embedded_map("CIMPATH=map/nad.json", 4269, json!({"defaultExtent": ext}))];
-    let mut sp = map_frame_element("SP", (1.0, 1.0, 5.0, 5.0), camera(2_296_583.333, 9_842_500.0, 13_000.0));
+        [embedded_map("CIMPATH=map/sp.json", 2263, json!({})), embedded_map("CIMPATH=map/nad.json", 4269, json!({"defaultExtent": ext}))];
+    let mut sp = map_frame_element("SP", (1.0, 1.0, 5.0, 5.0), camera(984_250.0, 0.0, 24_000.0));
     sp["uRI"] = json!("CIMPATH=map/sp.json");
     let mut nad = map_frame_element("NAD", (6.0, 1.0, 9.0, 5.0), json!({}));
     nad["uRI"] = json!("CIMPATH=map/nad.json");
     let (imp, report) = read_with_maps(&maps, &[sp, nad]);
     let (_, ElementKind::MapFrame { center, scale, .. }) = frame_of(&imp, "SP") else { panic!() };
-    assert!(near(center.x, -100.0 - 1.0 / 3.0, 1e-4) && near(center.y, 29.0 + 2.0 / 3.0, 1e-4) && scale == 13_000.0, "{center:?} {scale}");
+    assert!(near(center.x, -74.0, 1e-4) && near(center.y, 40.0 + 1.0 / 6.0, 1e-4) && scale == 24_000.0, "{center:?} {scale}");
     let (_, ElementKind::MapFrame { center, .. }) = frame_of(&imp, "NAD") else { panic!() };
-    assert!(near(center.x, -97.0, 1e-3) && near(center.y, 32.0, 1e-3), "{center:?}");
+    assert!(near(center.x, -79.0, 1e-3) && near(center.y, 39.0, 1e-3), "{center:?}");
     assert!(report.notes.is_empty(), "{:?}", notes(&report));
 }
 
@@ -2972,6 +2973,31 @@ fn xml_named_entries_that_hold_json_are_read_and_are_not_arcmap() {
 }
 
 #[test]
+fn an_xml_entry_too_large_to_read_leaves_the_project_open_and_the_item_arcmap() {
+    // A genuine ArcMap document, or metadata, can be large: past the cap on an `.xml` entry (here
+    // past the whole JSON budget too) it is skipped, and the JSON beside it is read as before.
+    let project = json!({
+        "type": "CIMGISProject",
+        "projectItems": [
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Main", "catalogPath": "CIMPATH=main/main.json"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Huge", "catalogPath": "CIMPATH=huge/huge.xml"},
+        ],
+    });
+    let map = json!({"type": "CIMMap", "name": "Main", "uRI": "CIMPATH=main/main.json", "layers": []});
+    let mut huge = b"<?xml version=\"1.0\"?><CIMMap>".to_vec();
+    huge.resize(MAX_XML_ENTRY.max(MAX_JSON) + 1, b' ');
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project.to_string().into_bytes()),
+        ("huge/huge.xml".into(), huge),
+        ("main/main.json".into(), map.to_string().into_bytes()),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+    assert_eq!(d.items().iter().map(|i| (i.name.as_str(), i.arcmap)).collect::<Vec<_>>(), [("Main", false), ("Huge", true)]);
+    assert_eq!(d.resolve("CIMPATH=main/main.json").unwrap()["name"], "Main");
+}
+
+#[test]
 fn a_document_that_is_not_a_project_has_no_items_or_views() {
     let d = Document::from_json(r#"{"type":"CIMLayoutDocument"}"#).unwrap();
     assert!(d.items().is_empty());
@@ -3934,6 +3960,35 @@ fn every_connection_kind_has_a_source_and_an_origin() {
             ),
             Wms { url: "https://example.org/wms".into(), layer: "1".into() },
             "WMS https://example.org/wms layer 1",
+            LayerKind::Tiles,
+        ),
+        (
+            // A named sublayer holding only hidden ones: it is the one drawn.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsParent",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "parent", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "off", "visibility": false}]}]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "parent".into() },
+            "WMS https://example.org/wms layer parent",
+            LayerKind::Tiles,
+        ),
+        (
+            // Named sublayers nested past the depth looked into: the deepest one looked at.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsDeep",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                    "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                "subLayers": [(0..12).rev().fold(json!({"type": "CIMWMSSubLayer", "name": "leaf"}), |inner, i| {
+                    json!({"type": "CIMServiceCompositeSubLayer", "name": format!("level{i}"), "subLayers": [inner]})
+                })]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "level7".into() },
+            "WMS https://example.org/wms layer level7",
             LayerKind::Tiles,
         ),
         (

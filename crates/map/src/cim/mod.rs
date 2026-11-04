@@ -35,6 +35,13 @@ pub use symbol::base64_text;
 /// The most JSON text a document (or all of a project's entries together) is read from.
 pub const MAX_JSON: usize = 64 << 20;
 
+/// The largest `.xml` entry of a project read for the CIM JSON Pro may keep under that name (see
+/// [`Document::from_zip`]); a bigger one (a genuine ArcMap document, metadata) is skipped.
+pub const MAX_XML_ENTRY: usize = 8 << 20;
+
+/// The `.xml` entries of a project read in all, apart from [`MAX_JSON`]'s budget.
+pub const MAX_XML_TOTAL: usize = 64 << 20;
+
 /// The most picture bytes a project's zip is read for, all pictures together.
 const MAX_PICTURE_TOTAL: usize = 64 << 20;
 /// The most bytes of one picture kept.
@@ -108,15 +115,15 @@ impl Document {
     }
 
     /// Reads an `.aprx`: `GISProject.json` is the root, and the other JSON entries are what its
-    /// maps, layers and layouts are found in, `.xml` ones too (Pro keeps the `.xml` name of what
-    /// came over from ArcMap after rewriting it as JSON). An entry that isn't JSON is left out,
-    /// since it isn't a definition.
+    /// maps, layers and layouts are found in. `.xml` ones are read too, as Pro keeps the `.xml`
+    /// name of what came over from ArcMap after rewriting it as JSON: apart, within their own
+    /// budget ([`MAX_XML_TOTAL`], [`MAX_XML_ENTRY`] each), and one that can't be read is skipped,
+    /// never failing the project. An entry that isn't JSON is left out, since it isn't a
+    /// definition.
     pub fn from_zip(bytes: &[u8]) -> Result<Document, String> {
-        let wanted = |name: &str| {
-            let name = name.to_ascii_lowercase();
-            name.ends_with(".json") || name.ends_with(".xml")
-        };
-        let files = rustgis_data::zip::read_matching_within(bytes, wanted, MAX_JSON)?;
+        let ends = |name: &str, ext: &str| name.to_ascii_lowercase().ends_with(ext);
+        let files = rustgis_data::zip::read_matching_within(bytes, |n| ends(n, ".json"), MAX_JSON)?;
+        let xml = rustgis_data::zip::read_matching_lenient(bytes, |n| ends(n, ".xml"), MAX_XML_ENTRY, MAX_XML_TOTAL).unwrap_or_default();
         let mut root = None;
         let mut entries = HashMap::new();
         for (name, data) in files {
@@ -126,6 +133,15 @@ impl Document {
                 root = Some(parse(&text)?);
             } else if let Ok(v) = parse(&text) {
                 entries.insert(key, v);
+            }
+        }
+        for (name, data) in xml {
+            // (Only text that starts as JSON is parsed: most `.xml` entries are XML.)
+            let Ok(text) = String::from_utf8(data) else { continue };
+            if text.trim_start_matches('\u{feff}').trim_start().starts_with('{')
+                && let Ok(v) = parse(&text)
+            {
+                entries.entry(path_key(&name)).or_insert(v);
             }
         }
         let root = root.ok_or("the archive has no GISProject.json, so it isn't an ArcGIS Pro project")?;

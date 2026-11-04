@@ -139,6 +139,30 @@ pub fn read_matching(bytes: &[u8], want: impl Fn(&str) -> bool) -> Result<Vec<(S
 
 /// [`read_matching`] within `budget` inflated bytes in all (at most [`MAX_TOTAL`]).
 pub fn read_matching_within(bytes: &[u8], want: impl Fn(&str) -> bool, budget: usize) -> Result<Vec<(String, Vec<u8>)>, String> {
+    read_entries(bytes, want, MAX_ENTRY, budget, false)
+}
+
+/// Like [`read_matching_within`], but an entry it can't take (one over `entry_cap` or past what is
+/// left of `budget`, an encrypted, ZIP64, damaged or oddly compressed one) is skipped rather than
+/// failing the whole archive. Only an archive that can't be read at all is an error.
+pub fn read_matching_lenient(
+    bytes: &[u8],
+    want: impl Fn(&str) -> bool,
+    entry_cap: usize,
+    budget: usize,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    read_entries(bytes, want, entry_cap.min(MAX_ENTRY), budget, true)
+}
+
+/// The wanted entries within `budget` inflated bytes, each at most `entry_cap`; `lenient` skips an
+/// entry that can't be taken instead of failing.
+fn read_entries(
+    bytes: &[u8],
+    want: impl Fn(&str) -> bool,
+    entry_cap: usize,
+    budget: usize,
+    lenient: bool,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut budget = budget.min(MAX_TOTAL);
     let bad = || "not a zip archive (or a damaged one)".to_string();
     // The end-of-central-directory record is in the last 64 KiB + 22 bytes.
@@ -180,35 +204,44 @@ pub fn read_matching_within(bytes: &[u8], want: impl Fn(&str) -> bool, budget: u
         if name.ends_with('/') || !want(&name) {
             continue;
         }
-        // Say what's wrong first: an encrypted entry or a ZIP64 one isn't damaged data.
-        if flags & 1 != 0 {
-            return Err(format!("{name} is encrypted; its contents can't be read"));
-        }
-        if csize == 0xFFFF_FFFF || usize_ == 0xFFFF_FFFF || local == 0xFFFF_FFFF {
-            return Err("the archive uses ZIP64, which can't be read yet".into());
-        }
-        let lnl = u16_at(bytes, add(&[local, 26]).ok_or_else(bad)?).ok_or_else(bad)?;
-        let lxl = u16_at(bytes, add(&[local, 28]).ok_or_else(bad)?).ok_or_else(bad)?;
-        let data_at = add(&[local, 30, lnl, lxl]).ok_or_else(bad)?;
-        let body = bytes.get(data_at..add(&[data_at, csize]).ok_or_else(bad)?).ok_or_else(bad)?;
-        if usize_ > MAX_ENTRY || usize_ > budget {
-            return Err(format!("{name} is too large"));
-        }
-        // Inflate no more than the entry says it holds (and the archive's budget allows).
-        let data = match method {
-            0 if csize != usize_ => return Err(format!("{name} is damaged (wrong size)")),
-            0 => body.to_vec(),
-            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(body, usize_).map_err(|_| format!("{name} is damaged"))?,
-            m => return Err(format!("{name} uses an unsupported compression ({m})")),
+        let entry = || -> Result<Vec<u8>, String> {
+            // Say what's wrong first: an encrypted entry or a ZIP64 one isn't damaged data.
+            if flags & 1 != 0 {
+                return Err(format!("{name} is encrypted; its contents can't be read"));
+            }
+            if csize == 0xFFFF_FFFF || usize_ == 0xFFFF_FFFF || local == 0xFFFF_FFFF {
+                return Err("the archive uses ZIP64, which can't be read yet".into());
+            }
+            let lnl = u16_at(bytes, add(&[local, 26]).ok_or_else(bad)?).ok_or_else(bad)?;
+            let lxl = u16_at(bytes, add(&[local, 28]).ok_or_else(bad)?).ok_or_else(bad)?;
+            let data_at = add(&[local, 30, lnl, lxl]).ok_or_else(bad)?;
+            let body = bytes.get(data_at..add(&[data_at, csize]).ok_or_else(bad)?).ok_or_else(bad)?;
+            if usize_ > entry_cap || usize_ > budget {
+                return Err(format!("{name} is too large"));
+            }
+            // Inflate no more than the entry says it holds (and the archive's budget allows).
+            let data = match method {
+                0 if csize != usize_ => return Err(format!("{name} is damaged (wrong size)")),
+                0 => body.to_vec(),
+                8 => miniz_oxide::inflate::decompress_to_vec_with_limit(body, usize_).map_err(|_| format!("{name} is damaged"))?,
+                m => return Err(format!("{name} uses an unsupported compression ({m})")),
+            };
+            if data.len() != usize_ {
+                return Err(format!("{name} is damaged (wrong size)"));
+            }
+            if crc32(&data) as usize != crc {
+                return Err(format!("{name} is damaged (checksum mismatch)"));
+            }
+            Ok(data)
         };
-        if data.len() != usize_ {
-            return Err(format!("{name} is damaged (wrong size)"));
+        match entry() {
+            Ok(data) => {
+                budget -= data.len();
+                out.push((name, data));
+            }
+            Err(_) if lenient => {}
+            Err(e) => return Err(e),
         }
-        budget -= data.len();
-        if crc32(&data) as usize != crc {
-            return Err(format!("{name} is damaged (checksum mismatch)"));
-        }
-        out.push((name, data));
     }
     Ok(out)
 }
@@ -242,6 +275,32 @@ mod tests {
         let eocd = far.len() - 22;
         far[eocd + 16..eocd + 20].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(read(&far).is_err());
+    }
+
+    #[test]
+    fn a_lenient_read_skips_entries_it_cannot_take_and_keeps_the_rest() {
+        let entries = vec![
+            ("a.xml".to_string(), b"small".to_vec()),
+            ("big.xml".to_string(), vec![b'x'; 100]),
+            ("bad.xml".to_string(), vec![7u8; 3]),
+            ("c.xml".to_string(), b"also small".to_vec()),
+            ("d.json".to_string(), b"{}".to_vec()),
+        ];
+        let mut z = write(&entries).unwrap();
+        // Damage bad.xml's stored bytes: its checksum fails.
+        let at = z.windows(7).position(|w| w == b"bad.xml").unwrap() + 7;
+        if let Some(b) = z.get_mut(at) {
+            *b ^= 0xFF;
+        }
+        // The strict read fails the whole archive; the lenient one skips what it can't take: an
+        // entry over the per-entry cap, a damaged one, and one past the budget.
+        assert!(read_matching_within(&z, |n| n.ends_with(".xml"), 1 << 20).is_err());
+        let got = read_matching_lenient(&z, |n| n.ends_with(".xml"), 50, 1 << 20).unwrap();
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a.xml", "c.xml"]);
+        let got = read_matching_lenient(&z, |n| n.ends_with(".xml"), 50, 8).unwrap();
+        assert_eq!(got, [("a.xml".to_string(), b"small".to_vec())], "c.xml is past the budget");
+        assert!(read_matching_lenient(b"not a zip", |_| true, 50, 50).is_err());
     }
 
     #[test]

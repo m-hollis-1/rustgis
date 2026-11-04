@@ -69,6 +69,8 @@ fn label_class(c: &Value, what: &str, report: &mut Report) -> Option<LabelClass>
         report.approximated(what, "text formatting tags, left out");
     }
     let field = t.template;
+    // (How many lines the expression makes itself, for stacking.)
+    let lines = field.lines().count();
     // The text symbol, without the halo the label class carries over itself.
     let raw = c.get("textSymbol").and_then(symbol_of).unwrap_or(&NULL);
     let mut plain = raw.clone();
@@ -110,7 +112,7 @@ fn label_class(c: &Value, what: &str, report: &mut Report) -> Option<LabelClass>
         spacing: 0.0,
         offset,
         background,
-        wrap_char: stacking(c, what, report),
+        wrap_char: stacking(c, lines, what, report),
         wrap_length: 0,
         line_align: TextAlign::Left,
         repeat,
@@ -346,14 +348,20 @@ fn shadow(text: &Value, what: &str, report: &mut Report) {
 
 /// The wrap character a class that stacks its labels breaks at: the first separator Pro drops
 /// from the label (`visible` false). One it keeps is noted, and the next dropped one is looked
-/// for. Pro writes the settings in the Maplex block; the class itself is read too.
-pub(crate) fn stacking(class: &Value, what: &str, report: &mut Report) -> Option<String> {
+/// for. Pro writes the settings in the Maplex block; the class itself is read too. A label whose
+/// expression already makes `lines` lines, as many as `maximumNumberOfLines` allows or more,
+/// isn't stacked: Pro has no line left to break it into.
+pub(crate) fn stacking(class: &Value, lines: usize, what: &str, report: &mut Report) -> Option<String> {
     let maplex = class.get("maplexLabelPlacementProperties").filter(|b| b.is_object());
     let find = |k: &str| maplex.and_then(|m| m.get(k)).or_else(|| class.get(k));
     if !find("canStackLabel").and_then(Value::as_bool).unwrap_or(false) {
         return None;
     }
-    for s in find("labelStackingProperties")?.get("separators")?.as_array()?.iter().take(MAX_SEPARATORS) {
+    let props = find("labelStackingProperties")?;
+    if num(props, "maximumNumberOfLines").is_some_and(|max| max >= 1.0 && lines as f64 >= max) {
+        return None;
+    }
+    for s in props.get("separators")?.as_array()?.iter().take(MAX_SEPARATORS) {
         let Some(sep) = str_of(s, "separator").and_then(wrap_char) else { continue };
         if flag(s, "visible", false) {
             report.approximated(what, format!("stacking at {} keeping it, drawn without", shown(&sep)));

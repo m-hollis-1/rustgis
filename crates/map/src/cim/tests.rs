@@ -3700,6 +3700,34 @@ fn a_hidden_stacking_separator_becomes_the_wrap_character() {
     assert_eq!(c.wrap_char, Some("\u{2192}".repeat(8)));
 }
 
+#[test]
+fn a_label_whose_expression_fills_the_stacking_lines_is_not_stacked_further() {
+    // Pro stacks a label into at most `maximumNumberOfLines` lines, its own line breaks
+    // counted: an expression that already makes that many lines is not broken at a separator.
+    let stacking = |max: serde_json::Value| {
+        maplex(json!({"canStackLabel": true, "labelStackingProperties": {"maximumNumberOfLines": max,
+            "separators": [{"separator": " ", "splitAfter": true}, {"separator": ",", "visible": true, "splitAfter": true}]}}))
+    };
+    let class = |expression: &str, max: serde_json::Value| {
+        let mut c = stacking(max);
+        if let Some(o) = c.as_object_mut() {
+            o.insert("expression".into(), json!(expression));
+        }
+        read_class(c, json!({})).0
+    };
+    let three = "$feature.A + TextFormatting.NewLine + $feature.B + \" \" + $feature.C + TextFormatting.NewLine + $feature.D";
+    assert_eq!(class(three, json!(3)).wrap_char, None, "three lines of three: nothing to stack");
+    assert_eq!(class(three, json!(2)).wrap_char, None, "more lines than the limit");
+    assert_eq!(class(three, json!(4)).wrap_char.as_deref(), Some(" "), "room for one more line");
+    assert_eq!(class("$feature.A + \" \" + $feature.B", json!(3)).wrap_char.as_deref(), Some(" "));
+    // No limit written: stacked as before.
+    let mut c = maplex(json!({"canStackLabel": true, "labelStackingProperties": {"separators": [{"separator": " "}]}}));
+    if let Some(o) = c.as_object_mut() {
+        o.insert("expression".into(), json!(three));
+    }
+    assert_eq!(read_class(c, json!({})).0.wrap_char.as_deref(), Some(" "));
+}
+
 // ---- the layer tree, sources and layer properties ----
 
 const CITY_GDB: &str = r"D:\data\city.gdb";

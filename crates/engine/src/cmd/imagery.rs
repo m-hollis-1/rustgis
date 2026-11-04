@@ -238,7 +238,9 @@ fn georeference(s: &mut Session, p: &Value) -> CmdResult {
         }
         GeoTransform { origin_x: bx, origin_y: by, pixel_width: ax, pixel_height: ay }
     };
-    let out = rebuild(&r, gt, Crs::LonLat, r.bands.iter().map(|b| b.data.clone()).collect())?;
+    let mut out = rebuild(&r, gt, Crs::LonLat, r.bands.iter().map(|b| b.data.clone()).collect())?;
+    // The same pixels, so the same values rounded when the file was read.
+    out.rounded = r.rounded.clone();
     let e = out.extent();
     let v = replace(s, &layer, out)?;
     Ok(json!({"layer": v["layer"], "extent": [e.min_x, e.min_y, e.max_x, e.max_y]}))
@@ -729,7 +731,7 @@ fn process(s: &mut Session, p: &Value) -> CmdResult {
                 log::warn!("{pl}: {} feature(s) failed polygon validation during clipping", failed_features.len());
             }
             let mut failed_parts = Vec::new();
-            let (cols, rows, mask) = rasterops::polygon_mask_with_failures(&r, &polygons, &mut failed_parts).ok_or_else(|| {
+            let (cols, rows, mask) = rasterops::polygon_mask_with_failures(&r, &polygons, &mut failed_parts)?.ok_or_else(|| {
                 format!("no cell of {} falls inside {pl} ({} polygon part(s) failed raster projection)", r.name, failed_parts.len())
             })?;
             let out = clip_window(&r, cols, rows, Some(&mask), name(p, format!("{}_clip", r.name)))?;

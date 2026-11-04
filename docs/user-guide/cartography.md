@@ -16,7 +16,17 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   classes that drawn features use (after the definition query and display filters);
   `<all other values>` appears only when a drawn feature falls outside the classes and its symbol
   is not fully transparent. A layout legend can leave it out with **Hide other values** (see
-  [Layouts](layouts.md)).
+  [Layouts](layouts.md)). Instead of a field, Unique Values can class by an
+  [expression](expressions.md) typed in the **Expression** box under the field: one colour per
+  distinct value it gives (`CASE WHEN pop_max > 1e7 THEN 'large' ELSE 'small' END`, `upper(kind)`),
+  a feature where it gives null in `<all other values>`. The classes are the values it gives
+  without a map; it can read `@map_scale`, so a feature can move between those classes as the map
+  zooms (a value it gives only at some scales draws as `<all other values>`), and the Layers pane
+  and layout legends list the classes drawn at the map's scale (on a layer too large to class
+  every feature for a legend, past 2,000,000 features × classes, all its classes). Clearing the
+  box goes back to a field. A layer classed by expression is drawn on the CPU, and a web style
+  shared from it draws every feature with one symbol, which a notice says
+  (`layer.symbology={"type": "unique", "expression": "…"}`).
 - **Graduated Colors**: 1 to 12 classes of a numeric field by natural breaks (Jenks), equal
   interval, quantile, geometric interval, standard deviation, arithmetic progression or head/tail
   breaks (the Method list is in alphabetical order). Geometric interval makes class
@@ -84,6 +94,32 @@ strokes of markers:
 ```text
 layer.markerRotation={"layer":"Signs","field":"angle","counterclockwise":true}
 layer.lineStrokes={"layer":"Signs","strokes":[{"color":"#FFFFFF","markers":{"mark":"circle","size":14}},{"color":"#000000","markers":{"mark":"character","char":"▲","size":10,"offsetAlong":0}}]}
+```
+
+### Symbols by expression
+
+**By Expression**, under the symbol in the Symbology pane, sets parts of the symbol per feature
+from an [expression](expressions.md): a point's **Size** (points), the **Fill** and **Outline**
+colours (a line's **Color**), the **Outline width** (a line's **Width**, in points) and a point's
+**Angle** (degrees clockwise, in place of the **Rotation** field; where it gives null, the field's). A colour is text: `'#d7301f'`,
+a CSS colour name such as `'navy'`, or `'r,g,b[,a]'` as `color_rgb()` and `color_rgba()` give it.
+A point with **Marks** scales them all with its **Size**, their sizes and offsets in proportion to
+the symbol's own size (each mark keeps its colours); a size of 0 or less draws nothing. Where an
+expression gives null (or, for a colour, text that isn't one), the feature takes the symbol's own, so a `CASE` without `ELSE` changes only the features it names. `@map_scale` is the
+scale the map is drawn at, so a width can change with the zoom (in a shared web map, whose
+reader zooms freely, it is null). They apply on top of the
+renderer: a Unique Values class's colour, then the expression's. An expression applies when its
+box loses focus; one that doesn't read shows why and isn't applied. A layer styled by expression
+is drawn on the CPU; points drawn as counted bins (aggregation) keep the bins' own symbol, and
+a line's stacked strokes keep the colour and width each sets. A shared web map draws each
+feature's colours, outline width and size as styled (points as circles, without their angle or
+marks); a layer's MapLibre style (a web layer's, or one exported alone) carries the renderer's
+symbol, without the expressions. By command:
+
+```text
+layer.symbolBy={"layer":"Cities","size":"scale_linear(pop_max, 0, 2e7, 4, 24)","fill":"CASE WHEN pop_max > 1e7 THEN '#d7301f' END"}
+layer.symbolBy={"layer":"Rivers","strokeWidth":"if(@map_scale < 5e6, 2, 0.5)"}
+layer.symbolBy={"layer":"Cities","fill":null}
 ```
 
 Pick a colour scheme from the pane's swatches, listed in groups: **Perceptually Uniform** (Viridis,
@@ -364,7 +400,7 @@ it unchanged.
 The **Labeling pane** brings together the label classes and the chosen class's field, SQL
 clause, text symbol, placement and visibility limits. Under its header (the layer, labels on or
 off, and the class chosen), a tab per topic shows one part at a time: **Content** (the label field,
-with a search in its list, above the SQL query), **Symbol**, **Position** and
+with a search in its list, the class's expressions under **By Expression**, and the SQL query), **Symbol**, **Position** and
 **Range**. Open it for a feature layer with Layers › right-click › **Labeling Properties…**,
 **View › Windows › Labeling**, or **Labeling › Labels › Properties**. It runs the same commands as
 the ribbon, so each setting change undoes on its own (a dragged size or a colour pick is one step).
@@ -385,6 +421,29 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   opens on **Expression**. Labels from ArcGIS Pro expressions that join fields and text come in
   this way. By command, `labels.field` takes the expression in place of a field's name
   (`labels.field={"layer": "Cities", "field": "{name} ({pop_max})"}`).
+- **By expression**: a class's **Text**, **Size**, **Color** and **Angle** per feature from an
+  [expression](expressions.md) (Labeling pane › Content › **By Expression**). The text replaces
+  the field's, as in `"name" || ' (' || round(pop_max / 1e6, 1) || ' M)'`, so a class with a
+  text expression needs no field; a feature whose text is null or blank isn't labelled (in the
+  example, one with no name). The size is in points (kept within 4–72), the colour is text as
+  for [symbols](#symbols-by-expression) (`'#d7301f'`, `'navy'`, `'r,g,b[,a]'`), and the angle
+  turns a point's or polygon's label about its centre, in degrees clockwise, kept upright (one
+  past 90° reads from its other end, as labels along lines do; those keep the line's angle). Where an expression gives null, or text that isn't a colour,
+  the class's own setting is used; `@map_scale` is the scale the map is drawn at. An expression
+  applies when its box loses focus; one that doesn't read shows why and isn't applied, and one
+  that stops reading (a field removed) is drawn as if it weren't set. **Convert** keeps each
+  label's text, and its size, colour and angle by expression (at the map's scale) in `SIZE`,
+  `COLOR` and `ANGLE` fields the annotation's classes draw by. A Web Style or Web Layer export labels with the
+  field, size and colour of the Default class, without its expressions (and says so). By command
+  (a key left out keeps its expression, `null` or `""` removes it; `class` as for the other label
+  commands):
+
+  ```text
+  labels.by={"layer":"Cities","text":"upper(name)","size":"scale_linear(pop_max, 0, 2e7, 8, 20)"}
+  labels.by={"layer":"Cities","color":"CASE WHEN pop_max > 1e7 THEN '#d7301f' END","angle":"15"}
+  labels.by={"layer":"Cities","text":null}
+  ```
+
 - **Halo and letter spacing**: a halo is white behind dark text and dark behind light, and thin,
   unless it is given a colour and a width of its own (Labeling pane › Symbol › **Halo color**,
   **Halo width**: how far it reaches beyond the letters, 0–10 points). The letters can be set
@@ -447,6 +506,14 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   next, is left unlabelled. A text over 200 characters long is set straight rather than
   curved. Points and polygons with these placements are labelled as automatic
   (`labels.placement={"layer": "Rivers", "position": "curved"}`).
+- **Other places round points**: a point's label whose place another label takes tries the
+  other places round the point, corners first (above right, above left, below right, below left,
+  right, left, above, below, leaving out its own), and goes to the first where
+  all of it shows; where none is free it is left out, as before (Labeling pane › Position ›
+  **Try other places round the point**, for point layers). Off by default: a label that moves can
+  take the place a less important one had. The class's offset applies to every place, and Lock
+  keeps the place each label took
+  (`labels.placement={"layer": "Cities", "otherPositions": true}`).
 - **Lock** keeps the labelled features fixed while you pan and zoom; **Pause** stops drawing
   labels for faster navigation; **View Unplaced** draws the labels that didn't fit in red. They
   apply to the whole map, so they are on the ribbon (Labeling › Map Labeling), not in the pane.

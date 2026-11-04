@@ -723,7 +723,7 @@ fn settle(s: &mut Session, id: u32, l: &LayerImport, a: &Adding, report: &mut Re
                 Err(e) => report.skipped(name, format!("its definition query `{}` ({e}), dropped", shown(q))),
             }
         }
-        qgis::check_fields(layer, name, report);
+        qgis::check_fields(layer, name, &[], report);
     }
     step(s, "layer.expand", &json!({"layer": id, "on": l.expanded}), name, "its expanded state", report);
     if !raster

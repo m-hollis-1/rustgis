@@ -1084,6 +1084,7 @@ fn unique(r: &Value, what: &str, style: &mut Style, report: &mut Report) -> bool
     style.line_strokes = Some(Vec::new());
     style.fill_layers = Some(Vec::new());
     style.renderer = Some(Renderer::Unique {
+        expression: None,
         field: field.to_string(),
         classes,
         other: other.symbol,

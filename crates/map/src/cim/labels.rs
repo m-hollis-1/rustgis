@@ -91,6 +91,7 @@ fn label_class(c: &Value, what: &str, report: &mut Report) -> Option<LabelClass>
     // (Scales at 96 dpi, as the layer's: see `feature_layer`.)
     let scale = |k: &str| num(c, k).filter(|s| *s > 0.0).map(|s| s * QGIS_SCALE);
     Some(LabelClass {
+        by: Default::default(),
         name: str_of(c, "name").unwrap_or_default().to_string(),
         visible: flag(c, "visibility", true),
         where_: str_of(c, "whereClause").map(str::trim).filter(|w| !w.is_empty()).map(str::to_string),

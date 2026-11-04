@@ -33,6 +33,9 @@ const MARGIN: f64 = 1.8;
 const STEPS: f64 = 4.0;
 /// Pixels a picture's sides are rounded up to (so a view's size changing a little keeps it).
 const ROUND: f64 = 256.0;
+/// Room past the view on each side, a share of its size, that the layer's last picture must
+/// reach beyond the view to be drawn instead of a new one.
+const ROOM: f64 = 0.15;
 /// Most layers whose last picture (and refused size) is kept.
 const MAX_KEPT: usize = 256;
 
@@ -150,11 +153,11 @@ fn picture(area: [f64; 4], res: f64, max_side: u32) -> Option<([f64; 4], u32, u3
 /// tried again (the failure may have been passing: a timeout, a busy server).
 const SMALL_FOR: web_time::Duration = web_time::Duration::from_secs(300);
 
-/// What is kept between frames, by the layer's address: its last picture drawn (the address
-/// and area), and when a large picture of it last failed.
+/// What is kept between frames, by the layer's address: its last picture drawn (the address,
+/// area and units a pixel), and when a large picture of it last failed.
 #[derive(Default)]
 struct Kept {
-    last: HashMap<String, (String, [f64; 4])>,
+    last: HashMap<String, (String, [f64; 4], f64)>,
     small: HashMap<String, web_time::Instant>,
 }
 
@@ -295,6 +298,25 @@ pub(crate) fn draw(pm: &mut Pixmap, req: &Request, t: &TileLayer, view: &View, f
             },
             None => (at, pw, ph),
         };
+        let r = (at[2] - at[0]) / f64::from(pw.max(1));
+        // The layer's last picture holding the whole view at this detail, with room to move, is
+        // drawn instead: a view turned (its box wider or narrower at each angle) or made smaller
+        // asks for nothing new. A view moving on asks for its next picture while the last still
+        // covers it, standing in.
+        let last = kept().last.get(&key).cloned();
+        let (gx, gy) = ((area[2] - area[0]) * ROOM, (area[3] - area[1]) * ROOM);
+        if let Some((u, last_at, last_r)) = &last
+            && (last_r / r - 1.0).abs() < 1e-6
+            && last_at[0] <= area[0] - gx
+            && last_at[1] <= area[1] - gy
+            && last_at[2] >= area[2] + gx
+            && last_at[3] >= area[3] + gy
+            && let Some(payload) = cache::peek(u)
+            && let Payload::Image(img) = &*payload
+        {
+            paint(pm, img, *last_at);
+            return nothing;
+        }
         let url = Warp::map_address(&req.base, &req.system, at, pw, ph);
         match cache::get(&url, Want::Image) {
             State::Ready(payload) => {
@@ -304,14 +326,13 @@ pub(crate) fn draw(pm: &mut Pixmap, req: &Request, t: &TileLayer, view: &View, f
                     if k.last.len() >= MAX_KEPT {
                         k.last.clear();
                     }
-                    k.last.insert(key, (url, at));
+                    k.last.insert(key, (url, at, r));
                 }
                 return nothing;
             }
             State::Pending => {
                 // The layer's last picture, where it still is in the cache, stands in.
-                let last = kept().last.get(&key).cloned();
-                if let Some((u, at)) = last
+                if let Some((u, at, _)) = last
                     && let Some(payload) = cache::peek(&u)
                     && let Payload::Image(img) = &*payload
                 {

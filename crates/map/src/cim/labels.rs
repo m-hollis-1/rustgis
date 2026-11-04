@@ -333,11 +333,13 @@ fn background(c: &Value, what: &str, report: &mut Report) -> (Option<LabelBackgr
     (Some(background.checked()), false)
 }
 
-/// Notes a text shadow (a colour that shows, or an offset), which RustGIS can't draw.
+/// Notes a text shadow, which RustGIS can't draw: one offset (`shadowOffsetX`/`Y`) in a colour
+/// that shows (black when none is given). Pro writes an opaque black `shadowColor` on most text
+/// symbols with no offset, which draws nothing.
 fn shadow(text: &Value, what: &str, report: &mut Report) {
-    let colored = text.get("shadowColor").and_then(color).is_some_and(|c| c.a() > 0);
-    let offset = ["shadowX", "shadowY"].iter().any(|k| num(text, k).is_some_and(|v| v != 0.0));
-    if colored || offset {
+    let shows = text.get("shadowColor").is_none_or(|c| color(c).is_some_and(|c| c.a() > 0));
+    let offset = ["shadowOffsetX", "shadowOffsetY"].iter().any(|k| num(text, k).is_some_and(|v| v != 0.0));
+    if shows && offset {
         report.skipped(what, "a text shadow, left out");
     }
 }

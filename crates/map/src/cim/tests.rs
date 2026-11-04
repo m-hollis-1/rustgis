@@ -3644,12 +3644,18 @@ fn line_callouts_and_shadows_are_noted() {
     let (_, report) = read_class(json!({}), json!({"callout": {"type": "CIMFancyCallout"}}));
     assert_eq!(notes(&report), ["Roads: callouts of type CIMFancyCallout, left out"]);
 
-    // A shadow: a colour that shows, or an offset.
+    // A shadow shows when it is offset (`shadowOffsetX`/`Y`, as Pro writes them) in a colour that
+    // shows (black when none is given). Pro writes an opaque black `shadowColor` on most text
+    // symbols with no offset: no shadow, nothing to note.
     let shadow = |extra: serde_json::Value| notes(&read_class(json!({}), extra).1);
-    assert_eq!(shadow(json!({"shadowColor": {"type": "CIMRGBColor", "values": [0, 0, 0, 50]}})), ["Roads: a text shadow, left out"]);
-    assert_eq!(shadow(json!({"shadowX": 1.5})), ["Roads: a text shadow, left out"]);
-    assert_eq!(shadow(json!({"shadowY": -1})), ["Roads: a text shadow, left out"]);
-    assert!(shadow(json!({"shadowColor": {"type": "CIMRGBColor", "values": [0, 0, 0, 0]}, "shadowX": 0, "shadowY": 0})).is_empty());
+    let black = json!({"type": "CIMRGBColor", "values": [0, 0, 0, 100]});
+    let clear = json!({"type": "CIMRGBColor", "values": [0, 0, 0, 0]});
+    assert!(shadow(json!({"shadowColor": black})).is_empty(), "Pro's default: a colour and no offset");
+    assert_eq!(shadow(json!({"shadowColor": black, "shadowOffsetX": 1, "shadowOffsetY": -1})), ["Roads: a text shadow, left out"]);
+    assert_eq!(shadow(json!({"shadowOffsetX": 1.5})), ["Roads: a text shadow, left out"]);
+    assert_eq!(shadow(json!({"shadowOffsetY": -1})), ["Roads: a text shadow, left out"]);
+    assert!(shadow(json!({"shadowColor": clear, "shadowOffsetX": 2})).is_empty(), "a clear shadow doesn't show");
+    assert!(shadow(json!({"shadowColor": black, "shadowOffsetX": 0, "shadowOffsetY": 0})).is_empty());
     assert!(shadow(json!({})).is_empty());
 }
 

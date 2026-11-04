@@ -22729,6 +22729,9 @@ fn geolibre_remote_plain_tiff_folder_opacity_is_not_baked_twice() {
                 }
                 Err(_) => break,
             };
+            // An accepted socket can inherit the listener's nonblocking mode (Windows): a read
+            // would find nothing yet and the request be answered empty, aborting the client's.
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
             let mut input = [0; 8192];
             let n = stream.read(&mut input).unwrap_or(0);

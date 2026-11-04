@@ -116,7 +116,8 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Repairs each broken file layer whose data was in `from` to the file of the same name in
-/// `to`, as one undo step. A layer whose file isn't in `to`, or doesn't fit, is skipped with why.
+/// `to`, as one undo step. A layer whose file isn't in `to`, or doesn't fit, is skipped with why;
+/// when none is repaired that is an error (so no empty undo step).
 fn repair_folder(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -156,6 +157,14 @@ fn repair_folder(s: &mut Session, p: &Value) -> CmdResult {
                 Ok(_) => repaired.push(name),
                 Err(why) => skipped.push(json!({"layer": name, "why": why})),
             }
+        }
+        if repaired.is_empty() {
+            // Nothing changed: an Ok would leave an empty undo step and mark the project changed.
+            let why: Vec<String> = skipped
+                .iter()
+                .map(|x| format!("{}: {}", x["layer"].as_str().unwrap_or_default(), x["why"].as_str().unwrap_or_default()))
+                .collect();
+            return Err(format!("nothing was repaired: {}", why.join("; ")));
         }
         Ok(json!({"repaired": repaired, "skipped": skipped}))
     }

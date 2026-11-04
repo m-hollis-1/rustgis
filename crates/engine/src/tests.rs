@@ -25922,37 +25922,66 @@ fn repair_folder_fixes_the_layers_that_fit_and_lists_the_rest() {
     let c = broken_countries(&mut s, &old.join("places.geojson"));
     // One more in another folder is left alone.
     let other = broken_countries(&mut s, &dir.join("data").join("countries.shp"));
-    for (id, name) in [(a, "A"), (b, "B"), (c, "C"), (other, "Other")] {
+    // D fits like A. E classes by a field its new file lacks.
+    let d = broken_countries(&mut s, &old.join("borders.shp"));
+    let e = broken_countries(&mut s, &old.join("regions.geojson"));
+    for (id, name) in [(a, "A"), (b, "B"), (c, "C"), (other, "Other"), (d, "D"), (e, "E")] {
         s.map_mut().layer_mut(id).unwrap().name = name.into();
     }
     // C remembers drawing polygons (a broken layer that never opened knows nothing of its geometry).
     s.map_mut().layer_mut(c).unwrap().dataset.geometry_type = rustgis_data::GeometryType::Polygon;
+    {
+        let l = s.map_mut().layer_mut(e).unwrap();
+        l.dataset.geometry_type = rustgis_data::GeometryType::Polygon;
+        l.dataset.fields = vec![rustgis_data::Field::new("continent", rustgis_data::FieldType::Text)];
+    }
     countries_shapefile(&new.join("countries.shp"));
+    countries_shapefile(&new.join("borders.shp"));
+    std::fs::write(
+        new.join("regions.geojson"),
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"x"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}}]}"#,
+    )
+    .unwrap();
     std::fs::write(
         new.join("places.geojson"),
         r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"x"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
     )
     .unwrap();
     let args = json!({"from": old.display().to_string(), "to": new.display().to_string()});
+    let source_of = |s: &Session, id: u32| {
+        let src = s.map().layer(id).unwrap().source.as_ref().unwrap();
+        (src.path.clone(), src.reason.clone())
+    };
+    let c_before = source_of(&s, c);
     let r = s.run("layer.repairFolder", &args).unwrap();
-    assert_eq!(r["repaired"], json!(["A"]), "{r}");
+    let mut repaired: Vec<&str> = r["repaired"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    repaired.sort_unstable();
+    assert_eq!(repaired, ["A", "D"], "{r}");
     let skipped = r["skipped"].as_array().unwrap();
-    assert_eq!(skipped.len(), 2, "{r}");
+    assert_eq!(skipped.len(), 3, "{r}");
     let why = |name: &str| skipped.iter().find(|x| x["layer"] == name).and_then(|x| x["why"].as_str()).unwrap_or_default().to_string();
     assert!(why("B").contains("not in"), "{r}");
     assert!(why("C").contains("Point") || why("C").contains("point"), "{r}");
+    assert!(why("E").contains("has no field continent"), "{r}");
     let broken = |s: &Session, id: u32| s.map().layer(id).unwrap().source.as_ref().unwrap().is_broken();
-    assert!(!broken(&s, a) && broken(&s, b) && broken(&s, c) && broken(&s, other));
-    // One undo takes the repair back.
+    assert!(!broken(&s, a) && !broken(&s, d) && broken(&s, b) && broken(&s, c) && broken(&s, e) && broken(&s, other));
+    // A layer that didn't fit is left exactly as it was.
+    assert_eq!(source_of(&s, c), c_before);
+    // One undo takes both repairs back.
     s.run("edit.undo", &json!({})).unwrap();
-    assert!(broken(&s, a));
+    assert!(broken(&s, a) && broken(&s, d));
+    // Every layer skipped: an error listing why, not an empty step.
+    let e = s.run("layer.repairFolder", &json!({"from": old.display().to_string(), "to": dir.join("empty").display().to_string()}));
+    let e = e.unwrap_err();
+    assert!(e.starts_with("nothing was repaired: ") && e.contains("A: not in ") && e.contains("E: not in ") && e.contains("; "), "{e}");
+    assert!(broken(&s, a) && broken(&s, d));
     // Nothing from a folder no layer reads: an error that says so.
     let e = s.run("layer.repairFolder", &json!({"from": dir.join("nowhere").display().to_string(), "to": new.display().to_string()}));
     assert!(e.unwrap_err().contains("no broken layer had its data in"));
     // Case and separators don't matter to the match.
     let loose = old.display().to_string().to_uppercase().replace('\\', "/");
     let r = s.run("layer.repairFolder", &json!({"from": format!("{loose}/"), "to": new.display().to_string()})).unwrap();
-    assert_eq!(r["repaired"], json!(["A"]), "{r}");
+    assert_eq!(r["repaired"].as_array().map(Vec::len), Some(2), "{r}");
     assert!(s.run("layer.repairFolder", &json!({"from": "x"})).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }

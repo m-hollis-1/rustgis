@@ -188,7 +188,7 @@ pub(crate) fn import_layout(s: &mut Session, text: &str, dir: Option<&str>, p: &
     for (key, m) in &maps {
         let name = match reusable(s, m, dir) {
             Some(name) => name,
-            None => add_map(s, m, dir, None, &mut report)?.name,
+            None => add_map(s, m, dir, None, m.bearing, &mut report)?.name,
         };
         if !added.contains(&name) {
             added.push(name.clone());
@@ -394,12 +394,14 @@ struct Adding<'a> {
 
 /// Adds `m` as a new map (its projection, groups, layers top to bottom, tables, view) and
 /// returns what it added, the map's name first; the new map is active afterwards. `camera` is
-/// the view Pro saved (`Document::view_camera`): `(x, y, scale)` in the map's coordinates.
+/// the view Pro saved (`Document::view_camera`): `(x, y, scale)` in the map's coordinates;
+/// `bearing` the way it faced (`Document::view_bearing`, else the map's own `bearing`).
 pub(crate) fn add_map(
     s: &mut Session,
     m: &MapImport,
     dir: Option<&str>,
     camera: Option<(f64, f64, f64)>,
+    bearing: Option<f64>,
     report: &mut Report,
 ) -> Result<Added, String> {
     let made = s.run_part("map.new", &json!({"name": m.name}))?;
@@ -412,6 +414,9 @@ pub(crate) fn add_map(
     let mut added = add_entries(s, m, dir, None, report);
     added.name = name;
     go_to_view(s, m, units, camera);
+    if let Some(b) = bearing {
+        s.map_mut().camera.set_bearing(b);
+    }
     Ok(added)
 }
 
@@ -563,6 +568,10 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
         LayerSource::File { path, table } => {
             let from = Origin { path: Some(resolve(path, a.dir)), table: table.clone(), service: None };
             let opened = local_path(path, a.dir).and_then(|path| {
+                // A JPEG or PNG would be read as a photo: one with a world file is a raster.
+                if l.kind == LayerKind::Raster && georeferenced_picture(&path) {
+                    return Err("a georeferenced JPEG or PNG: world files aren't read yet".into());
+                }
                 let mut q = json!({"path": path, "name": name});
                 if let Some(t) = table {
                     q["layer"] = json!(t);
@@ -592,14 +601,18 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
             (s.run_part("map.addTiles", &json!({"url": style_url(url), "kind": "style", "name": name, "overlay": true})), Origin::default())
         }
         // (The reader said why, in one skipped note.)
-        LayerSource::Unopenable => {
+        LayerSource::Unopenable | LayerSource::Missing(_) => {
             // The reader's note came before anything this import notes; with nothing dropped
             // yet it was kept. (Once the report is full, it may not have been: then it isn't
             // taken off, so the notice never takes off more than was noted.)
             if report.dropped() == 0 {
                 a.added.skipped_for_broken += 1;
             }
-            return broken_layer(s, l, Origin::default(), "RustGIS can't open this kind of data".into(), a);
+            let why = match &l.source {
+                LayerSource::Missing(why) => why.clone(),
+                _ => "RustGIS can't open this kind of data".into(),
+            };
+            return broken_layer(s, l, Origin::default(), why, a);
         }
     };
     match added {
@@ -615,6 +628,26 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
             broken_layer(s, l, from, e, a)
         }
     }
+}
+
+/// Whether `path` is a JPEG or PNG with a world file (`.jgw`, `.jgwx`, `.pgw`, `.pgwx`) or an
+/// `.aux.xml` beside it: a raster, which RustGIS can't place yet.
+#[cfg(not(target_arch = "wasm32"))]
+fn georeferenced_picture(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let worlds: &[&str] = match ext.as_deref() {
+        Some("jpg" | "jpeg") => &["jgw", "jgwx"],
+        Some("png") => &["pgw", "pgwx"],
+        _ => return false,
+    };
+    let beside = |w: &str| p.with_extension(w).is_file() || p.with_extension(w.to_ascii_uppercase()).is_file();
+    worlds.iter().any(|w| beside(w)) || std::path::Path::new(&format!("{path}.aux.xml")).is_file()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn georeferenced_picture(_: &str) -> bool {
+    false
 }
 
 /// The style a vector tile layer draws with: an ArcGIS vector tile service's default style, else
@@ -771,7 +804,7 @@ fn add_tables(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Re
                 }
             }
             // (The reader said why it can't be opened.)
-            LayerSource::Unopenable => {}
+            LayerSource::Unopenable | LayerSource::Missing(_) => {}
             _ => report.skipped(&t.name, format!("a table on a service ({}), which RustGIS doesn't add", shown(&t.origin))),
         }
     }
@@ -949,9 +982,14 @@ fn to_png(_: &[u8]) -> Result<Vec<u8>, String> {
 
 // ---- projects, maps and layer files ------------------------------------------------------------
 
-/// The most bytes of a file read from `path` (an `.aprx` holds its pictures and more beside its
+/// The most bytes of an ArcGIS Pro file read (an `.aprx` holds its pictures and more beside its
 /// JSON, which [`cim::MAX_JSON`] bounds on its own).
-const MAX_PROJECT: usize = 512 << 20;
+pub const MAX_PROJECT: usize = 512 << 20;
+
+/// Why a Pro file (`what`: its path or name) larger than [`MAX_PROJECT`] isn't read.
+pub fn too_large(what: &str) -> String {
+    format!("{} is too large: at most {} MB can be read", shown(what), MAX_PROJECT >> 20)
+}
 /// The most names `maps` or `layouts` may list.
 const MAX_NAMES: usize = 500;
 const NOT_A_PRO_FILE: &str = "not an ArcGIS Pro project, map or layer file";
@@ -964,7 +1002,7 @@ fn project_document(p: &Value) -> Result<Document, String> {
         (Some(d), ..) => {
             // Base64 is 4 characters for 3 bytes: a payload past the limit isn't decoded.
             if d.len() > MAX_PROJECT / 3 * 4 + 4 {
-                return Err(format!("data is too large: at most {} MB can be read", MAX_PROJECT >> 20));
+                return Err(too_large("data"));
             }
             use base64::Engine;
             (base64::engine::general_purpose::STANDARD.decode(d.trim()).map_err(|_| "data must be base64".to_string())?, false)
@@ -984,10 +1022,9 @@ fn project_document(p: &Value) -> Result<Document, String> {
 #[cfg(not(target_arch = "wasm32"))]
 fn read_project(path: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let too_large = || format!("{} is too large: at most {} MB can be read", shown(path), MAX_PROJECT >> 20);
     let len = std::fs::metadata(path).map_err(|e| format!("{}: {e}", shown(path)))?.len();
     if len > MAX_PROJECT as u64 {
-        return Err(too_large());
+        return Err(too_large(path));
     }
     let mut bytes = Vec::new();
     // At most one byte past the limit, so a file growing meanwhile is still refused.
@@ -995,7 +1032,7 @@ fn read_project(path: &str) -> Result<Vec<u8>, String> {
         .and_then(|f| f.take(MAX_PROJECT as u64 + 1).read_to_end(&mut bytes))
         .map_err(|e| format!("{}: {e}", shown(path)))?;
     if bytes.len() > MAX_PROJECT {
-        return Err(too_large());
+        return Err(too_large(path));
     }
     Ok(bytes)
 }
@@ -1144,7 +1181,7 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
             let def = doc.map_definition().ok_or("the map file has no map")?;
             let m = cim::read_map_def(&doc, def, &mut report)?;
             // The project changes from here.
-            let added = add_map(s, &m, dir, None, &mut report)?;
+            let added = add_map(s, &m, dir, None, m.bearing, &mut report)?;
             imported.add(added, true);
         }
         DocKind::Layer => {
@@ -1189,8 +1226,17 @@ fn import_items(
     let items = doc.items();
     let maps = pick(&items, ItemKind::Map, map_names, "map")?;
     let layouts = pick(&items, ItemKind::Layout, layout_names, "layout")?;
+    // An item whose definition the project's zip held but couldn't give (damaged, too large) is
+    // noted and left out; the rest still come in.
+    let unreadable = |name: &str, report: &mut Report| {
+        report.skipped(name, format!("its definition couldn't be read from the project ({}), left out", cim::UNREADABLE_JSON));
+    };
     let mut ready = Vec::new();
     for item in &layouts {
+        if layout_def(doc, &item.uri).is_none() && doc.unreadable(&item.uri) {
+            unreadable(&item.name, report);
+            continue;
+        }
         let def = layout_def(doc, &item.uri).ok_or_else(|| format!("the layout {} isn't in the project", shown(&item.name)))?;
         let mut imp = cim::read_layout_def(doc, def, report).map_err(|e| format!("{}: {e}", shown(&item.name)))?;
         read_pictures(&mut imp, dir, report);
@@ -1198,17 +1244,19 @@ fn import_items(
         ready.push(imp);
     }
     // The maps asked for, then those the layouts show, each once.
-    let asked = maps.iter().map(|i| (i.uri.as_str(), true));
-    let shown_by_layouts = ready.iter().flat_map(|imp| imp.embedded_maps.iter().map(|u| (u.as_str(), false)));
+    let asked = maps.iter().map(|i| (i.uri.as_str(), Some(i.name.as_str())));
+    let shown_by_layouts = ready.iter().flat_map(|imp| imp.embedded_maps.iter().map(|u| (u.as_str(), None)));
     let mut read: Vec<(String, &str, MapImport)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for (uri, asked) in asked.chain(shown_by_layouts) {
         let key = uri_key(uri);
-        if read.iter().any(|(k, ..)| *k == key) {
+        if !seen.insert(key.clone()) {
             continue;
         }
         match cim::read_map(doc, uri, report) {
             Ok(m) => read.push((key, uri, m)),
-            Err(e) if asked => return Err(e),
+            Err(_) if doc.unreadable(uri) => unreadable(asked.unwrap_or(&shown(uri)), report),
+            Err(e) if asked.is_some() => return Err(e),
             // (A map the project lacks was noted by the frame that names it.)
             Err(e) if doc.resolve(uri).is_some() => report.skipped(&shown(uri), e),
             Err(_) => {}
@@ -1218,7 +1266,8 @@ fn import_items(
     // The project changes from here.
     let mut bound: HashMap<String, String> = HashMap::new();
     for (key, uri, m) in &read {
-        let added = add_map(s, m, dir, doc.view_camera(uri), report)?;
+        let bearing = doc.view_bearing(uri, &m.name, report).or(m.bearing);
+        let added = add_map(s, m, dir, doc.view_camera(uri), bearing, report)?;
         bound.insert(key.clone(), added.name.clone());
         imported.add(added, true);
     }

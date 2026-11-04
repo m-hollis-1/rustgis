@@ -23631,6 +23631,55 @@ fn layer_retry_reopens_a_file_and_reports_a_service_it_cannot_reach() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A retried service that answers with a table, not a layer of features: the table isn't kept,
+/// so retrying again doesn't add another copy; the layer stays broken.
+#[test]
+fn a_retried_service_that_answers_a_table_leaves_no_table_behind() {
+    use ogc_server::{Route, Server, arcgis_layer};
+    let rows = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "id": 1, "properties": {"OBJECTID": 1, "code": "A"}, "geometry": null}]}"#;
+    let server = Server::new(vec![
+        Route::new("/arcgis/rest/services/T/FeatureServer", r#"{"currentVersion": 11.5, "layers": [{"id": 0, "name": "Lookup"}]}"#),
+        Route::new("/arcgis/rest/services/T/FeatureServer/0/query", rows),
+        Route::new("/arcgis/rest/services/T/FeatureServer/0", &arcgis_layer(1000, false)),
+    ]);
+    let url = format!("{}/arcgis/rest/services/T/FeatureServer", server.base);
+    let mut s = Session::new(Project::default());
+    let service = rustgis_map::source::ServiceOrigin { url: url.clone(), kind: "arcgis".into(), layer: "Lookup".into() };
+    let src = rustgis_map::source::SourceLayer::broken(
+        "ArcGIS Pro read it from a service".into(),
+        None,
+        None,
+        Some(service),
+        "it needs a sign-in".into(),
+    );
+    let id = s.map_mut().add_streamed("Lookup", src);
+    let tables = s.project.tables.len();
+    for _ in 0..2 {
+        let r = s.run("layer.retry", &json!({"layer": id})).unwrap();
+        let error = r["failed"][0]["error"].as_str().unwrap_or_default();
+        assert!(error.contains("came back as a table"), "{r}");
+        assert_eq!(s.project.tables.len(), tables, "{r}");
+    }
+    assert!(s.map().layer(id).and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken()));
+}
+
+/// A broken layer with no file or service to read again can't be retried or repaired: removing
+/// it is all there is to offer.
+#[test]
+fn retrying_a_layer_with_nothing_to_read_offers_only_removing_it() {
+    let mut s = Session::new(Project::default());
+    let src = rustgis_map::source::SourceLayer::broken(
+        "an SDE geodatabase".into(),
+        None,
+        None,
+        None,
+        "RustGIS can't open this kind of data".into(),
+    );
+    let id = s.map_mut().add_streamed("Mains", src);
+    let r = s.run("layer.retry", &json!({"layer": id})).unwrap();
+    assert_eq!(r["failed"][0]["error"], "there's no file or service to read it from again: remove it", "{r}");
+}
+
 #[test]
 fn a_broken_layer_draws_nothing_and_is_not_a_table() {
     let dir = broken_dir("draw");
@@ -23758,7 +23807,7 @@ fn add_pro_map_in(
     let doc = Document::from_json(text).unwrap();
     let mut report = Report::default();
     let m = cim::read_map_def(&doc, doc.map_definition().unwrap(), &mut report).unwrap();
-    let added = crate::cmd::arcgis_pro::add_map(s, &m, dir, camera, &mut report).unwrap();
+    let added = crate::cmd::arcgis_pro::add_map(s, &m, dir, camera, m.bearing, &mut report).unwrap();
     (added, report.notes.iter().map(|n| format!("{}: {}", n.layer, n.text)).collect())
 }
 
@@ -24063,6 +24112,128 @@ fn aprx_notice(s: &Session, mark: u64) -> String {
     let given: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.starts_with("Imported ")).collect();
     assert_eq!(given.len(), 1, "{given:?}");
     given.into_iter().next().unwrap()
+}
+
+/// `zip` with the stored bytes of entry `name` damaged, so its checksum fails.
+fn damaged_entry(mut zip: Vec<u8>, name: &str) -> Vec<u8> {
+    let at = zip.windows(name.len()).position(|w| w == name.as_bytes()).unwrap() + name.len();
+    zip[at] ^= 0xFF;
+    zip
+}
+
+/// A damaged map entry leaves the project open: the good map imports, the damaged one is noted
+/// and left out; a layer the map lists but the project doesn't define comes in broken, saying so,
+/// and is counted broken, not left out.
+#[test]
+fn a_damaged_entry_and_an_undefined_layer_leave_the_rest_of_the_project_importing() {
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, layers: Vec<&str>| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers, "spatialReference": {"wkid": 4326}});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("Main", "CIMPATH=main/main.json"), item("Broken", "CIMPATH=broken/broken.json")]}),
+        ),
+        ("broken/broken.json", map("Broken", "CIMPATH=broken/broken.json", vec![])),
+        ("main/main.json", map("Main", "CIMPATH=main/main.json", vec!["CIMPATH=main/countries.json", "CIMPATH=main/gone.json"])),
+        ("main/countries.json", aprx_countries_layer("Countries", "CIMPATH=main/countries.json")),
+    ]);
+    let zip = damaged_entry(zip, "broken/broken.json");
+    let mut s = world();
+    let r = s.run("project.inspectArcgis", &json!({"data": b64(&zip)})).unwrap();
+    assert_eq!(r["maps"].as_array().map(Vec::len), Some(2), "{r}");
+    let mark = s.notice_mark();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["Main", "Broken"]})).unwrap();
+    assert_eq!(r["maps"], json!(["Main"]), "{r}");
+    let notes: Vec<String> = r["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| format!("{}: {}", n["layer"].as_str().unwrap(), n["text"].as_str().unwrap()))
+        .collect();
+    assert!(
+        notes.iter().any(|n| n == "Broken: its definition couldn't be read from the project (damaged, or larger than 32 MB), left out"),
+        "{notes:?}"
+    );
+    assert!(notes.iter().any(|n| n == "gone: the layer CIMPATH=main/gone.json isn't defined in this document, added broken"), "{notes:?}");
+    let src = s.map().layer_by_name("gone").and_then(|l| l.source.as_ref()).unwrap();
+    assert!(src.is_broken());
+    assert_eq!(src.origin.as_deref(), Some("a layer the project doesn't define (CIMPATH=main/gone.json)"));
+    assert_eq!(src.why_broken(), Some("the project doesn't define this layer"));
+    assert_eq!(aprx_notice(&s, mark), "Imported 1 maps and 0 layouts: 2 layers, 1 broken; 0 things drawn differently, 1 left out", "{r}");
+}
+
+/// A map's saved view keeps its rotation: Pro's camera heading is RustGIS's bearing; a map with
+/// no saved view takes its defaultRotation, turned the other way.
+#[test]
+fn an_imported_map_view_keeps_its_rotation() {
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, rotation: f64| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": [], "spatialReference": {"wkid": 4326}, "defaultRotation": rotation});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("Viewed", "CIMPATH=v/v.json"), item("Unviewed", "CIMPATH=u/u.json"), item("Wild", "CIMPATH=w/w.json")],
+                "views": [
+                    {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=v/v.json", "camera": {"type": "CIMViewCamera", "x": 10.0, "y": 50.0, "scale": 50000.0, "heading": 13.8}},
+                    {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=w/w.json", "camera": {"type": "CIMViewCamera", "x": 10.0, "y": 50.0, "scale": 50000.0, "heading": 1e9}}]}),
+        ),
+        ("v/v.json", map("Viewed", "CIMPATH=v/v.json", -13.8)),
+        ("u/u.json", map("Unviewed", "CIMPATH=u/u.json", -20.0)),
+        ("w/w.json", map("Wild", "CIMPATH=w/w.json", 0.0)),
+    ]);
+    let mut s = world();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["Viewed", "Unviewed", "Wild"]})).unwrap();
+    let bearing = |s: &Session, name: &str| s.project.maps.iter().find(|m| m.name == name).unwrap().camera.bearing;
+    assert!((bearing(&s, "Viewed") - 13.8).abs() < 1e-9, "{}", bearing(&s, "Viewed"));
+    assert!((bearing(&s, "Unviewed") - 20.0).abs() < 1e-9, "{}", bearing(&s, "Unviewed"));
+    assert_eq!(bearing(&s, "Wild"), 0.0);
+    assert!(
+        r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["layer"] == "Wild" && n["text"] == "its rotation (1000000000.0), which isn't an angle, drawn north up"),
+        "{r}"
+    );
+}
+
+/// A georeferenced JPEG or PNG (a world file beside it) comes in broken, saying world files
+/// aren't read yet, rather than that it has no EXIF.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_jpeg_raster_with_a_world_file_comes_in_broken_saying_why() {
+    let dir = std::env::temp_dir().join(format!("rustgis-pro-worldfile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("scan.jpg"), [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+    std::fs::write(dir.join("scan.jgw"), "1\n0\n0\n-1\n500000\n4000000\n").unwrap();
+    std::fs::write(dir.join("plan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    std::fs::write(dir.join("plan.png.aux.xml"), "<PAMDataset/>").unwrap();
+    let raster = |name: &str, file: &str| {
+        json!({"type": "CIMRasterLayer", "name": name, "uRI": format!("CIMPATH=m/{name}.json"), "visibility": true,
+            "dataConnection": {"type": "CIMStandardDataConnection", "workspaceConnectionString": format!("DATABASE={}", dir.display()),
+                "workspaceFactory": "Raster", "dataset": file, "datasetType": "esriDTRasterDataset"}})
+    };
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [{"type": "CIMProjectItem", "itemType": "Map", "name": "M", "catalogPath": "CIMPATH=m/m.json"}]}),
+        ),
+        (
+            "m/m.json",
+            json!({"type": "CIMMap", "name": "M", "uRI": "CIMPATH=m/m.json", "layers": ["CIMPATH=m/Scan.json", "CIMPATH=m/Plan.json"], "spatialReference": {"wkid": 4326}}),
+        ),
+        ("m/Scan.json", raster("Scan", "scan.jpg")),
+        ("m/Plan.json", raster("Plan", "plan.png")),
+    ]);
+    let mut s = world();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["M"]})).unwrap();
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(2), Some(2)), "{r}");
+    for name in ["Scan", "Plan"] {
+        let src = s.map().layer_by_name(name).and_then(|l| l.source.as_ref()).unwrap();
+        assert_eq!(src.why_broken(), Some("a georeferenced JPEG or PNG: world files aren't read yet"), "{name}");
+        assert!(src.path.is_some(), "{name}: kept to repair");
+    }
+    assert!(!r.to_string().contains("EXIF"), "{r}");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

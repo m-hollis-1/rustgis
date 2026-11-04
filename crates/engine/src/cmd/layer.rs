@@ -381,7 +381,7 @@ pub fn commands() -> Vec<C> {
                 labels.enabled = true;
                 Ok(())
             })
-        }).params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "field": name (or a template: text with each field's name in braces)}"#)
+        }).params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "field": name (or a template: text with each field's name in braces, a brace doubled ({{ or }}) for a literal one)}"#)
         .when(need_feature_layer),
         C::new("labels.style", "Text Symbol", "Labeling › Text Symbol", |s, p| {
             let size = f(p, "size").map(|v| v.clamp(*LABEL_SIZE.start(), *LABEL_SIZE.end()) as f32);

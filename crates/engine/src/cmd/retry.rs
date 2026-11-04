@@ -68,7 +68,8 @@ fn retry_layer(s: &mut Session, id: u32) -> Result<Outcome, String> {
         return retry_service(s, id, &service);
     }
     if src.path.is_none() {
-        return Err("there's no file or service to read it from again: repair it (Repair Data Source) or remove it".into());
+        // (Repair Data Source isn't offered for it either: it has nothing to repair.)
+        return Err("there's no file or service to read it from again: remove it".into());
     }
     let l = s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?;
     let src = l.source.as_mut().ok_or("the layer no longer exists")?;
@@ -104,8 +105,13 @@ fn retry_service(s: &mut Session, id: u32, service: &rustgis_map::source::Servic
         return Ok(Outcome::Opened);
     }
     let Some(new_id) = added.filter(|_| raster == Some(false)) else {
-        // Not a layer (a table, say): what came back stays, and so does the broken layer.
-        let what = if r.get("table").is_some() { "a table" } else { "no layer" };
+        // Not a layer (a table, say): the broken layer stays, and a table that came back goes
+        // again, so another retry doesn't add another copy.
+        let table = r.get("table").is_some();
+        if let Some(i) = r.get("id").and_then(Value::as_u64).and_then(|t| u32::try_from(t).ok()).filter(|_| table) {
+            s.project.tables.retain(|t| t.id != i);
+        }
+        let what = if table { "a table" } else { "no layer" };
         return Err(format!("{}: '{}' came back as {what}, not a layer of features", service.url, service.layer));
     };
     // Taken out as Remove takes a layer out: the tile layers over it keep their place, its group

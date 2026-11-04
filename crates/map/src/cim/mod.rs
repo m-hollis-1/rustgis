@@ -80,7 +80,8 @@ pub struct ProjectItem {
     pub kind: ItemKind,
     /// Its `catalogPath`: the `CIMPATH=…` of its definition.
     pub uri: String,
-    /// `catalogPath` ends in `.xml`: saved by ArcMap, not CIM.
+    /// Saved by ArcMap, not CIM: `catalogPath` ends in `.xml` and no JSON is found there. (Pro
+    /// keeps the `.xml` name of an item it has rewritten as CIM JSON.)
     pub arcmap: bool,
 }
 
@@ -107,10 +108,15 @@ impl Document {
     }
 
     /// Reads an `.aprx`: `GISProject.json` is the root, and the other JSON entries are what its
-    /// maps, layers and layouts are found in. An entry that isn't JSON is left out, since it
-    /// isn't a definition.
+    /// maps, layers and layouts are found in, `.xml` ones too (Pro keeps the `.xml` name of what
+    /// came over from ArcMap after rewriting it as JSON). An entry that isn't JSON is left out,
+    /// since it isn't a definition.
     pub fn from_zip(bytes: &[u8]) -> Result<Document, String> {
-        let files = rustgis_data::zip::read_matching_within(bytes, |name| name.to_ascii_lowercase().ends_with(".json"), MAX_JSON)?;
+        let wanted = |name: &str| {
+            let name = name.to_ascii_lowercase();
+            name.ends_with(".json") || name.ends_with(".xml")
+        };
+        let files = rustgis_data::zip::read_matching_within(bytes, wanted, MAX_JSON)?;
         let mut root = None;
         let mut entries = HashMap::new();
         for (name, data) in files {
@@ -191,7 +197,7 @@ impl Document {
                 _ => return None,
             };
             let uri = str_of(item, "catalogPath")?.to_string();
-            let arcmap = uri.trim().to_ascii_lowercase().ends_with(".xml");
+            let arcmap = uri.trim().to_ascii_lowercase().ends_with(".xml") && self.resolve(&uri).is_none();
             Some(ProjectItem { name: str_of(item, "name").unwrap_or_default().to_string(), kind, uri, arcmap })
         })
         .take(MAX_ITEMS)

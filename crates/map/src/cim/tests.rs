@@ -2917,6 +2917,43 @@ fn a_project_lists_its_maps_layouts_open_views_and_pictures() {
 }
 
 #[test]
+fn xml_named_entries_that_hold_json_are_read_and_are_not_arcmap() {
+    // Pro keeps the `.xml` name of a map, layout or layer that came over from ArcMap after it
+    // has rewritten it as CIM JSON; one that is still XML can't be read.
+    let project = json!({
+        "type": "CIMGISProject",
+        "projectItems": [
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Converted", "catalogPath": "CIMPATH=conv/conv.xml"},
+            {"type": "CIMProjectItem", "itemType": "Layout", "name": "Converted Sheet", "catalogPath": "CIMPATH=layout/sheet.xml"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Still Xml", "catalogPath": "CIMPATH=old/old.xml"},
+            {"type": "CIMProjectItem", "itemType": "Map", "name": "Missing", "catalogPath": "CIMPATH=gone/gone.xml"},
+        ],
+    });
+    let map = json!({"type": "CIMMap", "name": "Converted", "uRI": "CIMPATH=conv/conv.xml", "layers": ["CIMPATH=conv/roads.xml"]});
+    let layer = json!({"type": "CIMFeatureLayer", "name": "Roads", "uRI": "CIMPATH=conv/roads.xml"});
+    let sheet = json!({"type": "CIMLayout", "name": "Converted Sheet", "uRI": "CIMPATH=layout/sheet.xml"});
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project.to_string().into_bytes()),
+        ("conv/conv.xml".into(), map.to_string().into_bytes()),
+        ("conv/roads.xml".into(), layer.to_string().into_bytes()),
+        ("layout/sheet.xml".into(), sheet.to_string().into_bytes()),
+        ("old/old.xml".into(), b"<?xml version=\"1.0\"?><CIMMap/>".to_vec()),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&zip).unwrap();
+    let items = d.items();
+    assert_eq!(items.iter().map(|i| (i.name.as_str(), i.arcmap)).collect::<Vec<_>>(), [
+        ("Converted", false),
+        ("Converted Sheet", false),
+        ("Still Xml", true),
+        ("Missing", true)
+    ]);
+    assert_eq!(d.resolve("CIMPATH=conv/conv.xml").unwrap()["name"], "Converted");
+    assert_eq!(d.resolve("CIMPATH=CONV/Roads.xml").unwrap()["name"], "Roads");
+    assert!(d.resolve("CIMPATH=old/old.xml").is_none());
+}
+
+#[test]
 fn a_document_that_is_not_a_project_has_no_items_or_views() {
     let d = Document::from_json(r#"{"type":"CIMLayoutDocument"}"#).unwrap();
     assert!(d.items().is_empty());

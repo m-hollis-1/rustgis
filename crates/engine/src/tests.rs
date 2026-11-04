@@ -25678,15 +25678,14 @@ fn broken_countries(s: &mut Session, path: &std::path::Path) -> u32 {
 
 /// A broken layer named Parcels on a feature service nobody answers at.
 fn broken_service(s: &mut Session) -> u32 {
+    broken_service_because(s, "it needs a sign-in")
+}
+
+/// [`broken_service`], with the reason the importer gave.
+fn broken_service_because(s: &mut Session, reason: &str) -> u32 {
     let url = "https://127.0.0.1:9/x/FeatureServer";
     let service = rustgis_map::source::ServiceOrigin { url: url.into(), kind: "arcgis".into(), layer: "0".into() };
-    let src = rustgis_map::source::SourceLayer::broken(
-        format!("ArcGIS Pro read it from {url}"),
-        None,
-        None,
-        Some(service),
-        "it needs a sign-in".into(),
-    );
+    let src = rustgis_map::source::SourceLayer::broken(format!("ArcGIS Pro read it from {url}"), None, None, Some(service), reason.into());
     s.map_mut().add_streamed("Parcels", src)
 }
 
@@ -25785,6 +25784,105 @@ fn a_broken_layer_whose_file_is_back_opens_on_its_own() {
     assert_eq!(t.map().layer(fits).unwrap().definition_query.as_deref(), Some("pop_est > 1000"));
     assert_eq!(t.map().layer(misfit).unwrap().definition_query, None);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn diagnose_text_sorts_the_reasons_rustgis_gives() {
+    use crate::cmd::broken::{Kind, diagnose_text};
+    let cases = [
+        ("https://x/FeatureServer: the service answered with an error: Token Required (the service is secured: sign in)", Kind::SignIn),
+        (
+            "https://x: the service answered with an error: Invalid Token (the ArcGIS token was refused, perhaps expired: sign in to the portal again)",
+            Kind::SignIn,
+        ),
+        ("https://x: http status: 401", Kind::SignIn),
+        ("https://x: http status: 403", Kind::SignIn),
+        ("https://x: rustls: invalid peer certificate: UnknownIssuer", Kind::Certificate),
+        ("https://x: http status: 404", Kind::ServiceMissing),
+        ("https://x: host not found", Kind::Unreachable),
+        ("https://x: connection failed", Kind::Unreachable),
+        ("https://x: timeout: global", Kind::Unreachable),
+        ("RustGIS can't open this kind of data", Kind::Other),
+    ];
+    for (text, want) in cases {
+        assert_eq!(diagnose_text(text), want, "{text}");
+    }
+}
+
+#[test]
+fn diagnose_names_the_server_and_the_folders_other_broken_layers() {
+    let dir = broken_dir("diagnose");
+    let shp = dir.join("data").join("countries.shp");
+    let other = dir.join("data").join("rivers.shp");
+    let elsewhere = dir.join("elsewhere").join("lakes.shp");
+    let mut s = Session::new(Project::default());
+    let first = broken_countries(&mut s, &shp);
+    let second = broken_countries(&mut s, &other);
+    let _apart = broken_countries(&mut s, &elsewhere);
+    let service = broken_service_because(
+        &mut s,
+        "https://127.0.0.1:9/x: the service answered with an error: Token Required (the service is secured)",
+    );
+
+    let r = s.run("layer.diagnose", &json!({"layer": first})).unwrap();
+    assert_eq!(r["layer"], first, "{r}");
+    assert_eq!(r["kind"], "fileMissing", "{r}");
+    assert_eq!(r["path"], shp.display().to_string(), "{r}");
+    assert_eq!(r["folder"], shp.parent().unwrap().display().to_string(), "{r}");
+    assert_eq!(r["siblings"], json!([second]), "{r}");
+    assert!(r.get("server").is_none(), "{r}");
+
+    let r = s.run("layer.diagnose", &json!({"layer": "Parcels"})).unwrap();
+    assert_eq!(
+        (r["layer"].as_u64(), r["kind"].as_str(), r["server"].as_str()),
+        (Some(u64::from(service)), Some("signIn"), Some("https://127.0.0.1:9")),
+        "{r}"
+    );
+    assert!(r["reason"].as_str().is_some_and(|t| t.contains("Token Required")), "{r}");
+    assert!(r.get("path").is_none() && r.get("siblings").is_none(), "{r}");
+
+    // A file that is there, but won't open, is sorted by what it said.
+    countries_shapefile(&shp);
+    let r = s.run("layer.diagnose", &json!({"layer": first})).unwrap();
+    assert_eq!(r["kind"], "other", "{r}");
+
+    // Nothing to diagnose in a layer that isn't broken.
+    let e = world().run("layer.diagnose", &json!({"layer": "Countries"})).unwrap_err();
+    assert!(e.contains("isn't broken"), "{e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_broken_layer_read_back_from_a_project_is_still_diagnosed() {
+    let dir = broken_dir("diagnose-reload");
+    let mut s = Session::new(Project::default());
+    let id = broken_service_because(
+        &mut s,
+        "https://127.0.0.1:9/x: the service answered with an error: Token Required (the service is secured)",
+    );
+    let project = dir.join("broken.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    let src = t.map().layer(id).unwrap().source.as_ref().unwrap();
+    assert!(src.error.is_none(), "only the reason is read back");
+    let r = t.run("layer.diagnose", &json!({"layer": id})).unwrap();
+    assert_eq!((r["kind"].as_str(), r["server"].as_str()), (Some("signIn"), Some("https://127.0.0.1:9")), "{r}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_failed_retry_records_its_error_for_the_next_diagnosis() {
+    let mut s = Session::new(Project::default());
+    let id = broken_service(&mut s);
+    let r = s.run("layer.diagnose", &json!({"layer": id})).unwrap();
+    assert_eq!(r["reason"], "it needs a sign-in", "{r}");
+    let retried = s.run("layer.retry", &json!({"layer": id})).unwrap();
+    let error = retried["failed"][0]["error"].as_str().unwrap().to_string();
+    let r = s.run("layer.diagnose", &json!({"layer": id})).unwrap();
+    assert_eq!(r["reason"], error, "{r}");
+    assert_ne!(r["reason"], "it needs a sign-in", "{r}");
+    assert_eq!(r["kind"], "unreachable", "{r}");
 }
 
 #[test]

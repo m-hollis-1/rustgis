@@ -40,7 +40,14 @@ fn retry(s: &mut Session, p: &Value) -> CmdResult {
                 check_query(s, id);
             }
             Ok(Outcome::Opening) => {}
-            Err(error) => failed.push(json!({"layer": name, "error": error})),
+            Err(error) => {
+                // What the next diagnosis (Repair Source) goes by.
+                if let Some(src) = s.map_mut().layer_mut(id).and_then(|l| l.source.as_mut()) {
+                    src.error = Some(error.clone());
+                    src.reason = Some(error.clone());
+                }
+                failed.push(json!({"layer": name, "error": error}));
+            }
         }
     }
     Ok(json!({"retried": retried, "opened": opened, "failed": failed}))

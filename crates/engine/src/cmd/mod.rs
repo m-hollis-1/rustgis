@@ -2,6 +2,7 @@
 
 pub mod arcgis;
 pub mod arcgis_pro;
+pub mod broken;
 pub mod catalogs;
 pub mod clipboard;
 pub mod connections;
@@ -82,6 +83,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(layer_copy::commands());
     v.extend(raster::commands());
     v.extend(repair::commands());
+    v.extend(broken::commands());
     v.extend(retry::commands());
     v.extend(zarr::commands());
     v.extend(cube::commands());

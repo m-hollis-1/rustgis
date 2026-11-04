@@ -3868,6 +3868,20 @@ fn every_connection_kind_has_a_source_and_an_origin() {
             LayerKind::Tiles,
         ),
         (
+            // A dynamic map service layer: the service's whole map, as a tiled one's.
+            layer_of(
+                "CIMMapImageLayer",
+                "Dynamic",
+                json!({"serviceConnection": {"type": "CIMAGSServiceConnection", "objectName": "Dynamic", "objectType": "MapServer",
+                        "url": "https://example.org/arcgis/rest/services/Dynamic/MapServer",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/arcgis/rest/services"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "Roads", "visibility": true}]}),
+            ),
+            MapService { url: "https://example.org/arcgis/rest/services/Dynamic/MapServer".into() },
+            "ArcGIS map service https://example.org/arcgis/rest/services/Dynamic/MapServer",
+            LayerKind::Tiles,
+        ),
+        (
             layer_of(
                 "CIMImageServiceLayer",
                 "Elevation",

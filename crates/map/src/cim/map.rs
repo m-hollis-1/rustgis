@@ -337,7 +337,9 @@ fn layer(def: &Value, name: String, report: &mut Report) -> LayerImport {
     let kind = match ty {
         "CIMFeatureLayer" | "CIMKMLLayer" => Some(LayerKind::Feature),
         "CIMRasterLayer" => Some(LayerKind::Raster),
-        "CIMTiledServiceLayer" | "CIMImageServiceLayer" | "CIMWMSLayer" | "CIMVectorTileLayer" => Some(LayerKind::Tiles),
+        "CIMTiledServiceLayer" | "CIMMapImageLayer" | "CIMImageServiceLayer" | "CIMWMSLayer" | "CIMVectorTileLayer" => {
+            Some(LayerKind::Tiles)
+        }
         "CIMStandaloneTable" => Some(LayerKind::Table),
         _ => None,
     };

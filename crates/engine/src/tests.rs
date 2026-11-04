@@ -25911,6 +25911,53 @@ fn a_failed_retry_records_its_error_for_the_next_diagnosis() {
 }
 
 #[test]
+fn repair_folder_fixes_the_layers_that_fit_and_lists_the_rest() {
+    let dir = broken_dir("repair-folder");
+    let (old, new) = (dir.join("old"), dir.join("new"));
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    let mut s = Session::new(Project::default());
+    let a = broken_countries(&mut s, &old.join("countries.shp"));
+    let b = broken_countries(&mut s, &old.join("gone.shp"));
+    let c = broken_countries(&mut s, &old.join("places.geojson"));
+    // One more in another folder is left alone.
+    let other = broken_countries(&mut s, &dir.join("data").join("countries.shp"));
+    for (id, name) in [(a, "A"), (b, "B"), (c, "C"), (other, "Other")] {
+        s.map_mut().layer_mut(id).unwrap().name = name.into();
+    }
+    // C remembers drawing polygons (a broken layer that never opened knows nothing of its geometry).
+    s.map_mut().layer_mut(c).unwrap().dataset.geometry_type = rustgis_data::GeometryType::Polygon;
+    countries_shapefile(&new.join("countries.shp"));
+    std::fs::write(
+        new.join("places.geojson"),
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"x"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    let args = json!({"from": old.display().to_string(), "to": new.display().to_string()});
+    let r = s.run("layer.repairFolder", &args).unwrap();
+    assert_eq!(r["repaired"], json!(["A"]), "{r}");
+    let skipped = r["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 2, "{r}");
+    let why = |name: &str| skipped.iter().find(|x| x["layer"] == name).and_then(|x| x["why"].as_str()).unwrap_or_default().to_string();
+    assert!(why("B").contains("not in"), "{r}");
+    assert!(why("C").contains("Point") || why("C").contains("point"), "{r}");
+    let broken = |s: &Session, id: u32| s.map().layer(id).unwrap().source.as_ref().unwrap().is_broken();
+    assert!(!broken(&s, a) && broken(&s, b) && broken(&s, c) && broken(&s, other));
+    // One undo takes the repair back.
+    s.run("edit.undo", &json!({})).unwrap();
+    assert!(broken(&s, a));
+    // Nothing from a folder no layer reads: an error that says so.
+    let e = s.run("layer.repairFolder", &json!({"from": dir.join("nowhere").display().to_string(), "to": new.display().to_string()}));
+    assert!(e.unwrap_err().contains("no broken layer had its data in"));
+    // Case and separators don't matter to the match.
+    let loose = old.display().to_string().to_uppercase().replace('\\', "/");
+    let r = s.run("layer.repairFolder", &json!({"from": format!("{loose}/"), "to": new.display().to_string()})).unwrap();
+    assert_eq!(r["repaired"], json!(["A"]), "{r}");
+    assert!(s.run("layer.repairFolder", &json!({"from": "x"})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn layer_retry_reopens_a_file_and_reports_a_service_it_cannot_reach() {
     let dir = broken_dir("retry");
     let shp = dir.join("data").join("countries.shp");

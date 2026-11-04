@@ -72,7 +72,7 @@ pub(crate) fn diagnose_text(reason: &str) -> Kind {
 }
 
 /// A broken feature layer's file, if it names one on this computer.
-fn file_of(src: &rustgis_map::source::SourceLayer) -> Option<&str> {
+pub(super) fn file_of(src: &rustgis_map::source::SourceLayer) -> Option<&str> {
     let path = src.path.as_deref().filter(|_| src.service.is_none())?;
     rustgis_map::paths::is_local(path).then(|| rustgis_map::paths::local_path(path))
 }
@@ -91,7 +91,7 @@ fn is_missing(path: &str) -> bool {
 }
 
 /// The folder a file is in, as the layer remembers it.
-fn folder_of(path: &str) -> Option<&str> {
+pub(super) fn folder_of(path: &str) -> Option<&str> {
     let i = path.rfind(['/', '\\'])?;
     path.get(..i).filter(|f| !f.is_empty())
 }
@@ -104,7 +104,7 @@ fn server_of(url: &str) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-fn same_folder(a: &str, b: &str) -> bool {
+pub(super) fn same_folder(a: &str, b: &str) -> bool {
     let norm = |f: &str| f.replace('\\', "/").trim_end_matches('/').to_lowercase();
     norm(a) == norm(b)
 }

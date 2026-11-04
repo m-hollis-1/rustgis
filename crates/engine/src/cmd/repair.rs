@@ -9,6 +9,8 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.repairSource", "Repair Data Source", "Data › Data Source", repair_source).params(
             r#"{"layer"?: name|id (default: the active layer), "path": "the file or folder (a Zarr store, a File Geodatabase) the layer's data moved to", "table"?: "the dataset in a GeoPackage, GDAL or DuckDB file, or a raster's subdataset (default: the one the layer reads now)"}"#),
+        C::new("layer.repairFolder", "Repair Data Sources in a Folder", "Data › Data Source", repair_folder).params(
+            r#"{"from": "the folder the broken layers' data was in", "to": "the folder it moved to"} → "repaired" (the names of the layers fixed, each to the file of the same name in the new folder) and "skipped" (each with its "layer" name and the "why" it wasn't fixed); fails when no broken layer had its data in the old folder"#),
         C::new("map.repairTiles", "Repair Tile Archive", "Layers", repair_tiles).params(
             r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id, "path": "the .pmtiles or .mbtiles file the archive moved to"}"#),
     ]
@@ -110,6 +112,52 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         Ok(json!({"layer": id, "path": full, "table": s.map().layer(id).and_then(|l| l.linked_table())}))
+    }
+}
+
+/// Repairs each broken file layer whose data was in `from` to the file of the same name in
+/// `to`, as one undo step. A layer whose file isn't in `to`, or doesn't fit, is skipped with why.
+fn repair_folder(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, p);
+        Err("the web app can't link to files on this computer: add the file again with Add Data".into())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use super::broken::{file_of, folder_of, same_folder};
+        let from = super::layer::s_req(p, "from")?.trim();
+        let to = super::layer::s_req(p, "to")?.trim();
+        let candidates: Vec<(u32, String, String)> = s
+            .map()
+            .layers
+            .iter()
+            .filter_map(|l| {
+                let src = l.source.as_ref().filter(|src| src.is_broken())?;
+                let path = file_of(src)?;
+                if !same_folder(folder_of(path)?, from) {
+                    return None;
+                }
+                let file = path.rsplit(['/', '\\']).next().filter(|f| !f.is_empty())?;
+                Some((l.id, l.name.clone(), file.to_string()))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(format!("no broken layer had its data in {from}"));
+        }
+        let (mut repaired, mut skipped) = (Vec::new(), Vec::new());
+        for (id, name, file) in candidates {
+            let target = std::path::Path::new(to).join(&file);
+            if !target.exists() {
+                skipped.push(json!({"layer": name, "why": format!("not in {to}")}));
+                continue;
+            }
+            match s.run_part("layer.repairSource", &json!({"layer": id, "path": target.display().to_string()})) {
+                Ok(_) => repaired.push(name),
+                Err(why) => skipped.push(json!({"layer": name, "why": why})),
+            }
+        }
+        Ok(json!({"repaired": repaired, "skipped": skipped}))
     }
 }
 

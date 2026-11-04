@@ -348,8 +348,11 @@ pub(crate) struct Added {
     pub layers: usize,
     /// Of those, the ones added broken.
     pub broken: usize,
-    /// The names of those added broken.
-    pub broken_names: Vec<String>,
+    /// The notes "added broken: …" made: a layer each, counted in `broken`.
+    pub added_broken_notes: usize,
+    /// The layers added broken because the reader couldn't open their kind of data, each of
+    /// which the reader noted as skipped (it said why): in the map, not left out.
+    pub skipped_for_broken: usize,
 }
 
 /// How a map's coordinates (its camera's, its default extent's) become longitude and latitude.
@@ -586,14 +589,18 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
         LayerSource::VectorTiles { url } => {
             (s.run_part("map.addTiles", &json!({"url": style_url(url), "kind": "style", "name": name, "overlay": true})), Origin::default())
         }
-        // (The reader said why.)
-        LayerSource::Unopenable => return broken_layer(s, l, Origin::default(), "RustGIS can't open this kind of data".into(), a),
+        // (The reader said why, in one skipped note.)
+        LayerSource::Unopenable => {
+            a.added.skipped_for_broken += 1;
+            return broken_layer(s, l, Origin::default(), "RustGIS can't open this kind of data".into(), a);
+        }
     };
     match added {
         Ok(r) => opened(s, l, &r, before, within, a, report),
         Err(e) => {
             // In the map, drawing nothing until repaired: not left out.
             report.approximated(name, format!("added broken: {e} (repair or retry it)"));
+            a.added.added_broken_notes += 1;
             broken_layer(s, l, from, e, a)
         }
     }
@@ -714,7 +721,6 @@ fn broken_layer(s: &mut Session, l: &LayerImport, from: Origin, error: String, a
     }
     a.added.layers += 1;
     a.added.broken += 1;
-    a.added.broken_names.push(l.name.clone());
     Placed::Layer(id)
 }
 
@@ -1071,8 +1077,9 @@ fn holdings(doc: &Document) -> CmdResult {
             Ok(json!({"kind": "project", "maps": maps, "layouts": layouts}))
         }
         DocKind::Map => {
+            // Named as the import names it.
             let def = doc.map_definition().ok_or("the map file has no map")?;
-            let name = def.get("name").and_then(Value::as_str).unwrap_or("Map");
+            let name = cim::read_map_def(doc, def, &mut Report::default())?.name;
             Ok(json!({"kind": "map", "maps": [{"name": name, "open": false, "arcmap": false}], "layouts": []}))
         }
         DocKind::Layer => Ok(json!({"kind": "layers", "maps": [], "layouts": []})),
@@ -1091,8 +1098,9 @@ struct Imported {
     layouts: Vec<String>,
     layers: usize,
     broken: usize,
-    /// The layers added broken, whose notes the notice doesn't count again.
-    broken_names: HashSet<String>,
+    /// The notes on layers added broken that the notice doesn't count again (see [`Added`]).
+    added_broken_notes: usize,
+    skipped_for_broken: usize,
 }
 
 impl Imported {
@@ -1103,7 +1111,8 @@ impl Imported {
         }
         self.layers += a.layers;
         self.broken += a.broken;
-        self.broken_names.extend(a.broken_names);
+        self.added_broken_notes += a.added_broken_notes;
+        self.skipped_for_broken += a.skipped_for_broken;
     }
 }
 
@@ -1134,9 +1143,11 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
         }
         _ => return Err(NOT_A_PRO_FILE.into()),
     }
-    // A broken layer is counted as broken, not again by its notes.
-    let counted = |kind: NoteKind| report.notes.iter().filter(|n| n.kind == kind && !imported.broken_names.contains(&n.layer)).count();
-    let (approximated, skipped) = (counted(NoteKind::Approximated), counted(NoteKind::Skipped));
+    // A broken layer is counted as broken, not again by the note that says it came in broken
+    // (or, for data RustGIS can't open, by the reader's note on why).
+    let count = |kind: NoteKind| report.notes.iter().filter(|n| n.kind == kind).count();
+    let approximated = count(NoteKind::Approximated).saturating_sub(imported.added_broken_notes);
+    let skipped = count(NoteKind::Skipped).saturating_sub(imported.skipped_for_broken);
     s.notify(
         format!(
             "Imported {} maps and {} layouts: {} layers, {} broken; {approximated} things drawn differently, {skipped} left out",

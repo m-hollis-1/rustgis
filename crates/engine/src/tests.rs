@@ -24031,6 +24031,7 @@ fn inspecting_a_project_lists_maps_layouts_and_the_open_map() {
 fn importing_chosen_maps_and_a_layout_binds_the_frames() {
     use rustgis_map::layout::ElementKind;
     let mut s = world();
+    let mark = s.notice_mark();
     let r = s.run("project.importArcgis", &json!({"data": b64(&aprx()), "maps": ["detail"], "layouts": ["Sheet"]})).unwrap();
     // Main comes in with the layout that shows it.
     assert_eq!(r["maps"], json!(["Detail", "Main"]), "{r}");
@@ -24051,6 +24052,84 @@ fn importing_chosen_maps_and_a_layout_binds_the_frames() {
     for secret in ["swordfish", "editor", "PASSWORD"] {
         assert!(!r.to_string().contains(secret), "{r}");
     }
+    // The notice: the SDE layer is the one broken, and its reader's note isn't left out again.
+    let notes = r["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n["layer"] == "Mains" && n["kind"] == "skipped"), "{r}");
+    let (approximated, skipped) = aprx_note_counts(notes);
+    assert_eq!(
+        aprx_notice(&s, mark),
+        format!("Imported 2 maps and 1 layouts: 3 layers, 1 broken; {approximated} things drawn differently, {skipped} left out")
+    );
+    assert_eq!(notes.iter().filter(|n| n["kind"] == "skipped").count(), skipped + 1, "{r}");
+}
+
+/// The counts the import's notice gives for `notes`: the approximated ones but those saying a
+/// layer came in broken, and the skipped ones but the reader's on data RustGIS can't open
+/// (which those tests' layers that come in broken are).
+fn aprx_note_counts(notes: &[Value]) -> (usize, usize) {
+    let text = |n: &Value| n["text"].as_str().unwrap_or_default().to_string();
+    let approximated = notes.iter().filter(|n| n["kind"] == "approximated" && !text(n).starts_with("added broken: ")).count();
+    let skipped = notes.iter().filter(|n| n["kind"] == "skipped" && !text(n).contains("which RustGIS can't open")).count();
+    (approximated, skipped)
+}
+
+/// The import's notice, the one notice given since `mark`.
+fn aprx_notice(s: &Session, mark: u64) -> String {
+    let given: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.starts_with("Imported ")).collect();
+    assert_eq!(given.len(), 1, "{given:?}");
+    given.into_iter().next().unwrap()
+}
+
+#[test]
+fn a_layer_named_as_a_broken_one_keeps_its_notes_counted() {
+    let shp = pro_map_shapefile();
+    let folder = shp.parent().unwrap().display().to_string();
+    // Map A's Roads: a file that isn't there, so it comes in broken. Map B's Roads: the sample's
+    // shapefile, labelled from a template with a field it hasn't (drawn differently).
+    let mut gone = aprx_countries_layer("Roads", "CIMPATH=a/roads.json");
+    gone["featureTable"]["dataConnection"]["dataset"] = json!("rustgis-no-such-roads.shp");
+    gone["featureTable"]["dataConnection"]["workspaceConnectionString"] = json!(format!("DATABASE={folder}"));
+    let mut labelled = aprx_countries_layer("Roads", "CIMPATH=b/roads.json");
+    labelled["labelVisibility"] = json!(true);
+    labelled["labelClasses"] = json!([{"type": "CIMLabelClass", "name": "Class 1", "expression": "$feature.name + \" \" + $feature.GONE",
+        "expressionEngine": "Arcade", "visibility": true, "textSymbol": {"type": "CIMSymbolReference", "symbol": {"type": "CIMTextSymbol", "height": 10}}}]);
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, layer: &str| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": [layer], "spatialReference": {"wkid": 4326}});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("A", "CIMPATH=a/a.json"), item("B", "CIMPATH=b/b.json")]}),
+        ),
+        ("a/a.json", map("A", "CIMPATH=a/a.json", "CIMPATH=a/roads.json")),
+        ("a/roads.json", gone),
+        ("b/b.json", map("B", "CIMPATH=b/b.json", "CIMPATH=b/roads.json")),
+        ("b/roads.json", labelled),
+    ]);
+    let mut s = world();
+    let mark = s.notice_mark();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["A", "B"]})).unwrap();
+    assert_eq!((r["layers"].as_u64(), r["broken"].as_u64()), (Some(2), Some(1)), "{r}");
+    let notes = r["notes"].as_array().unwrap();
+    let roads = |start: &str| {
+        notes.iter().any(|n| n["layer"] == "Roads" && n["kind"] == "approximated" && n["text"].as_str().unwrap().starts_with(start))
+    };
+    assert!(roads("added broken: ") && roads("labels from the field GONE"), "{r}");
+    // The working Roads' note counts, though a broken layer has its name.
+    let (approximated, skipped) = aprx_note_counts(notes);
+    assert!(approximated >= 1);
+    assert_eq!(
+        aprx_notice(&s, mark),
+        format!("Imported 2 maps and 0 layouts: 2 layers, 1 broken; {approximated} things drawn differently, {skipped} left out")
+    );
+}
+
+#[test]
+fn a_map_asked_for_and_shown_by_a_layout_comes_in_once() {
+    let mut s = world();
+    let maps = s.project.maps.len();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&aprx()), "maps": ["Main"], "layouts": ["Sheet"]})).unwrap();
+    assert_eq!(r["maps"], json!(["Main"]), "{r}");
+    assert_eq!(s.project.maps.len(), maps + 1);
 }
 
 #[test]

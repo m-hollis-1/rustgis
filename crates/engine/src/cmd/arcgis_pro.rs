@@ -348,10 +348,12 @@ pub(crate) struct Added {
     pub layers: usize,
     /// Of those, the ones added broken.
     pub broken: usize,
-    /// The notes "added broken: …" made: a layer each, counted in `broken`.
+    /// The "added broken: …" notes kept in the report (a layer each, counted in `broken`):
+    /// occurrences, as `Note::count` counts a repeat.
     pub added_broken_notes: usize,
     /// The layers added broken because the reader couldn't open their kind of data, each of
-    /// which the reader noted as skipped (it said why): in the map, not left out.
+    /// which the reader noted once as skipped (it said why): in the map, not left out. Only
+    /// those whose note the report is known to have kept.
     pub skipped_for_broken: usize,
 }
 
@@ -591,7 +593,12 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
         }
         // (The reader said why, in one skipped note.)
         LayerSource::Unopenable => {
-            a.added.skipped_for_broken += 1;
+            // The reader's note came before anything this import notes; with nothing dropped
+            // yet it was kept. (Once the report is full, it may not have been: then it isn't
+            // taken off, so the notice never takes off more than was noted.)
+            if report.dropped() == 0 {
+                a.added.skipped_for_broken += 1;
+            }
             return broken_layer(s, l, Origin::default(), "RustGIS can't open this kind of data".into(), a);
         }
     };
@@ -599,8 +606,12 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
         Ok(r) => opened(s, l, &r, before, within, a, report),
         Err(e) => {
             // In the map, drawing nothing until repaired: not left out.
+            let dropped = report.dropped();
             report.approximated(name, format!("added broken: {e} (repair or retry it)"));
-            a.added.added_broken_notes += 1;
+            // Taken off the notice's count only when the report kept it.
+            if report.dropped() == dropped {
+                a.added.added_broken_notes += 1;
+            }
             broken_layer(s, l, from, e, a)
         }
     }
@@ -1143,9 +1154,10 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
         }
         _ => return Err(NOT_A_PRO_FILE.into()),
     }
-    // A broken layer is counted as broken, not again by the note that says it came in broken
-    // (or, for data RustGIS can't open, by the reader's note on why).
-    let count = |kind: NoteKind| report.notes.iter().filter(|n| n.kind == kind).count();
+    // Every time a note came up (a repeat is one note, counted). A broken layer is counted as
+    // broken, not again by the note that says it came in broken (or, for data RustGIS can't
+    // open, by the reader's note on why).
+    let count = |kind: NoteKind| report.notes.iter().filter(|n| n.kind == kind).fold(0usize, |sum, n| sum.saturating_add(n.count));
     let approximated = count(NoteKind::Approximated).saturating_sub(imported.added_broken_notes);
     let skipped = count(NoteKind::Skipped).saturating_sub(imported.skipped_for_broken);
     s.notify(

@@ -51,6 +51,9 @@ pub struct Report {
     /// thousands of different notes, and a repeat is found without going through them all.
     #[serde(skip)]
     index: HashMap<(String, NoteKind, String), usize>,
+    /// How many new notes were dropped for [`MAX_NOTES`] (a repeat of a kept one is still counted).
+    #[serde(skip)]
+    dropped: usize,
 }
 
 /// One thing an import couldn't carry over as QGIS has it.
@@ -83,7 +86,15 @@ impl Report {
             self.index.insert(key.clone(), self.notes.len());
             let (layer, kind, text) = key;
             self.notes.push(Note { layer, kind, text, count: 1 });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
         }
+    }
+
+    /// How many notes were dropped, being new once [`MAX_NOTES`] were kept: a caller counting
+    /// its own notes against the report's can tell whether one was kept.
+    pub fn dropped(&self) -> usize {
+        self.dropped
     }
 
     pub fn approximated(&mut self, layer: &str, text: impl Into<String>) {

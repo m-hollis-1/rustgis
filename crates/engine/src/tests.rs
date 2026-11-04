@@ -24055,22 +24055,7 @@ fn importing_chosen_maps_and_a_layout_binds_the_frames() {
     // The notice: the SDE layer is the one broken, and its reader's note isn't left out again.
     let notes = r["notes"].as_array().unwrap();
     assert!(notes.iter().any(|n| n["layer"] == "Mains" && n["kind"] == "skipped"), "{r}");
-    let (approximated, skipped) = aprx_note_counts(notes);
-    assert_eq!(
-        aprx_notice(&s, mark),
-        format!("Imported 2 maps and 1 layouts: 3 layers, 1 broken; {approximated} things drawn differently, {skipped} left out")
-    );
-    assert_eq!(notes.iter().filter(|n| n["kind"] == "skipped").count(), skipped + 1, "{r}");
-}
-
-/// The counts the import's notice gives for `notes`: the approximated ones but those saying a
-/// layer came in broken, and the skipped ones but the reader's on data RustGIS can't open
-/// (which those tests' layers that come in broken are).
-fn aprx_note_counts(notes: &[Value]) -> (usize, usize) {
-    let text = |n: &Value| n["text"].as_str().unwrap_or_default().to_string();
-    let approximated = notes.iter().filter(|n| n["kind"] == "approximated" && !text(n).starts_with("added broken: ")).count();
-    let skipped = notes.iter().filter(|n| n["kind"] == "skipped" && !text(n).contains("which RustGIS can't open")).count();
-    (approximated, skipped)
+    assert_eq!(aprx_notice(&s, mark), "Imported 2 maps and 1 layouts: 3 layers, 1 broken; 0 things drawn differently, 0 left out", "{r}");
 }
 
 /// The import's notice, the one notice given since `mark`.
@@ -24115,12 +24100,40 @@ fn a_layer_named_as_a_broken_one_keeps_its_notes_counted() {
     };
     assert!(roads("added broken: ") && roads("labels from the field GONE"), "{r}");
     // The working Roads' note counts, though a broken layer has its name.
-    let (approximated, skipped) = aprx_note_counts(notes);
-    assert!(approximated >= 1);
-    assert_eq!(
-        aprx_notice(&s, mark),
-        format!("Imported 2 maps and 0 layouts: 2 layers, 1 broken; {approximated} things drawn differently, {skipped} left out")
-    );
+    assert_eq!(aprx_notice(&s, mark), "Imported 2 maps and 0 layouts: 2 layers, 1 broken; 1 things drawn differently, 0 left out", "{r}");
+}
+
+#[test]
+fn the_same_broken_layer_in_two_maps_counts_twice() {
+    // Maps X and Y each hold the same SDE layer (one note, come up twice); X also a shapefile
+    // layer whose definition query doesn't fit it (one note, left out).
+    let sde = |uri: &str| {
+        json!({"type": "CIMFeatureLayer", "name": "Mains", "uRI": uri, "visibility": true,
+            "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+                "workspaceConnectionString": "SERVER=gis-db;DATABASE=utility", "workspaceFactory": "SDE",
+                "dataset": "utility.dbo.mains", "datasetType": "esriDTFeatureClass"}}})
+    };
+    let mut misfit = aprx_countries_layer("Countries", "CIMPATH=x/countries.json");
+    misfit["featureTable"]["definitionExpression"] = json!("nope = 1");
+    let item = |name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": "Map", "name": name, "catalogPath": path});
+    let map = |name: &str, uri: &str, layers: Vec<&str>| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers, "spatialReference": {"wkid": 4326}});
+    let zip = aprx_zip(vec![
+        (
+            "GISProject.json",
+            json!({"type": "CIMGISProject", "projectItems": [item("X", "CIMPATH=x/x.json"), item("Y", "CIMPATH=y/y.json")]}),
+        ),
+        ("x/x.json", map("X", "CIMPATH=x/x.json", vec!["CIMPATH=x/countries.json", "CIMPATH=x/mains.json"])),
+        ("x/countries.json", misfit),
+        ("x/mains.json", sde("CIMPATH=x/mains.json")),
+        ("y/y.json", map("Y", "CIMPATH=y/y.json", vec!["CIMPATH=y/mains.json"])),
+        ("y/mains.json", sde("CIMPATH=y/mains.json")),
+    ]);
+    let mut s = world();
+    let mark = s.notice_mark();
+    let r = s.run("project.importArcgis", &json!({"data": b64(&zip), "maps": ["X", "Y"]})).unwrap();
+    let notes = r["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n["layer"] == "Mains" && n["kind"] == "skipped" && n["count"] == 2), "{r}");
+    assert_eq!(aprx_notice(&s, mark), "Imported 2 maps and 0 layouts: 3 layers, 2 broken; 0 things drawn differently, 1 left out", "{r}");
 }
 
 #[test]

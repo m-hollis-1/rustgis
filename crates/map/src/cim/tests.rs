@@ -1292,7 +1292,8 @@ fn a_camera_in_a_projected_system_is_converted() {
     // A state plane in US feet (NAD83 Texas Central): its false origin is its centre of
     // projection, 100°20'W 29°40'N. An extent in NAD83 degrees is read as degrees.
     let ext = json!({"type": "CIMEnvelope", "xmin": -98.0, "ymin": 31.0, "xmax": -96.0, "ymax": 33.0, "spatialReference": {"wkid": 4269}});
-    let maps = [embedded_map("CIMPATH=map/sp.json", 2277, json!({})), embedded_map("CIMPATH=map/nad.json", 4269, json!({"defaultExtent": ext}))];
+    let maps =
+        [embedded_map("CIMPATH=map/sp.json", 2277, json!({})), embedded_map("CIMPATH=map/nad.json", 4269, json!({"defaultExtent": ext}))];
     let mut sp = map_frame_element("SP", (1.0, 1.0, 5.0, 5.0), camera(2_296_583.333, 9_842_500.0, 13_000.0));
     sp["uRI"] = json!("CIMPATH=map/sp.json");
     let mut nad = map_frame_element("NAD", (6.0, 1.0, 9.0, 5.0), json!({}));
@@ -2961,12 +2962,10 @@ fn xml_named_entries_that_hold_json_are_read_and_are_not_arcmap() {
     .unwrap();
     let d = Document::from_zip(&zip).unwrap();
     let items = d.items();
-    assert_eq!(items.iter().map(|i| (i.name.as_str(), i.arcmap)).collect::<Vec<_>>(), [
-        ("Converted", false),
-        ("Converted Sheet", false),
-        ("Still Xml", true),
-        ("Missing", true)
-    ]);
+    assert_eq!(
+        items.iter().map(|i| (i.name.as_str(), i.arcmap)).collect::<Vec<_>>(),
+        [("Converted", false), ("Converted Sheet", false), ("Still Xml", true), ("Missing", true)]
+    );
     assert_eq!(d.resolve("CIMPATH=conv/conv.xml").unwrap()["name"], "Converted");
     assert_eq!(d.resolve("CIMPATH=CONV/Roads.xml").unwrap()["name"], "Roads");
     assert!(d.resolve("CIMPATH=old/old.xml").is_none());

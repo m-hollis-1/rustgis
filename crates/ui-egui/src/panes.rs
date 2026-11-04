@@ -2623,36 +2623,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             // A File Geodatabase's folder is data, listed and added like a file.
             (e.path().is_dir() && !rustgis_engine::data::source::is_gdb_name(&name), name, e.path())
         })
-        .filter(|(d, n, _)| {
-            !n.starts_with('.')
-                && (*d
-                    || [
-                        "geojson",
-                        "json",
-                        "csv",
-                        "tsv",
-                        "shp",
-                        "tif",
-                        "tiff",
-                        "asc",
-                        // A File Geodatabase's folder, listed as data above.
-                        "gdb",
-                        // Databases holding several layers, which ask which to add (#934).
-                        "gpkg",
-                        "duckdb",
-                        "ddb",
-                        "rgis",
-                        "rgisx",
-                        "rgispkg",
-                        "rgismap",
-                        "rgismpk",
-                        "rgislyr",
-                        "rgislayout",
-                        "pagx",
-                    ]
-                    .iter()
-                    .any(|x| n.to_lowercase().ends_with(&format!(".{x}"))))
-        })
+        .filter(|(d, n, _)| !n.starts_with('.') && (*d || BROWSER_EXTENSIONS.iter().any(|x| n.to_lowercase().ends_with(&format!(".{x}")))))
         .collect();
     entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
     for (is_dir, name, path) in entries.into_iter().take(300) {
@@ -2679,6 +2650,9 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     app.map.invalidate();
                 } else if name.ends_with(".rgislayout") || name.to_ascii_lowercase().ends_with(".pagx") {
                     let _ = app.import_layout_file(&path.display().to_string());
+                } else if crate::is_arcgis_pro_name(&name.to_ascii_lowercase()) {
+                    let _ = app.import_arcgis_file(&path.display().to_string());
+                    app.map.invalidate();
                 } else {
                     let _ = crate::layerchooser::add_file(app, &path.display().to_string());
                 }
@@ -2686,6 +2660,36 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         });
     }
 }
+
+/// The files the Browser pane lists (by extension), beside folders.
+pub(crate) const BROWSER_EXTENSIONS: &[&str] = &[
+    "geojson",
+    "json",
+    "csv",
+    "tsv",
+    "shp",
+    "tif",
+    "tiff",
+    "asc",
+    // A File Geodatabase's folder, listed as data rather than as a folder.
+    "gdb",
+    // Databases holding several layers, which ask which to add (#934).
+    "gpkg",
+    "duckdb",
+    "ddb",
+    "rgis",
+    "rgisx",
+    "rgispkg",
+    "rgismap",
+    "rgismpk",
+    "rgislyr",
+    "rgislayout",
+    "pagx",
+    // ArcGIS Pro projects, maps and layer files.
+    "aprx",
+    "mapx",
+    "lyrx",
+];
 
 /// `tools` grouped by the `depth`-th part of their toolbox (`GeoLibre › Raster › General`), one
 /// closed header per group and nested again below it; tools whose toolbox stops here are listed.

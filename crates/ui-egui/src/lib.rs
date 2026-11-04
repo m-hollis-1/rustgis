@@ -148,6 +148,14 @@ pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
 /// Tools pane's file parameter, not onto the map.
 pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";
 
+/// ArcGIS Pro's projects, maps and layer files, which `project.importArcgis` imports.
+pub(crate) const ARCGIS_PRO_EXTENSIONS: [&str; 3] = ["aprx", "mapx", "lyrx"];
+
+/// Whether `lower` (a file name in lower case) is an ArcGIS Pro project, map or layer file.
+pub(crate) fn is_arcgis_pro_name(lower: &str) -> bool {
+    ARCGIS_PRO_EXTENSIONS.iter().any(|e| lower.strip_suffix(e).is_some_and(|stem| stem.ends_with('.')))
+}
+
 /// The preference the default raster style (`raster.setDefaultStyle`) is kept under.
 const RASTER_DEFAULTS_PREF: &str = "raster_default_style";
 
@@ -1365,6 +1373,27 @@ impl RustGisApp {
         self.run("layout.import", json!({"path": path}))
     }
 
+    /// Imports the ArcGIS Pro file at `path`: a project (`.aprx`) opens Import ArcGIS Pro Project
+    /// to choose its maps and layouts (nothing is imported until Import is pressed); a map
+    /// (`.mapx`) or layer file (`.lyrx`) is imported at once.
+    pub(crate) fn import_arcgis_file(&mut self, path: &str) -> Result<Value, String> {
+        self.import_arcgis(path, json!({"path": path}))
+    }
+
+    /// [`Self::import_arcgis_file`] for the file `name` given as `source` (`{"path"}`, or in the
+    /// browser `{"data"}`, its bytes in base64).
+    fn import_arcgis(&mut self, name: &str, source: Value) -> Result<Value, String> {
+        let seen = self.run("project.inspectArcgis", source.clone())?;
+        if seen.get("kind").and_then(Value::as_str) == Some("project") {
+            let data = source.get("data").and_then(Value::as_str).map(str::to_string);
+            self.dialogs.open_arcgis(&self.session, name, data, &seen)?;
+            return Ok(Value::Null);
+        }
+        let r = self.run("project.importArcgis", source);
+        self.map.invalidate();
+        r
+    }
+
     /// Opens file bytes with picker options, forwarding source CRS overrides before ZIP parsing.
     fn open_bytes_with(&mut self, name: &str, bytes: &[u8], csv: Option<Value>) -> Result<Value, String> {
         let lower = name.to_ascii_lowercase();
@@ -1372,6 +1401,13 @@ impl RustGisApp {
         if lower.ends_with(".rgplugin") {
             pluginsui::received(self, bytes.to_vec(), None);
             return Ok(Value::Null);
+        }
+        // An ArcGIS Pro project asks which maps and layouts to import; a map or layer file comes
+        // in at once.
+        if is_arcgis_pro_name(&lower) {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            return self.import_arcgis(name, json!({"data": data}));
         }
         // Project items picked or dropped in the browser.
         let item = [
@@ -2871,6 +2907,7 @@ impl RustGisApp {
                     "importStyles" => ("style.import", &["rgislyr", "rgismap", "rgis", "rgisx"], "RustGIS layers, maps and projects"),
                     "geolibreProject" => ("project.importGeolibre", &["geolibre", "json"], "GeoLibre project"),
                     "qgisProject" => ("project.importQgis", &["qgs", "qgz"], "QGIS project"),
+                    "arcgisProject" => ("project.importArcgis", &ARCGIS_PRO_EXTENSIONS, "ArcGIS Pro project, map or layer file"),
                     "qgisStyle" => ("style.importQgis", &["qml"], "QGIS layer style"),
                     "template" => ("project.fromTemplate", &["rgistemplate"], "RustGIS project template"),
                     "task" => ("task.import", &["rgistask"], "RustGIS task"),
@@ -2882,14 +2919,20 @@ impl RustGisApp {
                     k => return Err(format!("unknown item '{k}'")),
                 };
                 if let Some(open) = &self.services.open_async {
-                    self.ui.pending_open = Some(cmd);
+                    // An ArcGIS Pro file is told by its name when it arrives: a project asks
+                    // which maps and layouts to import first.
+                    self.ui.pending_open = (kind != "arcgisProject").then_some(cmd);
                     open(match kind {
                         "ramps" => "ramp",
                         "geolibreProject" => "project",
                         "qgisProject" => "qgisProject",
+                        "arcgisProject" => "arcgisProject",
                         _ => "item",
                     });
                 } else if let Some(path) = dialogs::pick_open(exts, tl!(label)) {
+                    if kind == "arcgisProject" {
+                        return self.import_arcgis_file(&path);
+                    }
                     let r = self.run_by_user(cmd, json!({"path": path}));
                     self.map.invalidate();
                     return r;
@@ -3911,6 +3954,13 @@ impl RustGisApp {
                     let _ = self.import_layout_file(&p);
                     continue;
                 }
+                // An ArcGIS Pro project asks which maps and layouts to import; a map or layer
+                // file comes in at once.
+                if is_arcgis_pro_name(&lower) {
+                    let _ = self.import_arcgis_file(&p);
+                    self.map.invalidate();
+                    continue;
+                }
                 let _ = layerchooser::add_file(self, &p);
                 self.map.invalidate();
             }
@@ -4506,7 +4556,7 @@ mod pagx_tests {
     }
     /// A file dropped on the desktop window, as eframe passes it: by its path.
     #[derive(Debug)]
-    struct Dropped(std::path::PathBuf);
+    pub(super) struct Dropped(pub(super) std::path::PathBuf);
     impl egui::DroppedFile for Dropped {
         fn path(&self) -> &std::path::Path {
             &self.0
@@ -4576,5 +4626,179 @@ mod pagx_tests {
             assert!(tokens.contains(&token), "{token} is missing");
         }
         assert_eq!(tokens.len(), rustgis_engine::map::graphics::TOKENS.len() + 3);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod aprx_tests {
+    use super::RustGisApp;
+    use egui::vec2;
+    use serde_json::{Value, json};
+
+    /// A synthetic ArcGIS Pro project: maps Main and Detail (Detail's pane open when saved), a
+    /// layout Sheet whose one frame shows Main, and a map Old saved by ArcMap.
+    fn aprx() -> Vec<u8> {
+        let item = |ty: &str, name: &str, path: &str| json!({"type": "CIMProjectItem", "itemType": ty, "name": name, "catalogPath": path});
+        let root = json!({"type": "CIMGISProject", "version": "3.7.0",
+            "projectItems": [item("Map", "Main", "CIMPATH=main/main.json"), item("Map", "Detail", "CIMPATH=detail/detail.json"),
+                item("Layout", "Sheet", "CIMPATH=layout/sheet.json"), item("Map", "Old", "CIMPATH=old/old.xml")],
+            "views": [{"type": "CIMMapView", "viewableObjectPath": "CIMPATH=detail/detail.json"}]});
+        let map = |name: &str, uri: &str| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": [], "spatialReference": {"wkid": 4326, "latestWkid": 4326}});
+        let sheet = json!({"type": "CIMLayout", "name": "Sheet", "uRI": "CIMPATH=layout/sheet.json",
+            "page": {"type": "CIMPage", "width": 11, "height": 8.5, "units": {"uwkid": 109008}},
+            "elements": [{"type": "CIMMapFrame", "name": "Main Frame", "anchor": "BottomLeftCorner", "visible": true,
+                "frame": {"rings": [[[0.5, 0.5], [0.5, 8.0], [8.0, 8.0], [8.0, 0.5], [0.5, 0.5]]]}, "uRI": "CIMPATH=main/main.json"}]});
+        let files: Vec<(String, Vec<u8>)> = [
+            ("GISProject.json", root),
+            ("main/main.json", map("Main", "CIMPATH=main/main.json")),
+            ("detail/detail.json", map("Detail", "CIMPATH=detail/detail.json")),
+            ("layout/sheet.json", sheet),
+        ]
+        .into_iter()
+        .map(|(path, v)| (path.to_string(), v.to_string().into_bytes()))
+        .collect();
+        rustgis_engine::data::zip::write(&files).unwrap()
+    }
+
+    /// A layer file holding one shapefile layer, Rivers (its data isn't there: it comes in broken).
+    const LYRX: &str = r#"{"type":"CIMLayerDocument","version":"3.7.0","layers":["CIMPATH=small/rivers.json"],
+        "layerDefinitions":[{"type":"CIMFeatureLayer","name":"Rivers","uRI":"CIMPATH=small/rivers.json","visibility":true,
+          "featureTable":{"type":"CIMFeatureTable","dataConnection":{"type":"CIMStandardDataConnection",
+            "workspaceConnectionString":"DATABASE=data","workspaceFactory":"Shapefile","dataset":"rivers.shp",
+            "datasetType":"esriDTFeatureClass"}}}]}"#;
+
+    /// Removes the folder when the test ends, a failed assertion included.
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `bytes` written as `file` in a folder of its own: (the folder, the file's path).
+    fn written(tag: &str, file: &str, bytes: &[u8]) -> (TempDir, String) {
+        let dir = std::env::temp_dir().join(format!("rustgis-aprx-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file);
+        std::fs::write(&path, bytes).unwrap();
+        (TempDir(dir), path.display().to_string())
+    }
+
+    fn map_names(app: &RustGisApp) -> Vec<String> {
+        app.session.project.maps.iter().map(|m| m.name.clone()).collect()
+    }
+
+    #[test]
+    fn an_aprx_file_opens_the_picker_with_the_open_map_ticked() {
+        let (_dir, path) = written("picker", "p.aprx", &aprx());
+        let mut app = RustGisApp::with_sample();
+        let maps = app.session.project.maps.len();
+        assert_eq!(app.import_arcgis_file(&path).unwrap(), Value::Null);
+        assert_eq!(app.dialogs.open, Some("importArcgisPro"));
+        assert_eq!(app.dialogs.arcgis_path, path);
+        assert!(app.dialogs.arcgis_data.is_none());
+        let map = |name: &str| app.dialogs.arcgis_maps.iter().find(|m| m.0 == name).cloned().unwrap_or_else(|| panic!("no map {name}"));
+        assert_eq!(map("Detail"), ("Detail".to_string(), true, false));
+        assert_eq!(map("Main"), ("Main".to_string(), false, false));
+        assert_eq!(map("Old"), ("Old".to_string(), false, true));
+        assert_eq!(app.dialogs.arcgis_layouts, vec![("Sheet".to_string(), vec!["Main".to_string()], false, false)]);
+        // Nothing is imported until Import is pressed.
+        assert_eq!(app.session.project.maps.len(), maps);
+        crate::dialogs::finish_arcgis_import(&mut app).unwrap();
+        assert_eq!(app.session.project.maps.len(), maps + 1);
+        assert!(map_names(&app).iter().any(|m| m == "Detail"));
+    }
+
+    #[test]
+    fn ticking_a_layout_ticks_its_maps() {
+        use egui_kittest::kittest::Queryable;
+        let (_dir, path) = written("tick", "p.aprx", &aprx());
+        let mut app = RustGisApp::with_sample();
+        let layouts = app.session.project.layouts.len();
+        app.import_arcgis_file(&path).unwrap();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                crate::dialogs::show(app, &ctx);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label("Sheet").click();
+        h.run_steps(3);
+        assert!(h.state().dialogs.arcgis_maps.iter().any(|m| m.0 == "Main" && m.1), "{:?}", h.state().dialogs.arcgis_maps);
+        h.get_by_label("Import").click();
+        h.run_steps(3);
+        let app = h.state();
+        assert!(app.dialogs.open.is_none(), "{:?}", app.dialogs.error);
+        let names = map_names(app);
+        assert!(names.iter().any(|m| m == "Main") && names.iter().any(|m| m == "Detail"), "{names:?}");
+        assert_eq!(app.session.project.layouts.len(), layouts + 1);
+        assert!(app.session.project.layouts.iter().any(|l| l.name == "Sheet"));
+    }
+
+    #[test]
+    fn a_dropped_aprx_opens_the_picker_and_a_dropped_lyrx_adds_layers() {
+        use super::pagx_tests::Dropped;
+        let (dir, aprx_path) = written("drop", "p.APRX", &aprx());
+        let lyrx = dir.0.join("rivers.lyrx");
+        std::fs::write(&lyrx, LYRX).unwrap();
+        let mut app = RustGisApp::with_sample();
+        app.start(&Default::default()).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.step();
+        let maps = h.state().session.project.maps.len();
+        let layers = h.state().session.map().layers.len();
+        for f in [std::path::PathBuf::from(&aprx_path), lyrx] {
+            h.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(f)));
+        }
+        h.step();
+        h.step();
+        let app = h.state();
+        assert_eq!(app.dialogs.open, Some("importArcgisPro"));
+        assert_eq!(app.dialogs.arcgis_path, aprx_path);
+        assert_eq!(app.session.project.maps.len(), maps);
+        assert_eq!(app.session.map().layers.len(), layers + 1);
+        assert!(app.session.map().layer_by_name("Rivers").is_some());
+    }
+
+    #[test]
+    fn aprx_bytes_open_the_picker_on_the_web_path() {
+        let mut app = RustGisApp::with_sample();
+        let maps = app.session.project.maps.len();
+        assert_eq!(app.open_bytes_with("p.aprx", &aprx(), None).unwrap(), Value::Null);
+        assert_eq!(app.dialogs.open, Some("importArcgisPro"));
+        assert!(app.dialogs.arcgis_data.is_some());
+        assert!(app.dialogs.arcgis_maps.iter().any(|m| m.0 == "Detail" && m.1));
+        crate::dialogs::finish_arcgis_import(&mut app).unwrap();
+        assert_eq!(app.session.project.maps.len(), maps + 1);
+        assert!(map_names(&app).iter().any(|m| m == "Detail"));
+        // A layer file's bytes add its layers at once.
+        let layers = app.session.map().layers.len();
+        app.dialogs.open = None;
+        app.open_bytes_with("rivers.lyrx", LYRX.as_bytes(), None).unwrap();
+        assert!(app.dialogs.open.is_none());
+        assert_eq!(app.session.map().layers.len(), layers + 1);
+    }
+
+    #[test]
+    fn the_browser_pane_lists_pro_files() {
+        for ext in ["aprx", "mapx", "lyrx"] {
+            assert!(crate::panes::BROWSER_EXTENSIONS.contains(&ext), "{ext}");
+        }
     }
 }

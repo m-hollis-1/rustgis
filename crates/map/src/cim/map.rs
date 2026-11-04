@@ -551,9 +551,11 @@ fn source_at(c: &Value, owner: &Value, what: &str, report: &mut Report, joins: u
     }
 }
 
-/// The first named sublayer of a WMS layer that shows, depth first: a sublayer without a name
-/// (a WMS's root often has none) is looked into. A hidden sublayer hides the ones in it. At most
-/// [`MAX_LAYERS`] sublayers are looked at, [`MAX_GROUP_DEPTH`] deep.
+/// The first sublayer of a WMS layer that shows, depth first, by its WMS name: Pro writes that as
+/// `subLayerID` (its `name` is the title people see), and `name` is read when there's none. A
+/// sublayer holding others (Pro's `CIMServiceCompositeSubLayer`, the service's root) is looked
+/// into, as is one with no name. A hidden sublayer hides the ones in it. At most [`MAX_LAYERS`]
+/// sublayers are looked at, [`MAX_GROUP_DEPTH`] deep.
 fn wms_layer(owner: &Value) -> Option<String> {
     fn subs(v: &Value) -> &[Value] {
         v.get("subLayers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
@@ -573,7 +575,10 @@ fn wms_layer(owner: &Value) -> Option<String> {
         if !flag(s, "visibility", true) {
             continue;
         }
-        if let Some(name) = str_of(s, "name").map(str::trim).filter(|n| !n.is_empty()) {
+        let named = |k: &str| str_of(s, k).map(str::trim).filter(|n| !n.is_empty());
+        if subs(s).is_empty()
+            && let Some(name) = named("subLayerID").or_else(|| named("name"))
+        {
             return Some(name.to_string());
         }
         if stack.len() < MAX_GROUP_DEPTH {

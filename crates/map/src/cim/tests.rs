@@ -3860,6 +3860,23 @@ fn every_connection_kind_has_a_source_and_an_origin() {
             LayerKind::Tiles,
         ),
         (
+            // As Pro writes it: a named composite sublayer (the service's root, not a layer the
+            // server draws) holding the sublayers, each with its title as `name` and the WMS
+            // layer name as `subLayerID`.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsPro",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection", "version": "1.3.0",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "anonymous": true, "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "service_root", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "Hidden Title", "subLayerID": "0", "visibility": false},
+                        {"type": "CIMWMSSubLayer", "name": "Parcels Title", "subLayerID": "1", "visibility": true}]}]}),
+            ),
+            Wms { url: "https://example.org/wms".into(), layer: "1".into() },
+            "WMS https://example.org/wms layer 1",
+            LayerKind::Tiles,
+        ),
+        (
             layer_of(
                 "CIMWMSLayer",
                 "WmsHidden",

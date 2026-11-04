@@ -139,7 +139,7 @@ pub fn read_matching(bytes: &[u8], want: impl Fn(&str) -> bool) -> Result<Vec<(S
 
 /// [`read_matching`] within `budget` inflated bytes in all (at most [`MAX_TOTAL`]).
 pub fn read_matching_within(bytes: &[u8], want: impl Fn(&str) -> bool, budget: usize) -> Result<Vec<(String, Vec<u8>)>, String> {
-    read_entries(bytes, want, MAX_ENTRY, budget, false)
+    read_entries(bytes, want, MAX_ENTRY, budget, None)
 }
 
 /// Like [`read_matching_within`], but an entry it can't take (one over `entry_cap` or past what is
@@ -151,17 +151,29 @@ pub fn read_matching_lenient(
     entry_cap: usize,
     budget: usize,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    read_entries(bytes, want, entry_cap.min(MAX_ENTRY), budget, true)
+    Ok(read_matching_lenient_noting(bytes, want, entry_cap, budget)?.0)
 }
 
-/// The wanted entries within `budget` inflated bytes, each at most `entry_cap`; `lenient` skips an
-/// entry that can't be taken instead of failing.
+/// [`read_matching_lenient`], with the names of the wanted entries it skipped, in archive order.
+pub fn read_matching_lenient_noting(
+    bytes: &[u8],
+    want: impl Fn(&str) -> bool,
+    entry_cap: usize,
+    budget: usize,
+) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>), String> {
+    let mut skipped = Vec::new();
+    let read = read_entries(bytes, want, entry_cap.min(MAX_ENTRY), budget, Some(&mut skipped))?;
+    Ok((read, skipped))
+}
+
+/// The wanted entries within `budget` inflated bytes, each at most `entry_cap`; with `skipped`
+/// (lenient), an entry that can't be taken is named there instead of failing the read.
 fn read_entries(
     bytes: &[u8],
     want: impl Fn(&str) -> bool,
     entry_cap: usize,
     budget: usize,
-    lenient: bool,
+    mut skipped: Option<&mut Vec<String>>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut budget = budget.min(MAX_TOTAL);
     let bad = || "not a zip archive (or a damaged one)".to_string();
@@ -239,8 +251,10 @@ fn read_entries(
                 budget -= data.len();
                 out.push((name, data));
             }
-            Err(_) if lenient => {}
-            Err(e) => return Err(e),
+            Err(e) => match skipped.as_deref_mut() {
+                Some(names) => names.push(name),
+                None => return Err(e),
+            },
         }
     }
     Ok(out)
@@ -301,6 +315,10 @@ mod tests {
         let got = read_matching_lenient(&z, |n| n.ends_with(".xml"), 50, 8).unwrap();
         assert_eq!(got, [("a.xml".to_string(), b"small".to_vec())], "c.xml is past the budget");
         assert!(read_matching_lenient(b"not a zip", |_| true, 50, 50).is_err());
+        // And it can say which it skipped, in archive order.
+        let (got, skipped) = read_matching_lenient_noting(&z, |n| n.ends_with(".xml"), 50, 1 << 20).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(skipped, ["big.xml", "bad.xml"]);
     }
 
     #[test]

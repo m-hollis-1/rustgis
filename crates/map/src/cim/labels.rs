@@ -255,9 +255,9 @@ fn point_offset(placement: LabelPlacement, distance: f64) -> [f32; 2] {
 /// The Maplex settings RustGIS has nothing for, each noted when set off its default.
 fn unread(props: &Value, what: &str, report: &mut Report) {
     // (The zone priorities only rank candidate places, which RustGIS has no model of: Pro writes
-    // them on every class, and they are not noted.)
-    const SETTINGS: [(&str, &str); 6] = [
-        ("canOverrunFeature", "labels overrunning their features"),
+    // them on every class, and they are not noted. Nor is `canOverrunFeature`, set on most
+    // classes: RustGIS's labels may overrun their features anyway.)
+    const SETTINGS: [(&str, &str); 5] = [
         ("labelPriority", "label priorities"),
         ("featureWeight", "feature weights"),
         ("keyNumberMethod", "key numbering"),

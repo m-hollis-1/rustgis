@@ -2512,8 +2512,8 @@ fn unsupported_layers_are_noted() {
     // The group is kept, hidden on its own: its layers keep their own visibility.
     let [Entry::Group(g), ..] = map.entries.as_slice() else { panic!("{:?}", map.entries) };
     assert_eq!((g.name.as_str(), g.visible, g.children.len()), ("Boundaries", false, 2));
-    let got: Vec<(&str, bool, bool, LayerKind)> =
-        flat(&map).into_iter().map(|l| (l.name.as_str(), l.visible, l.source != LayerSource::Unopenable, l.kind)).collect();
+    let opens = |l: &LayerImport| !matches!(l.source, LayerSource::Unopenable | LayerSource::Missing(_));
+    let got: Vec<(&str, bool, bool, LayerKind)> = flat(&map).into_iter().map(|l| (l.name.as_str(), l.visible, opens(l), l.kind)).collect();
     assert_eq!(
         got,
         [
@@ -2541,8 +2541,13 @@ fn unsupported_layers_are_noted() {
         );
     }
     assert!(!n.iter().any(|t| t.contains("one by one")), "{n:?}");
-    assert!(n.iter().any(|t| t.contains("missing.json")), "{n:?}");
-    assert!(n.iter().any(|t| t.contains("gone.json")), "{n:?}");
+    // A layer the document lists but doesn't define comes in broken, and the note says so.
+    let said = "missing: the layer CIMPATH=new_detail_map/missing.json isn't defined in this document, added broken";
+    assert!(n.iter().any(|t| t == said), "{n:?}");
+    assert!(n.iter().any(|t| t.contains("gone.json") && t.ends_with("added broken")), "{n:?}");
+    let missing = nth(&map, 6);
+    assert_eq!(missing.source, LayerSource::Missing("the project doesn't define this layer".into()));
+    assert_eq!(missing.origin, "a layer the project doesn't define (CIMPATH=new_detail_map/missing.json)");
 
     // Not a map: an error, and no map at all.
     let mut report = Report::default();
@@ -3046,6 +3051,131 @@ fn oversize_picture_entries_are_left_out() {
     assert_eq!(d.binary("CIMPATH=Pictures/small.jpg"), Some("AQID"));
 }
 
+/// `zip` with the stored bytes of entry `name` damaged, so its checksum fails.
+fn damaged(mut zip: Vec<u8>, name: &str) -> Vec<u8> {
+    let at = zip.windows(name.len()).position(|w| w == name.as_bytes()).unwrap() + name.len();
+    zip[at] ^= 0xFF;
+    zip
+}
+
+#[test]
+fn a_bad_or_oversize_picture_skips_only_itself_and_is_noted_where_the_layout_uses_it() {
+    let picture = |name: &str, uri: &str| {
+        json!({"type": "CIMGraphicElement", "name": name, "anchor": "CenterPoint",
+            "graphic": {"type": "CIMPictureGraphic", "referenceURI": uri, "box": {"xmin": 1.0, "ymin": 1.0, "xmax": 2.0, "ymax": 2.0}}})
+    };
+    let sheet = json!({"type": "CIMLayout", "name": "Sheet", "uRI": "CIMPATH=sheet/sheet.json",
+        "page": {"type": "CIMPage", "width": 11, "height": 8.5, "units": {"uwkid": 109008}},
+        "elements": [picture("BIG", "CIMPATH=Pictures/big.png"), picture("BAD", "CIMPATH=Pictures/bad.png"),
+            picture("SMALL", "CIMPATH=Pictures/small.jpg")]});
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), br#"{"type":"CIMGISProject"}"#.to_vec()),
+        ("sheet/sheet.json".into(), sheet.to_string().into_bytes()),
+        ("Pictures/big.png".into(), vec![7u8; MAX_PICTURE_ENTRY + 1]),
+        ("Pictures/bad.png".into(), vec![9, 9, 9]),
+        ("Pictures/small.jpg".into(), vec![1, 2, 3]),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&damaged(zip, "Pictures/bad.png")).unwrap();
+    // The damaged one used to lose every picture of the project.
+    assert_eq!(d.binary("CIMPATH=Pictures/small.jpg"), Some("AQID"));
+    assert_eq!((d.binary("CIMPATH=Pictures/big.png"), d.binary("CIMPATH=Pictures/bad.png")), (None, None));
+    assert!(d.unreadable("CIMPATH=Pictures/BIG.png") && d.unreadable("CIMPATH=Pictures/bad.png"));
+    assert!(!d.unreadable("CIMPATH=Pictures/small.jpg") && !d.unreadable("CIMPATH=Pictures/none.png"));
+    let mut report = Report::default();
+    let imp = read_layout_def(&d, d.resolve("CIMPATH=sheet/sheet.json").unwrap(), &mut report).unwrap();
+    assert_eq!(imp.pictures.len(), 1);
+    assert_eq!(imp.pictures[0].1, PictureSource::Embedded("AQID".into()));
+    assert_eq!(
+        notes(&report),
+        [
+            "BIG: its picture CIMPATH=Pictures/big.png couldn't be read from the project (damaged, or larger than 16 MB), left empty",
+            "BAD: its picture CIMPATH=Pictures/bad.png couldn't be read from the project (damaged, or larger than 16 MB), left empty",
+        ]
+    );
+}
+
+#[test]
+fn a_damaged_json_entry_leaves_the_project_open_and_the_rest_readable() {
+    let project = json!({"type": "CIMGISProject", "projectItems": [
+        {"type": "CIMProjectItem", "itemType": "Map", "name": "Main", "catalogPath": "CIMPATH=main/main.json"},
+        {"type": "CIMProjectItem", "itemType": "Map", "name": "Broken", "catalogPath": "CIMPATH=broken/broken.json"}]});
+    let map = |name: &str, uri: &str, layers: &[&str]| json!({"type": "CIMMap", "name": name, "uRI": uri, "layers": layers});
+    let zip = rustgis_data::zip::write(&[
+        ("GISProject.json".into(), project.to_string().into_bytes()),
+        ("broken/broken.json".into(), map("Broken", "CIMPATH=broken/broken.json", &[]).to_string().into_bytes()),
+        ("main/roads.json".into(), json!({"type": "CIMFeatureLayer", "name": "Roads"}).to_string().into_bytes()),
+        ("main/main.json".into(), map("Main", "CIMPATH=main/main.json", &["CIMPATH=main/roads.json"]).to_string().into_bytes()),
+    ])
+    .unwrap();
+    let d = Document::from_zip(&damaged(damaged(zip, "broken/broken.json"), "main/roads.json")).unwrap();
+    assert_eq!(d.items().len(), 2);
+    assert!(d.resolve("CIMPATH=broken/broken.json").is_none());
+    assert!(d.unreadable("CIMPATH=broken/broken.json"));
+    // The good map reads; its layer whose entry is damaged comes in broken, saying why.
+    let mut report = Report::default();
+    let m = read_map(&d, "CIMPATH=main/main.json", &mut report).unwrap();
+    let roads = nth(&m, 0);
+    assert_eq!(roads.origin, "a layer the project couldn't read (CIMPATH=main/roads.json)");
+    assert_eq!(roads.source, LayerSource::Missing("its definition in the project couldn't be read (damaged, or larger than 32 MB)".into()));
+    assert_eq!(
+        notes(&report),
+        ["roads: the layer CIMPATH=main/roads.json couldn't be read from the project (damaged, or larger than 32 MB), added broken"]
+    );
+    // The project's own file is still read strictly: damaged, there is no project.
+    let zip = rustgis_data::zip::write(&[("GISProject.json".into(), project.to_string().into_bytes())]).unwrap();
+    assert!(Document::from_zip(&damaged(zip, "GISProject.json")).is_err());
+}
+
+#[test]
+fn a_view_heading_and_a_default_rotation_become_a_bearing() {
+    let view = |uri: &str, heading: serde_json::Value| json!({"type": "CIMMapView", "viewableObjectPath": uri, "camera": {"x": 1.0, "y": 2.0, "scale": 5000.0, "heading": heading}});
+    let project = json!({"type": "CIMGISProject", "views": [view("CIMPATH=a/a.json", json!(13.8)), view("CIMPATH=b/b.json", json!(350.0)),
+        view("CIMPATH=c/c.json", json!(1e30)), view("CIMPATH=d/d.json", json!("east")),
+        {"type": "CIMMapView", "viewableObjectPath": "CIMPATH=e/e.json", "camera": {"x": 1.0, "y": 2.0, "scale": 5000.0}}]});
+    let d = Document::from_json(&project.to_string()).unwrap();
+    let mut report = Report::default();
+    // Pro's heading is the compass direction the top of the view faces: RustGIS's bearing.
+    assert_eq!(d.view_bearing("CIMPATH=A/A.json", "A", &mut report), Some(13.8));
+    assert!(near(d.view_bearing("CIMPATH=b/b.json", "B", &mut report).unwrap(), -10.0, 1e-9));
+    assert_eq!(d.view_bearing("CIMPATH=c/c.json", "C", &mut report), None);
+    assert_eq!(d.view_bearing("CIMPATH=d/d.json", "D", &mut report), None);
+    assert_eq!(d.view_bearing("CIMPATH=e/e.json", "E", &mut report), None);
+    assert_eq!(d.view_bearing("CIMPATH=none.json", "N", &mut report), None);
+    assert_eq!(
+        notes(&report),
+        [
+            "C: its rotation (1e+30), which isn't an angle, drawn north up",
+            "D: its rotation (\"east\"), which isn't an angle, drawn north up",
+        ]
+    );
+    // A map's defaultRotation turns the other way: Pro writes -13.8 where its view's heading is 13.8.
+    let m = Document::from_json(
+        r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"M","defaultRotation":-13.8,"layers":[]}}"#,
+    )
+    .unwrap();
+    let imp = read_map_def(&m, m.map_definition().unwrap(), &mut Report::default()).unwrap();
+    assert_eq!(imp.bearing, Some(13.8));
+    let m = Document::from_json(r#"{"type":"CIMMapDocument","mapDefinition":{"type":"CIMMap","name":"M","layers":[]}}"#).unwrap();
+    assert_eq!(read_map_def(&m, m.map_definition().unwrap(), &mut Report::default()).unwrap().bearing, None);
+}
+
+#[test]
+fn a_frame_heading_that_isnt_an_angle_is_drawn_north_up_and_noted() {
+    let mut turned = map_frame_element("TURNED", (1.0, 1.0, 5.0, 5.0), camera(0.0, 0.0, 5000.0));
+    turned["view"]["camera"]["heading"] = json!(-13.8);
+    turned["uRI"] = json!("CIMPATH=map/detail.json");
+    let mut wild = map_frame_element("WILD", (6.0, 1.0, 9.0, 5.0), camera(0.0, 0.0, 5000.0));
+    wild["view"]["camera"]["heading"] = json!(-1e300);
+    wild["uRI"] = json!("CIMPATH=map/detail.json");
+    let (imp, report) = read_with_maps(&[embedded_map("CIMPATH=map/detail.json", 4326, json!({}))], &[turned, wild]);
+    let (_, ElementKind::MapFrame { bearing, .. }) = frame_of(&imp, "TURNED") else { panic!() };
+    assert!(near(bearing, -13.8, 1e-9), "{bearing}");
+    let (_, ElementKind::MapFrame { bearing, .. }) = frame_of(&imp, "WILD") else { panic!() };
+    assert_eq!(bearing, 0.0);
+    assert_eq!(notes(&report), ["WILD: its rotation (-1e+300), which isn't an angle, drawn north up"]);
+}
+
 #[test]
 fn a_layout_definition_and_a_map_definition_read_like_their_documents() {
     let text = r#"{"type":"CIMLayoutDocument","layoutDefinition":{"type":"CIMLayout","name":"P",
@@ -3539,8 +3669,10 @@ fn maplex_settings_without_a_counterpart_are_noted() {
         json!({}),
     );
     let n = notes(&report);
-    assert_eq!(n.len(), 7, "{n:?}");
+    assert_eq!(n.len(), 6, "{n:?}");
     assert!(!n.iter().any(|t| t.contains("zone")), "zone priorities are never noted: {n:?}");
+    // Nor is overrunning a feature: Pro sets it on most classes, and RustGIS's labels may overrun.
+    assert!(!n.iter().any(|t| t.contains("overrun")), "{n:?}");
     assert!(n.iter().all(|t| t.starts_with("Roads: ") && t.ends_with(", left out")), "{n:?}");
     // The defaults are not worth saying.
     let (_, report) = read_class(
@@ -3963,17 +4095,32 @@ fn every_connection_kind_has_a_source_and_an_origin() {
             LayerKind::Tiles,
         ),
         (
-            // A named sublayer holding only hidden ones: it is the one drawn.
+            // A named WMS sublayer holding only hidden ones: it is the one drawn.
             layer_of(
                 "CIMWMSLayer",
                 "WmsParent",
                 json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
                         "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
-                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "parent", "visibility": true, "subLayers": [
-                        {"type": "CIMWMSSubLayer", "name": "off", "visibility": false}]}]}),
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "service_root", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "Parent Title", "subLayerID": "parent", "visibility": true, "subLayers": [
+                            {"type": "CIMWMSSubLayer", "name": "off", "visibility": false}]}]}]}),
             ),
             Wms { url: "https://example.org/wms".into(), layer: "parent".into() },
             "WMS https://example.org/wms layer parent",
+            LayerKind::Tiles,
+        ),
+        (
+            // Pro's composite root is never the layer asked for, though nothing in it shows.
+            layer_of(
+                "CIMWMSLayer",
+                "WmsRootOnly",
+                json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
+                        "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
+                    "subLayers": [{"type": "CIMServiceCompositeSubLayer", "name": "service_root", "visibility": true, "subLayers": [
+                        {"type": "CIMWMSSubLayer", "name": "off", "visibility": false}]}]}),
+            ),
+            Unopenable,
+            "WMS https://example.org/wms",
             LayerKind::Tiles,
         ),
         (
@@ -3984,7 +4131,7 @@ fn every_connection_kind_has_a_source_and_an_origin() {
                 json!({"serviceConnection": {"type": "CIMWMSServiceConnection",
                     "serverConnection": {"type": "CIMInternetServerConnection", "url": "https://example.org/wms"}},
                 "subLayers": [(0..12).rev().fold(json!({"type": "CIMWMSSubLayer", "name": "leaf"}), |inner, i| {
-                    json!({"type": "CIMServiceCompositeSubLayer", "name": format!("level{i}"), "subLayers": [inner]})
+                    json!({"type": "CIMWMSSubLayer", "name": format!("level{i}"), "subLayers": [inner]})
                 })]}),
             ),
             Wms { url: "https://example.org/wms".into(), layer: "level7".into() },
@@ -4062,11 +4209,12 @@ fn every_connection_kind_has_a_source_and_an_origin() {
         "Sql: SQL query layers, which RustGIS can't open",
         "Joined: a join to owners, drawn without it",
         "WmsHidden: a WMS layer that names no visible sublayer, nothing to draw",
+        "WmsRootOnly: a WMS layer that names no visible sublayer, nothing to draw",
     ] {
         assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
     }
     // Each of the others opens as it is, without a word.
-    assert_eq!(n.len(), 5, "{n:?}");
+    assert_eq!(n.len(), 6, "{n:?}");
 }
 
 #[test]

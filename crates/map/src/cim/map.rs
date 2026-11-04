@@ -21,7 +21,7 @@ use super::expr;
 use super::labels::labels;
 use super::symbol::{self, shown};
 use super::units::pt96;
-use super::{Document, Report, flag, num, str_of, typed};
+use super::{Document, Report, UNREADABLE_JSON, bearing_of, flag, num, str_of, typed};
 use crate::color::{Ramp, Rgba};
 use crate::effects::Blend;
 use crate::fills::FillLayer;
@@ -54,6 +54,9 @@ pub struct MapImport {
     /// The scale symbols are drawn at their size (`referenceScale`), in RustGIS's scale (see
     /// [`QGIS_SCALE`]); `None` when the map has none.
     pub reference_scale: Option<f64>,
+    /// The bearing its `defaultRotation` gives (see [`bearing_of`]): the view's, when no view
+    /// of it was saved.
+    pub bearing: Option<f64>,
     /// Top first, as CIMMap.layers lists them.
     pub entries: Vec<Entry>,
     /// Its standalone tables, in order.
@@ -119,6 +122,9 @@ pub enum LayerSource {
     /// Data RustGIS can't open (a database, a spreadsheet, a query layer, a kind of layer it doesn't
     /// draw): the layer comes in broken, with its `origin`.
     Unopenable,
+    /// A layer the map lists that the document doesn't define (or whose definition in the
+    /// project's zip couldn't be read): it comes in broken for this reason, with its `origin`.
+    Missing(String),
 }
 
 /// One layer of a map.
@@ -165,17 +171,18 @@ pub fn read_map_def(doc: &Document, map: &Value, report: &mut Report) -> Result<
     });
     let extent = map.get("defaultExtent").and_then(|e| Some([num(e, "xmin")?, num(e, "ymin")?, num(e, "xmax")?, num(e, "ymax")?]));
     let reference_scale = scale(map, "referenceScale");
+    let bearing = bearing_of(map, "defaultRotation", true, &name, report);
     let mut reader = Reader::new(doc, report, &name);
     let entries = reader.list(map.get("layers"), 0);
     let tables = reader.tables(map.get("standaloneTables"));
-    Ok(MapImport { name, wkid, extent, reference_scale, entries, tables })
+    Ok(MapImport { name, wkid, extent, reference_scale, bearing, entries, tables })
 }
 
 /// A `.lyrx`'s layers (its `layers` list; groups kept), as a map with no name, projection or extent.
 pub fn read_layers(doc: &Document, uris: &[String], report: &mut Report) -> MapImport {
     let list = Value::Array(uris.iter().take(MAX_LAYERS + 1).map(|u| Value::String(u.clone())).collect());
     let entries = Reader::new(doc, report, "Layer file").list(Some(&list), 0);
-    MapImport { name: String::new(), wkid: None, extent: None, reference_scale: None, entries, tables: Vec::new() }
+    MapImport { name: String::new(), wkid: None, extent: None, reference_scale: None, bearing: None, entries, tables: Vec::new() }
 }
 
 /// Reads a map's layer tree.
@@ -227,9 +234,23 @@ impl<'a> Reader<'a> {
         let Some(def) = def else {
             let uri = uri.unwrap_or_default();
             let name = stem(uri);
-            self.report.skipped(&name, format!("the layer {} isn't defined in this document, left out", shown(uri)));
             self.layers += 1;
-            return Some(Entry::Layer(unread(name, uri.to_string())));
+            // In the map, broken, saying why: not left out.
+            let (why, origin, reason) = if self.doc.unreadable(uri) {
+                (
+                    format!("couldn't be read from the project ({UNREADABLE_JSON})"),
+                    format!("a layer the project couldn't read ({})", shown(uri)),
+                    format!("its definition in the project couldn't be read ({UNREADABLE_JSON})"),
+                )
+            } else {
+                (
+                    "isn't defined in this document".to_string(),
+                    format!("a layer the project doesn't define ({})", shown(uri)),
+                    "the project doesn't define this layer".to_string(),
+                )
+            };
+            self.report.skipped(&name, format!("the layer {} {why}, added broken", shown(uri)));
+            return Some(Entry::Layer(unread(name, origin, reason)));
         };
         let name = str_of(def, "name").map(str::to_string).or_else(|| uri.map(stem)).unwrap_or_else(|| "Layer".into());
         if str_of(def, "type") == Some("CIMGroupLayer") {
@@ -263,7 +284,12 @@ impl<'a> Reader<'a> {
             let Some((def, uri)) = definition(self.doc, entry) else { continue };
             let Some(def) = def else {
                 let uri = uri.unwrap_or_default();
-                self.report.skipped(&stem(uri), format!("the table {} isn't defined in this document, left out", shown(uri)));
+                let why = if self.doc.unreadable(uri) {
+                    format!("couldn't be read from the project ({UNREADABLE_JSON})")
+                } else {
+                    "isn't defined in this document".to_string()
+                };
+                self.report.skipped(&stem(uri), format!("the table {} {why}, left out", shown(uri)));
                 continue;
             };
             let name = str_of(def, "name").map(str::to_string).or_else(|| uri.map(stem)).unwrap_or_else(|| "Table".into());
@@ -290,13 +316,13 @@ fn definition<'v>(doc: &'v Document, entry: &'v Value) -> Option<(Option<&'v Val
     }
 }
 
-/// A layer that isn't there to read.
-fn unread(name: String, origin: String) -> LayerImport {
+/// A layer that isn't there to read: it comes in broken for `reason`.
+fn unread(name: String, origin: String, reason: String) -> LayerImport {
     LayerImport {
         name,
         visible: true,
         expanded: false,
-        source: LayerSource::Unopenable,
+        source: LayerSource::Missing(reason),
         origin,
         style: Style::default(),
         definition_query: None,
@@ -555,13 +581,18 @@ fn source_at(c: &Value, owner: &Value, what: &str, report: &mut Report, joins: u
 
 /// The first sublayer of a WMS layer that shows, depth first, by its WMS name: Pro writes that as
 /// `subLayerID` (its `name` is the title people see), and `name` is read when there's none. A
-/// sublayer holding others (Pro's `CIMServiceCompositeSubLayer`, the service's root) is looked
-/// into; when nothing in it shows (or it is [`MAX_GROUP_DEPTH`] deep) it is taken itself if it
-/// has a name. A hidden sublayer hides the ones in it. At most [`MAX_LAYERS`] sublayers are looked
-/// at.
+/// sublayer holding others is looked into; when nothing in it shows (or it is [`MAX_GROUP_DEPTH`]
+/// deep) it is taken itself if it has a name, unless it is Pro's `CIMServiceCompositeSubLayer`
+/// (the service's root, which the server doesn't draw as a layer): then there is none. A hidden
+/// sublayer hides the ones in it. At most [`MAX_LAYERS`] sublayers are looked at.
 fn wms_layer(owner: &Value) -> Option<String> {
     let mut seen = 0;
     wms_in(subs(owner), 1, &mut seen)
+}
+
+/// Whether a WMS sublayer is Pro's `CIMServiceCompositeSubLayer`, the service's root.
+fn composite(v: &Value) -> bool {
+    str_of(v, "type") == Some("CIMServiceCompositeSubLayer")
 }
 
 /// A WMS layer's or sublayer's `subLayers`.
@@ -580,7 +611,9 @@ fn wms_in(list: &[Value], depth: usize, seen: &mut usize) -> Option<String> {
             continue;
         }
         let named = |k: &str| str_of(s, k).map(str::trim).filter(|n| !n.is_empty());
-        let own = named("subLayerID").or_else(|| named("name")).map(str::to_string);
+        // Pro's composite sublayer is the service's root, not a layer the server draws: looked
+        // into, never taken itself.
+        let own = named("subLayerID").or_else(|| named("name")).map(str::to_string).filter(|_| !composite(s));
         let inner = subs(s);
         if !inner.is_empty()
             && depth < MAX_GROUP_DEPTH

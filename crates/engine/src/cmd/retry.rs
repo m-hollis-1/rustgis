@@ -41,7 +41,9 @@ fn retry(s: &mut Session, p: &Value) -> CmdResult {
             }
             Ok(Outcome::Opening) => {}
             Err(error) => {
-                // What the next diagnosis (Repair Source) goes by.
+                // What the next diagnosis (Repair Source) goes by. The project keeps it, so
+                // without the keys, tokens and passwords an error may quote.
+                let error = super::history::redacted_text(&error);
                 if let Some(src) = s.map_mut().layer_mut(id).and_then(|l| l.source.as_mut()) {
                     src.error = Some(error.clone());
                     src.reason = Some(error.clone());

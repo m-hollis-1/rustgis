@@ -25802,6 +25802,9 @@ fn diagnose_text_sorts_the_reasons_rustgis_gives() {
         ("https://x: host not found", Kind::Unreachable),
         ("https://x: connection failed", Kind::Unreachable),
         ("https://x: timeout: global", Kind::Unreachable),
+        ("https://x: io: No connection could be made because the target machine actively refused it. (os error 10061)", Kind::Unreachable),
+        ("https://x: io: A connection attempt failed because the connected party did not respond (os error 10060)", Kind::Unreachable),
+        ("https://x: io: Connection refused (os error 111)", Kind::Unreachable),
         ("RustGIS can't open this kind of data", Kind::Other),
     ];
     for (text, want) in cases {
@@ -25869,6 +25872,28 @@ fn a_broken_layer_read_back_from_a_project_is_still_diagnosed() {
     let r = t.run("layer.diagnose", &json!({"layer": id})).unwrap();
     assert_eq!((r["kind"].as_str(), r["server"].as_str()), (Some("signIn"), Some("https://127.0.0.1:9")), "{r}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_failed_retry_keeps_secrets_out_of_the_layer_and_the_saved_project() {
+    let mut s = Session::new(Project::default());
+    let id = broken_service(&mut s);
+    let url = "https://127.0.0.1:9/arcgis/rest/services/S/FeatureServer?token=SECRET123&password=hunter2";
+    let src = s.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap();
+    src.service.as_mut().unwrap().url = url.into();
+    let r = s.run("layer.retry", &json!({"layer": id})).unwrap();
+    let error = r["failed"][0]["error"].as_str().unwrap().to_string();
+    assert!(error.contains("127.0.0.1"), "the error still says where: {error}");
+    let src = s.map().layer(id).unwrap().source.as_ref().unwrap();
+    let (reason, shown) = (src.reason.clone().unwrap(), src.error.clone().unwrap());
+    let (saved, _) = s.project.saved_text(None).unwrap();
+    for text in [&error, &reason, &shown, &saved, &r.to_string()] {
+        assert!(!text.contains("SECRET123") && !text.contains("hunter2"), "{text}");
+    }
+    assert!(reason.contains("127.0.0.1"), "{reason}");
+    // The diagnosis still reads it.
+    let d = s.run("layer.diagnose", &json!({"layer": id})).unwrap();
+    assert_eq!(d["kind"], "unreachable", "{d}");
 }
 
 #[test]

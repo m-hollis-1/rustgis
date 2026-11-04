@@ -367,7 +367,9 @@ impl Layer {
     /// The dataset, streamed, raster and time-following Zarr addresses used to read this layer
     /// again, in that order. Local paths are included; database origins stay password-free.
     pub fn addresses_mut(&mut self) -> impl Iterator<Item = &mut String> {
-        self.dataset.source.iter_mut().chain(self.source.iter_mut().filter_map(|source| source.path.as_mut())).chain(
+        // (A broken layer's service address may carry a token, as `service.add` took it.)
+        let source = self.source.iter_mut().flat_map(|source| source.path.iter_mut().chain(source.service.iter_mut().map(|s| &mut s.url)));
+        self.dataset.source.iter_mut().chain(source).chain(
             self.raster.iter_mut().flat_map(|raster| raster.path.iter_mut().chain(raster.time_zarr.iter_mut().map(|zarr| &mut zarr.store))),
         )
     }

@@ -66,6 +66,7 @@ mod pluginsui;
 mod portalsui;
 #[cfg(not(target_arch = "wasm32"))]
 mod relayshot;
+mod repairbroken;
 mod repairsource;
 mod reportpane;
 mod ribbon;
@@ -3516,6 +3517,12 @@ impl RustGisApp {
                     self.dialogs = dialogs::Dialogs { open: Some("calculateGeometry"), geometry: Some(form), ..Default::default() };
                     return Ok(Value::Null);
                 }
+                if which == repairbroken::NAME {
+                    let id = self.session.layer_id(p)?;
+                    let form = repairbroken::Form::new(self, id)?;
+                    self.dialogs = dialogs::Dialogs { open: Some(repairbroken::NAME), broken: Some(form), ..Default::default() };
+                    return Ok(Value::Null);
+                }
                 if matches!(which, "repairSource" | "repairTiles") {
                     let form = (|| {
                         let target = if which == "repairSource" {
@@ -3880,6 +3887,8 @@ impl RustGisApp {
         let _diagnostics = self.session.diagnostics.enter();
         // A long call queued behind the working window, once that window was painted.
         busy::run_due(self, ctx);
+        // A sign-in finishing retries the broken layers, whichever dialog started it.
+        arcgisui::poll(self, ctx);
         // The MCP relay: what attached agents sent runs here, on this session, before the frame
         // draws (Session lives on this thread; the listener only queues messages).
         #[cfg(not(target_arch = "wasm32"))]

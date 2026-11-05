@@ -16,6 +16,8 @@ pub struct Dialogs {
     pub projection_map: Option<(u64, usize, String)>,
     pub geometry: Option<crate::geometrycalc::Form>,
     pub repair: Option<crate::repairsource::Form>,
+    /// Repair Source…: the broken layer it explains.
+    pub broken: Option<crate::repairbroken::Form>,
     pub open: Option<&'static str>,
     pub layer: String,
     /// GeoPackage save/discard targets use IDs because display names can repeat.
@@ -272,6 +274,10 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     if which == "repairSource" {
         crate::repairsource::show(app, ctx);
+        return;
+    }
+    if which == crate::repairbroken::NAME {
+        crate::repairbroken::show(app, ctx);
         return;
     }
     let title = match which {

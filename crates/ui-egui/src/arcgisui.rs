@@ -148,15 +148,6 @@ fn remember(app: &RustGisApp, portal: &str, client_id: &str) {
 #[cfg(target_arch = "wasm32")]
 fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
     fields(app, ui);
-    let done = app.ui.arcgis.pending.as_ref().and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).take());
-    if let Some(result) = done {
-        app.ui.arcgis.pending = None;
-        let signed_in = result.is_ok();
-        app.ui.arcgis.error = result.err();
-        if signed_in {
-            retry_broken_layers(app);
-        }
-    }
     if app.ui.arcgis.pending.is_some() {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -180,12 +171,7 @@ fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
 fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
     use arcgis_auth::Progress;
     fields(app, ui);
-    let progress = arcgis_auth::progress();
-    let completed = finished(&mut app.ui.arcgis.was_pending, &progress);
-    if completed {
-        retry_broken_layers(app);
-    }
-    match progress {
+    match arcgis_auth::progress() {
         Progress::Pending { .. } => {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -194,8 +180,6 @@ fn form(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
                     let _ = app.run("arcgis.cancelSignIn", json!({}));
                 }
             });
-            // The browser comes back on another thread: look again soon.
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
         progress => {
             if let Progress::Failed(e) = &progress {
@@ -216,6 +200,90 @@ fn finished(was_pending: &mut bool, progress: &arcgis_auth::Progress) -> bool {
     let completed = *was_pending && matches!(progress, Progress::Done(_));
     *was_pending = matches!(progress, Progress::Pending { .. });
     completed
+}
+
+/// Each frame, whichever dialog is open (Add From Service, Repair Source…, or none): a sign-in
+/// that has just finished retries the map's broken layers.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
+    let progress = arcgis_auth::progress();
+    if matches!(progress, arcgis_auth::Progress::Pending { .. }) {
+        // The browser comes back on another thread: look again soon.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+    poll_progress(app, &progress);
+}
+
+/// [`poll`] with the sign-in's progress given.
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_progress(app: &mut RustGisApp, progress: &arcgis_auth::Progress) {
+    if finished(&mut app.ui.arcgis.was_pending, progress) {
+        retry_broken_layers(app);
+    }
+}
+
+/// Each frame: the pop-up's sign-in, when it has come back, says why it failed or retries the
+/// map's broken layers.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn poll(app: &mut RustGisApp, _ctx: &egui::Context) {
+    let done = app.ui.arcgis.pending.as_ref().and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+    if let Some(result) = done {
+        app.ui.arcgis.pending = None;
+        let signed_in = result.is_ok();
+        app.ui.arcgis.error = result.err();
+        if signed_in {
+            retry_broken_layers(app);
+        }
+    }
+}
+
+/// Starts signing in to ArcGIS Online with RustGIS's own app, as Sign in does with the portal
+/// left blank (Repair Source… offers it for a layer that needs a sign-in).
+pub(crate) fn sign_in_online(app: &mut RustGisApp) -> Result<(), String> {
+    app.ui.arcgis.error = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let v = app.run("arcgis.signIn", json!({}))?;
+        app.ui.open_url = v.get("url").and_then(serde_json::Value::as_str).map(str::to_string);
+        Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let sign_in = app.services.arcgis_sign_in.as_ref().ok_or_else(|| tl!("Signing in isn't available here.").to_string())?;
+        let slot = crate::Slot::default();
+        sign_in(String::new(), arcgis_auth::DEFAULT_CLIENT_ID.to_string(), slot.clone());
+        app.ui.arcgis.pending = Some(slot);
+        Ok(())
+    }
+}
+
+/// Whether a sign-in is under way (the browser or its pop-up not back yet).
+pub(crate) fn signing_in(app: &RustGisApp) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = app;
+        matches!(arcgis_auth::progress(), arcgis_auth::Progress::Pending { .. })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.ui.arcgis.pending.is_some()
+    }
+}
+
+/// Why the last sign-in failed, if it did.
+pub(crate) fn sign_in_failure(app: &RustGisApp) -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = app;
+        match arcgis_auth::progress() {
+            arcgis_auth::Progress::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.ui.arcgis.error.clone()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -295,6 +363,37 @@ mod tests {
         );
         app.session.map_mut().add_streamed("Roads", src);
         retry_broken_layers(&mut app);
+        let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(said, ["Signed in: 0 layers opened"]);
+    }
+
+    /// The sign-in finishing is noticed each frame (`poll`), not only while Add From Service is
+    /// drawn: a sign-in started from Repair Source… retries the broken layers too, once.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sign_in_finishing_retries_broken_layers_without_the_service_dialog() {
+        use arcgis_auth::Progress;
+        let mut app = RustGisApp::with_sample();
+        let src = rustgis_engine::map::source::SourceLayer::broken(
+            "a shapefile at D:/data/roads.shp".into(),
+            Some("D:/data/no-such-folder/roads.shp".into()),
+            None,
+            None,
+            "the file isn't there".into(),
+        );
+        app.session.map_mut().add_streamed("Roads", src);
+        assert!(app.dialogs.open.is_none());
+        let done = Progress::Done(arcgis_auth::Info {
+            portal: "https://www.arcgis.com".into(),
+            username: "someone".into(),
+            expires_at: None,
+            renews: true,
+            token: false,
+        });
+        poll_progress(&mut app, &Progress::Pending { portal: "https://www.arcgis.com".into() });
+        assert!(app.session.notices.is_empty());
+        poll_progress(&mut app, &done);
+        poll_progress(&mut app, &done);
         let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(said, ["Signed in: 0 layers opened"]);
     }

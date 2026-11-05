@@ -2282,10 +2282,19 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("layer.loadAll", json!({"layer": l.id}));
         ui.close();
     }
+    // A broken feature layer: Repair Source… says why and offers the fix that fits (Retry and
+    // Repair Data Source… among them).
+    let broken = !l.is_raster() && l.source.as_ref().is_some_and(|s| s.is_broken());
+    if broken && ui.button(tl!("Repair Source…")).clicked() {
+        if let Err(e) = app.run("ui.dialog", json!({"name": crate::repairbroken::NAME, "layer": l.id})) {
+            app.session.notify(e, true);
+        }
+        ui.close();
+    }
     // A layer that came from a service, or a broken one with a file to read again: it can be
     // opened again (a file that has turned up, a sign-in made since).
     let retryable = l.source.as_ref().is_some_and(|s| s.service.is_some() || (s.is_broken() && s.path.is_some()));
-    if retryable && ui.button(tl!("Retry")).clicked() {
+    if !broken && retryable && ui.button(tl!("Retry")).clicked() {
         match app.run("layer.retry", json!({"layer": l.id})) {
             Ok(r) => {
                 if let Some(e) = r.get("failed").and_then(|f| f.get(0)).and_then(|f| f.get("error")).and_then(Value::as_str) {
@@ -2296,7 +2305,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         }
         ui.close();
     }
-    if l.linked_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
+    if !broken && l.linked_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
         let _ = app.run("ui.dialog", json!({"name": "repairSource", "layer": l.id}));
         ui.close();
     }
@@ -7711,10 +7720,10 @@ mod tests {
         assert!(h.query_by_label_contains("the file isn't there").is_some(), "the reason");
     }
 
-    /// Retry is offered for a layer that came from a service, or from a file that is broken; Repair
-    /// Data Source stays for a file; an open layer has neither Retry.
+    /// A broken feature layer's menu has Repair Source… in place of Retry and Repair Data
+    /// Source…; an open layer read from a service keeps Retry, and an open file layer has none.
     #[test]
-    fn retry_appears_for_service_origins_only() {
+    fn a_broken_layers_menu_offers_repair_source() {
         use egui_kittest::kittest::Queryable;
         let service = rustgis_engine::map::source::ServiceOrigin {
             url: "https://example.org/x/FeatureServer".into(),
@@ -7724,14 +7733,36 @@ mod tests {
         let menu = |name: &str| {
             let mut app = RustGisApp::with_sample();
             add_broken(&mut app, "Parcels", None, Some(service.clone()));
-            add_broken(&mut app, "Roads", Some("D:\\data\\roads.shp"), None);
+            add_broken(&mut app, "Roads", Some("D:/data/roads.shp"), None);
+            // A service layer that isn't broken: it has no origin to go back to.
+            let healthy = add_broken(&mut app, "Hydrants", None, Some(service.clone()));
+            app.session.map_mut().layer_mut(healthy).and_then(|l| l.source.as_mut()).unwrap().origin = None;
             let layer = layer_by_name(&app, name);
             let mut h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| layer_menu(app, ui, &layer, true), app);
             h.step();
-            (h.query_by_label("Retry").is_some(), h.query_by_label("Repair Data Source…").is_some())
+            (
+                h.query_by_label("Repair Source…").is_some(),
+                h.query_by_label("Retry").is_some(),
+                h.query_by_label("Repair Data Source…").is_some(),
+            )
         };
-        assert_eq!(menu("Parcels"), (true, false), "a service: Retry only");
-        assert_eq!(menu("Roads"), (true, true), "a broken file: Retry and Repair");
-        assert!(!menu("Cities").0, "an open layer has no Retry");
+        assert_eq!(menu("Parcels"), (true, false, false), "a broken service");
+        assert_eq!(menu("Roads"), (true, false, false), "a broken file");
+        assert_eq!(menu("Hydrants"), (false, true, false), "an open service layer keeps Retry");
+        assert_eq!(menu("Cities"), (false, false, false), "an open file layer");
+    }
+
+    /// Repair Source… opens the helper on the layer.
+    #[test]
+    fn repair_source_opens_the_helper() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        add_broken(&mut app, "Roads", Some("D:/data/roads.shp"), None);
+        let layer = layer_by_name(&app, "Roads");
+        let mut h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| layer_menu(app, ui, &layer, true), app);
+        h.step();
+        h.get_by_label("Repair Source…").click();
+        h.step();
+        assert_eq!(h.state().dialogs.open, Some(crate::repairbroken::NAME));
     }
 }

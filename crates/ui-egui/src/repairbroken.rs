@@ -44,8 +44,11 @@ struct Diagnosis {
     server: Option<String>,
     /// The file it read, on this computer.
     path: Option<String>,
+    /// (The web app has no files to browse for, so never asks about the folder.)
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     folder: Option<String>,
     /// How many other broken layers read their data from the same folder.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     siblings: usize,
 }
 
@@ -88,12 +91,12 @@ pub struct Form {
 }
 
 impl Form {
-    /// Opens on broken feature layer `layer`; an error for one that isn't broken.
+    /// Opens on broken feature layer `layer`; an error for a raster, or a layer that isn't broken.
     pub fn new(app: &mut RustGisApp, layer: u32) -> Result<Self, String> {
         let s = &mut app.session;
         let l = s.map().layer(layer).ok_or_else(|| tl!("Layer not found").to_string())?;
         if l.is_raster() {
-            return Err(crate::i18n::fmt("{name} isn't broken", &[("name", &l.name)]));
+            return Err(tl!("Repair Source… is for feature layers").to_string());
         }
         let name = l.name.clone();
         let was = l
@@ -133,11 +136,13 @@ fn diagnose(s: &mut Session, layer: u32) -> Result<Diagnosis, String> {
     })
 }
 
-/// The folder a file is in (either separator).
+/// The folder a file is in (either separator); a drive's or the file system's root keeps its
+/// separator (`C:\`, `/`).
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn folder_of(path: &str) -> Option<&str> {
     let i = path.rfind(['/', '\\'])?;
-    path.get(..i).filter(|f| !f.is_empty())
+    let folder = path.get(..i)?;
+    if folder.is_empty() || folder.ends_with(':') { path.get(..=i) } else { Some(folder) }
 }
 
 /// What the diagnosis means, in words.
@@ -298,11 +303,11 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         // A service can take a while to answer, or not to: the working window says so meanwhile.
         Some(Action::Retry) => {
             let message = crate::i18n::fmt("Trying {name} again…", &[("name", &name)]);
-            crate::busy::queue(app, message, move |app| retry(app, layer));
+            crate::busy::queue_short(app, message, move |app| retry(app, layer, &name));
         }
         Some(Action::Relink(url)) => {
             let message = crate::i18n::fmt("Opening {name} from its new address…", &[("name", &name)]);
-            crate::busy::queue(app, message, move |app| relink(app, layer, &url));
+            crate::busy::queue_short(app, message, move |app| relink(app, layer, &name, &url));
         }
         Some(Action::SignIn) => {
             let started = crate::arcgisui::sign_in_online(app);
@@ -311,7 +316,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 f.error = started.err();
             }
         }
-        Some(Action::Browse) => browse(app, layer),
+        Some(Action::Browse) => browse(app, layer, name),
         Some(Action::FixSiblings(yes)) => fix_siblings(app, yes),
         Some(Action::Remove) => match app.run("layer.remove", json!({"layer": layer})) {
             Ok(_) => done(app, crate::i18n::fmt("Removed {name}", &[("name", &name)])),
@@ -363,28 +368,37 @@ fn failed(app: &mut RustGisApp, layer: u32, error: String) {
     app.dialogs.broken = Some(f);
 }
 
-/// The layer opens again: the dialog closes with a notice.
-fn repaired(app: &mut RustGisApp, layer: u32) {
-    let name = form(app, layer).map(|f| f.name.clone()).unwrap_or_default();
-    done(app, crate::i18n::fmt("Repaired {name}", &[("name", &name)]));
+/// Layer `name` opens again: the dialog closes with a notice.
+fn repaired(app: &mut RustGisApp, name: &str) {
+    done(app, crate::i18n::fmt("Repaired {name}", &[("name", name)]));
 }
 
-fn retry(app: &mut RustGisApp, layer: u32) {
+/// The notice after `layer.retry`'s result `r` with no failure: opened, or (read off the frame,
+/// a file by its web address) still loading.
+fn retried(r: &Value, name: &str) -> String {
+    if r.get("opened").and_then(Value::as_u64).unwrap_or(0) > 0 {
+        crate::i18n::fmt("Repaired {name}", &[("name", name)])
+    } else {
+        crate::i18n::fmt("{name} is opening; it shows when it has loaded", &[("name", name)])
+    }
+}
+
+fn retry(app: &mut RustGisApp, layer: u32, name: &str) {
     match app.run("layer.retry", json!({"layer": layer})) {
         Ok(r) => {
             let error = r.get("failed").and_then(|f| f.get(0)).and_then(|f| f.get("error")).and_then(Value::as_str);
             match error {
                 Some(e) => failed(app, layer, e.to_string()),
-                None => repaired(app, layer),
+                None => done(app, retried(&r, name)),
             }
         }
         Err(e) => failed(app, layer, e),
     }
 }
 
-fn relink(app: &mut RustGisApp, layer: u32, url: &str) {
+fn relink(app: &mut RustGisApp, layer: u32, name: &str, url: &str) {
     match app.run("layer.relinkService", json!({"layer": layer, "url": url})) {
-        Ok(_) => repaired(app, layer),
+        Ok(_) => repaired(app, name),
         Err(e) => failed(app, layer, e),
     }
 }
@@ -392,44 +406,55 @@ fn relink(app: &mut RustGisApp, layer: u32, url: &str) {
 /// Browse for the file…: the layer reads the file picked; when its old folder held other broken
 /// layers' data, the dialog asks whether to fix those too.
 #[cfg(not(target_arch = "wasm32"))]
-fn browse(app: &mut RustGisApp, layer: u32) {
+fn browse(app: &mut RustGisApp, layer: u32, name: String) {
     let Some(path) = crate::dialogs::pick_open(&[], tl!("Data")) else { return };
-    match app.run("layer.repairSource", json!({"layer": layer, "path": path})) {
+    let message = crate::i18n::fmt("Opening {name} from {file}…", &[("name", &name), ("file", crate::busy::file_name(&path))]);
+    crate::busy::queue_short(app, message, move |app| match app.run("layer.repairSource", json!({"layer": layer, "path": path})) {
         Ok(_) => {
-            let Some(f) = form(app, layer) else { return };
+            let Some(f) = form(app, layer) else {
+                repaired(app, &name);
+                return;
+            };
             match (f.diagnosis.folder.clone(), folder_of(&path)) {
                 (Some(from), Some(to)) if f.diagnosis.siblings > 0 => {
                     f.error = None;
                     f.ask = Some(Siblings { from, to: to.to_string(), count: f.diagnosis.siblings });
                 }
-                _ => repaired(app, layer),
+                _ => repaired(app, &name),
             }
         }
         Err(e) => failed(app, layer, e),
-    }
+    });
 }
 
 /// The web app can't read files on this computer by their path.
 #[cfg(target_arch = "wasm32")]
-fn browse(app: &mut RustGisApp, layer: u32) {
+fn browse(app: &mut RustGisApp, layer: u32, _name: String) {
     if let Some(f) = form(app, layer) {
         f.error = Some(tl!("The web app can't link to files on this computer: add the file again with Add Data.").to_string());
     }
 }
 
 /// The answer to "Fix them too?": Yes repairs the old folder's other broken layers from the new
-/// one, and the notices list which were and which weren't.
+/// one, behind the working window.
 fn fix_siblings(app: &mut RustGisApp, yes: bool) {
     let Some(f) = app.dialogs.broken.as_ref() else { return };
-    let (name, layer) = (f.name.clone(), f.layer);
+    let name = f.name.clone();
     let folders = f.ask.as_ref().map(|a| (a.from.clone(), a.to.clone()));
     let Some((from, to)) = folders.filter(|_| yes) else {
-        repaired(app, layer);
+        repaired(app, &name);
         return;
     };
+    let message = crate::i18n::fmt("Repairing the other layers from {folder}…", &[("folder", &from)]);
+    crate::busy::queue_short(app, message, move |app| repair_folder(app, &name, &from, &to));
+}
+
+/// The old folder's other broken layers repaired from `to`; the notices list which were and
+/// which weren't.
+fn repair_folder(app: &mut RustGisApp, name: &str, from: &str, to: &str) {
     match app.run("layer.repairFolder", json!({"from": from, "to": to})) {
         Ok(r) => {
-            let mut all = vec![name];
+            let mut all = vec![name.to_string()];
             all.extend(r.get("repaired").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
             done(app, crate::i18n::fmt("Repaired {names}", &[("names", &all.join(", "))]));
             let skipped: Vec<String> = r
@@ -447,7 +472,7 @@ fn fix_siblings(app: &mut RustGisApp, yes: bool) {
             }
         }
         Err(e) => {
-            done(app, crate::i18n::fmt("Repaired {name}", &[("name", &name)]));
+            repaired(app, name);
             app.session.notify(redact_text(&e), true);
         }
     }
@@ -563,6 +588,46 @@ mod tests {
         assert!(h.state().dialogs.open.is_none());
     }
 
+    /// A file at a drive's or the file system's root: the folder keeps its separator.
+    #[test]
+    fn folder_of_keeps_a_roots_separator() {
+        assert_eq!(folder_of("C:\\x.shp"), Some("C:\\"));
+        assert_eq!(folder_of("C:/x.shp"), Some("C:/"));
+        assert_eq!(folder_of("/x.shp"), Some("/"));
+        assert_eq!(folder_of("C:\\data\\x.shp"), Some("C:\\data"));
+        assert_eq!(folder_of("/data/x.shp"), Some("/data"));
+        assert_eq!(folder_of("x.shp"), None);
+    }
+
+    /// A retry that only started reading (off the frame) doesn't claim the layer was repaired.
+    #[test]
+    fn a_retry_still_loading_says_so() {
+        assert_eq!(retried(&json!({"retried": 1, "opened": 1, "failed": []}), "Roads"), "Repaired Roads");
+        assert_eq!(retried(&json!({"retried": 1, "opened": 0, "failed": []}), "Roads"), "Roads is opening; it shows when it has loaded");
+    }
+
+    /// The notice names the layer even when the dialog closed before the queued call ran.
+    #[test]
+    fn a_queued_success_names_the_layer_after_the_dialog_closed() {
+        let mut app = RustGisApp::with_sample();
+        assert!(app.dialogs.open.is_none());
+        repaired(&mut app, "Parcels");
+        let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
+        assert!(said.contains(&"Repaired Parcels"), "{said:?}");
+    }
+
+    /// A raster's own entries repair it: the helper says it's for feature layers.
+    #[test]
+    fn a_raster_is_for_its_own_repair() {
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let mut app = RustGisApp::with_sample();
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new("dem", 1, 1, vec![vec![0.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let id = app.session.map_mut().add_raster("dem", rustgis_engine::map::RasterLayer::from_path(r, "dem.tif"));
+        let e = app.run("ui.dialog", json!({"name": NAME, "layer": id})).unwrap_err();
+        assert_eq!(e, "Repair Source… is for feature layers");
+    }
+
     /// Only a broken layer has something to repair.
     #[test]
     fn an_open_layer_has_nothing_to_repair() {
@@ -590,10 +655,10 @@ mod tests {
         assert!(h.query_by_label_contains("The file isn't at").is_some());
         crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(new.clone()));
         h.get_by_label("Browse for the file…").click();
-        h.run_steps(3);
+        h.run_steps(6);
         assert!(h.query_by_label_contains("1 other broken layer had data in the same folder").is_some());
         h.get_by_label("Yes").click();
-        h.run_steps(3);
+        h.run_steps(6);
         let s = &h.state().session;
         for id in [roads, other] {
             assert!(!s.map().layer(id).unwrap().source.as_ref().unwrap().is_broken(), "layer {id} still broken");

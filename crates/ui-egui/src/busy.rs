@@ -17,9 +17,9 @@ use crate::theme::semibold;
 type Action = Box<dyn FnOnce(&mut RustGisApp)>;
 
 /// What waits behind the working window: calls in the order queued, each with what the window
-/// says while it runs.
+/// says while it runs, and the line under it.
 pub(crate) struct Pending {
-    steps: VecDeque<(String, Action)>,
+    steps: VecDeque<(String, &'static str, Action)>,
     /// The first step's window was painted, visible: it runs on the next frame.
     painted: bool,
 }
@@ -27,10 +27,23 @@ pub(crate) struct Pending {
 /// What the window says under what is happening.
 const LINE: &str = "This can take several minutes for a large project. Windows may say RustGIS is not responding — don't close it.";
 
+/// The line under a call that isn't about a project's size (a service asked again, say).
+const SHORT_LINE: &str = "Windows may say RustGIS is not responding — don't close it.";
+
 /// Queues `action` behind the working window saying `message`. It runs on a frame after the one
 /// that painted the window (behind any queued before it).
 pub(crate) fn queue(app: &mut RustGisApp, message: String, action: impl FnOnce(&mut RustGisApp) + 'static) {
-    let step: (String, Action) = (message, Box::new(action));
+    push(app, message, LINE, action);
+}
+
+/// [`queue`], for a call whose time doesn't depend on a project's size: the window's second
+/// line doesn't speak of a large project.
+pub(crate) fn queue_short(app: &mut RustGisApp, message: String, action: impl FnOnce(&mut RustGisApp) + 'static) {
+    push(app, message, SHORT_LINE, action);
+}
+
+fn push(app: &mut RustGisApp, message: String, line: &'static str, action: impl FnOnce(&mut RustGisApp) + 'static) {
+    let step: (String, &'static str, Action) = (message, line, Box::new(action));
     match &mut app.ui.busy {
         Some(pending) => pending.steps.push_back(step),
         None => app.ui.busy = Some(Pending { steps: VecDeque::from([step]), painted: false }),
@@ -49,7 +62,7 @@ pub(crate) fn run_due(app: &mut RustGisApp, ctx: &egui::Context) {
         drop_input(ctx);
     }
     let Some(pending) = app.ui.busy.as_mut().filter(|p| p.painted) else { return };
-    let Some((_, action)) = pending.steps.pop_front() else {
+    let Some((_, _, action)) = pending.steps.pop_front() else {
         app.ui.busy = None;
         return;
     };
@@ -79,7 +92,7 @@ fn drop_input(ctx: &egui::Context) {
 /// has run.
 pub(crate) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(pending) = app.ui.busy.as_mut() else { return };
-    let Some((message, _)) = pending.steps.front() else { return };
+    let Some((message, line, _)) = pending.steps.front() else { return };
     let id = egui::Id::unique("busy_window");
     let mut painted = false;
     // No fade: the frame painted is the one on screen while the call blocks.
@@ -90,7 +103,7 @@ pub(crate) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             ui.label(egui::RichText::new(message.as_str()).font(semibold(15.0)));
         });
         ui.add_space(6.0);
-        ui.label(tl!(LINE));
+        ui.label(tl!(line));
         // A new window's first frame only measures it, unseen.
         painted = !ui.is_sizing_pass() && ui.is_visible();
     });
@@ -158,7 +171,7 @@ pub(crate) fn save(app: &mut RustGisApp, as_new: bool, then: impl FnOnce(&mut Ru
 /// In a unit test without frames: runs every queued call now.
 #[cfg(test)]
 pub(crate) fn finish(app: &mut RustGisApp) {
-    while let Some((_, action)) = app.ui.busy.as_mut().and_then(|p| p.steps.pop_front()) {
+    while let Some((_, _, action)) = app.ui.busy.as_mut().and_then(|p| p.steps.pop_front()) {
         action(app);
     }
     app.ui.busy = None;
@@ -250,5 +263,32 @@ mod tests {
         h.input_mut().events.extend(pressed);
         h.run_steps(2);
         assert_eq!(clicks.get(), 1);
+    }
+    /// A short call's window doesn't speak of a large project; a project's does.
+    #[test]
+    fn a_short_call_has_its_own_second_line() {
+        for (short, large) in [(true, false), (false, true)] {
+            let mut app = RustGisApp::with_sample();
+            if short {
+                queue_short(&mut app, "Trying Roads again…".into(), |_| {});
+            } else {
+                queue(&mut app, "Saving test.rgis…".into(), |_| {});
+            }
+            let mut fonts = false;
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 400.0)).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    if !fonts {
+                        crate::theme::install_fonts(ui.ctx(), &[], None);
+                        fonts = true;
+                        return;
+                    }
+                    show(app, ui.ctx());
+                },
+                app,
+            );
+            h.run_steps(3);
+            assert!(h.query_by_label_contains("don't close it").is_some());
+            assert_eq!(h.query_by_label_contains("for a large project").is_some(), large);
+        }
     }
 }

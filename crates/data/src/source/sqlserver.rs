@@ -153,8 +153,8 @@ pub struct Conn {
     client: Mutex<Option<Client>>,
     /// The database's geodatabase catalog, read on first use.
     geodatabase: OnceLock<Option<Arc<super::geodatabase::Catalog>>>,
-    /// Why a geodatabase's catalog couldn't be read.
-    geodatabase_problem: OnceLock<Option<String>>,
+    /// Why the geodatabase's catalog couldn't be read, last time it was tried.
+    geodatabase_problem: Mutex<Option<String>>,
 }
 
 fn err(e: tiberius::error::Error) -> DataError {
@@ -368,7 +368,7 @@ pub fn connect(address: &str, ask: bool) -> Result<Arc<Conn>> {
         rt,
         client: Mutex::new(Some(client)),
         geodatabase: OnceLock::new(),
-        geodatabase_problem: OnceLock::new(),
+        geodatabase_problem: Mutex::new(None),
     });
     live.push((address.to_string(), password, Arc::downgrade(&conn)));
     Ok(conn)
@@ -380,13 +380,17 @@ pub fn connect(address: &str, ask: bool) -> Result<Arc<Conn>> {
 /// The geodatabase the connection's database holds, read once per connection; None when it holds
 /// none or the catalog isn't readable (the reason is kept for [`geodatabase_problem`], not
 /// returned: the database then browses as plain SQL Server). A failure to tell whether there is
-/// one at all isn't kept, so the next call asks again.
+/// one at all is kept as the problem but not cached, so the next call asks again.
 pub fn geodatabase(conn: &Conn) -> Option<Arc<super::geodatabase::Catalog>> {
     if let Some(cached) = conn.geodatabase.get() {
         return cached.clone();
     }
+    // The error texts come from `Conn::query`, which redacts the password.
     let (catalog, problem) = match gdb::detect_owner(conn) {
-        Err(_) => return None,
+        Err(e) => {
+            set_problem(conn, Some(e.to_string()));
+            return None;
+        }
         Ok(None) => (None, None),
         Ok(Some(owner)) => match gdb::read_catalog(conn, &owner) {
             Ok(c) => (Some(Arc::new(c)), None),
@@ -394,15 +398,26 @@ pub fn geodatabase(conn: &Conn) -> Option<Arc<super::geodatabase::Catalog>> {
         },
     };
     // The problem is set first, so whoever sees the catalog cached also sees why it is missing.
-    let _ = conn.geodatabase_problem.set(problem);
+    set_problem(conn, problem);
     conn.geodatabase.get_or_init(|| catalog).clone()
 }
 
+fn set_problem(conn: &Conn, problem: Option<String>) {
+    *conn.geodatabase_problem.lock().unwrap_or_else(|e| e.into_inner()) = problem;
+}
+
 /// Why the catalog couldn't be read, when `geodatabase` is None for a database that has
-/// GDB_ITEMS (permissions): for the browse notice.
+/// GDB_ITEMS (permissions), or whether it has one couldn't be told: for the browse notice.
 pub fn geodatabase_problem(conn: &Conn) -> Option<String> {
-    let _ = geodatabase(conn);
-    conn.geodatabase_problem.get().cloned().flatten()
+    if geodatabase(conn).is_some() {
+        return None;
+    }
+    current_problem(conn)
+}
+
+/// The kept problem, without asking the server again.
+fn current_problem(conn: &Conn) -> Option<String> {
+    conn.geodatabase_problem.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -653,6 +668,14 @@ impl SqlServerSource {
         let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
         let reading = gdb::reading(&conn, &table, &names)?;
         let from = reading.as_ref().map_or_else(|| table.sql_from(), |r| r.from.clone());
+        // `reading` already asked for the catalog, so the kept problem is current; it only counts
+        // while there is still no catalog.
+        if reading.is_none()
+            && !matches!(conn.geodatabase.get(), Some(Some(_)))
+            && let Some(note) = gdb::catalog_note(current_problem(&conn).as_deref())
+        {
+            notes.push(note);
+        }
         let rows = conn.query(&format!("SELECT TOP (1) {g}.STSrid FROM {from} WHERE {g} IS NOT NULL"), &[])?;
         let raw_srid =
             rows.first().and_then(|r| int_of(at(r, 0))).and_then(|n| u32::try_from(n).ok()).unwrap_or(if geography { 4326 } else { 0 });

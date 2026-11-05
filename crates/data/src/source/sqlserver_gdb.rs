@@ -120,8 +120,7 @@ pub(super) struct Reading {
 pub(super) fn reading(conn: &Conn, table: &Table, columns: &[String]) -> Result<Option<Reading>> {
     let Some(catalog) = super::geodatabase(conn) else { return Ok(None) };
     let Some(item) = catalog.find(&format!("{}.{}", table.schema, table.name)) else { return Ok(None) };
-    let native_spatial = matches!(table.kind.as_str(), "geometry" | "geography")
-        && item.shape_column.as_deref().is_none_or(|s| s.eq_ignore_ascii_case(&table.column));
+    let native_spatial = native_spatial(table);
     // Only a traditionally versioned class is read through a view.
     let views: Vec<String> = if item.versioning == Versioning::Traditional {
         conn.query(
@@ -137,6 +136,23 @@ pub(super) fn reading(conn: &Conn, table: &Table, columns: &[String]) -> Result<
     let plan = geodatabase::read_plan(item, native_spatial, &views, columns);
     let srs = item.srid.and_then(|s| catalog.srs(s));
     reading_of(plan, table, item, srs).map(Some)
+}
+
+/// Whether the column is a native spatial column. Any of a class's `geometry` or `geography`
+/// columns (its shape or another) reads through the class's plan: the versioned view carries
+/// every column. Only `tables` columns reach here, so this is false only for other storage.
+pub(super) fn native_spatial(table: &Table) -> bool {
+    matches!(table.kind.as_str(), "geometry" | "geography")
+}
+
+/// The note for a table read without the catalog because the catalog couldn't be read. The
+/// problem text comes from `Conn::query`'s errors, which are redacted of the password.
+pub(super) fn catalog_note(problem: Option<&str>) -> Option<String> {
+    problem.map(|why| {
+        format!(
+            "the geodatabase catalog couldn't be read ({why}): a versioned table shows its base rows, without the edits in its delta tables"
+        )
+    })
 }
 
 /// The reading a plan gives, worked out without a server.
@@ -234,6 +250,28 @@ mod tests {
         for other in ["x]y", "SDE", "sde;", "", "dbo.x", "gis"] {
             assert_eq!(owner_prefix(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn any_native_spatial_column_reads_through_the_plan() {
+        let second = Table { column: "SHAPE2".into(), ..table() };
+        assert!(native_spatial(&second));
+        assert!(!native_spatial(&Table { kind: "varbinary".into(), ..table() }));
+        let views = ["MAINS_evw".to_string()];
+        let unversioned = Item { versioning: Versioning::Unversioned, ..item() };
+        assert_eq!(geodatabase::read_plan(&unversioned, native_spatial(&second), &views, &[]), ReadPlan::Base);
+        assert_eq!(geodatabase::read_plan(&item(), native_spatial(&second), &views, &[]), ReadPlan::VersionedView("MAINS_evw".into()));
+    }
+
+    #[test]
+    fn an_unreadable_catalog_is_noted() {
+        assert_eq!(catalog_note(None), None);
+        assert_eq!(
+            catalog_note(Some("permission denied")).as_deref(),
+            Some(
+                "the geodatabase catalog couldn't be read (permission denied): a versioned table shows its base rows, without the edits in its delta tables"
+            )
+        );
     }
 
     #[test]

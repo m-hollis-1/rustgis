@@ -82,7 +82,7 @@
   #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)] #[serde(rename_all = "camelCase")]
   pub enum ItemKind { FeatureDataset, FeatureClass, Table }
   #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)] #[serde(rename_all = "camelCase")]
-  pub enum Versioning { Unversioned, Traditional, Branch }  // serialized "unversioned" | "traditional" | "branch"
+  pub enum Versioning { #[serde(rename = "none")] Unversioned, Traditional, Branch }  // serialized "none" | "traditional" | "branch" (the spec's names)
   #[derive(Clone, Debug, PartialEq)]
   pub struct Item {
       pub name: String,             // GDB_ITEMS.Name as given ("utility.sde.Mains" or "sde.Mains")

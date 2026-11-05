@@ -238,3 +238,108 @@ fn renewals_land_or_end_the_session() {
     renewal_done(&r, Ok(br#"{"error":{"code":400,"error":"invalid_grant"}}"#));
     assert!(authorization(url).is_none() && signed_in(portal).is_none());
 }
+
+#[test]
+fn an_adopted_token_covers_the_organizations_hosted_services_only() {
+    let soon = now_secs() + 3600;
+    assert_eq!(adopt(ONLINE, "plugin-token-1", soon, "abc123", "ana"), Ok(true));
+    let bearer = Some("Bearer plugin-token-1".to_string());
+    assert_eq!(authorization("https://services5.arcgis.com/abc123/arcgis/rest/services/S/FeatureServer/0"), bearer);
+    assert_eq!(authorization("https://services5.arcgis.com/otherorg/arcgis/rest/services/S/FeatureServer/0"), None);
+    assert_eq!(authorization("https://example.org/arcgis/rest/services/S/FeatureServer"), None);
+    assert_eq!(authorization("https://example.org/abc123/arcgis/rest/services/S/FeatureServer"), None);
+    // Shown as a sign-in with its username, which doesn't renew; never its token.
+    let info = list().into_iter().find(|i| i.portal == ONLINE && i.username == "ana" && !i.renews && !i.token);
+    assert!(info.is_some_and(|i| i.expires_at == Some(soon)));
+    assert!(signed_in(ONLINE).is_some_and(|i| i.username == "ana"));
+    // The same token again changes nothing; a new one replaces it.
+    assert_eq!(adopt(ONLINE, "plugin-token-1", soon + 60, "abc123", "ana"), Ok(false));
+    assert_eq!(adopt(ONLINE, "plugin-token-2", soon, "abc123", "ana"), Ok(true));
+    assert_eq!(list().iter().filter(|i| i.portal == ONLINE).count(), 1);
+    assert_eq!(
+        authorization("https://services5.arcgis.com/abc123/arcgis/rest/services/S/FeatureServer/0").as_deref(),
+        Some("Bearer plugin-token-2")
+    );
+    // A sign-out forgets it, revoking nothing (the plugin's token is the plugin's).
+    let (revocations, gone) = sign_out(Some(ONLINE));
+    assert_eq!((revocations.len(), gone), (0, 1));
+    assert_eq!(authorization("https://services5.arcgis.com/abc123/arcgis/rest/services/S/FeatureServer/0"), None);
+}
+
+#[test]
+fn adopting_never_replaces_the_users_own_sign_in() {
+    let portal = "https://adoptown.maps.arcgis.com";
+    let url = "https://services1.arcgis.com/own456/arcgis/rest/services/A/FeatureServer/0";
+    sign_in(portal, "client", grant("users-token", now_secs() + 3600), scopes_for(portal, Some("own456"), &[]));
+    assert_eq!(adopt(portal, "plugin-token", now_secs() + 3600, "own456", "bob"), Ok(false));
+    let here: Vec<Info> = list().into_iter().filter(|i| i.portal == portal).collect();
+    assert!(here.len() == 1 && here[0].username == "ana" && here[0].renews, "{here:?}");
+    assert_eq!(authorization(url).as_deref(), Some("Bearer users-token"));
+    sign_out(Some(portal));
+
+    // An adopted token for an organization's own address never out-ranks the user's live sign-in
+    // covering the same services, though its portal's address is longer.
+    let org = "https://adoptrank.maps.arcgis.com";
+    let url = "https://services1.arcgis.com/rank42/arcgis/rest/services/A/FeatureServer/0";
+    sign_in("https://ar.example.org", "client", grant("x", now_secs() + 3600), vec![Scope::Org("rank42".into())]);
+    assert_eq!(adopt(org, "plugin-token", now_secs() + 3600, "rank42", "bob"), Ok(true));
+    assert_eq!(authorization(url).as_deref(), Some("Bearer x"));
+    // Once the user's has ended (expired, nothing to renew it), the adopted one is sent.
+    sign_in(
+        "https://ar.example.org",
+        "client",
+        Grant { refresh_token: None, ..grant("x", now_secs() - 1) },
+        vec![Scope::Org("rank42".into())],
+    );
+    assert_eq!(authorization(url).as_deref(), Some("Bearer plugin-token"));
+    // The user's own sign-in to the same portal replaces the adopted one.
+    sign_in(org, "client", grant("mine", now_secs() + 3600), scopes_for(org, Some("rank42"), &[]));
+    let here: Vec<Info> = list().into_iter().filter(|i| i.portal == org).collect();
+    assert!(here.len() == 1 && here[0].renews, "{here:?}");
+    sign_out(Some(org));
+    sign_out(Some("https://ar.example.org"));
+    // "plugin" is never taken for a user's client id.
+    assert!(!valid_client_id("plugin"));
+}
+
+#[test]
+fn an_expired_adopted_token_is_not_sent() {
+    let portal = "https://adoptold.maps.arcgis.com";
+    let url = "https://services2.arcgis.com/old789/arcgis/rest/services/A/FeatureServer/0";
+    assert_eq!(adopt(portal, "old-plugin-token", now_secs() - 5, "old789", ""), Ok(true));
+    assert_eq!(authorization(url), None);
+    assert_eq!(with_token(url), None);
+    // An expiry in milliseconds (ArcGIS's generateToken gives one) is read as such.
+    let soon = now_secs() + 600;
+    assert_eq!(adopt(portal, "ms-plugin-token", soon * 1000, "old789", ""), Ok(true));
+    assert!(list().iter().any(|i| i.portal == portal && i.expires_at == Some(soon)));
+    // One far off is cut to a year.
+    adopt(portal, "far-plugin-token", now_secs() + 10 * 366 * 86_400, "old789", "").unwrap();
+    assert!(list().iter().any(|i| i.portal == portal && i.expires_at.is_some_and(|e| e <= now_secs() + 366 * 86_400)));
+    sign_out(Some(portal));
+}
+
+#[test]
+fn adopt_refuses_an_enterprise_portal_or_plain_http() {
+    let soon = now_secs() + 3600;
+    for portal in [
+        "https://gis.example.org/portal",
+        "http://www.arcgis.com",
+        "https://www.arcgis.com.example.org",
+        "ftp://www.arcgis.com",
+        // Hosts of every organization's services: their whole host would get it.
+        "https://services1.arcgis.com",
+        "https://tiles.arcgis.com/tiles/abc999",
+        "https://basemaps.arcgis.com",
+        "https://adoptport.maps.arcgis.com:8443",
+    ] {
+        assert!(adopt(portal, "refused-token", soon, "abc999", "").is_err(), "{portal}");
+    }
+    // A bad organization id or token is refused, the token never repeated.
+    for org in ["", "a/b", "abc 999", "évil", &"a".repeat(65)] {
+        assert!(adopt("https://adoptbad.maps.arcgis.com", "refused-token", soon, org, "").is_err(), "{org}");
+    }
+    let e = adopt("https://adoptbad.maps.arcgis.com", "secret token\r\n", soon, "abc999", "").unwrap_err();
+    assert!(!e.contains("secret"), "{e}");
+    assert!(!list().iter().any(|i| i.portal.contains("adoptbad") || i.portal.contains("gis.example.org")));
+}

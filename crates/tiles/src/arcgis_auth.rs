@@ -50,6 +50,10 @@ const MAX_TOKEN: usize = 8 << 10;
 const MAX_SESSIONS: usize = 64;
 /// The most federated servers a session covers.
 const MAX_SERVERS: usize = 64;
+/// The client id of a session a plugin handed over ([`adopt`]): no user's (see [`valid_client_id`]).
+const ADOPTED: &str = "plugin";
+/// The latest an adopted token is kept to (seconds from now).
+const MAX_ADOPTED_LIFETIME: i64 = 366 * 86_400;
 
 /// The redirect address of a sign-in whose callback server listens on `port`.
 pub fn redirect_uri(port: u16) -> String {
@@ -179,7 +183,7 @@ pub fn query_params(query: &str) -> Vec<(String, String)> {
 
 /// Whether `id` looks like an OAuth client id (ArcGIS's are 16 letters and digits).
 pub fn valid_client_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    id != ADOPTED && !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
 fn valid_token(t: &str) -> bool {
@@ -384,10 +388,40 @@ fn now_secs() -> i64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// What a session is: a token given for a server, one a plugin handed over, or the user's sign-in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Token,
+    Adopted,
+    SignIn,
+}
+
+impl Session {
+    fn kind(&self) -> Kind {
+        if self.client_id.is_empty() {
+            Kind::Token
+        } else if self.client_id == ADOPTED {
+            Kind::Adopted
+        } else {
+            Kind::SignIn
+        }
+    }
+
+    /// Whether its token is still good, or can be renewed.
+    fn live(&self, now: i64) -> bool {
+        self.expires_at > now || self.refresh_token.is_some()
+    }
+}
+
 fn keep(session: Session) {
-    let mut all = sessions();
+    keep_in(&mut sessions(), session);
+}
+
+fn keep_in(all: &mut Vec<Session>, session: Session) {
     // A token given for a portal's own address doesn't replace a sign-in to it (nor the reverse).
-    all.retain(|s| !(s.portal == session.portal && s.client_id.is_empty() == session.client_id.is_empty()));
+    // A plugin's token replaces only one it handed over before; the user's sign-in replaces it too.
+    let kind = session.kind();
+    all.retain(|s| !(s.portal == session.portal && (s.kind() == kind || (kind == Kind::SignIn && s.kind() == Kind::Adopted))));
     if all.len() >= MAX_SESSIONS {
         all.remove(0);
     }
@@ -406,6 +440,59 @@ pub fn sign_in(portal: &str, client_id: &str, grant: Grant, scopes: Vec<Scope>) 
         scopes,
         retry_at: 0,
     });
+}
+
+/// Keeps an ArcGIS Online token a plugin signed in for (its own sign-in, as the ArcGIS Online
+/// plugin's generateToken), covering what a sign-in to `portal` would ([`scopes_for`]: the
+/// portal, www.arcgis.com's `sharing/rest` and the organization `org`'s hosted services) until
+/// `expires_at` (unix seconds; milliseconds, as generateToken gives, are read as such; a year at
+/// most). It never renews. Only ArcGIS Online on https. It replaces only a token handed over
+/// before for the portal; while the user's own sign-in to it is good (or renews), that is kept
+/// and this isn't. `Ok(true)` when the token kept for the portal changed. The token is never in
+/// an error.
+pub fn adopt(portal: &str, token: &str, expires_at: i64, org: &str, username: &str) -> Result<bool, String> {
+    let portal = portal_base(portal)?;
+    // A sign-in's scope holds its portal's whole host: never a host of every organization's
+    // services (services1.arcgis.com, tiles.arcgis.com), only www.arcgis.com or an organization's.
+    let host = host_of(&portal);
+    let with_port = portal.trim_start_matches("https://").contains(':');
+    if !is_online(&portal) || with_port || !(portal == ONLINE || host.ends_with(".maps.arcgis.com")) {
+        return Err(format!(
+            "{portal}: a token is handed over for ArcGIS Online only (https://www.arcgis.com or an organization's https://<name>.maps.arcgis.com)"
+        ));
+    }
+    let token = token.trim();
+    if !valid_token(token) {
+        return Err("an ArcGIS token is one word of letters, digits and - _ . ~ + / =".into());
+    }
+    if org.is_empty() || org.len() > 64 || !org.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err("org is the organization's id: letters and digits (portals/self's id)".into());
+    }
+    let now = now_secs();
+    // Later than the year 5138 in seconds: milliseconds.
+    let expires_at = if expires_at > 100_000_000_000 { expires_at / 1000 } else { expires_at };
+    let expires_at = expires_at.min(now.saturating_add(MAX_ADOPTED_LIFETIME));
+    let username: String = username.chars().filter(|c| !c.is_control()).take(200).collect();
+    let mut all = sessions();
+    if all.iter().any(|s| s.portal == portal && s.kind() == Kind::SignIn && s.live(now)) {
+        return Ok(false);
+    }
+    let changed = !all.iter().any(|s| s.portal == portal && s.kind() == Kind::Adopted && s.access_token == token);
+    let scopes = scopes_for(&portal, Some(org), &[]);
+    keep_in(
+        &mut all,
+        Session {
+            portal,
+            client_id: ADOPTED.to_string(),
+            username,
+            access_token: token.to_string(),
+            expires_at,
+            refresh_token: None,
+            scopes,
+            retry_at: 0,
+        },
+    );
+    Ok(changed)
 }
 
 /// The ArcGIS Server root of a service's address, which a token given with it covers:
@@ -480,13 +567,15 @@ pub fn adopt_url_token(url: &str) -> Result<String, String> {
 }
 
 /// The session covering `url`, by index, the most specific one first: a token given for a
-/// server over a portal's sign-in.
+/// server over a portal's sign-in, and the user's own sign-in over a token a plugin handed over.
+/// One that has ended (expired, with nothing to renew it) covers nothing.
 fn covering(all: &[Session], url: &str) -> Option<usize> {
     let (origin, path) = split(url)?;
+    let now = now_secs();
     all.iter()
         .enumerate()
-        .filter(|(_, s)| s.scopes.iter().any(|sc| sc.covers(&origin, &path)))
-        .max_by_key(|(_, s)| (s.client_id.is_empty(), s.portal.len()))
+        .filter(|(_, s)| s.live(now) && s.scopes.iter().any(|sc| sc.covers(&origin, &path)))
+        .max_by_key(|(_, s)| (s.kind() == Kind::Token, s.kind() != Kind::Adopted, s.portal.len()))
         .map(|(i, _)| i)
 }
 
@@ -716,7 +805,8 @@ pub fn sign_out(portal: Option<&str>) -> (Vec<Revocation>, usize) {
     let before = all.len();
     all.retain(|s| {
         let gone = portal.is_none_or(|p| p.trim_end_matches('/') == s.portal);
-        if gone && !s.client_id.is_empty() {
+        // A token a plugin handed over is the plugin's: forgotten, not revoked.
+        if gone && s.kind() == Kind::SignIn {
             let (token, refresh) = match &s.refresh_token {
                 Some(r) => (r.as_str(), true),
                 None => (s.access_token.as_str(), false),

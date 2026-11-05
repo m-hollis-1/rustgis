@@ -60,6 +60,8 @@ pub const NETWORK: &[&str] = &[
     "arcgis.signIn",
     "arcgis.signOut",
     "arcgis.token",
+    // A token a plugin hands over is then sent to the portal and its organization's services.
+    "arcgis.adoptToken",
 ];
 
 pub fn commands() -> Vec<C> {

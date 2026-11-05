@@ -27261,3 +27261,47 @@ fn background_runs_follow_a_renamed_map_a_moved_window_and_a_loaded_layer() {
     assert!(s.map().layers[0].dataset.features.iter().any(|f| f.attrs.first().and_then(|v| v.as_f64()) == Some(-1.0)));
     let _ = std::fs::remove_file(path);
 }
+
+/// The ArcGIS Online plugin hands its token over: kept as a sign-in to the portal would be, the
+/// answer counting the map's broken layers (for the plugin's `layer.retry`) and never holding
+/// the token. A plugin with `network` alone may run it; one without, not.
+#[test]
+fn adopt_token_reports_broken_layers_and_keeps_no_token() {
+    use crate::render::rustgis_tiles::arcgis_auth;
+    let mut s = Session::new(Project::default());
+    broken_service(&mut s);
+    let soon = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+    let params = json!({"portal": "https://adopteng.maps.arcgis.com/home", "token": "engine-secret-token", "expires": soon, "org": "eng321", "username": "ana"});
+    let a = s.run("arcgis.adoptToken", &params).unwrap();
+    assert_eq!(a, json!({"portal": "https://adopteng.maps.arcgis.com", "changed": true, "broken": 1}));
+    assert!(!a.to_string().contains("engine-secret-token"));
+    let url = "https://services3.arcgis.com/eng321/arcgis/rest/services/A/FeatureServer/0";
+    assert_eq!(arcgis_auth::authorization(url).as_deref(), Some("Bearer engine-secret-token"));
+    let status = s.run("arcgis.status", &json!({})).unwrap().to_string();
+    assert!(status.contains("adopteng") && !status.contains("engine-secret-token"), "{status}");
+    // Again: nothing changed.
+    assert_eq!(s.run("arcgis.adoptToken", &params).unwrap()["changed"], false);
+    // Refusals never repeat the token.
+    for bad in [
+        json!({"portal": "https://gis.example.org/portal", "token": "engine-secret-token", "expires": soon, "org": "eng321"}),
+        json!({"portal": "https://adopteng.maps.arcgis.com", "token": "engine secret token", "expires": soon, "org": "eng321"}),
+        json!({"portal": "https://adopteng.maps.arcgis.com", "token": "engine-secret-token", "expires": soon}),
+        json!({"portal": "https://adopteng.maps.arcgis.com", "token": "engine-secret-token", "org": "eng321"}),
+        json!({"portal": "https://adopteng.maps.arcgis.com", "expires": soon, "org": "eng321"}),
+    ] {
+        let e = s.run("arcgis.adoptToken", &bad).unwrap_err();
+        assert!(!e.contains("secret"), "{bad}: {e}");
+    }
+    // A plugin with `network` alone may hand one over; without it, not.
+    plugin("eng-adopt-net", &["network"]);
+    let p = json!({"portal": "https://adopteng.maps.arcgis.com", "token": "engine-other-token", "expires": soon, "org": "eng321"});
+    let a = forward(&mut s, "eng-adopt-net", "arcgis.adoptToken", p.clone()).unwrap();
+    assert!(a.to_string().contains("\"broken\":1") && !a.to_string().contains("engine-other-token"), "{a}");
+    rustgis_plugins::unload("eng-adopt-net");
+    plugin("eng-adopt-none", &["edit"]);
+    let e = forward(&mut s, "eng-adopt-none", "arcgis.adoptToken", p).unwrap_err();
+    assert!(e.contains("'network' permission") && !e.contains("engine-other-token"), "{e}");
+    rustgis_plugins::unload("eng-adopt-none");
+    s.run("arcgis.signOut", &json!({"portal": "https://adopteng.maps.arcgis.com"})).unwrap();
+    assert_eq!(arcgis_auth::authorization(url), None);
+}

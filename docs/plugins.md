@@ -306,6 +306,19 @@ can hide it like any other. Declare it in `plugin.json`:
 [Map Explorer](https://github.com/opengeos/rustgis-official-plugins/tree/main/plugins/map-explorer) is
 an example.
 
+### Buttons on the Edit tab
+
+A plugin that keeps edits somewhere else (a web service, a database) can put up to three buttons
+on RustGIS's **Edit** tab, in the Manage Edits group beside **Save**, so saving edits doesn't mean
+switching tabs:
+
+```json
+"editTab": ["save-edits"]
+```
+
+Each item is a command id, `tool:<id>` or `panel`, as in a tab. They show as a column of small
+buttons while the plugin is enabled. The same commands can also appear on the plugin's own tab.
+
 ### A panel
 
 A plugin can have a panel: a pane on the right of the map with texts, checkboxes, sliders,

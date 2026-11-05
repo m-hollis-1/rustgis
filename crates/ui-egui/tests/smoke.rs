@@ -1056,6 +1056,38 @@ fn plugins_can_have_a_tab_of_their_own() {
 }
 
 #[test]
+fn plugins_can_add_buttons_to_the_edit_tab() {
+    let _turn = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
+    use rustgis_ui_egui::rustgis_engine::plugins as rp;
+    let mut m: serde_json::Value = serde_json::from_str(&rp::testing::manifest("ui-edit", &[])).unwrap();
+    // Its own names, so the other tests (which share the loaded plugins) don't see them.
+    m["commands"][0]["label"] = json!("Edit Tab Hello");
+    m["tools"][0]["name"] = json!("Edit Tab Points");
+    m["editTab"] = json!(["h", "tool:m"]);
+    let pkg = rp::testing::zip_of(&[("plugin.json", m.to_string().as_bytes()), ("plugin.wasm", &rp::testing::wasm())]);
+    rp::load(rp::Package::from_zip(&pkg).unwrap(), "test").unwrap();
+    let mut h = harness();
+    for _ in 0..4 {
+        h.step();
+    }
+    h.state_mut().ui.tab = "Edit".into();
+    h.step();
+    h.step();
+    h.get_by_label("Edit Tab Hello").click();
+    h.step();
+    h.get_by_label("Edit Tab Points").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().gp.tool, Some("plugin:ui-edit/m"));
+    // A disabled plugin's buttons go.
+    rp::set_enabled("ui-edit", false).unwrap();
+    h.step();
+    h.step();
+    assert_eq!(h.query_all_by_label("Edit Tab Hello").count(), 0);
+    rp::unload("ui-edit");
+}
+
+#[test]
 fn plugin_small_ribbon_columns_and_nested_menus_preserve_actions() {
     let _turn = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
     use rustgis_ui_egui::rustgis_engine::plugins as rp;

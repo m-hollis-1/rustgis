@@ -400,6 +400,23 @@ fn plugin_tabs_are_checked() {
     }
 }
 
+/// Edit tab buttons name the plugin's own entries, at most three of them.
+#[test]
+fn plugin_edit_tab_buttons_are_checked() {
+    let with = |items: Value| {
+        let mut m: Value = serde_json::from_str(&testing::manifest("tabbed", &[])).unwrap();
+        m["editTab"] = items;
+        Manifest::parse(&m.to_string())
+    };
+    assert_eq!(with(json!(["h", "tool:m"])).unwrap().edit_tab, vec!["h".to_string(), "tool:m".to_string()]);
+    let plain: Value = serde_json::from_str(&testing::manifest("tabbed", &[])).unwrap();
+    assert!(Manifest::parse(&plain.to_string()).unwrap().edit_tab.is_empty());
+    for (bad, why) in [(json!(["nope"]), "isn't one of"), (json!(["tool:h"]), "isn't one of"), (json!(vec!["h"; 4]), "at most 3")] {
+        let e = with(bad.clone()).unwrap_err();
+        assert!(e.contains(why), "{bad}: {e}");
+    }
+}
+
 #[test]
 fn plugin_tab_layout_defaults_and_overrides() {
     use crate::{ItemDecl, Layout};

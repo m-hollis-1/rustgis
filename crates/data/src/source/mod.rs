@@ -16,6 +16,7 @@ pub(crate) mod external;
 pub mod fgb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
+pub mod geodatabase;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod geojson;
 #[cfg(not(target_arch = "wasm32"))]

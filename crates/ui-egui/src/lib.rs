@@ -18,6 +18,7 @@ mod assistantpane;
 mod autosave;
 mod backstage;
 mod bookmarkpane;
+mod busy;
 mod catalogsui;
 mod chrome;
 mod comets;
@@ -749,6 +750,10 @@ pub struct UiState {
     pub scale_text: Option<String>,
     /// A field chosen in the Symbology pane before applying Unique Values.
     pub symbology_pending: Option<PendingUniqueSymbology>,
+    /// What waits behind the working window ([`busy`]): a long call the interface queued.
+    pub(crate) busy: Option<busy::Pending>,
+    /// The frame a queued call ran in: on the next, what was pressed while it blocked is dropped.
+    pub(crate) busy_ran: Option<u64>,
 }
 
 impl UiState {
@@ -885,6 +890,8 @@ impl Default for UiState {
             dynamic_text: None,
             scale_text: None,
             symbology_pending: None,
+            busy: None,
+            busy_ran: None,
         }
     }
 }
@@ -1405,17 +1412,60 @@ impl RustGisApp {
     }
 
     /// [`Self::import_arcgis_file`] for the file `name` given as `source` (`{"path"}`, or in the
-    /// browser `{"data"}`, its bytes in base64).
+    /// browser `{"data"}`, its bytes in base64). It runs behind the working window: reading a
+    /// project can take a while, and importing a map longer.
     fn import_arcgis(&mut self, name: &str, source: Value) -> Result<Value, String> {
+        let file = busy::file_name(name);
+        let reads = name.to_ascii_lowercase().ends_with(".aprx");
+        let message = i18n::fmt(if reads { "Reading {file}…" } else { "Importing {file}…" }, &[("file", file)]);
+        let name = name.to_string();
+        busy::queue(self, message, move |app| {
+            let _ = app.import_arcgis_now(&name, source);
+        });
+        Ok(Value::Null)
+    }
+
+    /// [`Self::import_arcgis`], run now. A failure is said in a notice.
+    fn import_arcgis_now(&mut self, name: &str, source: Value) -> Result<Value, String> {
         let seen = self.run("project.inspectArcgis", source.clone())?;
         if seen.get("kind").and_then(Value::as_str) == Some("project") {
             let data = source.get("data").and_then(Value::as_str).map(str::to_string);
-            self.dialogs.open_arcgis(&self.session, name, data, &seen)?;
+            if let Err(e) = self.dialogs.open_arcgis(&self.session, name, data, &seen) {
+                self.session.notify(e.clone(), true);
+                return Err(e);
+            }
             return Ok(Value::Null);
         }
         let r = self.run("project.importArcgis", source);
         self.map.invalidate();
         r
+    }
+
+    /// A file dropped on the desktop window, opened as its kind says.
+    fn open_dropped(&mut self, p: &str) {
+        let lower = p.to_ascii_lowercase();
+        if lower.ends_with(".rgplugin") {
+            match std::fs::read(p) {
+                Ok(bytes) => pluginsui::received(self, bytes, None),
+                Err(e) => self.session.notify(format!("{p}: {e}"), true),
+            }
+            return;
+        }
+        // A layout (ArcGIS Pro's or RustGIS's own) imports as a layout, not as data. A
+        // failure is told by the command.
+        if lower.ends_with(".pagx") || lower.ends_with(".rgislayout") {
+            let _ = self.import_layout_file(p);
+            return;
+        }
+        // An ArcGIS Pro project asks which maps and layouts to import; a map or layer
+        // file comes in at once.
+        if is_arcgis_pro_name(&lower) {
+            let _ = self.import_arcgis_file(p);
+            self.map.invalidate();
+            return;
+        }
+        let _ = layerchooser::add_file(self, p);
+        self.map.invalidate();
     }
 
     /// Opens file bytes with picker options, forwarding source CRS overrides before ZIP parsing.
@@ -1811,7 +1861,7 @@ impl RustGisApp {
             saveprompt::ask(self, saveprompt::Discard::Replace(id.to_string(), params));
             return Ok(Value::Null);
         }
-        self.run(id, params)
+        busy::run(self, id, params)
     }
 
     /// Runs a command by id: `ui.*` here, everything else in the engine.
@@ -2862,18 +2912,8 @@ impl RustGisApp {
                     self.dialogs.open("saveProject", &self.session)?;
                 }
             }
-            "ui.save" => {
-                if self.session.path.is_some() {
-                    return self.run("project.save", Value::Null);
-                }
-                return self.run("ui.saveAs", Value::Null);
-            }
-            "ui.saveAs" => {
-                let name = format!("{}.rgis", self.session.project.name);
-                if let Some(path) = dialogs::pick_save(&name, &["rgis"], tl!("RustGIS project")) {
-                    return self.run("project.saveAs", json!({"path": path}));
-                }
-            }
+            // Behind the working window; Save As (or a first Save) asks where first.
+            "ui.save" | "ui.saveAs" => busy::save(self, id == "ui.saveAs", |_| {}),
             // Layouts: export (PDF/PNG/SVG), print, save and import layout files, draw frames.
             "ui.exportLayout" | "ui.printLayout" => {
                 let li = self.session.active_layout.ok_or("open a layout first")?;
@@ -3838,6 +3878,8 @@ impl RustGisApp {
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
         let _diagnostics = self.session.diagnostics.enter();
+        // A long call queued behind the working window, once that window was painted.
+        busy::run_due(self, ctx);
         // The MCP relay: what attached agents sent runs here, on this session, before the frame
         // draws (Session lives on this thread; the listener only queues messages).
         #[cfg(not(target_arch = "wasm32"))]
@@ -4038,29 +4080,14 @@ impl RustGisApp {
                     held += 1;
                     continue;
                 }
-                let lower = p.to_ascii_lowercase();
-                if lower.ends_with(".rgplugin") {
-                    match std::fs::read(f.path()) {
-                        Ok(bytes) => pluginsui::received(self, bytes, None),
-                        Err(e) => self.session.notify(format!("{p}: {e}"), true),
-                    }
-                    continue;
+                // A project opening behind the working window: what was dropped with it goes
+                // into that project, after it.
+                if self.ui.busy.is_some() {
+                    let message = i18n::fmt("Adding {file}…", &[("file", busy::file_name(&p))]);
+                    busy::queue(self, message, move |app| app.open_dropped(&p));
+                } else {
+                    self.open_dropped(&p);
                 }
-                // A layout (ArcGIS Pro's or RustGIS's own) imports as a layout, not as data. A
-                // failure is told by the command.
-                if lower.ends_with(".pagx") || lower.ends_with(".rgislayout") {
-                    let _ = self.import_layout_file(&p);
-                    continue;
-                }
-                // An ArcGIS Pro project asks which maps and layouts to import; a map or layer
-                // file comes in at once.
-                if is_arcgis_pro_name(&lower) {
-                    let _ = self.import_arcgis_file(&p);
-                    self.map.invalidate();
-                    continue;
-                }
-                let _ = layerchooser::add_file(self, &p);
-                self.map.invalidate();
             }
             if held == 1 {
                 self.session.notify(
@@ -4142,6 +4169,7 @@ impl RustGisApp {
         mapview::confirm_delete(self, &ctx);
         autosave::offer(self, &ctx);
         saveprompt::show(self, &ctx);
+        busy::show(self, &ctx);
         pluginsui::show(self, &ctx);
         update::show(self, &ctx);
         showme::tick(self, &ctx);
@@ -4897,6 +4925,7 @@ mod aprx_tests {
         let mut app = RustGisApp::with_sample();
         let maps = app.session.project.maps.len();
         assert_eq!(app.import_arcgis_file(&path).unwrap(), Value::Null);
+        crate::busy::finish(&mut app);
         assert_eq!(app.dialogs.open, Some("importArcgisPro"));
         assert_eq!(app.dialogs.arcgis_path, path);
         assert!(app.dialogs.arcgis_data.is_none());
@@ -4908,6 +4937,7 @@ mod aprx_tests {
         // Nothing is imported until Import is pressed.
         assert_eq!(app.session.project.maps.len(), maps);
         crate::dialogs::finish_arcgis_import(&mut app).unwrap();
+        crate::busy::finish(&mut app);
         assert_eq!(app.session.project.maps.len(), maps + 1);
         assert!(map_names(&app).iter().any(|m| m == "Detail"));
     }
@@ -4919,6 +4949,7 @@ mod aprx_tests {
         let mut app = RustGisApp::with_sample();
         let layouts = app.session.project.layouts.len();
         app.import_arcgis_file(&path).unwrap();
+        crate::busy::finish(&mut app);
         let mut fonts = false;
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
@@ -4938,12 +4969,47 @@ mod aprx_tests {
         assert!(h.state().dialogs.arcgis_maps.iter().any(|m| m.0 == "Main" && m.1), "{:?}", h.state().dialogs.arcgis_maps);
         h.get_by_label("Import").click();
         h.run_steps(3);
+        // (This harness draws the dialogs alone, not the working window.)
+        crate::busy::finish(h.state_mut());
         let app = h.state();
         assert!(app.dialogs.open.is_none(), "{:?}", app.dialogs.error);
         let names = map_names(app);
         assert!(names.iter().any(|m| m == "Main") && names.iter().any(|m| m == "Detail"), "{names:?}");
         assert_eq!(app.session.project.layouts.len(), layouts + 1);
         assert!(app.session.project.layouts.iter().any(|l| l.name == "Sheet"));
+    }
+
+    /// Import shows the working window first, on a frame of its own, then imports behind it.
+    #[test]
+    fn import_shows_the_busy_window_before_it_imports() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let (_dir, path) = written("busy", "p.aprx", &aprx());
+        let mut app = RustGisApp::with_sample();
+        app.start(&Default::default()).unwrap();
+        let maps = app.session.project.maps.len();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.state_mut().import_arcgis_file(&path).unwrap();
+        h.run_steps(4);
+        assert_eq!(h.state().dialogs.open, Some("importArcgisPro"));
+        h.get_by_role_and_label(Role::Button, "Import").click();
+        h.step();
+        assert!(h.query_by_label_contains("Importing 1 map from p.aprx").is_some(), "the window shows first");
+        assert!(h.query_by_label_contains("don't close it").is_some());
+        assert_eq!(h.state().session.project.maps.len(), maps, "nothing imported yet");
+        h.run_steps(4);
+        let app = h.state();
+        assert_eq!(app.session.project.maps.len(), maps + 1);
+        assert!(map_names(app).iter().any(|m| m == "Detail"));
+        assert!(h.query_by_label_contains("Importing").is_none(), "the window has closed");
     }
 
     #[test]
@@ -4968,8 +5034,8 @@ mod aprx_tests {
         for f in [std::path::PathBuf::from(&aprx_path), lyrx] {
             h.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(f)));
         }
-        h.step();
-        h.step();
+        // Each behind the working window, painted first.
+        h.run_steps(5);
         let app = h.state();
         assert_eq!(app.dialogs.open, Some("importArcgisPro"));
         assert_eq!(app.dialogs.arcgis_path, aprx_path);
@@ -4983,16 +5049,19 @@ mod aprx_tests {
         let mut app = RustGisApp::with_sample();
         let maps = app.session.project.maps.len();
         assert_eq!(app.open_bytes_with("p.aprx", &aprx(), None).unwrap(), Value::Null);
+        crate::busy::finish(&mut app);
         assert_eq!(app.dialogs.open, Some("importArcgisPro"));
         assert!(app.dialogs.arcgis_data.is_some());
         assert!(app.dialogs.arcgis_maps.iter().any(|m| m.0 == "Detail" && m.1));
         crate::dialogs::finish_arcgis_import(&mut app).unwrap();
+        crate::busy::finish(&mut app);
         assert_eq!(app.session.project.maps.len(), maps + 1);
         assert!(map_names(&app).iter().any(|m| m == "Detail"));
         // A layer file's bytes add its layers at once.
         let layers = app.session.map().layers.len();
         app.dialogs.open = None;
         app.open_bytes_with("rivers.lyrx", LYRX.as_bytes(), None).unwrap();
+        crate::busy::finish(&mut app);
         assert!(app.dialogs.open.is_none());
         assert_eq!(app.session.map().layers.len(), layers + 1);
     }

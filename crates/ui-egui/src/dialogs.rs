@@ -687,11 +687,19 @@ pub(crate) fn finish_arcgis_import(app: &mut RustGisApp) -> Result<(), String> {
         Some(data) => json!({"data": data}),
         None => json!({"path": d.arcgis_path}),
     };
+    let message = crate::busy::importing(maps.len(), layouts.len(), &d.arcgis_path);
     p["maps"] = json!(maps);
     p["layouts"] = json!(layouts);
-    let r = app.run("project.importArcgis", p);
-    app.map.invalidate();
-    r.map(|_| ())
+    // Behind the working window; a failure opens the dialog again, saying why.
+    crate::busy::queue(app, message, move |app| {
+        let r = app.run("project.importArcgis", p);
+        app.map.invalidate();
+        if let Err(e) = r {
+            app.dialogs.open = Some("importArcgisPro");
+            app.dialogs.error = Some(e);
+        }
+    });
+    Ok(())
 }
 
 /// Save Project As in the browser, which has no save dialog: the file name to download the

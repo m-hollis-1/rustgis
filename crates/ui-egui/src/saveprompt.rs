@@ -134,15 +134,10 @@ pub(crate) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     ctx.request_repaint();
     match answer {
         // Save As when the project has no file. A save that fails says why (its notice), and one
-        // cancelled leaves the changes unsaved: either way nothing is discarded. This reads the
-        // result at once: on the desktop, the only shell that asks (`asks`), `ui.save` writes the
-        // file, and Save As's picker returns, before it does. A shell that saved later (the
-        // browser's download dialog) would have to go on from there instead.
-        Answer::Save => {
-            if app.run("ui.save", Value::Null).is_ok() && !app.session.dirty() {
-                proceed(app, what);
-            }
-        }
+        // cancelled leaves the changes unsaved: either way nothing is discarded. The save runs
+        // behind the working window, and what waited goes on after it, only once it succeeded.
+        // On the desktop, the only shell that asks (`asks`), Save As's picker returns first.
+        Answer::Save => crate::busy::save(app, false, move |app| proceed(app, what)),
         Answer::DontSave => proceed(app, what),
         Answer::Cancel => {}
     }
@@ -160,7 +155,7 @@ enum Answer {
 fn proceed(app: &mut RustGisApp, what: Discard) {
     match what {
         Discard::Replace(id, params) => {
-            let _ = app.run(&id, params);
+            let _ = crate::busy::run(app, &id, params);
             app.ui.backstage = false;
             app.map.invalidate();
         }
@@ -329,6 +324,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Save, then go on: the replaced command runs only after the save finished, behind the
+    /// working window, and not at all when the save failed.
+    #[test]
+    fn save_then_continue_waits_for_the_save() {
+        let dir = folder("then");
+        let mut h = launch();
+        frames(&mut h, 2);
+        edit(&mut h, "Edited");
+        // A save that fails: its folder has gone.
+        h.state_mut().session.path = Some(dir.join("gone").join("atlas.rgis"));
+        h.state_mut().run_by_user("project.new", Value::Null).unwrap();
+        frames(&mut h, 2);
+        click(&mut h, "Save");
+        frames(&mut h, 4);
+        let app = h.state();
+        assert!(app.session.dirty() && app.session.project.name == "World Atlas" && app.session.map().name == "Edited");
+        // A save that succeeds: the project is replaced once it is written.
+        let file = dir.join("atlas.rgis");
+        h.state_mut().session.path = Some(file.clone());
+        h.state_mut().run_by_user("project.new", Value::Null).unwrap();
+        frames(&mut h, 2);
+        h.get_by_role_and_label(Role::Button, "Save").click();
+        h.step();
+        assert!(h.query_by_label_contains("Saving atlas.rgis").is_some(), "the working window shows first");
+        assert!(!file.exists() && h.state().session.project.name == "World Atlas", "nothing has run yet");
+        frames(&mut h, 4);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("\"Edited\"") && h.state().session.project.name == "Untitled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// New from the toolbar: Cancel keeps the project, Don't Save replaces it, and Save writes it
     /// to its file first. A project with nothing unsaved is replaced without a word, as is one
     /// undone back to the state it was saved in.
@@ -432,6 +458,30 @@ mod tests {
         assert!(h.state().session.notices[said..].iter().any(|n| n.text.starts_with("2 other dropped files weren't opened")));
         click(&mut h, "Don't Save");
         assert!(!h.state().session.dirty() && h.state().session.path.as_deref() == Some(other.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project dropped with data opens behind the working window; the data goes into it, after.
+    #[test]
+    fn data_dropped_with_a_project_goes_into_it() {
+        let dir = folder("drop-both");
+        let other = dir.join("other.rgis");
+        let mut h = launch();
+        frames(&mut h, 2);
+        h.state_mut().run("project.saveAs", json!({"path": other.display().to_string()})).unwrap();
+        h.state_mut().run("project.new", Value::Null).unwrap();
+        let data = dir.join("sites.geojson");
+        let point = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        std::fs::write(&data, point).unwrap();
+        for f in [data, other.clone()] {
+            h.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(f)));
+        }
+        frames(&mut h, 8);
+        let app = h.state();
+        assert!(app.ui.busy.is_none());
+        assert_eq!(app.session.path.as_deref(), Some(other.as_path()));
+        let notices: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
+        assert!(app.session.map().layer_by_name("sites").is_some(), "the data went into the project opened: {notices:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

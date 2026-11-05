@@ -27,6 +27,7 @@ const DEFAULT_PORT: u16 = 1433;
 // The enterprise geodatabase catalog, read with this module's private connection helpers.
 #[path = "sqlserver_gdb.rs"]
 mod gdb;
+pub use gdb::{GdbListing, geodatabase_tables, read_table};
 
 // ---------------------------------------------------------------------------------------------
 // Connection addresses
@@ -516,6 +517,16 @@ fn text_of(v: &ColumnData<'static>) -> Option<String> {
         _ => None,
     }
 }
+/// A column's value as the field type holds it; null when it doesn't convert.
+fn attr_of(ty: FieldType, v: &ColumnData<'static>) -> Value {
+    match ty {
+        FieldType::Integer => int_of(v).map(Value::Int),
+        FieldType::Double => float_of(v).map(Value::Float),
+        FieldType::Boolean => bool_of(v).map(Value::Bool),
+        FieldType::Text => text_of(v).map(Value::Text),
+    }
+    .unwrap_or(Value::Null)
+}
 fn bytes_of<'a>(v: &'a ColumnData<'static>) -> Option<&'a [u8]> {
     if let ColumnData::Binary(Some(v)) = v { Some(v) } else { None }
 }
@@ -663,8 +674,7 @@ impl SqlServerSource {
         let mut notes = Vec::new();
         let g = ident(&table.column);
         let geography = table.geography();
-        let cols = conn.query("SELECT COLUMN_NAME, LOWER(DATA_TYPE) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION", &[&table.schema, &table.name])?;
-        let columns: Vec<(String, String)> = cols.iter().filter_map(|r| Some((text_of(at(r, 0))?, text_of(at(r, 1))?))).collect();
+        let columns = gdb::columns_of(&conn, &table.schema, &table.name)?;
         let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
         let reading = gdb::reading(&conn, &table, &names)?;
         let from = reading.as_ref().map_or_else(|| table.sql_from(), |r| r.from.clone());
@@ -825,22 +835,7 @@ impl SqlServerSource {
     fn row_feature(&self, r: &Row) -> Option<Feature> {
         let id = id_of(at(r, 0))?;
         let geometry: Geometry = self.reproject.geometry(wkb::decode(bytes_of(at(r, 1))?)?)?;
-        let attrs = self
-            .info
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let v = at(r, i + 2);
-                match f.ty {
-                    FieldType::Integer => int_of(v).map(Value::Int),
-                    FieldType::Double => float_of(v).map(Value::Float),
-                    FieldType::Boolean => bool_of(v).map(Value::Bool),
-                    FieldType::Text => text_of(v).map(Value::Text),
-                }
-                .unwrap_or(Value::Null)
-            })
-            .collect();
+        let attrs = self.info.fields.iter().enumerate().map(|(i, f)| attr_of(f.ty, at(r, i + 2))).collect();
         Some(Feature { id, geometry: Some(geometry), attrs })
     }
 
@@ -1132,6 +1127,22 @@ mod tests {
                 src.info().name,
                 src.info().notes
             );
+            let listing =
+                geodatabase_tables(&conn).unwrap_or_else(|e| panic!("{e}")).unwrap_or_else(|| panic!("a geodatabase lists nothing"));
+            println!(
+                "listing: datasets={:?} classes={} tables={} other={}",
+                listing.datasets,
+                listing.classes.len(),
+                listing.tables.len(),
+                listing.other.len()
+            );
+            if let Some(item) = listing.tables.first() {
+                let (data, report) = read_table(&conn, item, 100).unwrap_or_else(|e| panic!("{}: {e}", item.name));
+                assert_eq!(data.geometry_type, GeometryType::None);
+                assert!(data.features.len() <= 100);
+                assert!(data.features.iter().all(|f| f.geometry.is_none() && f.attrs.len() == data.fields.len()));
+                println!("{}: {} fields, {} rows, messages={:?}", data.name, data.fields.len(), data.features.len(), report.messages);
+            }
         }
         for t in &all {
             let fams = families(&conn, t).unwrap_or_else(|e| panic!("{}: {e}", t.label()));

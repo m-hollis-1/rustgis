@@ -6,12 +6,14 @@
 //! [`MAX_ITEMS`] or `LIST_LIMIT`, and the owner is never taken from the server or the user as SQL:
 //! only the two names [`owner_prefix`] knows are written into a statement.
 
-use super::{Conn, LIST_LIMIT, Table, at, ident, int_of, text_of};
+use super::{Conn, LIST_LIMIT, PROBE_TIMEOUT, Table, at, attr_of, field_cast, first_count, id_of, ident, int_of, text_of};
 use crate::raster::Crs;
+use crate::source::clamp_limit;
 use crate::source::geodatabase::{
-    self, BRANCH_DEFAULT_FILTER, Catalog, Item, ItemRow, LayerRow, MAX_ITEMS, ReadPlan, RegistryRow, Srs, Versioning,
+    self, BRANCH_DEFAULT_FILTER, Catalog, Item, ItemKind, ItemRow, LayerRow, MAX_ITEMS, ReadPlan, RegistryRow, Srs, Versioning,
+    is_machinery,
 };
-use crate::{DataError, Result};
+use crate::{DataError, Dataset, Feature, Features, Field, GeometryType, ReadReport, Result};
 
 /// The owner as it may be written into a statement: only `sde` and `dbo` (what [`detect_owner`]
 /// returns), never anything else.
@@ -121,21 +123,30 @@ pub(super) fn reading(conn: &Conn, table: &Table, columns: &[String]) -> Result<
     let Some(catalog) = super::geodatabase(conn) else { return Ok(None) };
     let Some(item) = catalog.find(&format!("{}.{}", table.schema, table.name)) else { return Ok(None) };
     let native_spatial = native_spatial(table);
-    // Only a traditionally versioned class is read through a view.
-    let views: Vec<String> = if item.versioning == Versioning::Traditional {
-        conn.query(
-            &format!("SELECT TOP ({LIST_LIMIT}) TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = @P1"),
-            &[&table.schema],
-        )?
-        .iter()
-        .filter_map(|r| text_of(at(r, 0)))
-        .collect()
-    } else {
-        Vec::new()
-    };
+    let views = views_of(conn, item, &table.schema)?;
     let plan = geodatabase::read_plan(item, native_spatial, &views, columns);
     let srs = item.srid.and_then(|s| catalog.srs(s));
     reading_of(plan, table, item, srs).map(Some)
+}
+
+/// The views of `schema` a traditionally versioned `item` may be read through; none for any
+/// other item, which is read without one.
+fn views_of(conn: &Conn, item: &Item, schema: &str) -> Result<Vec<String>> {
+    if item.versioning != Versioning::Traditional {
+        return Ok(Vec::new());
+    }
+    let rows =
+        conn.query(&format!("SELECT TOP ({LIST_LIMIT}) TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = @P1"), &[schema])?;
+    Ok(rows.iter().filter_map(|r| text_of(at(r, 0))).collect())
+}
+
+/// The `(name, lower-case data type)` of every column of a table or view, in table order.
+pub(super) fn columns_of(conn: &Conn, schema: &str, table: &str) -> Result<Vec<(String, String)>> {
+    let rows = conn.query(
+        "SELECT COLUMN_NAME, LOWER(DATA_TYPE) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION",
+        &[schema, table],
+    )?;
+    Ok(rows.iter().filter_map(|r| Some((text_of(at(r, 0))?, text_of(at(r, 1))?))).collect())
 }
 
 /// Whether the column is a native spatial column. Any of a class's `geometry` or `geography`
@@ -187,6 +198,131 @@ pub(super) fn reading_of(plan: ReadPlan, table: &Table, item: &Item, srs: Option
         srid_fallback,
         notes,
     })
+}
+
+/// What a geodatabase lists: its feature datasets, its registered feature classes and tables, and
+/// the spatial tables it doesn't register that aren't its own machinery.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GdbListing {
+    /// The feature datasets' short names, in catalog order.
+    pub datasets: Vec<String>,
+    /// Every registered feature class with its spatial column (carrying the class alias and
+    /// dataset), or `None` when the table holds no native spatial column: it is listed, and
+    /// refuses at open.
+    pub classes: Vec<(Item, Option<Table>)>,
+    /// The registered non-spatial tables.
+    pub tables: Vec<Item>,
+    /// The spatial tables the catalog doesn't register, without the geodatabase's machinery.
+    pub other: Vec<Table>,
+}
+
+/// Groups the catalog's items with the database's spatial columns, worked out without a server.
+pub(super) fn listing_of(catalog: &Catalog, spatial: Vec<Table>) -> GdbListing {
+    let same = |t: &Table, i: &Item| t.schema.eq_ignore_ascii_case(&i.schema) && t.name.eq_ignore_ascii_case(&i.table);
+    let data = || catalog.items.iter().filter(|i| i.kind != ItemKind::FeatureDataset);
+    let classes = data()
+        .filter(|i| i.kind == ItemKind::FeatureClass)
+        .map(|item| {
+            let shape = item.shape_column.as_deref();
+            let table = spatial
+                .iter()
+                .find(|t| same(t, item) && shape.is_some_and(|s| t.column.eq_ignore_ascii_case(s)))
+                .or_else(|| spatial.iter().find(|t| same(t, item)))
+                .map(|t| Table { alias: item.alias.clone(), dataset: item.dataset.clone(), ..t.clone() });
+            (item.clone(), table)
+        })
+        .collect();
+    let tables = data().filter(|i| i.kind == ItemKind::Table).cloned().collect();
+    let other = spatial.iter().filter(|t| !is_machinery(&t.name) && !data().any(|i| same(t, i))).cloned().collect();
+    let datasets = catalog.feature_datasets().iter().map(|d| d.short_name().to_string()).collect();
+    GdbListing { datasets, classes, tables, other }
+}
+
+/// The geodatabase's listing; `None` when the database holds none (or its catalog can't be read:
+/// see [`super::geodatabase_problem`]).
+pub fn geodatabase_tables(conn: &Conn) -> Result<Option<GdbListing>> {
+    let Some(catalog) = super::geodatabase(conn) else { return Ok(None) };
+    Ok(Some(listing_of(&catalog, super::tables(conn)?)))
+}
+
+/// The statement that reads a registered table's rows, and the fields it yields. The first
+/// column is the feature id: the registered ObjectID column when the table has it as an integer
+/// (the rows are then read in its order), else the row number. The rest follow the fields, each
+/// cast as [`field_cast`] does; geometry and binary columns are left out.
+fn table_select(reading: &Reading, columns: &[(String, String)], limit: usize) -> (Vec<Field>, String) {
+    let rowid = reading.rowid.as_deref().and_then(|want| {
+        columns
+            .iter()
+            .find(|(name, ty)| name.eq_ignore_ascii_case(want) && matches!(ty.as_str(), "tinyint" | "smallint" | "int" | "bigint"))
+            .map(|(name, _)| ident(name))
+    });
+    let mut fields = Vec::new();
+    let mut select = vec![match &rowid {
+        Some(id) => format!("CAST({id} AS BIGINT)"),
+        None => "ROW_NUMBER() OVER (ORDER BY (SELECT NULL))".to_string(),
+    }];
+    for (name, ty) in columns {
+        let Some((field_type, cast)) = field_cast(ty, &ident(name)) else { continue };
+        let mut field = Field::new(name.clone(), field_type);
+        field.alias = reading.field_aliases.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, alias)| alias.clone());
+        fields.push(field);
+        select.push(cast);
+    }
+    let mut sql = format!("SELECT TOP ({limit}) {} FROM {}", select.join(", "), reading.from);
+    if let Some(filter) = &reading.filter {
+        sql.push_str(&format!(" WHERE {filter}"));
+    }
+    if let Some(id) = rowid {
+        sql.push_str(&format!(" ORDER BY {id}"));
+    }
+    (fields, sql)
+}
+
+/// A registered non-spatial table loaded whole (through its versioned view when versioned), at
+/// most `limit` rows, its fields carrying their geodatabase aliases. The report says when there
+/// are more rows than were read.
+pub fn read_table(conn: &Conn, item: &Item, limit: usize) -> Result<(Dataset, ReadReport)> {
+    let limit = clamp_limit(limit);
+    let columns = columns_of(conn, &item.schema, &item.table)?;
+    let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
+    let views = views_of(conn, item, &item.schema)?;
+    // A table has no storage question, so the plan is asked as for a native column.
+    let plan = geodatabase::read_plan(item, true, &views, &names);
+    let base = Table {
+        schema: item.schema.clone(),
+        name: item.table.clone(),
+        column: String::new(),
+        kind: String::new(),
+        current: false,
+        several: false,
+        alias: None,
+        dataset: None,
+    };
+    let reading = reading_of(plan, &base, item, None)?;
+    let (fields, sql) = table_select(&reading, &columns, limit);
+    let rows = conn.query(&sql, &[])?;
+    let features: Features = rows
+        .iter()
+        .zip(1u64..)
+        .map(|(r, n)| Feature {
+            id: id_of(at(r, 0)).unwrap_or(n),
+            geometry: None,
+            attrs: fields.iter().enumerate().map(|(i, f)| attr_of(f.ty, at(r, i + 1))).collect(),
+        })
+        .collect();
+    let mut report = ReadReport { skipped: 0, messages: reading.notes.clone() };
+    let mut count_sql = format!("SELECT COUNT_BIG(*) FROM {}", reading.from);
+    if let Some(filter) = &reading.filter {
+        count_sql.push_str(&format!(" WHERE {filter}"));
+    }
+    let count = conn.query_within(&count_sql, &[], PROBE_TIMEOUT).ok().flatten().and_then(|r| first_count(&r));
+    if let Some(count) = count.filter(|c| *c > limit as u64) {
+        report.messages.push(format!("the first {limit} rows of {count}"));
+    }
+    let mut dataset = Dataset::new(reading.alias.clone().unwrap_or_else(|| item.short_name().to_string()), GeometryType::None, fields);
+    dataset.features = features;
+    dataset.source = Some(format!("{}.{}", item.schema, item.table));
+    Ok((dataset, report))
 }
 
 #[cfg(test)]
@@ -307,5 +443,109 @@ mod tests {
         let srs = Srs { srid: 3, auth_srid: None, srtext: Some("not a coordinate system".into()) };
         let r = reading_of(ReadPlan::Base, &t, &i, Some(&srs)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(r.srid_fallback, None);
+    }
+
+    fn spatial(schema: &str, name: &str, column: &str) -> Table {
+        Table { schema: schema.into(), name: name.into(), column: column.into(), ..table() }
+    }
+
+    fn catalog() -> Catalog {
+        use geodatabase::{ItemRow, LayerRow, RegistryRow};
+        let row = |name: &str, physical: &str, path: &str, type_name: &str| ItemRow {
+            name: name.into(),
+            physical: physical.into(),
+            path: path.into(),
+            type_name: type_name.into(),
+            definition: None,
+        };
+        Catalog::from_rows(
+            "sde",
+            None,
+            vec![
+                row("utility.sde.Water", "", r"\Water", "Feature Dataset"),
+                row("utility.sde.Mains", "SDE.MAINS", r"\Water\Mains", "Feature Class"),
+                row("sde.Readings", "SDE.READINGS", r"\Readings", "Table"),
+            ],
+            vec![RegistryRow { owner: "SDE".into(), table: "MAINS".into(), rowid_column: Some("OBJECTID".into()) }],
+            vec![LayerRow { owner: "SDE".into(), table: "MAINS".into(), column: "SHAPE".into(), srid: Some(2) }],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn listing_groups_items_and_hides_machinery() {
+        let catalog = catalog();
+        let listing = listing_of(
+            &catalog,
+            vec![
+                spatial("SDE", "MAINS", "SHAPE"),
+                spatial("SDE", "MAINS_evw", "SHAPE"),
+                spatial("SDE", "A12", "SHAPE"),
+                spatial("dbo", "Parcels", "geom"),
+            ],
+        );
+        assert_eq!(listing.datasets, ["Water"]);
+        let mains = catalog.find("Mains").unwrap_or_else(|| panic!("Mains is registered"));
+        let expected = Table { dataset: Some("Water".into()), ..spatial("SDE", "MAINS", "SHAPE") };
+        assert_eq!(listing.classes, vec![(mains.clone(), Some(expected))]);
+        let readings = catalog.find("Readings").unwrap_or_else(|| panic!("Readings is registered"));
+        assert_eq!(listing.tables, vec![readings.clone()]);
+        assert_eq!(listing.other, vec![spatial("dbo", "Parcels", "geom")]);
+    }
+
+    #[test]
+    fn a_class_lists_its_shape_column_with_alias_and_dataset() {
+        let mut catalog = catalog();
+        if let Some(mains) = catalog.items.iter_mut().find(|i| i.table == "MAINS") {
+            mains.alias = Some("Water Mains".into());
+        }
+        let listing = listing_of(&catalog, vec![spatial("sde", "mains", "EXTRA"), spatial("sde", "mains", "SHAPE")]);
+        let table = listing.classes.first().and_then(|(_, t)| t.as_ref()).unwrap_or_else(|| panic!("a spatial column"));
+        assert_eq!(
+            (table.column.as_str(), table.alias.as_deref(), table.dataset.as_deref()),
+            ("SHAPE", Some("Water Mains"), Some("Water"))
+        );
+        assert!(listing.other.is_empty(), "{:?}", listing.other);
+        // No native spatial column: still listed.
+        let listing = listing_of(&catalog, vec![]);
+        assert_eq!(listing.classes.len(), 1);
+        assert!(listing.classes.iter().all(|(_, t)| t.is_none()));
+        // Without the shape column named, the first spatial column is the class's.
+        let mut unnamed = catalog.clone();
+        if let Some(mains) = unnamed.items.iter_mut().find(|i| i.table == "MAINS") {
+            mains.shape_column = None;
+        }
+        let listing = listing_of(&unnamed, vec![spatial("SDE", "MAINS", "EXTRA"), spatial("SDE", "MAINS", "SHAPE")]);
+        assert_eq!(listing.classes.first().and_then(|(_, t)| t.as_ref()).map(|t| t.column.as_str()), Some("EXTRA"));
+    }
+
+    #[test]
+    fn a_table_read_selects_the_columns_in_row_id_order() {
+        let columns: Vec<(String, String)> =
+            [("OBJECTID", "int"), ("DIAMETER", "float"), ("SHAPE", "geometry"), ("NOTE", "nvarchar"), ("RAW", "varbinary")]
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect();
+        let (t, i) = (table(), item());
+        let reading = reading_of(ReadPlan::VersionedView("MAINS_evw".into()), &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
+        let (fields, sql) = table_select(&reading, &columns, 50);
+        assert_eq!(
+            sql,
+            "SELECT TOP (50) CAST([OBJECTID] AS BIGINT), CAST([OBJECTID] AS BIGINT), CAST([DIAMETER] AS FLOAT), CAST([NOTE] AS NVARCHAR(MAX)) FROM [SDE].[MAINS_evw] ORDER BY [OBJECTID]"
+        );
+        let names: Vec<(&str, Option<&str>)> = fields.iter().map(|f| (f.name.as_str(), f.alias.as_deref())).collect();
+        assert_eq!(names, [("OBJECTID", None), ("DIAMETER", Some("Diameter (in)")), ("NOTE", None)]);
+
+        // Without a registered row id the rows are numbered; a branch table adds its filter.
+        let branch = reading_of(ReadPlan::Branch, &t, &Item { rowid_column: None, ..item() }, None).unwrap_or_else(|e| panic!("{e}"));
+        let (_, sql) = table_select(&branch, &columns, 5);
+        assert!(sql.starts_with("SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), "), "{sql}");
+        assert!(sql.ends_with(&format!("FROM [SDE].[MAINS] WHERE {BRANCH_DEFAULT_FILTER}")), "{sql}");
+
+        // A row id column the table lacks, or that isn't an integer, is no ordering.
+        let missing = Reading { rowid: Some("GONE".into()), ..reading_of(ReadPlan::Base, &t, &i, None).unwrap_or_else(|e| panic!("{e}")) };
+        assert!(table_select(&missing, &columns, 5).1.ends_with("FROM [SDE].[MAINS]"));
+        let text = Reading { rowid: Some("note".into()), ..missing };
+        assert!(table_select(&text, &columns, 5).1.ends_with("FROM [SDE].[MAINS]"));
     }
 }

@@ -57,7 +57,27 @@ const MAX_ADOPTED_LIFETIME: i64 = 366 * 86_400;
 /// Path words ArcGIS Online's hosts use: an organization id handed over is never one, or its
 /// [`Scope::Org`] (matched against an address's first two path words) would cover every
 /// organization's services (`services1.arcgis.com/<org>/arcgis/…`, `tiles.arcgis.com/tiles/<org>/…`).
-const HOST_PATH_WORDS: &[&str] = &["arcgis", "tiles", "rest", "services", "sharing", "home", "apps", "content", "admin", "info"];
+const HOST_PATH_WORDS: &[&str] = &[
+    "arcgis",
+    "tiles",
+    "rest",
+    "services",
+    "sharing",
+    "home",
+    "apps",
+    "content",
+    "admin",
+    "info",
+    "usrsvcs",
+    "servers",
+    "appservices",
+    "datasets",
+    "attribution",
+    "images",
+    "stories",
+    "collections",
+    "experience",
+];
 /// The shortest organization id handed over (ArcGIS Online's are 16 letters and digits).
 const MIN_ORG: usize = 6;
 

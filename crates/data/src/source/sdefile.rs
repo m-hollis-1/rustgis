@@ -158,7 +158,12 @@ fn text_value(text: &[char], key: &str) -> Option<String> {
             return None;
         }
         let rest = text.get(at + key.len() + 1..)?;
-        let end = rest.iter().position(|&c| c == ';' || c.is_control()).unwrap_or(rest.len());
+        // Look no further than a value can be long, so a pair start costs O(MAX_VALUE), not O(file).
+        let end = match rest.iter().take(MAX_VALUE + 1).position(|&c| c == ';' || c.is_control()) {
+            Some(end) => end,
+            None if rest.len() <= MAX_VALUE => rest.len(),
+            None => return None,
+        };
         let mut value: String = rest.get(..end)?.iter().collect();
         let upper = value.to_ascii_uppercase();
         if let Some(secret) = ["ENCRYPTED_PASSWORD", "PASSWORD"].iter().filter_map(|k| upper.find(k)).min() {
@@ -270,6 +275,14 @@ mod tests {
         assert!(!shown.contains("00ff") && !shown.to_uppercase().contains("PASSWORD"), "{shown}");
         let c = parse(b"SERVER=gis-db;PASSWORD=hunter2;DATABASE=d;").unwrap();
         assert!(!format!("{c:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn repeated_keys_without_a_terminator_are_cheap() {
+        // every `SERVER=` here starts a pair, and none ends: the scan must not run to the end each time
+        let started = std::time::Instant::now();
+        assert!(parse("SERVER=".repeat(150_000).as_bytes()).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]

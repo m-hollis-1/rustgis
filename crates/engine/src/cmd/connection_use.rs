@@ -162,13 +162,20 @@ pub(in crate::cmd) fn sqlserver_listing(connection: &rustgis_data::source::sqlse
         let rows = sqlserver::tables(connection)?.into_iter().map(plain).collect();
         return Ok((rows, None, sqlserver::geodatabase_problem(connection)));
     };
+    let rows = geodatabase_rows(listing);
+    let owner = sqlserver::geodatabase(connection).map(|g| json!({"owner": g.owner, "release": g.release}));
+    Ok((rows, owner, None))
+}
+
+/// A geodatabase listing's rows. A class without a spatial column (its table holds no native one)
+/// is listed with `column` and `kind` null: it isn't a layer, and refuses at open.
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::cmd) fn geodatabase_rows(listing: rustgis_data::source::sqlserver::GdbListing) -> Vec<Value> {
     let mut rows = Vec::new();
     for (item, table) in &listing.classes {
         let (schema, name, column, kind, label) = match table {
             Some(t) => (t.schema.clone(), t.name.clone(), json!(t.column), json!(t.kind), t.label()),
-            None => {
-                (item.schema.clone(), item.table.clone(), json!(item.shape_column), Value::Null, format!("{}.{}", item.schema, item.table))
-            }
+            None => (item.schema.clone(), item.table.clone(), Value::Null, Value::Null, format!("{}.{}", item.schema, item.table)),
         };
         rows.push(json!({
             "label": label, "schema": schema, "name": name, "column": column, "kind": kind,
@@ -184,12 +191,11 @@ pub(in crate::cmd) fn sqlserver_listing(connection: &rustgis_data::source::sqlse
         }));
     }
     for t in listing.other {
-        let mut row = plain(t);
-        row["item"] = json!("other");
-        rows.push(row);
+        rows.push(json!({
+            "label": t.label(), "schema": t.schema, "name": t.name, "column": t.column, "kind": t.kind, "item": "other",
+        }));
     }
-    let owner = sqlserver::geodatabase(connection).map(|g| json!({"owner": g.owner, "release": g.release}));
-    Ok((rows, owner, None))
+    rows
 }
 
 /// The labels of the rows that add a layer: a plain database's, and a geodatabase's classes with
@@ -198,7 +204,7 @@ pub(in crate::cmd) fn sqlserver_listing(connection: &rustgis_data::source::sqlse
 pub(super) fn layer_labels(rows: &[Value]) -> Vec<&str> {
     let is_layer = |r: &Value| match r.get("item").and_then(Value::as_str) {
         Some("table") => false,
-        Some("featureClass") => r.get("column").is_some_and(|c| c.as_str().is_some_and(|c| !c.is_empty())),
+        Some("featureClass") => r.get("kind").is_some_and(|k| k.as_str().is_some_and(|k| !k.is_empty())),
         _ => true,
     };
     rows.iter().filter(|r| is_layer(r)).filter_map(|r| r.get("label").and_then(Value::as_str)).collect()

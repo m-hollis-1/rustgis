@@ -861,6 +861,52 @@ mod tests {
     }
 
     #[test]
+    fn a_class_without_a_spatial_table_is_listed_but_is_not_a_layer() {
+        use rustgis_data::source::geodatabase::{Item, ItemKind, Versioning};
+        use rustgis_data::source::sqlserver::{GdbListing, Table};
+        let item = |name: &str, kind| Item {
+            name: format!("utility.sde.{name}"),
+            schema: "sde".into(),
+            table: name.to_uppercase(),
+            kind,
+            dataset: None,
+            alias: None,
+            shape_column: Some("Shape".into()),
+            field_aliases: Vec::new(),
+            versioning: Versioning::Unversioned,
+            archived: false,
+            rowid_column: None,
+            srid: None,
+        };
+        let valves = Table {
+            schema: "sde".into(),
+            name: "VALVES".into(),
+            column: "Shape".into(),
+            kind: "geometry".into(),
+            current: false,
+            several: false,
+            alias: None,
+            dataset: None,
+        };
+        let listing = GdbListing {
+            datasets: Vec::new(),
+            classes: vec![(item("Valves", ItemKind::FeatureClass), Some(valves)), (item("Orphans", ItemKind::FeatureClass), None)],
+            tables: vec![item("Readings", ItemKind::Table)],
+            other: Vec::new(),
+        };
+        let rows = super::super::connection_use::geodatabase_rows(listing);
+        let orphans = rows.iter().find(|r| r["name"] == "ORPHANS").unwrap();
+        assert!(orphans["column"].is_null() && orphans["kind"].is_null());
+        assert_eq!(orphans["label"], "sde.ORPHANS");
+        let result = super::super::connection_use::listing_result(&rows, None, None);
+        assert_eq!(result["layers"], json!(["sde.VALVES"]));
+        assert_eq!(result["count"], 1);
+        // Even a hand-built row that names a shape column isn't a layer without a geometry kind.
+        let named = [json!({"label": "sde.Orphans", "column": "Shape", "kind": null, "item": "featureClass"})];
+        assert!(super::super::connection_use::listing_result(&named, None, None)["layers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_plain_database_still_browses_schemas() {
         let tables = vec![table("tiger", "addr"), table("public", "roads")];
         assert!(!super::is_geodatabase(&tables));

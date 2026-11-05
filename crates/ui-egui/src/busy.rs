@@ -177,6 +177,12 @@ pub(crate) fn finish(app: &mut RustGisApp) {
     app.ui.busy = None;
 }
 
+/// In a unit test: what the queued calls' windows say, in order.
+#[cfg(test)]
+pub(crate) fn queued(app: &RustGisApp) -> Vec<String> {
+    app.ui.busy.as_ref().map(|p| p.steps.iter().map(|(m, _, _)| m.clone()).collect()).unwrap_or_default()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

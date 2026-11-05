@@ -25798,6 +25798,18 @@ fn diagnose_text_sorts_the_reasons_rustgis_gives() {
         ("https://x: http status: 401", Kind::SignIn),
         ("https://x: http status: 403", Kind::SignIn),
         ("https://x: rustls: invalid peer certificate: UnknownIssuer", Kind::Certificate),
+        ("https://x: the certificate chain is not trusted", Kind::Certificate),
+        // Any TLS failure names rustls: only a certificate one is a certificate's fault.
+        ("https://x: rustls: connection reset by peer", Kind::Other),
+        // ArcGIS's JSON errors arrive with their message and no status.
+        (
+            "https://x/FeatureServer: the service answered with an error: You do not have permissions to access this resource or perform this operation.",
+            Kind::SignIn,
+        ),
+        ("https://x: the service answered with an error: User not authorized", Kind::SignIn),
+        ("https://x: the service answered with an error: Unauthorized access", Kind::SignIn),
+        ("https://x: the service answered with an error: Forbidden (403)", Kind::SignIn),
+        ("https://x: the service answered with an error: Not signed in (401)", Kind::SignIn),
         ("https://x: http status: 404", Kind::ServiceMissing),
         ("https://x: host not found", Kind::Unreachable),
         ("https://x: connection failed", Kind::Unreachable),
@@ -25853,6 +25865,17 @@ fn diagnose_names_the_server_and_the_folders_other_broken_layers() {
     let e = world().run("layer.diagnose", &json!({"layer": "Countries"})).unwrap_err();
     assert!(e.contains("isn't broken"), "{e}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The reason a broken layer stored is answered redacted: a token in an address it names never is.
+#[test]
+fn diagnose_never_answers_a_token_in_the_reason() {
+    let mut s = Session::new(Project::default());
+    broken_service_because(&mut s, "https://127.0.0.1:9/x/FeatureServer?token=SECRET123&f=json: http status: 403");
+    let r = s.run("layer.diagnose", &json!({"layer": "Parcels"})).unwrap();
+    assert!(!r.to_string().contains("SECRET123"), "{r}");
+    assert_eq!(r["kind"], "signIn", "{r}");
+    assert!(r["reason"].as_str().is_some_and(|t| t.contains("http status: 403")), "{r}");
 }
 
 #[test]
@@ -27273,7 +27296,8 @@ fn adopt_token_reports_broken_layers_and_keeps_no_token() {
     let soon = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
     let params = json!({"portal": "https://adopteng.maps.arcgis.com/home", "token": "engine-secret-token", "expires": soon, "org": "eng321", "username": "ana"});
     let a = s.run("arcgis.adoptToken", &params).unwrap();
-    assert_eq!(a, json!({"portal": "https://adopteng.maps.arcgis.com", "changed": true, "broken": 1}));
+    assert_eq!(a, json!({"portal": "https://adopteng.maps.arcgis.com", "changed": true, "broken": 1, "retrying": false}));
+    assert!(!s.take_broken_retry(), "no retry was asked for");
     assert!(!a.to_string().contains("engine-secret-token"));
     let url = "https://services3.arcgis.com/eng321/arcgis/rest/services/A/FeatureServer/0";
     assert_eq!(arcgis_auth::authorization(url).as_deref(), Some("Bearer engine-secret-token"));
@@ -27302,6 +27326,31 @@ fn adopt_token_reports_broken_layers_and_keeps_no_token() {
     let e = forward(&mut s, "eng-adopt-none", "arcgis.adoptToken", p).unwrap_err();
     assert!(e.contains("'network' permission") && !e.contains("engine-other-token"), "{e}");
     rustgis_plugins::unload("eng-adopt-none");
+    // `"retry": true` (a plugin's sign-in asking RustGIS to open the broken layers itself): the
+    // command only leaves the request, for the app to run behind its working window, and says so.
+    // (Here, not in a test of its own: a plugin's token is one at a time, for every session.)
+    let with = |retry: Option<bool>| {
+        let mut p = params.clone();
+        if let Some(r) = retry {
+            p["retry"] = json!(r);
+        }
+        p
+    };
+    for retry in [None, Some(false)] {
+        let a = s.run("arcgis.adoptToken", &with(retry)).unwrap();
+        assert_eq!((a["broken"].clone(), a["retrying"].clone()), (json!(1), json!(false)), "{retry:?}");
+        assert!(!s.take_broken_retry(), "{retry:?}");
+    }
+    let a = s.run("arcgis.adoptToken", &with(Some(true))).unwrap();
+    assert_eq!(a, json!({"portal": "https://adopteng.maps.arcgis.com", "changed": false, "broken": 1, "retrying": true}));
+    assert!(s.map().layers[0].source.as_ref().is_some_and(|l| l.is_broken()), "the command itself retries nothing");
+    assert!(s.take_broken_retry());
+    assert!(!s.take_broken_retry(), "taken once");
+    // Nothing broken: nothing to retry.
+    let mut empty = Session::new(Project::default());
+    let a = empty.run("arcgis.adoptToken", &with(Some(true))).unwrap();
+    assert_eq!((a["broken"].clone(), a["retrying"].clone()), (json!(0), json!(false)));
+    assert!(!empty.take_broken_retry());
     s.run("arcgis.signOut", &json!({"portal": "https://adopteng.maps.arcgis.com"})).unwrap();
     assert_eq!(arcgis_auth::authorization(url), None);
 }

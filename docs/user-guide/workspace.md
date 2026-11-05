@@ -26,8 +26,9 @@ button, and clicks and keys made meanwhile are dropped so they don't land on som
 afterwards. Fixing one broken layer (trying a service again, opening a file from its new place)
 is quicker, and its window carries only the second half of that line.
 
-Only the interface shows it. Commands, scripts, plugins, the AI Assistant and the command line
-run as they always did, with no window.
+The window belongs to the app's own menus, buttons, shortcuts and drops. Commands run by
+scripts, plugins, the AI Assistant and the command line stay immediate: they run at once, with no
+window.
 
 A `•` after the project's name in the title bar means it has unsaved changes. Undoing or redoing
 back to the state you last saved clears it. Before the desktop app discards unsaved changes, it

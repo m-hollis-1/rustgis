@@ -80,14 +80,25 @@ pub fn section(app: &mut RustGisApp, ui: &mut egui::Ui) {
     });
 }
 
-/// A sign-in has just completed: the layers that couldn't open (a secured service, say) are
-/// opened again, once, and the notice says how many came back. Nothing is said when none was broken.
+/// A sign-in has just completed (RustGIS's own, or a plugin's handed over): the layers that
+/// couldn't open (a secured service, say) are opened again, once, behind the working window, and
+/// the notice says how many came back. Nothing is queued or said when none was broken.
 fn retry_broken_layers(app: &mut RustGisApp) {
     // With none broken, the command would change nothing and still leave an undo step.
-    let broken = app.session.map().layers.iter().any(|l| l.source.as_ref().is_some_and(|s| s.is_broken()));
-    if !broken {
+    let broken = app.session.map().layers.iter().filter(|l| l.source.as_ref().is_some_and(|s| s.is_broken())).count();
+    if broken == 0 {
         return;
     }
+    let message = if broken == 1 {
+        tl_raw!("Opening 1 broken layer…").to_string()
+    } else {
+        crate::i18n::fmt("Opening {n} broken layers…", &[("n", &broken.to_string())])
+    };
+    crate::busy::queue_short(app, message, retry_now);
+}
+
+/// [`retry_broken_layers`]'s work, once its window is up.
+fn retry_now(app: &mut RustGisApp) {
     let Ok(r) = app.run("layer.retry", json!({"all": true})) else { return };
     if r.get("retried").and_then(serde_json::Value::as_u64).unwrap_or(0) == 0 {
         return;
@@ -212,6 +223,16 @@ pub(crate) fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
     poll_progress(app, &progress);
+    poll_plugin(app);
+}
+
+/// A plugin's sign-in handed over with `"retry": true` (`arcgis.adoptToken`) asked for the
+/// broken layers to be opened again: here, behind the working window, not inside the plugin's
+/// command and its time limit.
+fn poll_plugin(app: &mut RustGisApp) {
+    if app.session.take_broken_retry() {
+        retry_broken_layers(app);
+    }
 }
 
 /// [`poll`] with the sign-in's progress given.
@@ -235,6 +256,7 @@ pub(crate) fn poll(app: &mut RustGisApp, _ctx: &egui::Context) {
             retry_broken_layers(app);
         }
     }
+    poll_plugin(app);
 }
 
 /// Starts signing in to ArcGIS Online with RustGIS's own app, as Sign in does with the portal
@@ -363,6 +385,9 @@ mod tests {
         );
         app.session.map_mut().add_streamed("Roads", src);
         retry_broken_layers(&mut app);
+        assert!(app.session.notices.is_empty(), "queued behind the working window, not run yet");
+        assert_eq!(crate::busy::queued(&app), ["Opening 1 broken layer…"]);
+        crate::busy::finish(&mut app);
         let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(said, ["Signed in: 0 layers opened"]);
     }
@@ -394,16 +419,52 @@ mod tests {
         assert!(app.session.notices.is_empty());
         poll_progress(&mut app, &done);
         poll_progress(&mut app, &done);
+        assert_eq!(crate::busy::queued(&app).len(), 1, "queued once");
+        crate::busy::finish(&mut app);
         let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(said, ["Signed in: 0 layers opened"]);
     }
 
-    /// A sign-in with no broken layer in the map changes nothing, so it leaves no undo step.
+    /// A sign-in with no broken layer in the map changes nothing, so it leaves no undo step
+    /// and puts up no working window.
     #[test]
     fn signing_in_with_nothing_broken_leaves_no_undo_step() {
         let mut app = RustGisApp::with_sample();
         let before = (app.session.can_undo(), app.session.undo_label());
         retry_broken_layers(&mut app);
+        assert!(app.ui.busy.is_none());
         assert_eq!((app.session.can_undo(), app.session.undo_label()), before);
+    }
+
+    /// A plugin's sign-in (`arcgis.adoptToken` with `"retry": true`) leaves a request: the next
+    /// frame takes it and opens the broken layers behind the working window, once, as after
+    /// RustGIS's own sign-in.
+    #[test]
+    fn a_plugin_sign_in_retries_the_broken_layers_behind_the_working_window() {
+        let mut app = RustGisApp::with_sample();
+        for name in ["Roads", "Rivers"] {
+            let src = rustgis_engine::map::source::SourceLayer::broken(
+                format!("a shapefile at D:/data/{name}.shp"),
+                Some(format!("D:/data/no-such-folder/{name}.shp")),
+                None,
+                None,
+                "the file isn't there".into(),
+            );
+            app.session.map_mut().add_streamed(name, src);
+        }
+        app.session.request_broken_retry();
+        let ctx = egui::Context::default();
+        poll(&mut app, &ctx);
+        assert_eq!(crate::busy::queued(&app), ["Opening 2 broken layers…"], "the working window first");
+        assert!(app.session.notices.is_empty(), "not run yet");
+        assert!(!app.session.take_broken_retry(), "the request was taken");
+        poll(&mut app, &ctx);
+        assert_eq!(crate::busy::queued(&app).len(), 1, "queued once");
+        crate::busy::finish(&mut app);
+        let said: Vec<&str> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(said, ["Signed in: 0 layers opened"]);
+        // No request, nothing queued.
+        poll(&mut app, &ctx);
+        assert!(app.ui.busy.is_none());
     }
 }

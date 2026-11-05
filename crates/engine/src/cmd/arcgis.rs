@@ -17,7 +17,7 @@ pub fn commands() -> Vec<C> {
             r#"{"url": "an ArcGIS REST address on https:// (a service's, …/rest/services, or a portal's …/sharing/rest)", "token": "an ArcGIS token for it"} — kept for the session only, never in the project; sent to that ArcGIS Server's (or portal's) requests only. A service address given to service.layers or service.add with ?token=… does the same"#,
         ),
         C::new("arcgis.adoptToken", "Use ArcGIS Online Token from a Plugin", "Home › Add › Service", adopt_token).view().params(
-            r#"{"portal": "the ArcGIS Online portal signed in to (https://www.arcgis.com or an organization's https://myorg.maps.arcgis.com)", "token": "an ArcGIS Online token for it (a plugin's own sign-in)", "expires": "when it expires, unix seconds (milliseconds are read as such)", "org": "the organization's id (portals/self's id)", "username"?: text} → the portal's base address, changed (whether the token kept changed) and broken (how many of the current map's layers are broken: layer.retry with all tries them again) — kept for the session only, as a sign-in to the portal is: sent to the portal, www.arcgis.com's sharing/rest and the organization's hosted services only, until it expires. The user's own sign-in to the portal, while good, is kept instead. ArcGIS Online on https only"#,
+            r#"{"portal": "the ArcGIS Online portal signed in to (https://www.arcgis.com or an organization's https://myorg.maps.arcgis.com)", "token": "an ArcGIS Online token for it (a plugin's own sign-in)", "expires": "when it expires, unix seconds (milliseconds are read as such)", "org": "the organization's id (portals/self's id)", "username"?: text, "retry"?: "true to have RustGIS open the current map's broken layers again itself, once this command has answered (behind its working window in the app)"} → the portal's base address, changed (whether the token kept changed), broken (how many of the current map's layers are broken) and retrying (whether RustGIS will open them again: retry was asked and some are broken; otherwise layer.retry with all tries them) — kept for the session only, as a sign-in to the portal is: sent to the portal, www.arcgis.com's sharing/rest and the organization's hosted services only, until it expires. The user's own sign-in to the portal, while good, is kept instead. ArcGIS Online on https only"#,
         ),
         C::new("arcgis.signOut", "Sign Out of ArcGIS", "Home › Add › Service", sign_out)
             .view()
@@ -112,7 +112,13 @@ fn adopt_token(s: &mut Session, p: &Value) -> CmdResult {
         crate::render::rustgis_tiles::cache::clear();
     }
     let broken = s.map().layers.iter().filter(|l| l.source.as_ref().is_some_and(rustgis_map::source::SourceLayer::is_broken)).count();
-    Ok(json!({"portal": base, "changed": changed, "broken": broken}))
+    // Opened by the app on its own time: a plugin's command has a time limit, and its failure
+    // would roll back every layer that opened.
+    let retrying = broken > 0 && p.get("retry").and_then(Value::as_bool).unwrap_or(false);
+    if retrying {
+        s.request_broken_retry();
+    }
+    Ok(json!({"portal": base, "changed": changed, "broken": broken, "retrying": retrying}))
 }
 
 fn sign_out(_s: &mut Session, p: &Value) -> CmdResult {

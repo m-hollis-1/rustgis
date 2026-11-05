@@ -684,6 +684,10 @@ pub struct Session {
     /// one succeeds) through this. Python leaves it unset: a run there holds the interpreter's
     /// lock and can't be interrupted, so it keeps the Script pane's bounds.
     pub long_runs: Option<fn(&str, f64)>,
+    /// A plugin's sign-in asked for the map's broken layers to be opened again
+    /// (`arcgis.adoptToken` with `"retry": true`): the app runs it behind its working window
+    /// ([`Session::take_broken_retry`]), not inside the plugin's command and its time limit.
+    broken_retry: bool,
 }
 
 /// The most `layer.addUrl` requests kept for the front end at a time.
@@ -916,7 +920,19 @@ impl Session {
             sql_results: Vec::new(),
             trend_results: Vec::new(),
             long_runs: None,
+            broken_retry: false,
         }
+    }
+
+    /// Asks the front end to open the map's broken layers again (`layer.retry` with all), on its
+    /// own time rather than the command's.
+    pub fn request_broken_retry(&mut self) {
+        self.broken_retry = true;
+    }
+
+    /// Whether a retry of the broken layers was asked for since last taken; taking it clears it.
+    pub fn take_broken_retry(&mut self) -> bool {
+        std::mem::take(&mut self.broken_retry)
     }
 
     /// Keeps a query's result the app ran off the frame, for `layer.addSql {"ran": id}`, with the

@@ -376,7 +376,7 @@ The dialog sorts the reason into one of these and offers the fixes that fit it. 
 
 | What is wrong | What it says | What it offers |
 | --- | --- | --- |
-| The service wants a sign-in, or refused the one it had (a "Token Required" answer, or a 401, 403, 498 or 499) | The layer is on that server, which needs you to sign in. | **Sign in to ArcGIS Online**, and **Retry**. |
+| The service wants a sign-in, or refused the one it had (a "Token Required" or "You do not have permissions…" answer, or a 401, 403, 498 or 499) | The layer is on that server, which needs you to sign in. | **Sign in to ArcGIS Online**, and **Retry**. |
 | The server's security certificate isn't trusted on this computer | RustGIS can't connect safely. ArcGIS Pro may have been set to accept it anyway. Ask whoever runs that server to install a certificate from a trusted authority, or check you're on the network it's meant for. | **Retry**, once the server's certificate is fixed. |
 | The server didn't answer | That server didn't answer. | **Retry**, **Use another address…**. |
 | The server answered, but the service isn't there any more | The service isn't there any more. | **Retry**, **Use another address…**. |
@@ -387,6 +387,10 @@ The dialog sorts the reason into one of these and offers the fixes that fit it. 
   [Secured ArcGIS services](data-formats.md#secured-arcgis-services) describes) and, once you are
   back, tries every broken layer of the map again, whichever dialog is open, so one sign-in can
   open several layers. The dialog closes when its layer opens.
+- Signing in with the ArcGIS Online plugin instead hands its sign-in to RustGIS, which then opens
+  the map's broken layers itself, behind the [working window](workspace.md#the-working-window)
+  ("Opening 12 broken layers…"), as after its own sign-in. The plugin's command doesn't wait for
+  them, so a map with many service layers opens them all.
 - **Use another address…** takes the service's new address (`…/FeatureServer/0`, say) and opens
   the layer from it, as the same kind of service and the same layer, keeping the layer's place
   and look. If the new address fails too, the layer stays broken at its old address, and the

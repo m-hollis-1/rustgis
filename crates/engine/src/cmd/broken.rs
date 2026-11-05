@@ -29,9 +29,22 @@ pub enum Kind {
     Other,
 }
 
-const SIGN_IN: &[&str] =
-    &["token required", "invalid token", "token was refused", "http status: 401", "http status: 403", "(499)", "(498)"];
-const CERTIFICATE: &[&str] = &["certificate", "unknownissuer", "untrusted", "rustls"];
+const SIGN_IN: &[&str] = &[
+    "token required",
+    "invalid token",
+    "token was refused",
+    "http status: 401",
+    "http status: 403",
+    "(499)",
+    "(498)",
+    // ArcGIS's JSON errors (a 401 or 403 in the answer's body) come with their message alone.
+    "do not have permissions",
+    "not authorized",
+    "unauthorized",
+    "(401)",
+    "(403)",
+];
+const CERTIFICATE: &[&str] = &["certificate", "unknownissuer", "untrusted", "not trusted"];
 const UNREACHABLE: &[&str] = &[
     "host not found",
     "connection failed",
@@ -115,7 +128,8 @@ fn diagnose(s: &mut Session, p: &Value) -> CmdResult {
     let src = l.source.as_ref().filter(|src| src.is_broken()).ok_or_else(|| format!("{} isn't broken", l.name))?;
     let reason = src.why_broken().unwrap_or_default();
     let mut kind = if src.service.is_some() { diagnose_text(reason) } else { classify(reason, false) };
-    let mut out = json!({"layer": id, "reason": reason});
+    // An address in the reason may carry a token.
+    let mut out = json!({"layer": id, "reason": super::history::redacted_text(reason)});
     if let Some(service) = &src.service {
         if let Some(server) = server_of(&service.url) {
             out["server"] = json!(server);

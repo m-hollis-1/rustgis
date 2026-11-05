@@ -21,6 +21,8 @@ use logins::request_password;
 pub(crate) use logins::{clear_active, resolve_keys, resolve_project, restore_active};
 #[path = "connection_use.rs"]
 mod connection_use;
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::cmd) use connection_use::{listing_result, sqlserver_listing};
 
 pub fn commands() -> Vec<C> {
     vec![
@@ -46,10 +48,10 @@ pub fn commands() -> Vec<C> {
         ),
         C::new("connection.forgetPassword", "Forget Saved Password", "Home › Add › Data Sources", forget_password).view().params(r#"{"id": "a database connection's id or name"}"#),
         C::new("connection.test", "Test Connection", "Home › Add › Data Sources", test).view().params(
-            r#"{"id"?: "a connection's id or name", "kind"?: "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "name"?: text, "group"?: text, "address"?: text, "options"?: "an unsaved connection, as connection.new (when no id)", "password"?: "for a named database, authentication refusal restores prior session credentials; a later listing failure keeps the new password; never persisted", "accessKeyId"?: text, "secretAccessKey"?: text, "sessionToken"?: "as connection.login (logs in first)", "probe"?: "true: only the address the test reads, {fetch} (null for databases, which their driver tests)", "answer"?: "non-database kinds only: what that address returned, when the app fetched it (no network request then); databases ignore answer and test through their driver"}"#,
+            r#"{"id"?: "a connection's id or name", "kind"?: "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "name"?: text, "group"?: text, "address"?: text, "options"?: "an unsaved connection, as connection.new (when no id)", "password"?: "for a named database, authentication refusal restores prior session credentials; a later listing failure keeps the new password; never persisted", "accessKeyId"?: text, "secretAccessKey"?: text, "sessionToken"?: "as connection.login (logs in first)", "probe"?: "true: only the address the test reads, {fetch} (null for databases, which their driver tests)", "answer"?: "non-database kinds only: what that address returned, when the app fetched it (no network request then); databases ignore answer and test through their driver"} → a database's result has {count, layers}, and for an Esri enterprise geodatabase on SQL Server geodatabase: {owner, release}, or geodatabaseProblem: why its catalog couldn't be read"#,
         ),
         C::new("connection.browse", "Browse Connection", "Home › Add › Data Sources", browse::browse).view().params(
-            r#"{"id": "a connection's id or name", "node"?: "a child's node, as a listing gives it (the connection's top level when absent)", "probe"?: "true: only the address this level reads, {fetch} (null: read without a fetch, or by the database driver); an S3 connection logs in first, as connection.test does", "answer"?: "what that address returned, when the app fetched it", "documents"?: [{"url": "a further document a listing asked for (next)", "text": "its answer"}]} → {connection, node, children: [{key, name, what, detail?, node? (browse it), children? (listed already), add? {command, params}: the command that adds it}], truncated?, matched?, notes?, service? {url, type}, next? (fetch it, then ask again with answer and documents)}. Database roots list schemas; open a schema node to list its tables."#,
+            r#"{"id": "a connection's id or name", "node"?: "a child's node, as a listing gives it (the connection's top level when absent)", "probe"?: "true: only the address this level reads, {fetch} (null: read without a fetch, or by the database driver); an S3 connection logs in first, as connection.test does", "answer"?: "what that address returned, when the app fetched it", "documents"?: [{"url": "a further document a listing asked for (next)", "text": "its answer"}]} → {connection, node, children: [{key, name, what, detail?, node? (browse it), children? (listed already), add? {command, params}: the command that adds it}], truncated?, matched?, notes?, service? {url, type}, next? (fetch it, then ask again with answer and documents)}. Database roots list schemas; open a schema node to list its tables. A geodatabase's root lists feature datasets, feature classes, tables and other spatial tables (open a feature dataset node to list its classes); if its catalog couldn't be read, the database browses as plain SQL Server, with a note."#,
         ),
     ]
 }
@@ -849,9 +851,9 @@ fn test(s: &mut Session, p: &Value) -> CmdResult {
                 if c.id.is_empty() {
                     super::layer::database_tables(s, &json!({"database":c.address,"password":ps(p,"password")}))?
                 } else {
-                    let tables = connection_use::tables(s, &c, ps(p, "password").filter(|pw| !pw.is_empty()))?;
-                    let layers: Vec<_> = tables.iter().filter_map(|v| v["label"].as_str()).collect();
-                    json!({"count":layers.len(),"layers":layers})
+                    let (rows, geodatabase, problem) =
+                        connection_use::tables_and_geodatabase(s, &c, ps(p, "password").filter(|pw| !pw.is_empty()))?;
+                    listing_result(&rows, geodatabase, problem)
                 }
             }
         }

@@ -50,7 +50,7 @@ pub fn commands() -> Vec<C> {
         ),
         C::new("info.databaseTables", "List Database Tables", "Home › Add › Add Data › Database", database_tables)
             .view()
-            .params(r#"{"database": "as layer.addDatabase", "password"?: string}"#),
+            .params(r#"{"database": "as layer.addDatabase", "password"?: string} → {count, layers: [labels of the tables with a geometry column], and for an Esri enterprise geodatabase on SQL Server: tables: [labels of its registered tables without one], items: [{label, item: "featureClass"|"table"|"other", schema, name, column?, kind?, dataset, alias, versioning: "none"|"traditional"|"branch", display}], geodatabase: {owner, release}}"#),
         C::new("layer.defineProjection", "Define Projection", "Layers", define_projection)
             .when(need_feature_layer)
             .params(r#"{"layer"?: name|id, "crs": "EPSG:… or WKT; reinterpret native coordinates, without rewriting the source file"}"#),
@@ -2055,18 +2055,30 @@ pub(super) fn database_tables(_s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let db = database_param(p).ok_or("database is required")?;
-        let layers: Vec<String> = match LiveDb::connect(&db) {
-            Some(live) => {
-                let live = live.map_err(|e| format!("{}: {e}", db.short()))?;
-                live.tables().map_err(|e| format!("{}: {e}", db.short()))?.iter().map(LiveTable::label).collect()
+        let err = |e: rustgis_data::DataError| format!("{}: {e}", db.short());
+        match LiveDb::connect(&db) {
+            // An Esri geodatabase lists its classes and registered tables too: `items` has the
+            // rows the connection browser shows, `tables` the labels of the non-spatial ones.
+            Some(Ok(LiveDb::Sqlserver(conn))) => {
+                let (rows, geodatabase, problem) = super::connections::sqlserver_listing(&conn).map_err(err)?;
+                let mut out = super::connections::listing_result(&rows, geodatabase, problem);
+                if rows.iter().any(|r| r.get("item").is_some()) {
+                    let tables: Vec<&str> =
+                        rows.iter().filter(|r| r["item"] == "table").filter_map(|r| r.get("label").and_then(Value::as_str)).collect();
+                    out["tables"] = json!(tables);
+                    out["items"] = json!(rows);
+                }
+                Ok(out)
             }
-            None => rustgis_data::source::duckdb::tables_of(&db)
-                .map_err(|e| format!("{}: {e}", db.short()))?
-                .iter()
-                .map(|t| t.label())
-                .collect(),
-        };
-        Ok(json!({"count": layers.len(), "layers": layers}))
+            Some(live) => {
+                let layers: Vec<String> = live.map_err(err)?.tables().map_err(err)?.iter().map(LiveTable::label).collect();
+                Ok(json!({"count": layers.len(), "layers": layers}))
+            }
+            None => {
+                let layers: Vec<String> = rustgis_data::source::duckdb::tables_of(&db).map_err(err)?.iter().map(|t| t.label()).collect();
+                Ok(json!({"count": layers.len(), "layers": layers}))
+            }
+        }
     }
 }
 

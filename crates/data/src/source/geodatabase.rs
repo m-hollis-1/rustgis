@@ -52,9 +52,10 @@ pub enum Versioning {
 pub struct Item {
     /// `GDB_ITEMS.Name` as given (`utility.sde.Mains` or `sde.Mains`).
     pub name: String,
-    /// The owner, from `PhysicalName` (`SDE.MAINS` gives `SDE`); empty when it has none.
+    /// The owner, from `PhysicalName`: its second-to-last part (`SDE.MAINS` and the database
+    /// qualified `UTILITY.SDE.MAINS` both give `SDE`); empty when it has only one part.
     pub schema: String,
-    /// The table, from `PhysicalName` (`MAINS`).
+    /// The table, from `PhysicalName`: its last part (`MAINS`).
     pub table: String,
     pub kind: ItemKind,
     /// The feature dataset a class is in, from `Path` (`\Water\Mains` gives `Water`); `None` at
@@ -161,7 +162,7 @@ impl Catalog {
             .take(MAX_ITEMS)
             .filter_map(|row| {
                 let kind = kind_of(&row.type_name)?;
-                let (schema, table) = row.physical.rsplit_once('.').unwrap_or(("", row.physical.as_str()));
+                let (schema, table) = split_physical(&row.physical);
                 let def = row.definition.as_deref().map(read_definition).unwrap_or_default();
                 let layer = layer_of.get(&key(schema, table));
                 let segments: Vec<&str> = row.path.split('\\').filter(|s| !s.is_empty()).collect();
@@ -294,6 +295,14 @@ pub fn read_plan(item: &Item, native_spatial: bool, views: &[String], columns: &
 /// The part of a name after its last `.`.
 fn short(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(_, s)| s)
+}
+
+/// The owner and table of a `PhysicalName` (`SDE.MAINS` or `UTILITY.SDE.MAINS` give `SDE` and
+/// `MAINS`): its last two parts, the owner empty when there is only one.
+fn split_physical(physical: &str) -> (&str, &str) {
+    let mut parts = physical.rsplit('.');
+    let table = parts.next().unwrap_or(physical);
+    (parts.next().unwrap_or(""), table)
 }
 
 /// A three-part name (`utility.sde.Mains`) without its first part (`sde.Mains`); `None` for any
@@ -455,6 +464,26 @@ mod tests {
         );
         let item = c.items.first().unwrap();
         assert_eq!((item.alias.as_deref(), item.shape_column.as_deref(), item.srid), (None, Some("SHAPE"), None));
+    }
+
+    #[test]
+    fn a_database_qualified_physical_name_gives_its_owner_and_table() {
+        let c = Catalog::from_rows(
+            "sde",
+            None,
+            vec![
+                row("utility.sde.Mains", "UTILITY.SDE.MAINS", "\\Mains", "Feature Class", None),
+                row("Bare", "BARE", "\\Bare", "Table", None),
+            ],
+            vec![RegistryRow { owner: "SDE".into(), table: "MAINS".into(), rowid_column: Some("OBJECTID".into()) }],
+            vec![],
+            vec![],
+        );
+        let mains = c.find("sde.mains").unwrap();
+        assert_eq!((mains.schema.as_str(), mains.table.as_str()), ("SDE", "MAINS"));
+        assert_eq!(mains.rowid_column.as_deref(), Some("OBJECTID"));
+        let bare = c.find("bare").unwrap();
+        assert_eq!((bare.schema.as_str(), bare.table.as_str()), ("", "BARE"));
     }
 
     #[test]

@@ -86,8 +86,8 @@
   #[derive(Clone, Debug, PartialEq)]
   pub struct Item {
       pub name: String,             // GDB_ITEMS.Name as given ("utility.sde.Mains" or "sde.Mains")
-      pub schema: String,           // from PhysicalName "SDE.MAINS" → "SDE"
-      pub table: String,            // "MAINS"
+      pub schema: String,           // the owner: the second-to-last segment of PhysicalName ("UTILITY.SDE.MAINS" or "SDE.MAINS" → "SDE")
+      pub table: String,            // the last segment: "MAINS"
       pub kind: ItemKind,
       pub dataset: Option<String>,  // from Path "\Water\Mains" → "Water"; None at the root
       pub alias: Option<String>,    // Definition <AliasName>, when it differs from the short name

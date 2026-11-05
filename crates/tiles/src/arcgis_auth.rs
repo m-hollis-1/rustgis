@@ -54,6 +54,12 @@ const MAX_SERVERS: usize = 64;
 const ADOPTED: &str = "plugin";
 /// The latest an adopted token is kept to (seconds from now).
 const MAX_ADOPTED_LIFETIME: i64 = 366 * 86_400;
+/// Path words ArcGIS Online's hosts use: an organization id handed over is never one, or its
+/// [`Scope::Org`] (matched against an address's first two path words) would cover every
+/// organization's services (`services1.arcgis.com/<org>/arcgis/…`, `tiles.arcgis.com/tiles/<org>/…`).
+const HOST_PATH_WORDS: &[&str] = &["arcgis", "tiles", "rest", "services", "sharing", "home", "apps", "content", "admin", "info"];
+/// The shortest organization id handed over (ArcGIS Online's are 16 letters and digits).
+const MIN_ORG: usize = 6;
 
 /// The redirect address of a sign-in whose callback server listens on `port`.
 pub fn redirect_uri(port: u16) -> String {
@@ -465,8 +471,12 @@ pub fn adopt(portal: &str, token: &str, expires_at: i64, org: &str, username: &s
     if !valid_token(token) {
         return Err("an ArcGIS token is one word of letters, digits and - _ . ~ + / =".into());
     }
-    if org.is_empty() || org.len() > 64 || !org.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return Err("org is the organization's id: letters and digits (portals/self's id)".into());
+    if org.len() < MIN_ORG
+        || org.len() > 64
+        || !org.bytes().all(|b| b.is_ascii_alphanumeric())
+        || HOST_PATH_WORDS.iter().any(|w| org.eq_ignore_ascii_case(w))
+    {
+        return Err("org is the organization's id: 6 to 64 letters and digits (portals/self's id)".into());
     }
     let now = now_secs();
     // Later than the year 5138 in seconds: milliseconds.
@@ -477,21 +487,30 @@ pub fn adopt(portal: &str, token: &str, expires_at: i64, org: &str, username: &s
     if all.iter().any(|s| s.portal == portal && s.kind() == Kind::SignIn && s.live(now)) {
         return Ok(false);
     }
-    let changed = !all.iter().any(|s| s.portal == portal && s.kind() == Kind::Adopted && s.access_token == token);
     let scopes = scopes_for(&portal, Some(org), &[]);
-    keep_in(
-        &mut all,
-        Session {
-            portal,
-            client_id: ADOPTED.to_string(),
-            username,
-            access_token: token.to_string(),
-            expires_at,
-            refresh_token: None,
-            scopes,
-            retry_at: 0,
-        },
-    );
+    let changed = !all.iter().any(|s| s.portal == portal && s.kind() == Kind::Adopted && s.access_token == token && s.scopes == scopes);
+    // A plugin has one sign-in at a time: this replaces every token handed over before. Room is
+    // made from sessions that have ended, never the user's own.
+    let others = all.iter().filter(|s| s.kind() != Kind::Adopted).count();
+    if others >= MAX_SESSIONS && all.iter().all(|s| s.kind() == Kind::Adopted || s.live(now)) {
+        return Err("too many ArcGIS sessions are kept to take the plugin's: sign out of one".into());
+    }
+    all.retain(|s| s.kind() != Kind::Adopted);
+    if all.len() >= MAX_SESSIONS
+        && let Some(i) = all.iter().position(|s| !s.live(now))
+    {
+        all.remove(i);
+    }
+    all.push(Session {
+        portal,
+        client_id: ADOPTED.to_string(),
+        username,
+        access_token: token.to_string(),
+        expires_at,
+        refresh_token: None,
+        scopes,
+        retry_at: 0,
+    });
     Ok(changed)
 }
 

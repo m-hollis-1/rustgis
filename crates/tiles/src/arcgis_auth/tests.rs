@@ -2,6 +2,13 @@ use super::*;
 
 // The sessions are shared by the process's tests: each test uses its own hosts.
 
+/// A plugin's token handed over replaces every one handed over before: the tests that hand one
+/// over take turns.
+fn adopting() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: Mutex<()> = Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn grant(token: &str, expires_at: i64) -> Grant {
     Grant { access_token: token.into(), refresh_token: Some("refresh".into()), expires_at, username: "ana".into() }
 }
@@ -241,6 +248,7 @@ fn renewals_land_or_end_the_session() {
 
 #[test]
 fn an_adopted_token_covers_the_organizations_hosted_services_only() {
+    let _turn = adopting();
     let soon = now_secs() + 3600;
     assert_eq!(adopt(ONLINE, "plugin-token-1", soon, "abc123", "ana"), Ok(true));
     let bearer = Some("Bearer plugin-token-1".to_string());
@@ -256,6 +264,14 @@ fn an_adopted_token_covers_the_organizations_hosted_services_only() {
     assert_eq!(adopt(ONLINE, "plugin-token-1", soon + 60, "abc123", "ana"), Ok(false));
     assert_eq!(adopt(ONLINE, "plugin-token-2", soon, "abc123", "ana"), Ok(true));
     assert_eq!(list().iter().filter(|i| i.portal == ONLINE).count(), 1);
+    // The same token for another organization changes what it covers: changed.
+    assert_eq!(adopt(ONLINE, "plugin-token-2", soon, "xyz789", "ana"), Ok(true));
+    assert_eq!(
+        authorization("https://services5.arcgis.com/xyz789/arcgis/rest/services/S/FeatureServer/0").as_deref(),
+        Some("Bearer plugin-token-2")
+    );
+    assert_eq!(authorization("https://services5.arcgis.com/abc123/arcgis/rest/services/S/FeatureServer/0"), None);
+    assert_eq!(adopt(ONLINE, "plugin-token-2", soon, "abc123", "ana"), Ok(true));
     assert_eq!(
         authorization("https://services5.arcgis.com/abc123/arcgis/rest/services/S/FeatureServer/0").as_deref(),
         Some("Bearer plugin-token-2")
@@ -268,6 +284,7 @@ fn an_adopted_token_covers_the_organizations_hosted_services_only() {
 
 #[test]
 fn adopting_never_replaces_the_users_own_sign_in() {
+    let _turn = adopting();
     let portal = "https://adoptown.maps.arcgis.com";
     let url = "https://services1.arcgis.com/own456/arcgis/rest/services/A/FeatureServer/0";
     sign_in(portal, "client", grant("users-token", now_secs() + 3600), scopes_for(portal, Some("own456"), &[]));
@@ -304,6 +321,7 @@ fn adopting_never_replaces_the_users_own_sign_in() {
 
 #[test]
 fn an_expired_adopted_token_is_not_sent() {
+    let _turn = adopting();
     let portal = "https://adoptold.maps.arcgis.com";
     let url = "https://services2.arcgis.com/old789/arcgis/rest/services/A/FeatureServer/0";
     assert_eq!(adopt(portal, "old-plugin-token", now_secs() - 5, "old789", ""), Ok(true));
@@ -321,6 +339,7 @@ fn an_expired_adopted_token_is_not_sent() {
 
 #[test]
 fn adopt_refuses_an_enterprise_portal_or_plain_http() {
+    let _turn = adopting();
     let soon = now_secs() + 3600;
     for portal in [
         "https://gis.example.org/portal",
@@ -339,7 +358,40 @@ fn adopt_refuses_an_enterprise_portal_or_plain_http() {
     for org in ["", "a/b", "abc 999", "évil", &"a".repeat(65)] {
         assert!(adopt("https://adoptbad.maps.arcgis.com", "refused-token", soon, org, "").is_err(), "{org}");
     }
+    // An id that is one of the hosts' own path words would cover every organization's services
+    // (`services1.arcgis.com/<org>/arcgis/…`, `tiles.arcgis.com/tiles/<org>/…`); a short one is refused too.
+    for org in ["arcgis", "ArcGIS", "tiles", "TILES", "rest", "services", "sharing", "home", "apps", "content", "admin", "info", "abc12"] {
+        assert!(adopt("https://adoptbad.maps.arcgis.com", "refused-token", soon, org, "").is_err(), "{org}");
+    }
     let e = adopt("https://adoptbad.maps.arcgis.com", "secret token\r\n", soon, "abc999", "").unwrap_err();
     assert!(!e.contains("secret"), "{e}");
     assert!(!list().iter().any(|i| i.portal.contains("adoptbad") || i.portal.contains("gis.example.org")));
+    // A real organization's covers its own services only.
+    let portal = "https://adoptgood.maps.arcgis.com";
+    assert_eq!(adopt(portal, "good-token", soon, "abc123def", ""), Ok(true));
+    assert!(authorization("https://services1.arcgis.com/abc123def/arcgis/rest/services/S/FeatureServer/0").is_some());
+    assert_eq!(authorization("https://services1.arcgis.com/otherorg/arcgis/rest/services/S/FeatureServer/0"), None);
+    assert_eq!(authorization("https://tiles.arcgis.com/tiles/otherorg/arcgis/rest/services/S/MapServer/tile/1/0/0"), None);
+    sign_out(Some(portal));
+}
+
+#[test]
+fn adopting_never_evicts_the_users_sessions() {
+    let _turn = adopting();
+    let portal = "https://adoptkeep.example.org/portal";
+    sign_in(portal, "client", grant("keep-token", now_secs() + 3600), scopes_for(portal, None, &[]));
+    add_token("https://adoptkeep.example.org/server/rest/services", "keep-server-token").unwrap();
+    for n in 0..(MAX_SESSIONS + 10) {
+        let p = format!("https://adoptmany{n}.maps.arcgis.com");
+        assert_eq!(adopt(&p, "many-token", now_secs() + 3600, "many123", ""), Ok(true), "{p}");
+    }
+    // One token handed over at a time; the user's sign-in and token stay.
+    let kept = list();
+    assert_eq!(kept.iter().filter(|i| i.portal.contains("adoptmany")).count(), 1);
+    assert!(kept.iter().any(|i| i.portal == portal && i.renews));
+    assert!(kept.iter().any(|i| i.portal == "https://adoptkeep.example.org/server" && i.token));
+    assert_eq!(authorization("https://adoptkeep.example.org/portal/sharing/rest/portals/self").as_deref(), Some("Bearer keep-token"));
+    sign_out(Some(&format!("https://adoptmany{}.maps.arcgis.com", MAX_SESSIONS + 9)));
+    sign_out(Some(portal));
+    sign_out(Some("https://adoptkeep.example.org/server"));
 }

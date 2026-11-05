@@ -15,6 +15,20 @@ templates, packages and files for individual items.
 command line. A package opens as a new, unsaved project; Save writes a plain `.rgis` file.
 Opening or creating a project clears undo history; saving does not.
 
+### The working window
+
+Importing an ArcGIS Pro project, saving (Save, Save As) and opening a project file can take
+minutes for a large project, and the app can't redraw while it works. So a small window comes up
+first: a spinner and what is happening ("Saving Site.rgis…", "Opening Site.rgis…", "Importing 2
+maps from Site.aprx…"), and under it "This can take several minutes for a large project. Windows
+may say RustGIS is not responding — don't close it." Wait for it to close. It has no close
+button, and clicks and keys made meanwhile are dropped so they don't land on something else
+afterwards. Fixing one broken layer (trying a service again, opening a file from its new place)
+is quicker, and its window carries only the second half of that line.
+
+Only the interface shows it. Commands, scripts, plugins, the AI Assistant and the command line
+run as they always did, with no window.
+
 A `•` after the project's name in the title bar means it has unsaved changes. Undoing or redoing
 back to the state you last saved clears it. Before the desktop app discards unsaved changes, it
 asks **Save changes to…?** That happens when you quit or close the window, and when New, Open, the
@@ -345,9 +359,12 @@ its scale range is not kept: it draws at every scale.
 
 A **broken layer** is a placeholder in the layer's place. It keeps the layer's name, visibility,
 symbology, labels and definition query, draws nothing, and has a warning after its name in the
-Layers pane; hover over it to read where Pro read the data from and why it didn't open. Once the
-file has turned up or the service answers, right-click the layer and choose **Retry**, or **Repair
-Data Source…** to point it at the file's new place; see [Broken layers](maps.md#broken-layers). A
+Layers pane; hover over it to read where Pro read the data from and why it didn't open. Right-click a
+broken layer of features and choose **Repair Source…**: it says why the layer didn't open (a
+service that needs a sign-in, a certificate this computer doesn't trust, a server that didn't
+answer, a moved file) and offers the fix that fits, including pointing the other broken layers
+from the same folder at the new place too; see [Broken layers](maps.md#broken-layers). Signing in
+to ArcGIS Online, in that dialog or with the ArcGIS Online plugin, tries the broken layers again. A
 password, user name or token in a connection never reaches a layer's origin, a note or a saved
 project: they are removed from connection strings and service addresses as the layer is read.
 

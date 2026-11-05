@@ -340,6 +340,16 @@ A secured ArcGIS service answers error 499, "Token Required". There are two ways
   `https://web.rustgis.app/oauth-callback.html`), where the sign-in opens in a pop-up window.
   ArcGIS accepts only an address the app registers, port and path included. The portal and
   client ID are remembered; the session is not.
+- **Sign in with the ArcGIS Online plugin.** Version 0.4.0 of the plugin hands its sign-in to
+  RustGIS after each command it runs, and after its own **Sign In** it tries the project's broken
+  layers again and says how many opened, so layers that need an ArcGIS Online login open without
+  signing in a second time. This is `arcgis.adoptToken`, which takes `portal`, `token`, `expires`
+  (unix seconds), `org` (the organization's id) and optionally `username`, and answers the portal,
+  whether the token kept `changed` and how many of the map's layers are `broken` (`layer.retry`
+  with `"all": true` tries them again). Like any sign-in, the token is kept for the session only,
+  and is sent only to the portal and the organization's own hosted services, only for ArcGIS
+  Online over https; your own sign-in to the portal, while it is good, is kept instead. The plugin
+  needs a RustGIS that has the command.
 - **A token with the address**: a service address given with `?token=…` (from the portal, or
   `arcgis.token` with `"url"` and `"token"`) keeps the token for that ArcGIS Server and takes it
   out of the address the layer keeps.
@@ -352,6 +362,10 @@ and, for ArcGIS Online, the organization's own hosted services (`services*.arcgi
 federated servers; a token given with an address goes to that server alone. Its layers, tiles and
 feature pages are then read with it. Tokens live in memory for the session, never in a project or
 a connection, and a sign-in renews itself until the portal's session ends (two weeks at most).
+A layer that couldn't be opened for want of a sign-in stays in the map as a
+[broken layer](maps.md#broken-layers), and a saved project keeps its address without the token.
+**Repair Source…** on it offers **Sign in to ArcGIS Online**.
+
 **Sign out** (`arcgis.signOut`) forgets it (and, on the desktop, revokes it with the portal); `arcgis.status` lists
 the sessions.
 

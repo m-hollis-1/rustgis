@@ -206,7 +206,9 @@ If a tile archive is removed or reordered out of its captured slot while the dia
 the dialog closes rather than applying the replacement to another archive.
 It does not change embedded data, databases or web links. The web app cannot link to files
 on your computer: add the file again with **Add Data**. The same repairs a [broken
-layer](maps.md#broken-layers) from an ArcGIS Pro import whose file has moved.
+layer](maps.md#broken-layers) from an ArcGIS Pro import whose file has moved. A broken layer of
+features has [Repair Source…](maps.md#repair-source) in its menu instead, which also fixes the
+broken layers that had their data in the same folder.
 
 CLI and Python use the same commands: `layer.repairSource` with
 `{"layer":"Cities","path":"/data/towns.fgb"}` (and optional `"table"`), or `map.repairTiles`

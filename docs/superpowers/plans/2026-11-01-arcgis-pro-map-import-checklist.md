@@ -78,7 +78,10 @@ The checks were run with `rustgis-cli`, the CLI build of the importer at this br
   - the warning glyph on the 20 broken layers;
   - each tooltip names where Pro read the layer: the SDE server and table (with no password), the feature service URL
     and layer, and the FileGDB path;
-  - after Sign in to ArcGIS, Retry on the 8 token-secured feature service layers opens them.
+  - sign in with the ArcGIS Online plugin (0.4.0: it hands its token to RustGIS and retries the broken layers), or
+    right-click a layer, Repair Source…, Sign in to ArcGIS Online: the 8 token-secured feature service layers open;
+  - layers on a self-hosted server whose certificate isn't trusted stay broken, and Repair Source… gives the
+    certificate explanation (RustGIS never skips the check, though Pro may have been set to).
 - [ ] **Step 3: compare the drawing against Pro at three scales** (a township, a section, a parcel). Check colours, widths,
   dash patterns, markers (the drawn and stacked ones in particular), fills, and labels (text, font, size, halo,
   placement, stacking). Check that definition queries draw the same features.

@@ -342,7 +342,10 @@ A warning after the layer's name in the Layers pane marks it. Hover over it to r
 layer came from and why it didn't open: "Broken: …" with the place and the reason. A password,
 user name or token is never in that place.
 
-Right-click the layer to bring it back:
+Right-click a broken layer of features and choose **Repair Source…**. The dialog shows the layer,
+where its data was and why it didn't open, says in plain words what is wrong, and offers the fixes
+that fit ([below](#repair-source)). The menu of any other broken layer (a raster, say) has
+**Retry** and **Repair Data Source…** instead, which do this:
 
 - **Retry** opens its source again, from the file or the service it came from, once the file has
   turned up or the service answers (or you have signed in). The layer keeps its place, symbology
@@ -362,7 +365,60 @@ Right-click the layer to bring it back:
 
 Both are undoable. A saved project keeps a broken layer as it is (where it came from, why, its
 file or service and its look), so it can be retried or repaired after the project is opened
-again.
+again; a service address's token is taken out of it. A failed retry replaces the layer's reason
+with what it ran into this time (with any password, key or token removed), so the hover text and
+**Repair Source…** describe the latest attempt.
+
+### Repair Source…
+
+The dialog sorts the reason into one of these and offers the fixes that fit it. **Remove** and
+**Close** are always there.
+
+| What is wrong | What it says | What it offers |
+| --- | --- | --- |
+| The service wants a sign-in, or refused the one it had (a "Token Required" answer, or a 401, 403, 498 or 499) | The layer is on that server, which needs you to sign in. | **Sign in to ArcGIS Online**, and **Retry**. |
+| The server's security certificate isn't trusted on this computer | RustGIS can't connect safely. ArcGIS Pro may have been set to accept it anyway. Ask whoever runs that server to install a certificate from a trusted authority, or check you're on the network it's meant for. | **Retry**, once the server's certificate is fixed. |
+| The server didn't answer | That server didn't answer. | **Retry**, **Use another address…**. |
+| The server answered, but the service isn't there any more | The service isn't there any more. | **Retry**, **Use another address…**. |
+| The file isn't where the layer remembers it | The file isn't at that place. | **Browse for the file…**. |
+| Anything else | The reason as it was recorded. | **Retry**, and **Browse for the file…** for a layer with a file. |
+
+- **Sign in to ArcGIS Online** signs in on ArcGIS Online's own page (as
+  [Secured ArcGIS services](data-formats.md#secured-arcgis-services) describes) and, once you are
+  back, tries every broken layer of the map again, whichever dialog is open, so one sign-in can
+  open several layers. The dialog closes when its layer opens.
+- **Use another address…** takes the service's new address (`…/FeatureServer/0`, say) and opens
+  the layer from it, as the same kind of service and the same layer, keeping the layer's place
+  and look. If the new address fails too, the layer stays broken at its old address, and the
+  reason says why.
+- **Browse for the file…** picks the file's new place. When other broken layers had their data in
+  the same folder, the dialog asks "Fix them too?" and, on **Yes**, points each at the file of the
+  same name in the new folder. A layer whose file isn't there is left as it is, and a notice names
+  it and says why. The web app can't link to files on your computer: add the file again with
+  **Add Data**.
+- **Remove** takes the layer out of the map (undoable).
+
+A self-hosted ArcGIS Server may present a security certificate that Windows and RustGIS don't
+trust (one it issued itself, say). ArcGIS Pro may have been set to accept it. RustGIS never skips
+the check, so such a layer stays broken and the dialog says why; the fix is on the server's side,
+a certificate from a trusted authority.
+
+Each fix that can take a moment (asking a service again, opening a file) shows the
+[working window](workspace.md#the-working-window), with a shorter line, while it runs.
+
+The same steps as commands:
+
+- `layer.diagnose={"layer": "Parcels"}` answers the layer's `kind` (`signIn`, `certificate`,
+  `unreachable`, `serviceMissing`, `fileMissing` or `other`) and `reason`; for a service layer its
+  `server`, and for a file layer its `path`, its `folder` and the `siblings`, the other broken file
+  layers of the map read from that folder. It goes by what the layer recorded and doesn't touch
+  the network.
+- `layer.relinkService={"layer": "Parcels", "url": "https://…/FeatureServer/0"}` is **Use another
+  address…**.
+- `layer.repairFolder={"from": "/old/data", "to": "/new/data"}` is the "Fix them too?" step: it
+  points each broken layer whose data was in `from` at the file of the same name in `to`, and
+  answers the names `repaired` and those `skipped`, each with the reason `why`. It fails when no
+  broken layer had its data in `from`, or when none could be repaired.
 
 ## Projections
 

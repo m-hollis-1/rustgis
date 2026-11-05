@@ -5,9 +5,14 @@ use crate::{CmdResult, CommandSpec as C, Session};
 use serde_json::{Value, json};
 
 pub fn commands() -> Vec<C> {
-    vec![C::new("layer.retry", "Retry", "Layers", retry).params(
-        r#"{"layer"?: name|id | "all"?: true (every broken layer of the map)} → {"retried": n, "opened": m, "failed": [{"layer", "error"}]}"#,
-    )]
+    vec![
+        C::new("layer.retry", "Retry", "Layers", retry).params(
+            r#"{"layer"?: name|id | "all"?: true (every broken layer of the map)} → {"retried": n, "opened": m, "failed": [{"layer", "error"}]}"#,
+        ),
+        C::new("layer.relinkService", "Use Another Address", "Layers", relink).params(
+            r#"{"layer": name|id of a broken service layer, "url": "the service's new address"} → the layer's id and whether it opened; the layer stays broken, at its old address, when the new one fails (the error says why)"#,
+        ),
+    ]
 }
 
 /// How one broken layer's retry went.
@@ -53,6 +58,37 @@ fn retry(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     Ok(json!({"retried": retried, "opened": opened, "failed": failed}))
+}
+
+/// `layer.relinkService`: a broken service layer opened from another address (the same kind of
+/// service and layer, moved), keeping its place and style. When the new address fails, the layer
+/// stays broken at its old one, with the error as its reason.
+fn relink(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let url = super::ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required: the service's new address")?;
+    let l = s.map().layer(id).ok_or("the layer no longer exists")?;
+    let old = l.source.as_ref().filter(|src| src.is_broken()).and_then(|src| src.service.clone());
+    let Some(old) = old else { return Err(format!("{} isn't a broken service layer", l.name)) };
+    let service = rustgis_map::source::ServiceOrigin { url: url.to_string(), kind: old.kind, layer: old.layer };
+    match retry_service(s, id, &service) {
+        Ok(outcome) => {
+            let layer = s.map().layer(id).map(|_| id);
+            if layer.is_some() {
+                check_query(s, id);
+            }
+            Ok(json!({"layer": layer, "opened": matches!(outcome, Outcome::Opened)}))
+        }
+        Err(error) => {
+            // As a failed retry: what the next diagnosis goes by, without the keys, tokens and
+            // passwords the error may quote.
+            let error = super::history::redacted_text(&error);
+            if let Some(src) = s.map_mut().layer_mut(id).and_then(|l| l.source.as_mut()) {
+                src.error = Some(error.clone());
+                src.reason = Some(error.clone());
+            }
+            Err(error)
+        }
+    }
 }
 
 /// A broken layer's definition query was kept unchecked while it had no fields to check it

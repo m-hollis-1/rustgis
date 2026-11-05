@@ -26066,6 +26066,69 @@ fn a_retried_service_that_answers_a_table_leaves_no_table_behind() {
     assert!(s.map().layer(id).and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken()));
 }
 
+/// A broken service layer pointed at another address: the service there answers, and the layer
+/// opens from it, keeping its id, name and symbology.
+#[test]
+fn relinking_a_broken_service_layer_opens_it_from_the_new_address() {
+    use ogc_server::{Route, Server, arcgis_layer, arcgis_page};
+    let server = Server::new(vec![
+        Route::new("/arcgis/rest/services/P/FeatureServer", r#"{"currentVersion": 11.5, "layers": [{"id": 0, "name": "Parcels"}]}"#),
+        Route::new("/arcgis/rest/services/P/FeatureServer/0/query", &arcgis_page(&[1, 2, 3], false)),
+        Route::new("/arcgis/rest/services/P/FeatureServer/0", &arcgis_layer(1000, false)),
+    ]);
+    let url = format!("{}/arcgis/rest/services/P/FeatureServer", server.base);
+    let mut s = Session::new(Project::default());
+    let id = broken_service(&mut s);
+    s.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap().service.as_mut().unwrap().layer = "Parcels".into();
+    let renderer = serde_json::to_value(&s.map().layer(id).unwrap().renderer).unwrap();
+    let layers = s.map().layers.len();
+    let r = s.run("layer.relinkService", &json!({"layer": "Parcels", "url": url})).unwrap();
+    assert_eq!(r, json!({"layer": id, "opened": true}));
+    assert_eq!(s.map().layers.len(), layers);
+    let l = s.map().layer(id).unwrap();
+    assert_eq!(l.name, "Parcels");
+    assert_eq!(l.dataset.name, "Parcels");
+    assert_eq!(serde_json::to_value(&l.renderer).unwrap(), renderer);
+    assert_eq!(l.dataset.features.len(), 3);
+    // Opened: like any layer service.add brings in, it holds the features it downloaded (saved
+    // with the project) and keeps no address: nothing broken and nothing of the old address
+    // is left on it.
+    let saved = serde_json::to_string(&l.source).unwrap();
+    assert!(l.source.as_ref().is_none_or(|src| !src.is_broken() && src.service.is_none() && src.origin.is_none()), "{saved}");
+    assert!(!saved.contains("127.0.0.1:9"), "{saved}");
+    // One undo step puts the broken layer back, at its old address.
+    s.run("edit.undo", &json!({})).unwrap();
+    let src = s.map().layer(id).and_then(|l| l.source.as_ref()).unwrap();
+    assert!(src.is_broken());
+    assert_eq!(src.service.as_ref().map(|v| v.url.as_str()), Some("https://127.0.0.1:9/x/FeatureServer"));
+}
+
+/// An address that doesn't answer: the layer stays broken, at its old address, with the error
+/// (scrubbed, as Retry's is) as its reason. A layer that isn't a broken service layer is refused.
+#[test]
+fn relinking_to_an_unreachable_address_leaves_the_layer_broken() {
+    let dir = broken_dir("relink");
+    let mut s = Session::new(Project::default());
+    let id = broken_service(&mut s);
+    let file = broken_countries(&mut s, &dir.join("data").join("missing.shp"));
+    let e = s.run("layer.relinkService", &json!({"layer": id, "url": "https://127.0.0.1:9/y/FeatureServer?token=secret1"})).unwrap_err();
+    assert!(!e.is_empty() && !e.contains("secret1"), "{e}");
+    let src = s.map().layer(id).and_then(|l| l.source.as_ref()).unwrap();
+    assert!(src.is_broken());
+    assert_eq!(src.service.as_ref().map(|v| v.url.as_str()), Some("https://127.0.0.1:9/x/FeatureServer"));
+    assert!(src.reason.as_deref().is_some_and(|r| !r.is_empty() && !r.contains("secret1")), "{:?}", src.reason);
+    // Not a service layer: refused, by name.
+    let e = s.run("layer.relinkService", &json!({"layer": file, "url": "https://127.0.0.1:9/y"})).unwrap_err();
+    assert_eq!(e, "Borders isn't a broken service layer");
+    // A healthy layer too.
+    let e = world().run("layer.relinkService", &json!({"layer": "Countries", "url": "https://127.0.0.1:9/y"})).unwrap_err();
+    assert_eq!(e, "Countries isn't a broken service layer");
+    // url is required.
+    assert!(s.run("layer.relinkService", &json!({"layer": id})).is_err());
+    assert!(s.run("layer.relinkService", &json!({"url": "https://127.0.0.1:9/y"})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A broken layer with no file or service to read again can't be retried or repaired: removing
 /// it is all there is to offer.
 #[test]

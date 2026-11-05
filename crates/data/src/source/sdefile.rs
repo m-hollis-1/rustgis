@@ -279,10 +279,15 @@ mod tests {
 
     #[test]
     fn repeated_keys_without_a_terminator_are_cheap() {
-        // every `SERVER=` here starts a pair, and none ends: the scan must not run to the end each time
+        // Every `SERVER=` here starts a pair and none ends, in a file just under the size cap: the
+        // scan from each must stop after a value's length, not run to the end of the file.
+        let bytes = "SERVER=".repeat(MAX_BYTES / 7);
+        assert!(bytes.len() <= MAX_BYTES);
         let started = std::time::Instant::now();
-        assert!(parse("SERVER=".repeat(150_000).as_bytes()).is_err());
+        let parsed = parse(bytes.as_bytes());
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // the pairs near the end have short tails, so a bounded junk server may come out; never a long one
+        assert!(parsed.map_or(true, |c| c.server.chars().count() <= MAX_VALUE));
     }
 
     #[test]

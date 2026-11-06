@@ -224,12 +224,26 @@ fn sql_server(platform: &str) -> bool {
     platform.trim().is_empty() || platform.trim().eq_ignore_ascii_case("sqlserver")
 }
 
+/// A platform as people write it (`PostgreSQL` for Pro's `postgresql`); another as Pro wrote it.
+fn platform_name(platform: &str) -> &str {
+    let platform = platform.trim();
+    match platform.to_ascii_lowercase().as_str() {
+        "postgresql" => "PostgreSQL",
+        "oracle" => "Oracle",
+        "db2" => "Db2",
+        "informix" => "Informix",
+        "sqlserver" => "SQL Server",
+        _ => platform,
+    }
+}
+
 /// What a geodatabase layer's diagnosis means, and which connection (if any) serves it.
 fn geodatabase_text(d: &Diagnosis, c: &Choices) -> String {
     if !sql_server(&d.platform) {
+        // "on {platform}", so no article depends on the platform's name ("a oracle").
         return crate::i18n::fmt(
-            "This layer is in a {platform} geodatabase, which RustGIS can't connect to yet.",
-            &[("platform", &d.platform)],
+            "This layer is in a geodatabase on {platform}, which RustGIS can't connect to yet.",
+            &[("platform", platform_name(&d.platform))],
         );
     }
     let server = d.server.as_deref().unwrap_or(tl_raw!("its server"));
@@ -488,6 +502,13 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         }
         Some(Action::Browse) => browse(app, layer, name),
         Some(Action::FixSiblings(yes)) => fix_siblings(app, yes),
+        // A connection that signs in with a password it doesn't have asks for it first, then
+        // comes back here to repair.
+        Some(Action::ConnectAndRepair(connection)) if needs_password(&app.session, &connection) => {
+            if crate::connectionui::log_in(app, &connection) {
+                app.ui.connection.continue_repair = Some(layer);
+            }
+        }
         Some(Action::ConnectAndRepair(connection)) => {
             if let Some(f) = app.dialogs.broken.as_mut() {
                 f.login = None;
@@ -679,6 +700,15 @@ fn repair_folder(app: &mut RustGisApp, name: &str, from: &str, to: &str) {
     }
 }
 
+/// Whether repairing through connection `id` needs a password typed first: its address names a
+/// user (not a Windows sign-in) and no password is known for it this session or remembered.
+fn needs_password(s: &Session, id: &str) -> bool {
+    let Some(c) = s.connections.find(id) else { return false };
+    rustgis_engine::geodatabase::has_user(&c.address)
+        && s.database_logins.known_password(id).is_none()
+        && !(c.remembered && !s.database_logins.is_rejected(id))
+}
+
 /// Whether a failed repair through connection `id` was about its password: the connection has
 /// none to sign in with (the server refused it, or none was given), or the error says so.
 fn login_problem(s: &Session, id: &str, error: &str) -> bool {
@@ -795,15 +825,24 @@ mod tests {
         assert!(h.query_by_label_contains("enterprise geodatabase on gis-db, database utility (table utility.sde.Mains)").is_some());
         h.get_by_label("Remove");
         assert!(h.query_by_label("Retry").is_none());
-        // No password to sign in with: the error shows, and Log in… offers to type it.
+        // No password to sign in with: the connection's form opens to type it, then comes back
+        // to repair.
         h.get_by_label("Connect and repair").click();
-        h.run_steps(8);
-        assert_eq!(h.state().dialogs.open, Some(NAME));
-        assert!(h.query_by_label_contains("no password to sign in with").is_some());
-        h.get_by_label("Log in…").click();
         h.run_steps(3);
         assert_eq!(h.state().dialogs.open, Some("editConnection"));
+        assert!(h.state().ui.connection.login);
         assert_eq!(h.state().ui.connection.continue_repair, Some(id));
+    }
+
+    #[test]
+    fn a_windows_sign_in_connection_repairs_without_asking_for_a_password() {
+        let mut app = RustGisApp::with_sample();
+        let c = connect(&mut app, "Utility (Windows)", "mssql://gis-db/utility");
+        assert!(!needs_password(&app.session, &c));
+        let user = connect(&mut app, "Utility GIS", "mssql://reader@gis-db/utility");
+        assert!(needs_password(&app.session, &user));
+        app.session.database_logins.set_session_password(&user, "made-up-pw");
+        assert!(!needs_password(&app.session, &user));
     }
 
     #[test]
@@ -842,7 +881,7 @@ mod tests {
         let id = broken_geodatabase(&mut app, "Mains", "oracle");
         let mut h = harness(app, id);
         h.run_steps(3);
-        assert!(h.query_by_label_contains("This layer is in a oracle geodatabase, which RustGIS can't connect to yet.").is_some());
+        assert!(h.query_by_label_contains("This layer is in a geodatabase on Oracle, which RustGIS can't connect to yet.").is_some());
         assert!(h.query_by_label("Add connection…").is_none());
         assert!(h.query_by_label("Connect and repair").is_none());
         h.get_by_label("Remove");

@@ -21,7 +21,7 @@ pub enum SdeError {
     TooLarge,
     /// The file names no server.
     NoServer,
-    /// Not a SQL Server geodatabase; carries the platform for people, with its article ("a PostgreSQL geodatabase").
+    /// Not a SQL Server geodatabase; carries the platform for people ("a geodatabase on PostgreSQL").
     OtherPlatform(String),
     /// Anything else (an unusable server, port or similar).
     Other(String),
@@ -150,11 +150,12 @@ pub fn mssql_address(c: &SdeConnection) -> Result<String, SdeError> {
     Ok(address)
 }
 
-/// A platform for people, with its article: "a PostgreSQL geodatabase".
+/// A platform for people: "a geodatabase on PostgreSQL" (worded so no article depends on the
+/// platform's name).
 fn platform_phrase(platform: &str) -> String {
     match platform {
-        "postgresql" => "a PostgreSQL geodatabase".into(),
-        "oracle" => "an Oracle geodatabase".into(),
+        "postgresql" => "a geodatabase on PostgreSQL".into(),
+        "oracle" => "a geodatabase on Oracle".into(),
         "" => "a geodatabase of an unknown kind".into(),
         other => format!("a geodatabase on `{other}`"),
     }
@@ -510,10 +511,10 @@ mod tests {
         assert_eq!(a(&c), "mssql://editor@gis-db");
         c.platform = "postgresql".into();
         let err = mssql_address(&c).unwrap_err();
-        assert_eq!(err, SdeError::OtherPlatform("a PostgreSQL geodatabase".into()));
-        assert!(err.to_string().contains("a PostgreSQL geodatabase"), "{err}");
+        assert_eq!(err, SdeError::OtherPlatform("a geodatabase on PostgreSQL".into()));
+        assert!(err.to_string().contains("this is a geodatabase on PostgreSQL"), "{err}");
         c.platform = "oracle".into();
-        assert_eq!(mssql_address(&c).unwrap_err(), SdeError::OtherPlatform("an Oracle geodatabase".into()));
+        assert_eq!(mssql_address(&c).unwrap_err(), SdeError::OtherPlatform("a geodatabase on Oracle".into()));
     }
 
     #[test]

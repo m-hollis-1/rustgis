@@ -1546,7 +1546,7 @@ mod tests {
         app.run("ui.connection", json!({"kind": "sqlserver", "form": true, "sdeFile": path})).unwrap();
         assert_eq!(app.dialogs.open, Some("newConnection"));
         let e = app.dialogs.error.clone().unwrap();
-        assert!(e.contains("a PostgreSQL geodatabase; RustGIS reads SQL Server geodatabases"), "{e}");
+        assert!(e.contains("a geodatabase on PostgreSQL; RustGIS reads SQL Server geodatabases"), "{e}");
         assert!(app.session.connections.connections.is_empty());
     }
 

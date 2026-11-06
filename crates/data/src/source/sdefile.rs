@@ -8,6 +8,33 @@
 /// Largest `.sde` file read.
 pub const MAX_BYTES: usize = 1 << 20;
 
+/// Why a `.sde` file or the connection it describes can't be used. `Display` is a sentence for the
+/// person, not a log line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SdeError {
+    /// Over [`MAX_BYTES`].
+    TooLarge,
+    /// The file names no server.
+    NoServer,
+    /// Not a SQL Server geodatabase; carries the platform for people, with its article ("a PostgreSQL geodatabase").
+    OtherPlatform(String),
+    /// Anything else (an unusable server, port or similar).
+    Other(String),
+}
+
+impl std::fmt::Display for SdeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => write!(f, "that file is too large to be a connection file (over {} MB)", MAX_BYTES >> 20),
+            Self::NoServer => f.write_str("that connection file doesn't name a server; enter the server by hand"),
+            Self::OtherPlatform(phrase) => write!(f, "this is {phrase}; only SQL Server geodatabases can be opened for now"),
+            Self::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for SdeError {}
+
 /// Longest value kept; a longer one is junk, not a server or a user.
 const MAX_VALUE: usize = 1024;
 
@@ -30,9 +57,9 @@ pub struct SdeConnection {
 }
 
 /// The connection a `.sde` file describes. An error is a sentence for the person, not a log line.
-pub fn parse(bytes: &[u8]) -> Result<SdeConnection, String> {
+pub fn parse(bytes: &[u8]) -> Result<SdeConnection, SdeError> {
     if bytes.len() > MAX_BYTES {
-        return Err(format!("that file is too large to be a connection file (over {} MB)", MAX_BYTES >> 20));
+        return Err(SdeError::TooLarge);
     }
     let texts = Texts::new(bytes);
     let instance = texts.value("INSTANCE");
@@ -40,7 +67,7 @@ pub fn parse(bytes: &[u8]) -> Result<SdeConnection, String> {
     let platform = texts.value("DBCLIENT").or(instance_platform).map(|p| p.to_ascii_lowercase()).unwrap_or_default();
     let server = ["SERVER", "DB_CONNECTION_PROPERTIES"].iter().find_map(|k| texts.value(k)).or(instance_server);
     let Some(server) = server else {
-        return Err("that connection file doesn't name a server; enter the server by hand".into());
+        return Err(SdeError::NoServer);
     };
     let os_auth = texts.value("AUTHENTICATION_MODE").is_some_and(|m| m.eq_ignore_ascii_case("OSA"));
     Ok(SdeConnection {
@@ -56,21 +83,21 @@ pub fn parse(bytes: &[u8]) -> Result<SdeConnection, String> {
 /// The SQL Server address for a connection: `mssql://<user>@<host>[:port][/<database>][?instance=<i>]`.
 /// `host\instance` gives `?instance=`, `host,port` gives `:port`. Any other platform is refused,
 /// saying which it is.
-pub fn mssql_address(c: &SdeConnection) -> Result<String, String> {
+pub fn mssql_address(c: &SdeConnection) -> Result<String, SdeError> {
     if c.platform != "sqlserver" {
-        return Err(format!("this is {}; only SQL Server geodatabases can be opened for now", platform_phrase(&c.platform)));
+        return Err(SdeError::OtherPlatform(platform_phrase(&c.platform)));
     }
     let (rest, port) = match c.server.trim().rsplit_once(',') {
         Some((rest, port)) => match port.trim().parse::<u16>() {
             Ok(p) if p > 0 => (rest, Some(p)),
-            _ => return Err(format!("the server's port `{}` isn't a port number", port.trim())),
+            _ => return Err(SdeError::Other(format!("the server's port `{}` isn't a port number", port.trim()))),
         },
         None => (c.server.trim(), None),
     };
     let (host, instance) = rest.split_once('\\').map_or((rest, None), |(h, i)| (h, Some(i)));
     let host = host.trim();
     if host.is_empty() || !host.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')) {
-        return Err("the server's name isn't one a connection address can carry; enter the server by hand".into());
+        return Err(SdeError::Other("the server's name isn't one a connection address can carry; enter the server by hand".into()));
     }
     let mut address = String::from("mssql://");
     if let Some(user) = c.user.as_deref().filter(|u| !u.is_empty() && !c.os_auth) {
@@ -93,7 +120,7 @@ pub fn mssql_address(c: &SdeConnection) -> Result<String, String> {
 }
 
 /// A platform for people, with its article: "a PostgreSQL geodatabase".
-pub fn platform_phrase(platform: &str) -> String {
+fn platform_phrase(platform: &str) -> String {
     match platform {
         "postgresql" => "a PostgreSQL geodatabase".into(),
         "oracle" => "an Oracle geodatabase".into(),
@@ -255,14 +282,15 @@ mod tests {
     #[test]
     fn no_server_is_refused() {
         let err = parse(b"DATABASE=d;USER=u").unwrap_err();
-        assert!(err.contains("enter the server"), "{err}");
-        assert!(parse(b"").is_err());
+        assert_eq!(err, SdeError::NoServer);
+        assert!(err.to_string().contains("enter the server"), "{err}");
+        assert_eq!(parse(b"").unwrap_err(), SdeError::NoServer);
     }
 
     #[test]
     fn too_large_is_refused() {
-        assert!(parse(&vec![b'x'; MAX_BYTES + 1]).is_err());
-        assert!(parse(&vec![b'x'; MAX_BYTES]).is_err()); // right size, no server
+        assert_eq!(parse(&vec![b'x'; MAX_BYTES + 1]).unwrap_err(), SdeError::TooLarge);
+        assert_eq!(parse(&vec![b'x'; MAX_BYTES]).unwrap_err(), SdeError::NoServer); // right size, no server
     }
 
     #[test]
@@ -302,15 +330,16 @@ mod tests {
         assert_eq!(a(&c), "mssql://editor@gis-db");
         c.platform = "postgresql".into();
         let err = mssql_address(&c).unwrap_err();
-        assert!(err.contains("a PostgreSQL geodatabase"), "{err}");
+        assert_eq!(err, SdeError::OtherPlatform("a PostgreSQL geodatabase".into()));
+        assert!(err.to_string().contains("a PostgreSQL geodatabase"), "{err}");
         c.platform = "oracle".into();
-        assert!(mssql_address(&c).unwrap_err().contains("an Oracle geodatabase"));
+        assert_eq!(mssql_address(&c).unwrap_err(), SdeError::OtherPlatform("an Oracle geodatabase".into()));
     }
 
     #[test]
     fn hostile_servers_are_refused() {
         for server in ["", r"\GIS", "h/x", "h?x", "h@x", "h,notaport", "h,0", "h,70000", "h x,1"] {
-            assert!(mssql_address(&connection(server, Some("u"), false)).is_err(), "{server:?}");
+            assert!(matches!(mssql_address(&connection(server, Some("u"), false)), Err(SdeError::Other(_))), "{server:?}");
         }
     }
 }

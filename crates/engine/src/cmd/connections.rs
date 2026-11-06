@@ -167,11 +167,12 @@ fn new(s: &mut Session, p: &Value) -> CmdResult {
         options: p.get("options").map(options).transpose()?.unwrap_or_default(),
         ..Connection::default()
     };
+    // A name filled in from the file is a default, as one made from an address is.
+    let explicit = !c.name.trim().is_empty();
     let from_file = match ps(p, "sdeFile") {
         Some(path) => Some(sde_connection(&mut c, path)?),
         None => None,
     };
-    let explicit = !c.name.trim().is_empty();
     let (c, stripped) = s.connections.add(c, explicit)?;
     resolve_keys(s, &address_keys(&c.address));
     let mut out = shown_stripped(s, &c, stripped);
@@ -201,12 +202,9 @@ fn sde_connection(c: &mut Connection, path: &str) -> Result<rustgis_data::source
         let path = std::path::Path::new(path.trim());
         let shown = path.file_name().map_or_else(|| "the .sde file".into(), |n| n.to_string_lossy().into_owned());
         let file = read_sde_file(path).map_err(|e| format!("{shown}: {e}"))?;
-        c.address = sdefile::mssql_address(&file).map_err(|e| {
-            if file.platform == "sqlserver" {
-                format!("{shown}: {e}")
-            } else {
-                format!("{shown}: {}; RustGIS reads SQL Server geodatabases", sdefile::platform_phrase(&file.platform))
-            }
+        c.address = sdefile::mssql_address(&file).map_err(|e| match e {
+            sdefile::SdeError::OtherPlatform(phrase) => format!("{shown}: {phrase}; RustGIS reads SQL Server geodatabases"),
+            e => format!("{shown}: {e}"),
         })?;
         if c.name.trim().is_empty() {
             c.name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -225,12 +223,9 @@ fn read_sde_file(path: &std::path::Path) -> Result<rustgis_data::source::sdefile
     let file = std::fs::File::open(path).map_err(|e| format!("couldn't be opened ({})", e.kind()))?;
     let mut bytes = Vec::new();
     file.take(sdefile::MAX_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("couldn't be read ({})", e.kind()))?;
-    sdefile::parse(&bytes).map_err(|e| {
-        if e.contains("name a server") {
-            "this .sde file isn't one RustGIS can read; enter the server and database instead".into()
-        } else {
-            e
-        }
+    sdefile::parse(&bytes).map_err(|e| match e {
+        sdefile::SdeError::NoServer => "this .sde file isn't one RustGIS can read; enter the server and database instead".into(),
+        e => e.to_string(),
     })
 }
 

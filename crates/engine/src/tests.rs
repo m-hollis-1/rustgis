@@ -27435,6 +27435,25 @@ mod sde_file_connections {
     }
 
     #[test]
+    fn importing_the_same_sde_file_twice_numbers_the_default_name() {
+        let (dir, path) = fixture("twice.sde", ASCII);
+        let (dir2, id_like) = fixture("c1.sde", ASCII);
+        let mut s = Session::new(Project::default());
+        let p = json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy()});
+        let first = s.run("connection.new", &p);
+        let second = s.run("connection.new", &p);
+        let id_stem = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": id_like.to_string_lossy()}));
+        let explicit = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy(), "name": "twice"}));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+        assert_eq!(first.unwrap()["name"], "twice");
+        assert_eq!(second.unwrap()["name"], "twice (2)");
+        assert_eq!(id_stem.unwrap()["name"], "c1 (2)");
+        assert!(explicit.unwrap_err().contains("exists"));
+        assert_eq!(s.connections.connections.len(), 3);
+    }
+
+    #[test]
     fn an_sde_file_with_os_authentication_needs_no_password() {
         let bytes: &[u8] = b"SERVER=gis-db;DBCLIENT=sqlserver;DATABASE=utility;AUTHENTICATION_MODE=OSA;";
         let (dir, path) = fixture("os.sde", bytes);

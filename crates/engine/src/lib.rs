@@ -7,6 +7,7 @@
 
 pub mod cmd;
 pub mod connections;
+pub mod geodatabase;
 pub mod geometry_calc;
 pub mod model;
 #[cfg(not(target_arch = "wasm32"))]

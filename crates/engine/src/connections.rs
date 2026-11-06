@@ -198,6 +198,23 @@ impl Connections {
         }
     }
 
+    /// Every saved SQL Server connection that names the same server and database as an Esri
+    /// enterprise geodatabase a layer was imported from, in list order (see
+    /// [`crate::geodatabase::matches`]).
+    pub fn matching_geodatabase(&self, g: &rustgis_map::source::GeodatabaseOrigin) -> Vec<&Connection> {
+        self.geodatabase_connections(g, crate::geodatabase::Match::Exact)
+    }
+
+    /// Saved SQL Server connections to the same database name on another host, in list order:
+    /// worth offering when no connection is an exact match.
+    pub fn near_geodatabase(&self, g: &rustgis_map::source::GeodatabaseOrigin) -> Vec<&Connection> {
+        self.geodatabase_connections(g, crate::geodatabase::Match::Near)
+    }
+
+    fn geodatabase_connections(&self, g: &rustgis_map::source::GeodatabaseOrigin, wanted: crate::geodatabase::Match) -> Vec<&Connection> {
+        self.connections.iter().filter(|c| c.kind == "sqlserver" && crate::geodatabase::matches(g, &c.address) == wanted).collect()
+    }
+
     /// Every saved connection of a kind with this driver address (see [`database_key`]).
     pub fn matching_key(&self, kind: &str, key: &str) -> Vec<&Connection> {
         self.connections

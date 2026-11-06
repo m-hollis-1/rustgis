@@ -9,7 +9,7 @@ use serde_json::json;
 
 pub fn commands() -> Vec<C> {
     vec![C::new("layer.repairGeodatabase", "Repair Geodatabase Layer", "Data › Data Source", repair_geodatabase).params(
-        r#"{"layer"?: name|id (default: the active layer) | "all"?: true (every broken layer read from the connection's geodatabase), "connection": "the saved SQL Server connection's id or name to read the layer's table through; sign in with connection.login first when it has no saved password"} → "repaired" (the names of the layers fixed, each reading the table of the same name through the connection, at the Default version, keeping its style) and "skipped" (each with its "layer" name and the "why" it wasn't fixed); a named layer that can't be repaired is an error, and so is "all" when none could be (the error says why for each)"#,
+        r#"{"layer"?: name|id (default: the active layer) | "all"?: true (every broken layer read from the connection's geodatabase), "connection": "the saved SQL Server connection's id or name to read the layer's table through; sign in with connection.login first when it has a user and no saved password; a Windows sign-in connection (no user) connects as you"} → "repaired" (the names of the layers fixed, each reading the table of the same name through the connection, at the Default version, keeping its style) and "skipped" (each with its "layer" name and the "why" it wasn't fixed); a named layer that can't be repaired is an error, and so is "all" when none could be (the error says why for each)"#,
     )]
 }
 
@@ -61,8 +61,9 @@ fn repair_geodatabase(s: &mut Session, p: &Value) -> CmdResult {
         }
         vec![id]
     };
-    // A connection with no password to sign in with fails the same for every layer: said once.
-    if super::connections::credential(s, &c)?.is_none() {
+    // A connection with no password to sign in with fails the same for every layer: said once. One
+    // whose address names no user signs in as the Windows user (the user picked it), with none.
+    if crate::geodatabase::has_user(&c.address) && super::connections::credential(s, &c)?.is_none() {
         return Err(format!("{} has no password to sign in with: sign in to it first (connection.login)", c.name));
     }
     let (mut repaired, mut skipped) = (Vec::new(), Vec::new());
@@ -103,12 +104,12 @@ fn repair_geodatabase(s: &mut Session, p: &Value) -> CmdResult {
 /// fits the layer's style, labels and time slider.
 #[cfg(not(target_arch = "wasm32"))]
 fn repair_layer(s: &mut Session, c: &crate::connections::Connection, id: u32) -> Result<(), Fail> {
-    use super::geodatabase_open::AddError;
+    use super::geodatabase_open::{AddError, Windows};
     let g = s.map().layer(id).and_then(|l| l.source.as_ref()).filter(|src| src.is_broken()).and_then(|src| src.geodatabase.clone());
     let g = g.ok_or_else(|| Fail::Why("isn't an enterprise geodatabase layer".into()))?;
     let (had_session, was_rejected) = (s.database_logins.session_password(&c.id).is_some(), s.database_logins.is_rejected(&c.id));
     let fit = |old: &rustgis_map::Layer, info: &rustgis_data::source::SourceInfo| super::repair::fits(old, info, &c.name);
-    match super::geodatabase_open::open_into(s, id, c, &g, Some(&fit)) {
+    match super::geodatabase_open::open_into(s, id, c, &g, Some(&fit), Windows::SignIn) {
         Ok(()) => {
             // A query kept unchecked while the layer had no fields must fit the new table's.
             super::retry::check_query(s, id);

@@ -209,7 +209,7 @@ fn retry_geodatabase(
     if let Some(named) = dead.get(&c.id) {
         return Err(format!("not tried again after {} failed", named.chars().take(60).collect::<String>()));
     }
-    match super::geodatabase_open::open_into(s, id, &c, g, None) {
+    match super::geodatabase_open::open_into(s, id, &c, g, None, super::geodatabase_open::Windows::Refuse) {
         Ok(()) => Ok(Outcome::Opened),
         Err(AddError::Connect(e)) => {
             // Not tried (and waited for) again for the next layer of this run.

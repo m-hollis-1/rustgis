@@ -6,6 +6,14 @@
 use rustgis_data::source::{msconn, pgconn};
 use rustgis_map::source::GeodatabaseOrigin;
 
+/// Whether a `mssql://` address names a user (a SQL login, or a `DOMAIN\user` one): without one it
+/// signs in as the Windows user, with no password, which the import and Retry never do unasked.
+pub fn has_user(address: &str) -> bool {
+    let Some((public, _)) = msconn::split_password(address) else { return false };
+    let Some((_, rest)) = public.split_once("://") else { return false };
+    pgconn::userinfo_end(rest).is_some_and(|at| at > 0)
+}
+
 /// SQL Server's port when neither the address nor the server text names a port or an instance.
 const DEFAULT_PORT: u16 = 1433;
 

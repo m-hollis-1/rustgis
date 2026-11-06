@@ -17506,8 +17506,8 @@ fn sqlserver_live_end_to_end() {
 }
 
 /// `RUSTGIS_TEST_SDE` names a live SQL Server enterprise geodatabase: its listing has feature
-/// classes, a class opens as a layer named by its alias, and a registered table opens as a
-/// standalone table.
+/// classes, a class opens as a layer named as the tree shows it (its alias, else its short name),
+/// and a registered table opens as a standalone table.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 #[ignore]
@@ -17518,9 +17518,9 @@ fn sde_live_classes_and_tables() {
     let items = listed["items"].as_array().expect("a geodatabase lists items");
     let classes: Vec<&Value> = items.iter().filter(|i| i["item"] == "featureClass" && i["column"].is_string()).collect();
     assert!(!classes.is_empty(), "{listed}");
-    // A class with an alias is named by it; one without, by its label.
+    // A class is named as the tree shows it: by its alias, else by its short name.
     let class = classes.iter().find(|c| c["alias"].is_string()).unwrap_or(&classes[0]);
-    let expected = if class["alias"].is_string() { class["display"].as_str() } else { class["label"].as_str() };
+    let expected = class["display"].as_str();
     let label = class["label"].as_str().unwrap();
     let r = s.run("layer.addDatabase", &json!({"database": address, "layer": label})).unwrap();
     let id = r["layer"].as_u64().unwrap() as u32;
@@ -27727,7 +27727,7 @@ mod sde_file_connections {
         let mut s = Session::new(Project::default());
         let err = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy()})).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(err, "pg.sde: a PostgreSQL geodatabase; RustGIS reads SQL Server geodatabases");
+        assert_eq!(err, "pg.sde: a geodatabase on PostgreSQL; RustGIS reads SQL Server geodatabases");
         assert!(s.connections.connections.is_empty());
     }
 
@@ -27785,6 +27785,27 @@ fn repairing_needs_a_connection_and_a_geodatabase_layer() {
     let e = s.run("layer.repairGeodatabase", &json!({"layer": "Mains", "connection": "Utility Editor"})).unwrap_err();
     assert!(e.contains("password"), "{e}");
     // Nothing changed.
+    assert!(s.map().layer_by_name("Mains").and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken() && src.geodatabase.is_some()));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn repairing_through_a_windows_sign_in_connects_as_the_user() {
+    use crate::connections::Connection;
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &sde_network_mapx(), None);
+    assert_eq!((added.layers, added.broken), (3, 3), "{notes:?}");
+    // No user in the address: it signs in as the Windows user, with no password to ask for.
+    s.connections.connections.push(Connection {
+        id: "win".into(),
+        name: "Utility (Windows)".into(),
+        kind: "sqlserver".into(),
+        address: "mssql://127.0.0.1:9/utility".into(),
+        ..Connection::default()
+    });
+    let e = s.run("layer.repairGeodatabase", &json!({"layer": "Mains", "connection": "win"})).unwrap_err();
+    // The server was tried (and is unreachable): not refused for a missing password.
+    assert!(e.starts_with("Mains: ") && !e.contains("password"), "{e}");
     assert!(s.map().layer_by_name("Mains").and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken() && src.geodatabase.is_some()));
 }
 

@@ -22,17 +22,7 @@ pub(crate) fn quiet_connection(s: &Session, g: &GeodatabaseOrigin) -> Option<Con
     // Two exact matches are two ways in: which one is the user's choice, even if only one would
     // open quietly.
     let [c] = exact.as_slice() else { return None };
-    (c.remembered && !s.database_logins.is_rejected(&c.id) && has_user(&c.address)).then(|| (*c).clone())
-}
-
-/// Whether a `mssql://` address names a user (a SQL login, or a `DOMAIN\user` one): without one it
-/// signs in as the Windows user, which the import never does unasked.
-#[cfg(not(target_arch = "wasm32"))]
-fn has_user(address: &str) -> bool {
-    use rustgis_data::source::{msconn, pgconn};
-    let Some((public, _)) = msconn::split_password(address) else { return false };
-    let Some((_, rest)) = public.split_once("://") else { return false };
-    pgconn::userinfo_end(rest).is_some_and(|at| at > 0)
+    (c.remembered && !s.database_logins.is_rejected(&c.id) && crate::geodatabase::has_user(&c.address)).then(|| (*c).clone())
 }
 
 /// The `layer` name `layer.addDatabase` gets for a Pro dataset: a 3-part name loses its first part
@@ -64,40 +54,63 @@ impl AddError {
     }
 }
 
+/// How `add_through` may sign in to a connection whose address names no user.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Windows {
+    /// Never as the Windows user: such a connection has no password, so it is an error (the
+    /// import and Retry, which never sign in unasked).
+    Refuse,
+    /// As the Windows user, with no password: the user picked the connection (Repair Source…).
+    SignIn,
+}
+
 /// Opens `layer.addDatabase {database: c.address, layer: table_name(g.table), name}` after
 /// activating the connection's credential and logging in, as a new layer: the caller moves or
 /// keeps it. A connection with no password it can use without asking is an error (the import
-/// never asks). A password the server refuses is handled as Data Sources handles it (a saved one
+/// never asks), except that a connection with no user signs in as the Windows user when `windows`
+/// allows it. A password the server refuses is handled as Data Sources handles it (a saved one
 /// rejected, a session one dropped, neither left active), so it isn't tried again.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn add_through(s: &mut Session, c: &Connection, g: &GeodatabaseOrigin, name: &str) -> Result<Value, AddError> {
+pub(super) fn add_through(s: &mut Session, c: &Connection, g: &GeodatabaseOrigin, name: &str, windows: Windows) -> Result<Value, AddError> {
     use rustgis_data::DataError;
     use rustgis_data::source::{duckdb, sqlserver};
 
     let duckdb::Database::Sqlserver(key) = duckdb::Database::parse(&c.address) else {
         return Err(AddError::Connect("not a SQL Server connection".into()));
     };
-    let Some((password, saved)) = super::connections::credential(s, c).map_err(AddError::Connect)? else {
-        return Err(AddError::Connect("the connection has no usable password".into()));
-    };
-    let secret = password.expose();
-    super::connections::activate(s, c, secret);
-    s.database_logins.select("sqlserver", &key, &c.id);
-    // Logged in first, so a refusal is told from any other failure; the layer then reads through
-    // the live connection this leaves.
-    if let Err(e) = sqlserver::connect(&key, true) {
-        let e = e.redact_secret(secret);
-        if matches!(e, DataError::Login(_)) {
-            if saved {
-                s.database_logins.reject(&c.id);
-            } else {
-                s.database_logins.reject_session_password(c);
-            }
-            duckdb::forget_connection_password(&c.id);
-            s.database_logins.drop_activation(&key);
+    let password = if windows == Windows::SignIn && !crate::geodatabase::has_user(&c.address) {
+        None
+    } else {
+        match super::connections::credential(s, c).map_err(AddError::Connect)? {
+            Some(found) => Some(found),
+            None => return Err(AddError::Connect("the connection has no usable password".into())),
         }
-        return Err(AddError::Connect(e.to_string()));
+    };
+    let secret = password.as_ref().map_or("", |(p, _)| p.expose());
+    let saved = password.as_ref().is_some_and(|(_, saved)| *saved);
+    if password.is_some() {
+        super::connections::activate(s, c, secret);
     }
+    s.database_logins.select("sqlserver", &key, &c.id);
+    // Logged in first, so a refusal is told from any other failure. The connection is held until
+    // the layer is added, so `layer.addDatabase` reads through it rather than logging in again.
+    let _live = match sqlserver::connect(&key, true) {
+        Ok(conn) => conn,
+        Err(e) => {
+            let e = e.redact_secret(secret);
+            if password.is_some() && matches!(e, DataError::Login(_)) {
+                if saved {
+                    s.database_logins.reject(&c.id);
+                } else {
+                    s.database_logins.reject_session_password(c);
+                }
+                duckdb::forget_connection_password(&c.id);
+                s.database_logins.drop_activation(&key);
+            }
+            return Err(AddError::Connect(e.to_string()));
+        }
+    };
     let params = json!({"database": c.address, "layer": table_name(&g.table), "name": name});
     s.run_part("layer.addDatabase", &params).map_err(|e| AddError::Add(if secret.is_empty() { e } else { e.replace(secret, "***") }))
 }
@@ -112,13 +125,20 @@ pub(super) type Fit<'a> = &'a dyn Fn(&rustgis_map::Layer, &rustgis_data::source:
 /// error. A table of mixed geometry types comes as a layer per type: the first takes the layer's
 /// place. The view and the active layer are as they were, whatever the outcome.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn open_into(s: &mut Session, id: u32, c: &Connection, g: &GeodatabaseOrigin, fit: Option<Fit>) -> Result<(), AddError> {
+pub(super) fn open_into(
+    s: &mut Session,
+    id: u32,
+    c: &Connection,
+    g: &GeodatabaseOrigin,
+    fit: Option<Fit>,
+    windows: Windows,
+) -> Result<(), AddError> {
     let name = s.map().layer(id).map(|l| l.name.clone()).ok_or_else(|| AddError::Add("the layer no longer exists".into()))?;
     // Adding a layer goes to it and makes it active. A registered table that came back stays out
     // of the project's.
     let (camera, active) = (s.map().camera, s.active_layer);
     let tables: Vec<_> = s.project.tables.iter().map(|t| t.id).collect();
-    let done = match add_through(s, c, g, &name) {
+    let done = match add_through(s, c, g, &name, windows) {
         Ok(r) => take_in(s, id, &name, g, &r, &tables, fit).map_err(AddError::Add),
         Err(e) => Err(e),
     };

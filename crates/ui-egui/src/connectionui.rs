@@ -40,6 +40,9 @@ pub struct State {
     /// A project's S3 source waiting for this connection (the chooser's), as (source address,
     /// connection id): its choice is made again once that connection has logged in.
     pub resolving: Option<(String, String)>,
+    /// Opened from Repair Source… for this layer: once the connection is saved and logged in, the
+    /// layer is repaired through it.
+    pub continue_repair: Option<u32>,
 }
 
 /// The chooser of the saved S3 connection that reads a project's S3 sources (Data Sources ›
@@ -599,6 +602,9 @@ fn save(app: &mut RustGisApp) -> Result<(), String> {
         }
     }
     resolve_waiting(app, &id);
+    if let Some(layer) = app.ui.connection.continue_repair.take() {
+        crate::repairbroken::continue_repair(app, layer, id);
+    }
     Ok(())
 }
 

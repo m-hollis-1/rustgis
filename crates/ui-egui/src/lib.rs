@@ -4323,6 +4323,7 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "data.similar",
     "layer.geocode",
     "layer.repairSource",
+    "layer.repairGeodatabase",
     "report.new",
     "report.open",
     "share.webLayer",

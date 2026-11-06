@@ -465,6 +465,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     let layer = f.layer;
     let name = f.name.clone();
+    // What Add connection… fills the form with: the layer's server and database.
+    let (server, database) = (f.diagnosis.server.clone(), f.diagnosis.database.clone());
     app.dialogs.broken = Some(f);
     match action {
         None => {}
@@ -494,11 +496,13 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             let message = crate::i18n::fmt("Repairing {name} through {connection}…", &[("name", &name), ("connection", &shown)]);
             crate::busy::queue_short(app, message, move |app| repair_geodatabase(app, layer, &name, &connection));
         }
-        Some(Action::AddConnection) => match app.run("ui.connection", json!({"kind": "sqlserver"})) {
-            // Back here, repairing, once the connection is saved and logged in.
-            Ok(_) => app.ui.connection.continue_repair = Some(layer),
-            Err(e) => failed(app, layer, e),
-        },
+        Some(Action::AddConnection) => {
+            match app.run("ui.connection", json!({"kind": "sqlserver", "form": true, "server": server, "database": database})) {
+                // Back here, repairing, once the connection is saved and logged in.
+                Ok(_) => app.ui.connection.continue_repair = Some(layer),
+                Err(e) => failed(app, layer, e),
+            }
+        }
         Some(Action::LogIn(connection)) => {
             if crate::connectionui::log_in(app, &connection) {
                 app.ui.connection.continue_repair = Some(layer);
@@ -827,6 +831,9 @@ mod tests {
         assert_eq!(h.state().dialogs.open, Some("newConnection"));
         assert_eq!(h.state().ui.connection.continue_repair, Some(id));
         assert_eq!(h.state().ui.connection.kind, "sqlserver");
+        // The geodatabase form, with the layer's database filled in.
+        assert!(h.state().ui.connection.form);
+        assert_eq!(h.state().ui.connection.database, "utility");
     }
 
     #[test]

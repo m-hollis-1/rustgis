@@ -2705,6 +2705,8 @@ pub(crate) const BROWSER_EXTENSIONS: &[&str] = &[
     "rgislyr",
     "rgislayout",
     "pagx",
+    // An ArcGIS Pro database connection, which opens the connection form.
+    "sde",
     // ArcGIS Pro projects, maps and layer files.
     "aprx",
     "mapx",

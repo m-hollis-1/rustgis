@@ -1442,6 +1442,22 @@ impl RustGisApp {
         r
     }
 
+    /// A `.sde` file (an ArcGIS Pro database connection): the SQL Server connection form,
+    /// filled from it. Database connections are for the desktop app.
+    pub(crate) fn open_sde_file(&mut self, path: &str) -> Result<Value, String> {
+        if cfg!(target_arch = "wasm32") {
+            return self.sde_unavailable();
+        }
+        self.run("ui.connection", json!({"kind": "sqlserver", "form": true, "sdeFile": path}))
+    }
+
+    /// The notice a `.sde` file gets in the browser.
+    fn sde_unavailable(&mut self) -> Result<Value, String> {
+        let error = tl!("Database connections are used by the desktop app").to_string();
+        self.session.notify(error.clone(), true);
+        Err(error)
+    }
+
     /// A file dropped on the desktop window, opened as its kind says.
     fn open_dropped(&mut self, p: &str) {
         let lower = p.to_ascii_lowercase();
@@ -1456,6 +1472,11 @@ impl RustGisApp {
         // failure is told by the command.
         if lower.ends_with(".pagx") || lower.ends_with(".rgislayout") {
             let _ = self.import_layout_file(p);
+            return;
+        }
+        // A database connection file opens the connection form.
+        if lower.ends_with(".sde") {
+            let _ = self.open_sde_file(p);
             return;
         }
         // An ArcGIS Pro project asks which maps and layouts to import; a map or layer
@@ -1476,6 +1497,11 @@ impl RustGisApp {
         if lower.ends_with(".rgplugin") {
             pluginsui::received(self, bytes.to_vec(), None);
             return Ok(Value::Null);
+        }
+        // A database connection file: the browser has no database connections, and no path to
+        // read the file from.
+        if lower.ends_with(".sde") && cfg!(target_arch = "wasm32") {
+            return self.sde_unavailable();
         }
         // An ArcGIS Pro project asks which maps and layouts to import; a map or layer file comes
         // in at once.
@@ -2727,6 +2753,17 @@ impl RustGisApp {
                     connectionui::open_edit(self, id)?;
                 } else {
                     connectionui::open_new(self, p.get("kind").and_then(Value::as_str).unwrap_or("service"))?;
+                    // An enterprise geodatabase: the form (server, sign-in, database), filled with
+                    // what is known, or from a .sde file (desktop) which makes the connection.
+                    if p.get("form").and_then(Value::as_bool) == Some(true) && self.ui.connection.kind == "sqlserver" {
+                        let text = |key: &str| p.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+                        connectionui::use_form(&mut self.ui.connection, text("server"), text("database"));
+                        if let Some(file) = text("sdeFile")
+                            && let Err(e) = connectionui::fill_from_sde(self, file)
+                        {
+                            self.dialogs.error = Some(e);
+                        }
+                    }
                 }
                 if p.get("test").and_then(Value::as_bool) == Some(true) {
                     connectionui::start_test(self);

@@ -49,6 +49,10 @@ pub fn lists_layers(path: &str) -> bool {
 pub fn add_file(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
     // Opening a project replaces this one: asked about first when it has unsaved changes. Only
     // the interface comes here (drops, Add Data, the Browser pane, `ui.addFile`).
+    // A database connection file opens the connection form, not data.
+    if path.to_ascii_lowercase().ends_with(".sde") {
+        return app.open_sde_file(path);
+    }
     let command = rustgis_engine::project::open_command(path);
     if command != "layer.addData" {
         return app.run_by_user(command, json!({"path": path}));

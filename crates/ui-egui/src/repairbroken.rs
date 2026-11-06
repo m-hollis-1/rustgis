@@ -68,6 +68,8 @@ struct Diagnosis {
 /// What the dialog is asking about, after the layer was repaired.
 enum Ask {
     /// The file was found in another folder; the folder's other broken layers can be fixed too.
+    /// Only Browse for the file… builds it, and that's desktop-only.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Folder { from: String, to: String, count: usize },
     /// The layer was repaired through a connection; the geodatabase's other broken layers can be
     /// too.

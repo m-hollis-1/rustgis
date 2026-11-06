@@ -26371,6 +26371,10 @@ fn a_pro_map_adds_its_groups_layers_and_broken_layers() {
     for part in ["gis-db", "utility", "utility.dbo.mains"] {
         assert!(origin.contains(part), "{origin}");
     }
+    // The structured origin is kept (with no login), for a connection to open it later.
+    let g = src.geodatabase.as_ref().unwrap();
+    assert_eq!((g.server.as_str(), g.database.as_str(), g.table.as_str()), ("gis-db", "utility", "utility.dbo.mains"), "{g:?}");
+    assert!(!format!("{g:?}").contains("editor") && !format!("{g:?}").contains("swordfish"), "{g:?}");
     for secret in ["PASSWORD", "USER", "swordfish", "editor", "00ff"] {
         assert!(!origin.contains(secret) && !src.why_broken().unwrap_or_default().contains(secret), "{origin}");
         assert!(!notes.iter().any(|n| n.contains(secret)), "{notes:?}");

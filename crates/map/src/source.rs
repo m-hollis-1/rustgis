@@ -120,6 +120,10 @@ pub struct SourceLayer {
     /// For a broken layer read from a web service: the service, added again by Retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceOrigin>,
+    /// For a broken layer read from an enterprise geodatabase: its server, database, table and
+    /// version, for the engine to open through a saved connection. Never holds a login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geodatabase: Option<GeodatabaseOrigin>,
     /// For a broken layer: why the importer couldn't open it, shown until the source opens. (Kept
     /// apart from `error`, which isn't saved: an error read back would stop the source opening
     /// again when the project loads.)
@@ -367,6 +371,37 @@ pub struct MysqlOrigin {
     /// The coordinate system given for a geometry whose SRID is 0.
     #[serde(default)]
     pub crs: Option<String>,
+}
+
+/// A table of an Esri enterprise geodatabase (SDE) that ArcGIS Pro read a layer from: what the
+/// engine needs to find a saved connection to it. Never holds a user or a password.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeodatabaseOrigin {
+    /// The database system: `sqlserver`, `postgresql`, `oracle`, or empty when the connection doesn't say.
+    #[serde(default)]
+    pub platform: String,
+    /// The server (or instance) the geodatabase is on.
+    #[serde(default)]
+    pub server: String,
+    /// The database on it.
+    #[serde(default)]
+    pub database: String,
+    /// The table, as the connection names it ("utility.sde.Mains").
+    #[serde(default)]
+    pub table: String,
+    /// The geodatabase version the layer reads (none: the default one).
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl GeodatabaseOrigin {
+    /// Whether the layer reads the default version: none named, or one called `DEFAULT` (`sde.DEFAULT`),
+    /// in any case.
+    pub fn is_default_version(&self) -> bool {
+        let Some(v) = self.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) else { return true };
+        let v = v.to_ascii_uppercase();
+        v == "DEFAULT" || v.ends_with(".DEFAULT")
+    }
 }
 
 /// A SQL Server table a layer reads live.
@@ -726,6 +761,7 @@ impl SourceLayer {
         self.window = None;
         self.error = None;
         self.origin = None;
+        self.geodatabase = None;
         self.reason = None;
     }
 

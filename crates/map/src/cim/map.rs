@@ -27,6 +27,7 @@ use crate::effects::Blend;
 use crate::fills::FillLayer;
 use crate::qgis::symbol::{hidden as hidden_symbol, stacked};
 use crate::qgis::{QGIS_SCALE, Style};
+use crate::source::GeodatabaseOrigin;
 use crate::symbology::{ClassMethod, LineStroke, Marker, OTHER_VALUES, Renderer, Symbol};
 
 /// The most layers read from one map, and the most standalone tables.
@@ -111,6 +112,9 @@ pub enum LayerSource {
     /// feature dataset's too: `table` is the feature class), a raster, a CAD drawing's layer, KML.
     /// A relative `path` is as Pro wrote it, for the caller to resolve.
     File { path: String, table: Option<String> },
+    /// A table of an enterprise geodatabase (SDE): the engine opens it through a saved connection
+    /// that matches, else the layer comes in broken, with its `origin`. Never holds a login.
+    EnterpriseGeodatabase(GeodatabaseOrigin),
     /// A layer (`layer`, its id) of an ArcGIS feature service at `url`.
     FeatureService { url: String, layer: String },
     /// An ArcGIS map service (…/MapServer) or image service (…/ImageServer).
@@ -648,8 +652,9 @@ fn workspace(c: &Value, what: &str, report: &mut Report) -> (LayerSource, String
         return (LayerSource::FeatureService { url, layer: dataset.to_string() }, origin);
     }
     if factory.eq_ignore_ascii_case("SDE") {
-        report.skipped(what, "data in SDE workspaces, which RustGIS can't open");
-        return (LayerSource::Unopenable, format!("{}, table {dataset}", sde_place(&conn)));
+        // (Whether it opens is for the engine to say, and to note.)
+        let origin = format!("{}, table {dataset}", sde_place(&conn));
+        return (LayerSource::EnterpriseGeodatabase(geodatabase_origin(&conn, dataset)), origin);
     }
     // A CAD drawing is the feature dataset; its layer is the dataset (Pro may write it as
     // `drawing.dwg:Polyline`).
@@ -705,6 +710,34 @@ fn sde_place(conn: &str) -> String {
         place.push_str(&format!(", database {db}"));
     }
     place
+}
+
+/// An SDE connection's facts, from its scrubbed connection string (which holds no user or password).
+fn geodatabase_origin(conn: &str, dataset: &str) -> GeodatabaseOrigin {
+    // `INSTANCE=sde:<platform>:<host>` (the host may hold a `:`, a port).
+    let instance = connection_value(conn, "INSTANCE");
+    let prefixed = instance.as_deref().filter(|i| i.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("sde:"))).and_then(|i| i.get(4..));
+    let (in_platform, in_host) = match prefixed.and_then(|r| r.split_once(':')) {
+        Some((p, h)) => (Some(p.trim().to_string()), Some(h.trim().to_string())),
+        None => (None, None),
+    };
+    let mut platform = connection_value(conn, "DBCLIENT").or(in_platform).unwrap_or_default().to_ascii_lowercase();
+    // (Oracle's instances name its release: `oracle11g`.)
+    if platform.starts_with("oracle") {
+        platform = "oracle".to_string();
+    }
+    let server = connection_value(conn, "SERVER")
+        .or_else(|| connection_value(conn, "DB_CONNECTION_PROPERTIES"))
+        .or(in_host.filter(|h| !h.is_empty()))
+        .or(instance)
+        .unwrap_or_default();
+    GeodatabaseOrigin {
+        platform,
+        server,
+        database: connection_value(conn, "DATABASE").unwrap_or_default(),
+        table: dataset.to_string(),
+        version: connection_value(conn, "VERSION"),
+    }
 }
 
 /// The value of `key` (in any case) in a `KEY=VALUE;KEY=VALUE` connection string.

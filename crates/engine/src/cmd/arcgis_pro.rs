@@ -601,7 +601,12 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
             (s.run_part("map.addTiles", &json!({"url": style_url(url), "kind": "style", "name": name, "overlay": true})), Origin::default())
         }
         // (The reader said why, in one skipped note.)
-        LayerSource::Unopenable | LayerSource::Missing(_) => {
+        LayerSource::Unopenable | LayerSource::EnterpriseGeodatabase(_) | LayerSource::Missing(_) => {
+            // An SDE layer is opened through a connection in a later step; for now it says so as
+            // the reader once did, so the notes and the notice stay as they were.
+            if matches!(l.source, LayerSource::EnterpriseGeodatabase(_)) {
+                report.skipped(name, "data in SDE workspaces, which RustGIS can't open");
+            }
             // The reader's note came before anything this import notes; with nothing dropped
             // yet it was kept. (Once the report is full, it may not have been: then it isn't
             // taken off, so the notice never takes off more than was noted.)
@@ -746,7 +751,10 @@ fn unapplied_query(l: &LayerImport, report: &mut Report) {
 /// expansion and definition query (unchecked: there are no fields yet; Retry and Repair check it).
 fn broken_layer(s: &mut Session, l: &LayerImport, from: Origin, error: String, a: &mut Adding) -> Placed {
     let origin = if l.origin.trim().is_empty() { "an ArcGIS Pro layer whose source isn't known".to_string() } else { l.origin.clone() };
-    let src = SourceLayer::broken(origin, from.path, from.table, from.service, error);
+    let mut src = SourceLayer::broken(origin, from.path, from.table, from.service, error);
+    if let LayerSource::EnterpriseGeodatabase(g) = &l.source {
+        src.geodatabase = Some(g.clone());
+    }
     let id = s.map_mut().add_streamed(l.name.clone(), src);
     // Active, as a layer just added is (the layer commands that follow work on it).
     s.active_layer = Some(id);
@@ -804,6 +812,8 @@ fn add_tables(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Re
                 }
             }
             // (The reader said why it can't be opened.)
+            // (An SDE table is opened through a connection in a later step; for now it is noted.)
+            LayerSource::EnterpriseGeodatabase(_) => report.skipped(&t.name, "data in SDE workspaces, which RustGIS can't open"),
             LayerSource::Unopenable | LayerSource::Missing(_) => {}
             _ => report.skipped(&t.name, format!("a table on a service ({}), which RustGIS doesn't add", shown(&t.origin))),
         }

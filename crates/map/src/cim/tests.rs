@@ -4,6 +4,7 @@ use serde_json::json;
 
 use super::*;
 use crate::Rgba;
+use crate::source::GeodatabaseOrigin;
 
 #[test]
 fn a_layout_document_resolves_its_embedded_maps_layers_and_binaries() {
@@ -2337,8 +2338,19 @@ fn file_paths_follow_the_connections_folder_and_factory() {
     );
     assert_eq!(nth(&map, 1).origin, r"FileGDB Parcels in C:\data\parcels.gdb");
     let n = notes(&report);
-    assert!(n.iter().any(|t| t.starts_with("D: ") && t.contains("SDE")), "{n:?}");
+    // (An SDE layer keeps its place for the engine to decide: the reader says nothing of it.)
+    assert!(!n.iter().any(|t| t.starts_with("D: ")), "{n:?}");
     assert!(n.iter().any(|t| t.starts_with("E: ")), "{n:?}");
+    let sde = flat(&map).into_iter().nth(3).map(|l| l.source.clone());
+    assert_eq!(
+        sde,
+        Some(LayerSource::EnterpriseGeodatabase(GeodatabaseOrigin {
+            server: "x".into(),
+            database: "y".into(),
+            table: "d".into(),
+            ..GeodatabaseOrigin::default()
+        }))
+    );
 }
 
 fn unique_class(label: &str, values: &[&str], symbol: serde_json::Value) -> serde_json::Value {
@@ -4163,9 +4175,22 @@ fn every_connection_kind_has_a_source_and_an_origin() {
             LayerKind::Tiles,
         ),
         (
-            fl("Sde", standard_connection("SDE", "SERVER=s;INSTANCE=sde:sqlserver:s;DATABASE=d;VERSION=sde.DEFAULT", "d.dbo.parcels")),
-            Unopenable,
-            "an SDE geodatabase on s, database d, table d.dbo.parcels",
+            fl(
+                "Sde",
+                standard_connection(
+                    "SDE",
+                    "ENCRYPTED_PASSWORD=00ff;SERVER=gis-db;INSTANCE=sde:sqlserver:gis-db;DBCLIENT=sqlserver;DATABASE=utility;USER=editor;VERSION=sde.DEFAULT",
+                    "utility.sde.Mains",
+                ),
+            ),
+            EnterpriseGeodatabase(GeodatabaseOrigin {
+                platform: "sqlserver".into(),
+                server: "gis-db".into(),
+                database: "utility".into(),
+                table: "utility.sde.Mains".into(),
+                version: Some("sde.DEFAULT".into()),
+            }),
+            "an SDE geodatabase on gis-db, database utility, table utility.sde.Mains",
             LayerKind::Feature,
         ),
         (
@@ -4201,10 +4226,14 @@ fn every_connection_kind_has_a_source_and_an_origin() {
     assert_eq!(got.len(), cases.len());
     for (l, (_, source, origin, kind)) in got.into_iter().zip(&cases) {
         assert_eq!((&l.source, l.origin.as_str(), l.kind), (source, *origin, *kind), "{}", l.name);
+        // (Nothing the reader keeps says anything of a login.)
+        let debug = format!("{:?}", l.source);
+        for leak in ["editor", "00ff", "PASSWORD"] {
+            assert!(!debug.contains(leak), "{leak} in {debug}");
+        }
     }
     let n = notes(&report);
     for expected in [
-        "Sde: data in SDE workspaces, which RustGIS can't open",
         "Excel: data in Excel workspaces, which RustGIS can't open",
         "Sql: SQL query layers, which RustGIS can't open",
         "Joined: a join to owners, drawn without it",
@@ -4213,8 +4242,42 @@ fn every_connection_kind_has_a_source_and_an_origin() {
     ] {
         assert!(n.iter().any(|t| t == expected), "{expected}\n{n:?}");
     }
-    // Each of the others opens as it is, without a word.
-    assert_eq!(n.len(), 6, "{n:?}");
+    // Each of the others opens as it is, without a word (an SDE layer's too: the engine says).
+    assert_eq!(n.len(), 5, "{n:?}");
+}
+
+#[test]
+fn an_sde_connection_without_dbclient_takes_the_instance_platform() {
+    let layer = |connection: &str| feature_layer("Sde", standard_connection("SDE", connection, "d.dbo.t"), json!({}));
+    let origin = |connection: &str| {
+        let (map, _) = read_listed(&[layer(connection)]);
+        match flat(&map).first().map(|l| l.source.clone()) {
+            Some(LayerSource::EnterpriseGeodatabase(o)) => o,
+            other => panic!("{other:?}"),
+        }
+    };
+    let o = origin("INSTANCE=sde:postgresql:pg;DATABASE=d");
+    assert_eq!((o.platform.as_str(), o.server.as_str(), o.database.as_str()), ("postgresql", "pg", "d"));
+    assert_eq!((o.table.as_str(), o.version.clone()), ("d.dbo.t", None));
+    assert!(o.is_default_version());
+    // DBCLIENT wins (in lower case), SERVER wins over the instance, and nothing named is still a place.
+    let o = origin("SERVER=gis-db;INSTANCE=sde:oracle:other;DBCLIENT=SQLServer;VERSION=editor.Plan");
+    assert_eq!((o.platform.as_str(), o.server.as_str(), o.version.as_deref()), ("sqlserver", "gis-db", Some("editor.Plan")));
+    assert!(!o.is_default_version());
+    let o = origin("DB_CONNECTION_PROPERTIES=host;INSTANCE=sde:oracle:other");
+    assert_eq!((o.platform.as_str(), o.server.as_str()), ("oracle", "host"));
+    assert_eq!(origin("OTHER=1"), GeodatabaseOrigin { table: "d.dbo.t".into(), ..GeodatabaseOrigin::default() });
+}
+
+#[test]
+fn the_default_version_is_none_empty_or_default_in_any_case() {
+    let version = |v: Option<&str>| GeodatabaseOrigin { version: v.map(str::to_string), ..GeodatabaseOrigin::default() };
+    for v in [None, Some(""), Some("DEFAULT"), Some("sde.DEFAULT"), Some("dbo.default"), Some("SDE.Default")] {
+        assert!(version(v).is_default_version(), "{v:?}");
+    }
+    for v in [Some("editor.Plan"), Some("sde.NOTDEFAULT"), Some("default.x")] {
+        assert!(!version(v).is_default_version(), "{v:?}");
+    }
 }
 
 #[test]
@@ -4252,6 +4315,14 @@ fn origins_never_carry_passwords() {
     let origin = &layers[0].origin;
     for part in ["s", "d", "d.dbo.parcels"] {
         assert!(origin.contains(part), "{origin}");
+    }
+    // The structured origin never holds a login either, in a field or in its Debug text.
+    assert!(matches!(layers[0].source, LayerSource::EnterpriseGeodatabase(_)));
+    for l in &layers {
+        let debug = format!("{:?}", l.source);
+        for leak in ["\"sa\"", "PASSWORD", "USER", hex, "pw", "tk123"] {
+            assert!(!debug.contains(leak), "{leak} in {debug}");
+        }
     }
     let n = notes(&report);
     for text in layers.iter().map(|l| &l.origin).chain(&n) {

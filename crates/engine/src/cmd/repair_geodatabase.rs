@@ -109,7 +109,11 @@ fn repair_layer(s: &mut Session, c: &crate::connections::Connection, id: u32) ->
     let (had_session, was_rejected) = (s.database_logins.session_password(&c.id).is_some(), s.database_logins.is_rejected(&c.id));
     let fit = |old: &rustgis_map::Layer, info: &rustgis_data::source::SourceInfo| super::repair::fits(old, info, &c.name);
     match super::geodatabase_open::open_into(s, id, c, &g, Some(&fit)) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // A query kept unchecked while the layer had no fields must fit the new table's.
+            super::retry::check_query(s, id);
+            Ok(())
+        }
         Err(AddError::Add(why)) => Err(Fail::Why(super::history::redacted_text(&why))),
         Err(AddError::Connect(why)) => {
             let why = super::history::redacted_text(&why);

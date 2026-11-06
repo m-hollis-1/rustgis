@@ -27893,8 +27893,13 @@ fn sde_live_repair() {
     let c = s.run("connection.new", &json!({"kind": "sqlserver", "address": public, "name": "live"})).unwrap();
     let cid = c["id"].as_str().unwrap().to_string();
     s.run("connection.login", &json!({"id": cid, "password": password})).unwrap();
+    // A query the broken layer kept unchecked, on a field the table doesn't have.
+    s.map_mut().layer_mut(id).unwrap().definition_query = Some("no_such_field_zz = 1".into());
+    let mark = s.notice_mark();
     let r = s.run("layer.repairGeodatabase", &json!({"layer": id, "connection": "live"})).unwrap();
     assert_eq!(r["repaired"], json!(["Live Layer"]), "{r}");
+    assert_eq!(s.map().layer(id).unwrap().definition_query, None, "the query that doesn't fit is cleared");
+    assert!(s.notices_since(mark).iter().any(|n| n.text.starts_with("Live Layer: its definition query")), "{:?}", s.notices_since(mark));
     let l = s.map().layer(id).unwrap();
     let src = l.source.as_ref().unwrap();
     assert!(src.is_open() && src.geodatabase.is_none(), "{:?}", src.error);

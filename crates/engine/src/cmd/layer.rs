@@ -46,7 +46,7 @@ pub fn commands() -> Vec<C> {
             r#"{"sql": "one DuckDB SELECT; DuckDB Spatial's ST_ functions, read_parquet('…'), web addresses", "name"?: string, "database"?: "a .duckdb file or a PostgreSQL connection (postgres:host=… dbname=…) whose tables the query names", "password"?: "the connection's, kept for this session only", "crs"?: "EPSG:… of a geometry that doesn't say", "stream"?: bool, "ran"?: "a result the app ran (the SQL pane)"}"#,
         ),
         C::new("layer.addDatabase", "Add Data From Database", "Home › Add › Add Data", add_database).params(
-            r#"{"database": "postgres:host=… dbname=… user=… (or a postgresql:// address; PostGIS tables are read live), a mysql://user@host:port/database address (MySQL or MariaDB, read live; mariadb:// too), an mssql://user@host:1433/database address (SQL Server or Azure SQL, read live; ?encrypt=strict|false, ?trust-server-certificate=true for a self-signed certificate, ?instance=NAME; on Windows DOMAIN\\user or no user signs in with Windows), or a .duckdb file", "password"?: "kept for this session only, never saved", "layer"?: "a table, as table or schema.table (table:column for one of several geometry columns; default: every table with a geometry column)", "crs"?: "EPSG:… of a geometry that doesn't say", "name"?: string, "stream"?: bool}"#,
+            r#"{"database": "postgres:host=… dbname=… user=… (or a postgresql:// address; PostGIS tables are read live), a mysql://user@host:port/database address (MySQL or MariaDB, read live; mariadb:// too), an mssql://user@host:1433/database address (SQL Server or Azure SQL, read live; ?encrypt=strict|false, ?trust-server-certificate=true for a self-signed certificate, ?instance=NAME; on Windows DOMAIN\\user or no user signs in with Windows), or a .duckdb file", "password"?: "kept for this session only, never saved", "layer"?: "a table, as table or schema.table (table:column for one of several geometry columns; default: every table with a geometry column). On a SQL Server enterprise geodatabase, a feature class by name, alias-less short name, schema.table or Pro's db.schema.table, and a registered non-spatial table becomes a standalone table; without layer every class is added and registered tables are not", "crs"?: "EPSG:… of a geometry that doesn't say", "name"?: string, "stream"?: bool}"#,
         ),
         C::new("info.databaseTables", "List Database Tables", "Home › Add › Add Data › Database", database_tables)
             .view()
@@ -2201,6 +2201,14 @@ impl LiveTable {
             LiveTable::Sqlserver(t) => t.label(),
         }
     }
+
+    /// The name of the layer the table gives: a geodatabase class's alias, else its label.
+    fn display(&self) -> String {
+        match self {
+            LiveTable::Sqlserver(t) => t.alias.clone().unwrap_or_else(|| t.label()),
+            t => t.label(),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2227,11 +2235,11 @@ impl LiveDb {
     }
 
     fn find(&self, name: &str) -> rustgis_data::Result<LiveTable> {
-        use rustgis_data::source::{mysql, postgis, sqlserver};
+        use rustgis_data::source::{mysql, postgis};
         Ok(match self {
             LiveDb::Postgis(c) => LiveTable::Postgis(postgis::find_table(c, name)?),
             LiveDb::Mysql(c) => LiveTable::Mysql(mysql::find_table(c, name)?),
-            LiveDb::Sqlserver(c) => LiveTable::Sqlserver(sqlserver::find_table(c, name)?),
+            LiveDb::Sqlserver(c) => LiveTable::Sqlserver(find_sqlserver(c, name)?),
         })
     }
 
@@ -2263,6 +2271,46 @@ impl LiveDb {
     }
 }
 
+/// A SQL Server table by name. In an enterprise geodatabase the catalog reads the name first, so
+/// a class is found by its short name or Pro's `db.schema.table` too, and its table carries the
+/// class alias and feature dataset; any other name is looked up as the database's own.
+#[cfg(not(target_arch = "wasm32"))]
+fn find_sqlserver(
+    conn: &rustgis_data::source::sqlserver::Conn,
+    name: &str,
+) -> rustgis_data::Result<rustgis_data::source::sqlserver::Table> {
+    use rustgis_data::source::{geodatabase::ItemKind, sqlserver};
+    if let Some(catalog) = sqlserver::geodatabase(conn)
+        && let Some(item) = catalog.find(name).filter(|i| i.kind == ItemKind::FeatureClass)
+    {
+        let full = format!("{}.{}", item.schema, item.table);
+        let wanted = match &item.shape_column {
+            Some(column) => format!("{full}:{column}"),
+            None => full,
+        };
+        if let Ok(t) = sqlserver::find_table(conn, &wanted) {
+            return Ok(sqlserver::Table { alias: item.alias.clone(), dataset: item.dataset.clone(), ..t });
+        }
+    }
+    sqlserver::find_table(conn, name)
+}
+
+/// Adds a registered non-spatial table of an enterprise geodatabase as a standalone table,
+/// loaded whole (through its versioned view when it has one).
+#[cfg(not(target_arch = "wasm32"))]
+fn add_geodatabase_table(
+    s: &mut Session,
+    p: &Value,
+    conn: &rustgis_data::source::sqlserver::Conn,
+    item: &rustgis_data::source::geodatabase::Item,
+    label: &str,
+) -> CmdResult {
+    let read = rustgis_data::source::sqlserver::read_table(conn, item, rustgis_data::source::sqlserver::MAX_EDITABLE)
+        .map_err(|e| format!("{label}: {e}"))?;
+    let added = add_read(s, p, read)?;
+    Ok(json!({"layer": null, "layers": [], "tables": [added["id"]], "features": 0}))
+}
+
 /// Adds the tables of a PostGIS, MySQL, MariaDB or SQL Server database that have a geometry
 /// column (or the one `layer` names), read live: large ones a view at a time, others loaded
 /// whole. A column of mixed geometry types becomes a layer per type.
@@ -2274,9 +2322,28 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
     let err = |e: rustgis_data::DataError| format!("{label}: {e}");
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let live = live.map_err(err)?;
-    let mut tables = match ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()) {
-        Some(l) => vec![live.find(l).map_err(err)?],
-        None => live.tables().map_err(err)?,
+    let wanted = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty());
+    // An enterprise geodatabase: a registered table is added whole, as a standalone table; all
+    // its classes are added without a name, and the tables it registers are left to be named.
+    let mut unadded = 0;
+    let mut tables = match (&live, wanted) {
+        (LiveDb::Sqlserver(conn), Some(l)) => {
+            let table = rustgis_data::source::sqlserver::geodatabase(conn)
+                .and_then(|catalog| catalog.find(l).filter(|i| i.kind == rustgis_data::source::geodatabase::ItemKind::Table).cloned());
+            if let Some(item) = table {
+                return add_geodatabase_table(s, p, conn, &item, &label);
+            }
+            vec![live.find(l).map_err(err)?]
+        }
+        (LiveDb::Sqlserver(conn), None) => match rustgis_data::source::sqlserver::geodatabase_tables(conn).map_err(err)? {
+            Some(listing) => {
+                unadded = listing.tables.len();
+                listing.classes.into_iter().filter_map(|(_, t)| t).chain(listing.other).map(LiveTable::Sqlserver).collect()
+            }
+            None => live.tables().map_err(err)?,
+        },
+        (_, Some(l)) => vec![live.find(l).map_err(err)?],
+        (_, None) => live.tables().map_err(err)?,
     };
     if tables.is_empty() {
         return Err(format!("{label}: no tables with a geometry column"));
@@ -2320,8 +2387,8 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
             }
             let name = match ps(p, "name").map(str::trim).filter(|n| !n.is_empty() && single && !mixed) {
                 Some(n) => n.to_string(),
-                None if mixed => format!("{} ({})", t.label(), family.label()),
-                None => t.label(),
+                None if mixed => format!("{} ({})", t.display(), family.label()),
+                None => t.display(),
             };
             let (database, table, family, crs) = (original.clone(), t.label(), Some(family), crs.map(str::to_string));
             let (pg, my, ms);
@@ -2378,6 +2445,9 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
     // Empty tables (common in a PostGIS database: its TIGER geocoder's) are left out quietly.
     if empty > 0 {
         s.notify(format!("{label}: {empty} empty tables were left out"), false);
+    }
+    if unadded > 0 {
+        s.notify(format!("{label}: {unadded} tables not added; add one by name with \"layer\""), false);
     }
     let mut out = json!({"layer": ids.first(), "layers": ids, "features": features, "streamed": streamed});
     if !skipped.is_empty() {
@@ -3643,4 +3713,27 @@ fn class_style(s: &mut Session, p: &Value) -> CmdResult {
     let g = l.geometry_type();
     let e = l.renderer.set_class_style(&class, &style, g)?;
     Ok(json!({"label": e.label, "color": e.symbol.fill.hex(), "outline": e.symbol.stroke.hex()}))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::LiveTable;
+    use rustgis_data::source::sqlserver::Table;
+
+    /// A geodatabase class names its layer by its alias, else by its label.
+    #[test]
+    fn geodatabase_class_layer_name_is_its_alias() {
+        let table = |alias: Option<&str>| Table {
+            schema: "gis".into(),
+            name: "MAINS".into(),
+            column: "SHAPE".into(),
+            kind: "geometry".into(),
+            current: false,
+            several: false,
+            alias: alias.map(str::to_string),
+            dataset: None,
+        };
+        assert_eq!(LiveTable::Sqlserver(table(Some("Water Mains"))).display(), "Water Mains");
+        assert_eq!(LiveTable::Sqlserver(table(None)).display(), "gis.MAINS");
+    }
 }

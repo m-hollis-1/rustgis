@@ -29,6 +29,9 @@ const DEFAULT_PORT: u16 = 1433;
 mod gdb;
 pub use gdb::{GdbListing, geodatabase_tables, read_table};
 
+/// The most rows of a registered table [`read_table`] is asked for when the table is added whole.
+pub const MAX_EDITABLE: usize = 100_000;
+
 // ---------------------------------------------------------------------------------------------
 // Connection addresses
 

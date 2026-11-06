@@ -17505,6 +17505,44 @@ fn sqlserver_live_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `RUSTGIS_TEST_SDE` names a live SQL Server enterprise geodatabase: its listing has feature
+/// classes, a class opens as a layer named by its alias, and a registered table opens as a
+/// standalone table.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn sde_live_classes_and_tables() {
+    let Ok(address) = std::env::var("RUSTGIS_TEST_SDE") else { return };
+    let mut s = Session::new(Project::default());
+    let listed = s.run("info.databaseTables", &json!({"database": address})).unwrap();
+    let items = listed["items"].as_array().expect("a geodatabase lists items");
+    let classes: Vec<&Value> = items.iter().filter(|i| i["item"] == "featureClass" && i["column"].is_string()).collect();
+    assert!(!classes.is_empty(), "{listed}");
+    // A class with an alias is named by it; one without, by its label.
+    let class = classes.iter().find(|c| c["alias"].is_string()).unwrap_or(&classes[0]);
+    let expected = if class["alias"].is_string() { class["display"].as_str() } else { class["label"].as_str() };
+    let label = class["label"].as_str().unwrap();
+    let r = s.run("layer.addDatabase", &json!({"database": address, "layer": label})).unwrap();
+    let id = r["layer"].as_u64().unwrap() as u32;
+    assert_eq!(Some(s.map().layer(id).unwrap().name.as_str()), expected, "{r}");
+    let tables: Vec<&str> = items.iter().filter(|i| i["item"] == "table").filter_map(|i| i["label"].as_str()).collect();
+    assert!(!tables.is_empty(), "the test geodatabase registers a table");
+    let before = s.project.tables.len();
+    let r = s.run("layer.addDatabase", &json!({"database": address, "layer": tables[0]})).unwrap();
+    assert_eq!(r["tables"].as_array().map(Vec::len), Some(1), "{r}");
+    assert_eq!(r["layers"].as_array().map(Vec::len), Some(0), "{r}");
+    assert_eq!(s.project.tables.len(), before + 1);
+    // Without a name every class is added and the registered tables are not.
+    let layers = s.map().layers.len();
+    let r = s.run("layer.addDatabase", &json!({"database": address})).unwrap();
+    assert!(r["layers"].as_array().unwrap().len() >= classes.len().min(1), "{r}");
+    assert!(s.map().layers.len() > layers);
+    assert_eq!(s.project.tables.len(), before + 1, "registered tables are not added without a name");
+    let text = serde_json::to_string(&s.project).unwrap();
+    let password = rustgis_data::source::msconn::split_password(&address).and_then(|(_, p)| p);
+    assert!(password.is_none_or(|p| !text.contains(&p)), "the project keeps no password");
+}
+
 /// Deleting a map or layout other than the one in view (a tab's close button) keeps that view;
 /// deleting the one in view falls back to the first map; the last map stays.
 #[test]

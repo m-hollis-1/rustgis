@@ -37,6 +37,7 @@ fn has_user(address: &str) -> bool {
 
 /// The `layer` name `layer.addDatabase` gets for a Pro dataset: a 3-part name loses its first part
 /// (the database: "utility.sde.Mains" → "sde.Mains"); a shorter one is kept as it is.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn table_name(dataset: &str) -> String {
     let dataset = dataset.trim();
     match dataset.split_once('.') {
@@ -46,17 +47,39 @@ pub(crate) fn table_name(dataset: &str) -> String {
 }
 
 /// Opens `layer.addDatabase {database: c.address, layer: table_name(g.table), name}` after
-/// activating the connection's credential, as a new layer: the caller moves or keeps it. A
-/// connection with no password it can use without asking is an error (the import never asks).
+/// activating the connection's credential and logging in, as a new layer: the caller moves or
+/// keeps it. A connection with no password it can use without asking is an error (the import
+/// never asks). A password the server refuses is handled as Data Sources handles it (a saved one
+/// rejected, a session one dropped, neither left active), so it isn't tried again.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn add_through(s: &mut Session, c: &Connection, g: &GeodatabaseOrigin, name: &str) -> Result<Value, String> {
-    let Some((password, _)) = super::connections::credential(s, c)? else {
+    use rustgis_data::DataError;
+    use rustgis_data::source::{duckdb, sqlserver};
+
+    let duckdb::Database::Sqlserver(key) = duckdb::Database::parse(&c.address) else {
+        return Err("not a SQL Server connection".into());
+    };
+    let Some((password, saved)) = super::connections::credential(s, c)? else {
         return Err("the connection has no usable password".into());
     };
-    super::connections::activate(s, c, password.expose());
-    if let Some((kind, key)) = crate::connections::database_key(&c.address) {
-        s.database_logins.select(kind, &key, &c.id);
+    let secret = password.expose();
+    super::connections::activate(s, c, secret);
+    s.database_logins.select("sqlserver", &key, &c.id);
+    // Logged in first, so a refusal is told from any other failure; the layer then reads through
+    // the live connection this leaves.
+    if let Err(e) = sqlserver::connect(&key, true) {
+        let e = e.redact_secret(secret);
+        if matches!(e, DataError::Login(_)) {
+            if saved {
+                s.database_logins.reject(&c.id);
+            } else {
+                s.database_logins.reject_session_password(c);
+            }
+            duckdb::forget_connection_password(&c.id);
+            s.database_logins.drop_activation(&key);
+        }
+        return Err(e.to_string());
     }
     let params = json!({"database": c.address, "layer": table_name(&g.table), "name": name});
-    s.run_part("layer.addDatabase", &params).map_err(|e| if password.expose().is_empty() { e } else { e.replace(password.expose(), "***") })
+    s.run_part("layer.addDatabase", &params).map_err(|e| if secret.is_empty() { e } else { e.replace(secret, "***") })
 }

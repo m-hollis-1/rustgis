@@ -26477,6 +26477,52 @@ fn a_quiet_connection_needs_an_exact_remembered_sql_login() {
 }
 
 #[test]
+fn a_quiet_connection_that_fails_is_tried_once_per_import() {
+    use crate::connections::Connection;
+    let sde = |name: &str, uri: &str, dataset: &str| {
+        json!({"type": "CIMFeatureLayer", "name": name, "uRI": uri, "visibility": true,
+            "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+                "workspaceConnectionString": "SERVER=127.0.0.1,9;INSTANCE=sde:sqlserver:127.0.0.1,9;DATABASE=utility", "workspaceFactory": "SDE",
+                "dataset": dataset, "datasetType": "esriDTFeatureClass"}}})
+    };
+    let doc = json!({"type": "CIMMapDocument", "version": "3.7.0",
+        "mapDefinition": {"type": "CIMMap", "name": "Network", "uRI": "CIMPATH=map/network.json",
+            "layers": ["CIMPATH=network/mains.json", "CIMPATH=network/valves.json"],
+            "spatialReference": {"wkid": 4326, "latestWkid": 4326}},
+        "layerDefinitions": [sde("Mains", "CIMPATH=network/mains.json", "utility.sde.Mains"),
+            sde("Valves", "CIMPATH=network/valves.json", "utility.sde.Valves")]});
+    let mut s = world();
+    // The one exact, remembered SQL login, on a port nothing answers at.
+    s.connections.connections.push(Connection {
+        id: "c1".into(),
+        name: "Utility Editor".into(),
+        kind: "sqlserver".into(),
+        address: "mssql://sde@127.0.0.1:9/utility".into(),
+        remembered: true,
+        ..Connection::default()
+    });
+    s.database_logins.set_session_password("c1", "made-up-pw");
+    let (added, notes) = add_pro_map_in(&mut s, &type_first(doc), None, None);
+    assert_eq!((added.layers, added.broken), (2, 2), "{notes:?}");
+    let why = |name: &str| s.map().layer_by_name(name).and_then(|l| l.source.as_ref()).and_then(|src| src.why_broken()).unwrap_or_default();
+    let (mains, valves) = (why("Mains"), why("Valves"));
+    // Whichever is added first tries the connection; the other doesn't try it again.
+    let again = |why: &str| why.contains("not tried again after Utility Editor failed");
+    assert!(again(mains) != again(valves), "{mains} / {valves}");
+    for text in [&mains, &valves] {
+        assert!(!text.contains("made-up-pw"), "{text}");
+    }
+    assert!(!notes.iter().any(|n| n.contains("made-up-pw")), "{notes:?}");
+    // The server didn't refuse the password: it's still this session's.
+    assert!(s.database_logins.session_password("c1").is_some());
+    assert!(!s.database_logins.is_rejected("c1"));
+    // Both keep their origin, for Repair Source….
+    for name in ["Mains", "Valves"] {
+        assert!(s.map().layer_by_name(name).and_then(|l| l.source.as_ref()).is_some_and(|src| src.geodatabase.is_some()), "{name}");
+    }
+}
+
+#[test]
 fn a_pro_map_opens_at_its_saved_camera() {
     use rustgis_geom::{Coord, lonlat_to_merc};
     let at = lonlat_to_merc(Coord::new(-97.0, 38.0));

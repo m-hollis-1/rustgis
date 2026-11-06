@@ -392,6 +392,10 @@ struct Adding<'a> {
     /// The map's reference scale, which the layers whose symbols take it are given.
     reference_scale: Option<f64>,
     added: Added,
+    /// The saved connections an SDE layer of this map failed to open through, by id, with their
+    /// names: the map's other layers on them come in broken without trying again. (A refused
+    /// password is rejected besides, so later maps don't try it either.)
+    failed: HashMap<String, String>,
 }
 
 /// Adds `m` as a new map (its projection, groups, layers top to bottom, tables, view) and
@@ -466,7 +470,12 @@ fn projection(s: &mut Session, m: &MapImport, name: &str, report: &mut Report) -
 /// Adds `m`'s entries to the active map (a `.lyrx`, or a `.mapx`'s layers into an existing map),
 /// in `group` when it is one of the map's (above its layers), and its standalone tables.
 pub(crate) fn add_entries(s: &mut Session, m: &MapImport, dir: Option<&str>, group: Option<u32>, report: &mut Report) -> Added {
-    let mut a = Adding { dir, reference_scale: m.reference_scale, added: Added { name: s.map().name.clone(), ..Added::default() } };
+    let mut a = Adding {
+        dir,
+        reference_scale: m.reference_scale,
+        added: Added { name: s.map().name.clone(), ..Added::default() },
+        failed: HashMap::new(),
+    };
     let into = group.and_then(|g| s.map().group(g).map(|x| (g, x.name.clone())));
     // The group's top layer before anything is added: what the entries go above.
     let top = into.as_ref().and_then(|(g, _)| s.map().group_layers(*g).first().copied());
@@ -604,7 +613,7 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
         }
         LayerSource::EnterpriseGeodatabase(g) => {
             let from = Origin { geodatabase: Some(g.clone()), ..Origin::default() };
-            match open_quietly(s, g, name) {
+            match open_quietly(s, g, name, &mut a.failed) {
                 Some(added) => (added, from),
                 None => {
                     // Noted once as skipped, as the reader notes data it can't open, and counted
@@ -660,14 +669,22 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
 
 /// Opens an SDE layer through the one saved connection it may use without asking, as `name`;
 /// `None` when there's no such connection (always on the web: there are no database connections).
+/// A connection in `failed` isn't tried again; one that fails now is put there.
 #[cfg(not(target_arch = "wasm32"))]
-fn open_quietly(s: &mut Session, g: &GeodatabaseOrigin, name: &str) -> Option<CmdResult> {
+fn open_quietly(s: &mut Session, g: &GeodatabaseOrigin, name: &str, failed: &mut HashMap<String, String>) -> Option<CmdResult> {
     let c = super::geodatabase_open::quiet_connection(s, g)?;
-    Some(super::geodatabase_open::add_through(s, &c, g, name))
+    if let Some(named) = failed.get(&c.id) {
+        return Some(Err(format!("not tried again after {} failed", shown(named))));
+    }
+    let added = super::geodatabase_open::add_through(s, &c, g, name);
+    if added.is_err() {
+        failed.insert(c.id.clone(), c.name.clone());
+    }
+    Some(added)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn open_quietly(_: &mut Session, _: &GeodatabaseOrigin, _: &str) -> Option<CmdResult> {
+fn open_quietly(_: &mut Session, _: &GeodatabaseOrigin, _: &str, _: &mut HashMap<String, String>) -> Option<CmdResult> {
     None
 }
 

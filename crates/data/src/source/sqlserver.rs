@@ -165,8 +165,19 @@ fn err(e: tiberius::error::Error) -> DataError {
     match e {
         tiberius::error::Error::Server(t) if t.code() == 18456 => DataError::Login(t.message().to_string()),
         tiberius::error::Error::Server(t) => DataError::Format(t.message().to_string()),
+        tiberius::error::Error::Tls(m) if untrusted_certificate(&m) => DataError::Format(UNTRUSTED_CERTIFICATE.into()),
         e => DataError::Format(e.to_string()),
     }
+}
+
+/// Why a server whose certificate this computer doesn't trust can't be reached, and what to do.
+pub const UNTRUSTED_CERTIFICATE: &str = "the server's certificate isn't from an authority this computer trusts      (SQL Server's own self-signed certificate is the usual reason). If this is your organisation's server, tick      Trust the server's certificate in the connection (or add trust-server-certificate=true to its address) and      connect again";
+
+/// Whether a TLS error says the server's certificate wasn't trusted (rather than, say, a protocol
+/// mismatch): tiberius words it "the server's certificate was rejected", rustls "UnknownIssuer".
+fn untrusted_certificate(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("unknownissuer") || m.contains("certificate was rejected") || m.contains("invalid peer certificate")
 }
 
 fn dropped(e: &tiberius::error::Error) -> bool {
@@ -1203,5 +1214,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_untrusted_certificate_says_how_to_connect_anyway() {
+        let tls = |m: &str| err(tiberius::error::Error::Tls(m.into())).to_string();
+        let raw = "Error forming TLS connection: the server's certificate was rejected during the TLS handshake: UnknownIssuer. To connect anyway you can: (1) trust a specific CA";
+        let said = tls(raw);
+        assert!(said.contains("Trust the server's certificate"), "{said}");
+        assert!(said.contains("trust-server-certificate=true"), "{said}");
+        assert!(!said.contains("Config::"), "{said}");
+        // Other TLS failures keep their own words.
+        assert!(tls("protocol version not supported").contains("protocol version"));
     }
 }

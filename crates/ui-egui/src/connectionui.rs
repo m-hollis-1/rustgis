@@ -53,6 +53,9 @@ pub struct State {
     pub sign_in: String,
     pub user: String,
     pub database: String,
+    /// Trust the server's certificate without checking who issued it (SQL Server's own
+    /// self-signed certificate): `trust-server-certificate=true` in the address.
+    pub trust_cert: bool,
     /// The Name or Group was typed since the form was last filled from a .sde file: only what a
     /// person typed is sent with the next file, never what the engine made from the last one.
     pub typed_name: bool,
@@ -68,6 +71,8 @@ pub(crate) struct Mssql {
     pub server: String,
     pub user: Option<String>,
     pub database: String,
+    /// `trust-server-certificate=true` (or `yes`) is in the address.
+    pub trust_cert: bool,
 }
 
 /// `s` with its `%XX` escapes undone (an escape that isn't valid is kept as it is).
@@ -105,12 +110,17 @@ pub(crate) fn parse_mssql(address: &str) -> Option<Mssql> {
         Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => (host, Some(port)),
         _ => (hostport, None),
     };
-    let instance = query
-        .split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| k.eq_ignore_ascii_case("instance"))
-        .map(|(_, v)| percent_decode(v))
-        .filter(|v| !v.is_empty());
+    let param = |name: &str| {
+        query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| k.to_ascii_lowercase().replace('_', "-") == name)
+            .map(|(_, v)| percent_decode(v))
+    };
+    let instance = param("instance").filter(|v| !v.is_empty());
+    let trust_cert = param("trust-server-certificate")
+        .or_else(|| param("trustservercertificate"))
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes"));
     let mut server = percent_decode(host);
     if let Some(instance) = instance {
         server.push('\\');
@@ -120,7 +130,7 @@ pub(crate) fn parse_mssql(address: &str) -> Option<Mssql> {
         server.push(',');
         server.push_str(port);
     }
-    Some(Mssql { server, user: user.filter(|u| !u.is_empty()), database: percent_decode(database) })
+    Some(Mssql { server, user: user.filter(|u| !u.is_empty()), database: percent_decode(database), trust_cert })
 }
 
 /// The address the geodatabase form makes, or why it can't.
@@ -130,7 +140,7 @@ fn form_address(st: &State) -> Result<String, String> {
         return Err(tl!("Type the server").into());
     }
     let windows = st.sign_in == "windows";
-    mssql_address(&SdeConnection {
+    let address = mssql_address(&SdeConnection {
         platform: if st.platform.is_empty() { "sqlserver".into() } else { st.platform.clone() },
         server: st.server.clone(),
         database: st.database.trim().to_owned(),
@@ -138,7 +148,14 @@ fn form_address(st: &State) -> Result<String, String> {
         os_auth: windows,
         version: None,
     })
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(if st.trust_cert { with_trust(address) } else { address })
+}
+
+/// `address` with `trust-server-certificate=true` added to its query.
+fn with_trust(address: String) -> String {
+    let joiner = if address.contains('?') { '&' } else { '?' };
+    format!("{address}{joiner}trust-server-certificate=true")
 }
 
 /// Why the geodatabase form can't make an address (`None` outside the form, or when it can).
@@ -844,6 +861,14 @@ fn geodatabase_rows(ui: &mut egui::Ui, st: &mut State) -> bool {
     let input_label = ui.label(tl!("Database"));
     changed |= ui.add(egui::TextEdit::singleline(&mut st.database).desired_width(360.0)).labelled_by(input_label.id).changed();
     ui.end_row();
+    ui.label("");
+    changed |= ui
+        .checkbox(&mut st.trust_cert, tl!("Trust the server's certificate"))
+        .on_hover_text(tl!(
+            "Connect even though the server's certificate isn't from an authority this computer trusts, as Pro and SQL Server Management Studio do with \"Trust server certificate\". SQL Server's own self-signed certificate needs it. Tick it only for your organisation's server."
+        ))
+        .changed();
+    ui.end_row();
     let input_label = ui.label(tl!("Name"));
     let default = i18n::fmt("Geodatabase on {server}", &[("server", st.server.trim())]);
     let edited =
@@ -898,6 +923,7 @@ pub(crate) fn fill_from_sde(app: &mut RustGisApp, path: &str) -> Result<(), Stri
     st.server = parsed.as_ref().map(|m| m.server.clone()).unwrap_or_default();
     st.database = parsed.as_ref().map(|m| m.database.clone()).unwrap_or_default();
     st.sign_in = if windows { "windows" } else { "sql" }.into();
+    st.trust_cert = parsed.as_ref().is_some_and(|m| m.trust_cert);
     st.user = v["user"].as_str().map(str::to_owned).or_else(|| parsed.and_then(|m| m.user)).unwrap_or_default();
     st.address = address;
     st.password.clear();
@@ -1435,6 +1461,26 @@ mod tests {
         // Address mode is never checked against the form.
         st.form = false;
         assert!(form_error(&st).is_none());
+    }
+
+    #[test]
+    fn trusting_the_certificate_goes_into_the_address_and_back() {
+        let mut st = form("sql");
+        assert!(!form_address(&st).unwrap().contains("trust"));
+        st.trust_cert = true;
+        let address = form_address(&st).unwrap();
+        assert!(address.ends_with("trust-server-certificate=true"), "{address}");
+        assert_eq!(address.matches('?').count(), 1, "{address}");
+        assert!(parse_mssql(&address).unwrap().trust_cert);
+        // After an instance, the option joins the query.
+        st.server = r"gis-db\GIS".into();
+        let address = form_address(&st).unwrap();
+        assert!(address.contains("?instance=GIS&trust-server-certificate=true"), "{address}");
+        let back = parse_mssql(&address).unwrap();
+        assert!(back.trust_cert);
+        assert_eq!(back.server, r"gis-db\GIS");
+        assert!(parse_mssql("mssql://h/d?TrustServerCertificate=yes").unwrap().trust_cert);
+        assert!(!parse_mssql("mssql://h/d?trust-server-certificate=false").unwrap().trust_cert);
     }
 
     #[test]

@@ -449,7 +449,13 @@ Pro's own dialog asks for:
 - **Sign in**: **Database user** (with **User** and **Password**) or **Windows**.
 - **Remember on this computer** keeps the password in the operating system's keychain, as for
   any [named connection](#named-connections).
-- **Database**, **Name** and **Group**.
+- **Database**.
+- **Trust the server's certificate**: tick it when connecting fails with "the server's certificate
+  isn't from an authority this computer trusts". SQL Server's own self-signed certificate does
+  that; Pro and SQL Server Management Studio connect to it with their **Trust server certificate**
+  option, and this is the same choice (`trust-server-certificate=true` in the address). Tick it
+  only for your organisation's server.
+- **Name** and **Group**.
 
 **Enter an address instead** swaps the form for the `mssql://…` address field, and **Use the form
 instead** swaps back. **Test** says "Enterprise geodatabase 11.2, 40 tables with geometry" (the

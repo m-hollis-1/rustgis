@@ -381,6 +381,7 @@ The dialog sorts the reason into one of these and offers the fixes that fit it. 
 | The server didn't answer | That server didn't answer. | **Retry**, **Use another address…**. |
 | The server answered, but the service isn't there any more | The service isn't there any more. | **Retry**, **Use another address…**. |
 | The file isn't where the layer remembers it | The file isn't at that place. | **Browse for the file…**. |
+| The layer is in an enterprise geodatabase (it came from an ArcGIS Pro map) | Which server, database and table it is in, and the connection you have to it, if any (below). | **Connect and repair**, **Use** a near-match connection, or **Add connection…**. |
 | Anything else | The reason as it was recorded. | **Retry**, and **Browse for the file…** for a layer with a file. |
 
 - **Sign in to ArcGIS Online** signs in on ArcGIS Online's own page (as
@@ -400,6 +401,21 @@ The dialog sorts the reason into one of these and offers the fixes that fit it. 
   same name in the new folder. A layer whose file isn't there is left as it is, and a notice names
   it and says why. The web app can't link to files on your computer: add the file again with
   **Add Data**.
+- An **enterprise geodatabase** layer says "This layer is in an enterprise geodatabase on
+  gis-db, database utility (table Mains)." When you have a
+  [connection](data.md#enterprise-geodatabases-sde) to that server and database, it adds "You
+  have a connection to it: Utility.", and **Connect and repair** signs in through it (asking for
+  the password if it isn't remembered) and opens the layer with its look kept. A connection
+  matches when it names the same database on the same server, whoever the user is; a host written
+  differently (an address against a name) is never assumed to be the same. A connection to a
+  database of that name on another host is offered as "Use Utility", and using it is your choice.
+  With none, **Add connection…** opens the enterprise geodatabase form with the server and
+  database filled in, and saving it continues the repair. Afterwards, when other broken layers
+  are in the same geodatabase, the dialog asks "3 other broken layers are in the same
+  geodatabase. Repair them too?"; on **Yes** each is opened the same way, and a notice names any
+  that weren't (a class that isn't there, fields that don't fit) and why. A layer from a version
+  other than Default is opened at Default, with a note. Only SQL Server geodatabases can be
+  connected to.
 - **Remove** takes the layer out of the map (undoable).
 
 A self-hosted ArcGIS Server may present a security certificate that Windows and RustGIS don't
@@ -423,6 +439,11 @@ The same steps as commands:
   points each broken layer whose data was in `from` at the file of the same name in `to`, and
   answers the names `repaired` and those `skipped`, each with the reason `why`. It fails when no
   broken layer had its data in `from`, or when none could be repaired.
+- `layer.repairGeodatabase={"layer": "Mains", "connection": "Utility"}` is **Connect and repair**;
+  `{"all": true, "connection": "Utility"}` repairs every broken layer in that geodatabase. It
+  answers the layers it `repaired` and those it `skipped`, each with the reason `why`.
+  `layer.diagnose` answers the kind `geodatabase` for such a layer, with its `server`, `database`,
+  `table` and the saved connections that fit it.
 
 ## Projections
 

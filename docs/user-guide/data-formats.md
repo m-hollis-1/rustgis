@@ -400,7 +400,9 @@ database live, talking to the server itself: see [MySQL and MariaDB](data.md#mys
 ## SQL Server and Azure SQL
 
 The desktop app reads SQL Server 2012 or later and Azure SQL spatial tables live, without an
-external client: see [SQL Server and Azure SQL](data.md#sql-server-and-azure-sql).
+external client: see [SQL Server and Azure SQL](data.md#sql-server-and-azure-sql). Esri enterprise
+geodatabases (SDE) on SQL Server are read through the same connection: see
+[Enterprise geodatabases (SDE)](data.md#enterprise-geodatabases-sde).
 
 | Source | How to add it | Notes |
 | --- | --- | --- |

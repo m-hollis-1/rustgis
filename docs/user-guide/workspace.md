@@ -350,7 +350,8 @@ equivalent, each noted. What is added depends on where the layer's data is:
 | A WMS layer | The service's first visible named sublayer, as a web layer. |
 | A vector tile service | A vector tile layer drawn with the service's default style (`…/VectorTileServer/resources/styles/root.json`). An address that is already a style is used as it is. |
 | A table on a file | A project table. A table on a service, or one RustGIS can't open, is left out. |
-| Data RustGIS can't open: an SDE (enterprise) geodatabase or another database, a spreadsheet, a query layer; and the kinds of layer RustGIS doesn't draw (annotation, dimensions, elevation surfaces) | A **broken layer** (below). |
+| An SDE (enterprise) geodatabase layer | The layer, opened through your saved SQL Server [connection](data.md#enterprise-geodatabases-sde) to that server and database when exactly one matches and its password is remembered (a Windows sign-in connection never opens a layer by itself). Otherwise a **broken layer** that keeps where it came from, for **Repair Source…** to connect. |
+| Data RustGIS can't open: another database, a spreadsheet, a query layer; and the kinds of layer RustGIS doesn't draw (annotation, dimensions, elevation surfaces) | A **broken layer** (below). |
 | A file that is missing, or a service that can't be reached | A broken layer, noted "added broken: … (repair or retry it)". |
 | A JPEG or PNG raster placed by a world file (`.jgw`, `.jgwx`, `.pgw`, `.pgwx`) or an `.aux.xml` beside it | A broken layer: "a georeferenced JPEG or PNG: world files aren't read yet". |
 | A layer the map lists that the project doesn't define (or whose definition couldn't be read) | A broken layer whose origin reads "a layer the project doesn't define (CIMPATH=…)", noted "… added broken"; it has nothing to retry or repair, and can be removed. |
@@ -363,7 +364,7 @@ symbology, labels and definition query, draws nothing, and has a warning after i
 Layers pane; hover over it to read where Pro read the data from and why it didn't open. Right-click a
 broken layer of features and choose **Repair Source…**: it says why the layer didn't open (a
 service that needs a sign-in, a certificate this computer doesn't trust, a server that didn't
-answer, a moved file) and offers the fix that fits, including pointing the other broken layers
+answer, a moved file, an enterprise geodatabase that needs a connection) and offers the fix that fits, including pointing the other broken layers
 from the same folder at the new place too; see [Broken layers](maps.md#broken-layers). Signing in
 to ArcGIS Online, in that dialog or with the ArcGIS Online plugin, tries the broken layers again. A
 password, user name or token in a connection never reaches a layer's origin, a note or a saved

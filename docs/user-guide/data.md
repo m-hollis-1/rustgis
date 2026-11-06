@@ -433,6 +433,86 @@ requires that same address to have been added this session: opening a project do
 authorize Windows identity. Reconnect with **Home › Add › Add Data › Database…** when needed. SQL queries
 (`layer.addSql`, the SQL pane) do not run on SQL Server connections.
 
+### Enterprise geodatabases (SDE)
+
+A SQL Server database that holds an Esri enterprise geodatabase is read through the same SQL
+Server connection, and browsed the way ArcGIS Pro's Catalog shows it. There is no separate kind
+of connection: RustGIS looks for the geodatabase's catalog tables when the connection is browsed
+or a table is opened. A database without them browses and reads exactly as described above. Only
+SQL Server geodatabases are read; PostgreSQL and Oracle ones are not, yet.
+
+**New Connection ▾ › Enterprise Geodatabase…** in the [Data Sources](#data-sources) pane opens the connection dialog as a form, with what
+Pro's own dialog asks for:
+
+- **Platform**: SQL Server.
+- **Server**: `gis-db`, `gis-db\utility` for a named instance, or `gis-db,1433` for a port.
+- **Sign in**: **Database user** (with **User** and **Password**) or **Windows**.
+- **Remember on this computer** keeps the password in the operating system's keychain, as for
+  any [named connection](#named-connections).
+- **Database**, **Name** and **Group**.
+
+**Enter an address instead** swaps the form for the `mssql://…` address field, and **Use the form
+instead** swaps back. **Test** says "Enterprise geodatabase 11.2, 40 tables with geometry" (the
+geodatabase's release, and how many tables hold geometry). When the account can't read the
+geodatabase's catalog, it says so instead, and the database browses as plain SQL Server, with a
+notice saying why.
+
+**From .sde file…** fills the form from a connection file saved by ArcGIS Pro: the server, the
+database, the user and the version. **The password is never read from the file**: RustGIS asks
+for it, unless the file says Windows sign-in. The file's name becomes the connection's name. A
+`.sde` file dropped on the window, opened with **Add Data** or double-clicked in the Browser
+starts the same dialog. A file for another platform is refused with its platform named, and one
+RustGIS can't read says so and leaves the form open for you to type the server and database. The
+file is read once and not kept. On the command line,
+`connection.new={"kind": "sqlserver", "sdeFile": "utility.sde"}` does the same.
+
+The connection's tree shows what ArcGIS Pro shows, and none of the geodatabase's machinery:
+
+- **Feature datasets**, each with its feature classes.
+- **Feature classes** that aren't in a dataset, at the top.
+- **Tables**: the registered tables without geometry.
+- **Other spatial tables**: spatial tables and views the geodatabase doesn't register, left out
+  when there are none.
+
+A class is listed by its alias, and field aliases come through as the layer's field names. A
+versioned class says "feature class · traditional" or "feature class · branch" on hover. The
+geodatabase's own tables (`GDB_*` and `SDE_*`, the delta tables, `_evw` views and archive tables)
+are hidden. Click a class to select it, double-click to add it, or right-click for **Add With
+Options…**, as for any database table.
+
+`layer.addDatabase` takes a class as its name (`Mains`), `schema.table` or the name Pro writes,
+`db.schema.table`, and a registered table by its name:
+
+```sh
+rustgis-cli run --cmd 'layer.addDatabase={"database":"mssql://gis@gis-db/utility","password":"…","layer":"Mains"}'
+```
+
+`info.databaseTables` lists a geodatabase's tables as `items`: each has `item` (`featureClass`,
+`table` or `other`), `dataset`, `alias`, `versioning` (`none`, `traditional` or `branch`) and
+`display`, the name the tree shows. `connection.browse` lists the tree level by level.
+
+**Versions.** A feature class shows the current rows of the **Default** version. A traditionally
+versioned class is read through its versioned view, so edits not yet compressed into the base
+table are included; if the view is missing, the class is refused with "ask the geodatabase
+administrator to enable SQL access for it", rather than showing the base table's stale rows. A
+branch-versioned class is read at the default branch. A layer imported from a Pro map that was
+on another version is read at Default, with a note saying so. A class that isn't versioned is
+read from its table.
+
+**Tables** without geometry add as standalone tables: **Add** loads the whole table, up to
+100,000 rows, with a notice when there are more. A versioned table is read through its versioned
+view. A standalone table doesn't keep its source, so it doesn't reopen with the project: add it
+again.
+
+**What isn't read.** Named versions other than Default; feature classes in Esri's older SDEBINARY
+storage (refused, naming the storage); subtype and domain descriptions (the codes are read as
+stored); relationship classes, topologies and attachments; PostgreSQL and Oracle geodatabases.
+The connection is read-only: nothing is edited or written back.
+
+A connection that signs in with **Windows** connects each session, from the form or the tree,
+like any Windows sign-in above, and is never used to open a layer without you. For broken layers
+from an imported ArcGIS Pro map, see [Repair Source…](maps.md#repair-source).
+
 ## Web Data
 
 **Home › Add › Web Data** gathers public web services and catalogs: STAC imagery catalogs, Overture
@@ -600,6 +680,10 @@ Search and Planetary Computer remain available under **Library**.
 connection** picker; STAC includes saved connections in its existing API/catalog list.
 Picking one keeps its identity, not just its address: two connections can point to the same
 server with different names or users.
+
+**New Connection ▾ › Enterprise Geodatabase…** opens the same form for a SQL Server connection to
+an Esri enterprise geodatabase, with the server, sign-in and database as separate fields or taken
+from a `.sde` file: see [Enterprise geodatabases (SDE)](#enterprise-geodatabases-sde).
 
 To keep an endpoint entered by hand, click **Save as Connection** after it connects: after
 **List Tables** for a database, **Collections** or **Browse** for STAC, a catalogue search with

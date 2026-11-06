@@ -106,11 +106,15 @@ fn broken(l: &rustgis_map::Layer) -> bool {
     l.source.as_ref().is_some_and(rustgis_map::source::SourceLayer::is_broken)
 }
 
-/// Opens the broken layer `id`'s source again: its service added again, else its file reopened.
+/// Opens the broken layer `id`'s source again: its service added again, its geodatabase table
+/// through the one connection that opens quietly, else its file reopened.
 fn retry_layer(s: &mut Session, id: u32) -> Result<Outcome, String> {
     let src = s.map().layer(id).and_then(|l| l.source.as_ref()).ok_or("the layer no longer exists")?;
     if let Some(service) = src.service.clone() {
         return retry_service(s, id, &service);
+    }
+    if let Some(g) = src.geodatabase.clone() {
+        return retry_geodatabase(s, id, &g);
     }
     if src.path.is_none() {
         // (Repair Data Source isn't offered for it either: it has nothing to repair.)
@@ -159,8 +163,14 @@ fn retry_service(s: &mut Session, id: u32, service: &rustgis_map::source::Servic
         let what = if table { "a table" } else { "no layer" };
         return Err(format!("{}: '{}' came back as {what}, not a layer of features", service.url, service.layer));
     };
-    // Taken out as Remove takes a layer out: the tile layers over it keep their place, its group
-    // and the legends forget it.
+    adopt(s, id, new_id)?;
+    Ok(Outcome::Opened)
+}
+
+/// Moves what the newly added layer `new_id` read into the broken layer `id`, which keeps its
+/// place and style; the added layer is taken out as Remove takes a layer out.
+fn adopt(s: &mut Session, id: u32, new_id: u32) -> Result<(), String> {
+    // The tile layers over it keep their place, its group and the legends forget it.
     let m = s.map_mut();
     m.release_tiles(&[new_id]);
     m.set_group(new_id, None);
@@ -177,5 +187,52 @@ fn retry_service(s: &mut Session, id: u32, service: &rustgis_map::source::Servic
     }
     l.selection.clear();
     l.touch_geometry();
+    Ok(())
+}
+
+/// Reads the broken geodatabase layer `id`'s table again through the one saved connection that
+/// opens without asking; with none, the layer stays broken and Repair Source… is the way in.
+#[cfg(not(target_arch = "wasm32"))]
+fn retry_geodatabase(s: &mut Session, id: u32, g: &rustgis_map::source::GeodatabaseOrigin) -> Result<Outcome, String> {
+    let Some(c) = super::geodatabase_open::quiet_connection(s, g) else {
+        return Err(format!("needs a connection to the geodatabase on {}: use Repair Source…", g.server));
+    };
+    let name = s.map().layer(id).map(|l| l.name.clone()).ok_or("the layer no longer exists")?;
+    // Adding a layer goes to it and makes it active; a retry leaves the view and the active
+    // layer as they were. A registered table that came back stays out of the project's.
+    let (camera, active) = (s.map().camera, s.active_layer);
+    let tables: Vec<_> = s.project.tables.iter().map(|t| t.id).collect();
+    let r = super::geodatabase_open::add_through(s, &c, g, &name);
+    s.map_mut().camera = camera;
+    s.active_layer = active.filter(|a| s.map().layer(*a).is_some());
+    let r = r?;
+    let mut added: Vec<u32> = r
+        .get("layers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .filter_map(|n| u32::try_from(n).ok())
+        .collect();
+    added.retain(|n| *n != id);
+    s.project.tables.retain(|t| tables.contains(&t.id));
+    let Some((&new_id, extra)) = added.split_first() else {
+        return Err(format!("{}: '{}' came back as no layer of features", g.server, g.table));
+    };
+    // A table of mixed geometry types comes as a layer per type: the first takes the broken
+    // layer's place.
+    for n in extra {
+        super::layer::remove(s, &json!({"layer": n}))?;
+    }
+    adopt(s, id, new_id)?;
+    if !g.is_default_version() {
+        let version = g.version.as_deref().unwrap_or_default();
+        s.notify(format!("{name}: read at the Default version, not {version}"), false);
+    }
     Ok(Outcome::Opened)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn retry_geodatabase(_: &mut Session, _: u32, g: &rustgis_map::source::GeodatabaseOrigin) -> Result<Outcome, String> {
+    Err(format!("needs a connection to the geodatabase on {}: use Repair Source…", g.server))
 }

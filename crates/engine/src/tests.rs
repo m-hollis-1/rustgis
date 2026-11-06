@@ -26522,6 +26522,105 @@ fn a_quiet_connection_that_fails_is_tried_once_per_import() {
     }
 }
 
+/// A Pro map with broken SDE layers: "Mains" and "Valves" in the `utility` database, "Parcels" in
+/// `cadastre`, all on the same (unreachable) server.
+fn sde_network_mapx() -> String {
+    let sde = |name: &str, uri: &str, database: &str, dataset: &str| {
+        json!({"type": "CIMFeatureLayer", "name": name, "uRI": uri, "visibility": true,
+            "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+                "workspaceConnectionString": format!("SERVER=127.0.0.1,9;INSTANCE=sde:sqlserver:127.0.0.1,9;DATABASE={database}"),
+                "workspaceFactory": "SDE", "dataset": dataset, "datasetType": "esriDTFeatureClass"}}})
+    };
+    let doc = json!({"type": "CIMMapDocument", "version": "3.7.0",
+        "mapDefinition": {"type": "CIMMap", "name": "Network", "uRI": "CIMPATH=map/network.json",
+            "layers": ["CIMPATH=network/mains.json", "CIMPATH=network/valves.json", "CIMPATH=network/parcels.json"],
+            "spatialReference": {"wkid": 4326, "latestWkid": 4326}},
+        "layerDefinitions": [sde("Mains", "CIMPATH=network/mains.json", "utility", "utility.sde.Mains"),
+            sde("Valves", "CIMPATH=network/valves.json", "utility", "utility.sde.Valves"),
+            sde("Parcels", "CIMPATH=network/parcels.json", "cadastre", "cadastre.sde.Parcels")]});
+    type_first(doc)
+}
+
+#[test]
+fn diagnosing_an_sde_layer_names_its_connections() {
+    use crate::connections::Connection;
+    let saved = |id: &str, address: &str| Connection {
+        id: id.into(),
+        name: format!("Connection {id}"),
+        kind: "sqlserver".into(),
+        address: address.into(),
+        ..Connection::default()
+    };
+    let mut s = world();
+    // The near one is saved first: the exact one is still listed first.
+    s.connections.connections = vec![
+        saved("near", "mssql://sde@10.0.0.5/utility"),
+        saved("exact", "mssql://sde@127.0.0.1:9/utility"),
+        saved("other", "mssql://sde@127.0.0.1:9/billing"),
+    ];
+    let (added, notes) = add_pro_map(&mut s, &sde_network_mapx(), None);
+    assert_eq!((added.layers, added.broken), (3, 3), "{notes:?}");
+    let r = s.run("layer.diagnose", &json!({"layer": "Mains"})).unwrap();
+    assert_eq!(r["kind"], "geodatabase", "{r}");
+    assert_eq!(r["server"], "127.0.0.1,9");
+    assert_eq!(r["database"], "utility");
+    assert_eq!(r["table"], "utility.sde.Mains");
+    assert_eq!(r["platform"], "sqlserver");
+    assert!(r["version"].is_null(), "{r}");
+    assert_eq!(
+        r["connections"],
+        json!([{"id": "exact", "name": "Connection exact", "exact": true}, {"id": "near", "name": "Connection near", "exact": false}]),
+        "{r}"
+    );
+    // Valves is in the same database; Parcels, in another, is not.
+    let valves = s.map().layer_by_name("Valves").unwrap().id;
+    assert_eq!(r["siblings"], json!([valves]), "{r}");
+    assert!(!r.to_string().contains("sde@"), "{r}");
+}
+
+#[test]
+fn retrying_an_sde_layer_without_a_connection_says_so() {
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &sde_network_mapx(), None);
+    assert_eq!((added.layers, added.broken), (3, 3), "{notes:?}");
+    let r = s.run("layer.retry", &json!({"layer": "Mains"})).unwrap();
+    assert_eq!(r["opened"], 0, "{r}");
+    let error = r["failed"][0]["error"].as_str().unwrap();
+    assert!(error.contains("Repair Source"), "{error}");
+    assert!(error.contains("127.0.0.1,9"), "{error}");
+    // The layer is still broken, with its origin, for Repair Source….
+    let src = s.map().layer_by_name("Mains").unwrap().source.clone().unwrap();
+    assert!(src.is_broken() && src.geodatabase.is_some());
+}
+
+#[test]
+fn retrying_an_sde_layer_through_a_quiet_connection_that_fails_keeps_it_broken() {
+    use crate::connections::Connection;
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &sde_network_mapx(), None);
+    assert_eq!((added.layers, added.broken), (3, 3), "{notes:?}");
+    let layers = s.map().layers.len();
+    s.connections.connections.push(Connection {
+        id: "c1".into(),
+        name: "Utility Editor".into(),
+        kind: "sqlserver".into(),
+        address: "mssql://sde@127.0.0.1:9/utility".into(),
+        remembered: true,
+        ..Connection::default()
+    });
+    s.database_logins.set_session_password("c1", "made-up-pw");
+    let r = s.run("layer.retry", &json!({"layer": "Mains"})).unwrap();
+    assert_eq!(r["opened"], 0, "{r}");
+    let error = r["failed"][0]["error"].as_str().unwrap();
+    assert!(!error.contains("made-up-pw") && !error.contains("Repair Source"), "{error}");
+    // Nothing was left behind: no extra layer, the layer broken with its origin and the reason.
+    assert_eq!(s.map().layers.len(), layers);
+    let src = s.map().layer_by_name("Mains").unwrap().source.clone().unwrap();
+    assert!(src.is_broken() && src.geodatabase.is_some());
+    assert_eq!(src.why_broken(), Some(error));
+    assert!(!s.database_logins.is_rejected("c1"));
+}
+
 #[test]
 fn a_pro_map_opens_at_its_saved_camera() {
     use rustgis_geom::{Coord, lonlat_to_merc};

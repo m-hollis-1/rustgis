@@ -41,6 +41,7 @@ pub mod project;
 pub mod qgis;
 pub mod raster;
 pub mod repair;
+pub mod repair_geodatabase;
 pub mod report;
 pub mod retry;
 pub mod s3;
@@ -84,6 +85,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(layer_copy::commands());
     v.extend(raster::commands());
     v.extend(repair::commands());
+    v.extend(repair_geodatabase::commands());
     v.extend(broken::commands());
     v.extend(retry::commands());
     v.extend(zarr::commands());

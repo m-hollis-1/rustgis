@@ -30,6 +30,55 @@ fn replacement(p: &Value) -> Result<String, String> {
     Ok(full)
 }
 
+/// Whether data read as `info` can stand in for the layer `l`'s: the same geometry type, every
+/// field its symbology, labels and time slider use, and an expression its classes read on the old
+/// fields still reading on the new ones. `what` names the new data in the message (a file's path,
+/// a connection's name).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn fits(l: &rustgis_map::Layer, info: &rustgis_data::source::SourceInfo, what: &str) -> Result<(), String> {
+    if l.dataset.geometry_type != rustgis_data::GeometryType::None && info.geometry_type != l.dataset.geometry_type {
+        return Err(format!(
+            "{what} holds {} features; {} draws {} features: choose a file of {} features",
+            info.geometry_type.label(),
+            l.name,
+            l.dataset.geometry_type.label(),
+            l.dataset.geometry_type.label()
+        ));
+    }
+    let mut required: Vec<&str> = l.renderer.field().into_iter().collect();
+    if l.labels.enabled {
+        // A template requires each of its fields.
+        for c in l.labels.in_order() {
+            let fields = rustgis_map::symbology::template_fields(&c.field);
+            if fields.is_empty() { required.push(&c.field) } else { required.extend(fields) }
+        }
+    }
+    if let Some(time) = &l.time {
+        required.push(&time.field);
+    }
+    required.retain(|f| l.dataset.fields.iter().any(|old| old.name.eq_ignore_ascii_case(f)));
+    required.sort_unstable();
+    required.dedup();
+    let missing: Vec<&str> = required.into_iter().filter(|f| !info.fields.iter().any(|new| new.name.eq_ignore_ascii_case(f))).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{what} has no field {}, which {}'s symbology, labels or time slider use: choose a file that has them",
+            missing.join(", "),
+            l.name
+        ));
+    }
+    // Classes by an expression that reads on the old fields must read on the new ones.
+    if let Some(e) = l.renderer.expression().filter(|e| rustgis_data::query::parse(e, &l.dataset).is_ok())
+        && let Err(why) = rustgis_data::query::parse(e, &rustgis_data::Dataset::new("", info.geometry_type, info.fields.clone()))
+    {
+        return Err(format!(
+            "{what} doesn't fit {}'s symbology, which classes by `{e}` ({why}): choose a file that has its fields",
+            l.name
+        ));
+    }
+    Ok(())
+}
+
 fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -58,48 +107,7 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
             let src = l.source.as_ref().ok_or("the layer has no linked source")?;
             let new = src.relinked(&full, table)?;
             if let Some(info) = new.info() {
-                if l.dataset.geometry_type != rustgis_data::GeometryType::None && info.geometry_type != l.dataset.geometry_type {
-                    return Err(format!(
-                        "{full} holds {} features; {} draws {} features: choose a file of {} features",
-                        info.geometry_type.label(),
-                        l.name,
-                        l.dataset.geometry_type.label(),
-                        l.dataset.geometry_type.label()
-                    ));
-                }
-                let mut required: Vec<&str> = l.renderer.field().into_iter().collect();
-                if l.labels.enabled {
-                    // A template requires each of its fields.
-                    for c in l.labels.in_order() {
-                        let fields = rustgis_map::symbology::template_fields(&c.field);
-                        if fields.is_empty() { required.push(&c.field) } else { required.extend(fields) }
-                    }
-                }
-                if let Some(time) = &l.time {
-                    required.push(&time.field);
-                }
-                required.retain(|f| l.dataset.fields.iter().any(|old| old.name.eq_ignore_ascii_case(f)));
-                required.sort_unstable();
-                required.dedup();
-                let missing: Vec<&str> =
-                    required.into_iter().filter(|f| !info.fields.iter().any(|new| new.name.eq_ignore_ascii_case(f))).collect();
-                if !missing.is_empty() {
-                    return Err(format!(
-                        "{full} has no field {}, which {}'s symbology, labels or time slider use: choose a file that has them",
-                        missing.join(", "),
-                        l.name
-                    ));
-                }
-                // Classes by an expression that reads on the old fields must read on the new ones.
-                if let Some(e) = l.renderer.expression().filter(|e| rustgis_data::query::parse(e, &l.dataset).is_ok())
-                    && let Err(why) =
-                        rustgis_data::query::parse(e, &rustgis_data::Dataset::new("", info.geometry_type, info.fields.clone()))
-                {
-                    return Err(format!(
-                        "{full} doesn't fit {}'s symbology, which classes by `{e}` ({why}): choose a file that has its fields",
-                        l.name
-                    ));
-                }
+                fits(l, info, &full)?;
             }
             // A broken layer's query was kept unchecked while it had no fields to check it against.
             let was_broken = src.is_broken();

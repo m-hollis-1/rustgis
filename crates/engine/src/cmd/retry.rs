@@ -95,7 +95,7 @@ fn relink(s: &mut Session, p: &Value) -> CmdResult {
 
 /// A broken layer's definition query was kept unchecked while it had no fields to check it
 /// against: kept now when it fits the fields its source opened with, else cleared with a notice.
-fn check_query(s: &mut Session, id: u32) {
+pub(super) fn check_query(s: &mut Session, id: u32) {
     let Some(l) = s.map_mut().layer_mut(id) else { return };
     let dropped = l.definition_query.take_if(|q| rustgis_data::query::parse(q, &l.dataset).is_err());
     if let Some(q) = dropped {
@@ -171,7 +171,7 @@ fn retry_service(s: &mut Session, id: u32, service: &rustgis_map::source::Servic
 
 /// Moves what the newly added layer `new_id` read into the broken layer `id`, which keeps its
 /// place and style; the added layer is taken out as Remove takes a layer out.
-fn adopt(s: &mut Session, id: u32, new_id: u32) -> Result<(), String> {
+pub(super) fn adopt(s: &mut Session, id: u32, new_id: u32) -> Result<(), String> {
     // The tile layers over it keep their place, its group and the legends forget it.
     let m = s.map_mut();
     m.release_tiles(&[new_id]);

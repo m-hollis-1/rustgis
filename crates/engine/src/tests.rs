@@ -27748,3 +27748,153 @@ mod sde_file_connections {
         assert!(s.connections.connections.is_empty());
     }
 }
+
+/// A saved SQL Server connection to the unreachable `utility` database of `sde_network_mapx`.
+#[cfg(not(target_arch = "wasm32"))]
+fn utility_connection(s: &mut Session) {
+    use crate::connections::Connection;
+    s.connections.connections.push(Connection {
+        id: "c1".into(),
+        name: "Utility Editor".into(),
+        kind: "sqlserver".into(),
+        address: "mssql://sde@127.0.0.1:9/utility".into(),
+        ..Connection::default()
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn repairing_needs_a_connection_and_a_geodatabase_layer() {
+    // A broken file layer isn't a geodatabase layer.
+    let mut s = world();
+    let (_, notes) = add_pro_map(&mut s, &pro_mapx(), None);
+    utility_connection(&mut s);
+    assert!(s.map().layer_by_name("Elevation").and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken()), "{notes:?}");
+    let e = s.run("layer.repairGeodatabase", &json!({"layer": "Elevation", "connection": "Utility Editor"})).unwrap_err();
+    assert!(e.contains("isn't an enterprise geodatabase layer"), "{e}");
+    // An unknown connection, and a connection to another database.
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &sde_network_mapx(), None);
+    assert_eq!((added.layers, added.broken), (3, 3), "{notes:?}");
+    utility_connection(&mut s);
+    let e = s.run("layer.repairGeodatabase", &json!({"layer": "Mains", "connection": "Nowhere"})).unwrap_err();
+    assert!(e.contains("no connection"), "{e}");
+    let e = s.run("layer.repairGeodatabase", &json!({"layer": "Parcels", "connection": "Utility Editor"})).unwrap_err();
+    assert!(e.contains("Parcels") && e.contains("Utility Editor"), "{e}");
+    // A connection that has no password to sign in with says so, before any layer is tried.
+    let e = s.run("layer.repairGeodatabase", &json!({"layer": "Mains", "connection": "Utility Editor"})).unwrap_err();
+    assert!(e.contains("password"), "{e}");
+    // Nothing changed.
+    assert!(s.map().layer_by_name("Mains").and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken() && src.geodatabase.is_some()));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn repairing_all_through_a_server_that_fails_changes_nothing() {
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &sde_network_mapx(), None);
+    assert_eq!((added.layers, added.broken), (3, 3), "{notes:?}");
+    utility_connection(&mut s);
+    s.database_logins.set_session_password("c1", "made-up-pw");
+    let layers = s.map().layers.len();
+    let (camera, active) = (s.map().camera, s.active_layer);
+    // Mains and Valves are of the utility database; Parcels (another database) is not tried.
+    let e = s.run("layer.repairGeodatabase", &json!({"all": true, "connection": "c1"})).unwrap_err();
+    assert!(e.starts_with("nothing was repaired"), "{e}");
+    assert!(e.contains("Mains") && e.contains("Valves") && !e.contains("Parcels"), "{e}");
+    assert!(!e.contains("made-up-pw"), "{e}");
+    assert_eq!(s.map().layers.len(), layers);
+    assert_eq!((s.map().camera, s.active_layer), (camera, active));
+    for name in ["Mains", "Valves", "Parcels"] {
+        assert!(
+            s.map().layer_by_name(name).and_then(|l| l.source.as_ref()).is_some_and(|src| src.is_broken() && src.geodatabase.is_some()),
+            "{name}"
+        );
+    }
+    // The server didn't refuse the password.
+    assert!(s.database_logins.session_password("c1").is_some());
+    // A layer named on its own: its error is the command's.
+    let e = s.run("layer.repairGeodatabase", &json!({"layer": "Mains", "connection": "c1"})).unwrap_err();
+    assert!(e.starts_with("Mains: ") && !e.contains("made-up-pw"), "{e}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_fit_check_is_shared() {
+    use rustgis_data::source::SourceInfo;
+    let s = world();
+    let mut l = s.map().layer_by_name("Countries").unwrap().clone();
+    l.dataset.fields.push(rustgis_data::Field::new("DIAM", rustgis_data::FieldType::Double));
+    l.renderer = rustgis_map::Renderer::Proportional {
+        field: "DIAM".into(),
+        base: l.renderer.base_symbol(),
+        min_size: 2.0,
+        max_size: 12.0,
+        min: 0.0,
+        max: 1.0,
+    };
+    let info = |geometry_type, fields: Vec<rustgis_data::Field>| SourceInfo {
+        name: "mains".into(),
+        format: "test",
+        geometry_type,
+        fields,
+        extent: rustgis_geom::Extent::default(),
+        count: None,
+        crs: "EPSG:4326".into(),
+        indexed: false,
+        notes: Vec::new(),
+        zm_dropped: false,
+    };
+    let (kind, fields) = (l.dataset.geometry_type, l.dataset.fields.clone());
+    let without: Vec<_> = fields.iter().filter(|f| f.name != "DIAM").cloned().collect();
+    let e = crate::cmd::repair::fits(&l, &info(kind, without), "Utility Editor").unwrap_err();
+    assert!(e.starts_with("Utility Editor has no field DIAM"), "{e}");
+    // Another geometry type is named first.
+    let other =
+        if kind == rustgis_data::GeometryType::Point { rustgis_data::GeometryType::Polyline } else { rustgis_data::GeometryType::Point };
+    let e = crate::cmd::repair::fits(&l, &info(other, fields.clone()), "Utility Editor").unwrap_err();
+    assert!(e.starts_with("Utility Editor holds "), "{e}");
+    assert!(crate::cmd::repair::fits(&l, &info(kind, fields), "Utility Editor").is_ok());
+}
+
+/// `RUSTGIS_TEST_SDE` names a live SQL Server enterprise geodatabase and `RUSTGIS_TEST_SDE_TABLE`
+/// one of its feature classes: a Pro map's broken SDE layer for it is repaired through a saved
+/// connection logged in with a session password, keeping its style.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn sde_live_repair() {
+    let (Ok(address), Ok(table)) = (std::env::var("RUSTGIS_TEST_SDE"), std::env::var("RUSTGIS_TEST_SDE_TABLE")) else { return };
+    let Some((key, database)) = crate::geodatabase::address_key(&address) else { panic!("RUSTGIS_TEST_SDE is not a mssql:// address") };
+    let server = match (&key.instance, key.port) {
+        (Some(instance), _) => format!("{}\\{instance}", key.host),
+        (None, Some(port)) => format!("{},{port}", key.host),
+        (None, None) => key.host.clone(),
+    };
+    let dataset = if table.matches('.').count() >= 2 { table.clone() } else { format!("{database}.{table}") };
+    let doc = json!({"type": "CIMMapDocument", "version": "3.7.0",
+        "mapDefinition": {"type": "CIMMap", "name": "Live", "uRI": "CIMPATH=map/live.json",
+            "layers": ["CIMPATH=live/layer.json"], "spatialReference": {"wkid": 4326, "latestWkid": 4326}},
+        "layerDefinitions": [{"type": "CIMFeatureLayer", "name": "Live Layer", "uRI": "CIMPATH=live/layer.json", "visibility": true,
+            "featureTable": {"type": "CIMFeatureTable", "dataConnection": {"type": "CIMStandardDataConnection",
+                "workspaceConnectionString": format!("SERVER={server};INSTANCE=sde:sqlserver:{server};DATABASE={database}"),
+                "workspaceFactory": "SDE", "dataset": dataset, "datasetType": "esriDTFeatureClass"}}}]});
+    let mut s = world();
+    let (added, notes) = add_pro_map_in(&mut s, &type_first(doc), None, None);
+    assert_eq!((added.layers, added.broken), (1, 1), "{notes:?}");
+    let id = s.map().layer_by_name("Live Layer").unwrap().id;
+    s.run("layer.color", &json!({"layer": id, "color": "#336699"})).unwrap();
+    let style = serde_json::to_value(&s.map().layer(id).unwrap().renderer).unwrap();
+    // The connection's address names the user; the password is this session's, never saved.
+    let (public, password) = rustgis_data::source::msconn::split_password(&address).map(|(p, w)| (p, w.unwrap_or_default())).unwrap();
+    let c = s.run("connection.new", &json!({"kind": "sqlserver", "address": public, "name": "live"})).unwrap();
+    let cid = c["id"].as_str().unwrap().to_string();
+    s.run("connection.login", &json!({"id": cid, "password": password})).unwrap();
+    let r = s.run("layer.repairGeodatabase", &json!({"layer": id, "connection": "live"})).unwrap();
+    assert_eq!(r["repaired"], json!(["Live Layer"]), "{r}");
+    let l = s.map().layer(id).unwrap();
+    let src = l.source.as_ref().unwrap();
+    assert!(src.is_open() && src.geodatabase.is_none(), "{:?}", src.error);
+    assert_eq!(serde_json::to_value(&l.renderer).unwrap(), style, "the style is kept");
+    assert!(password.is_empty() || !serde_json::to_string(&s.project).unwrap().contains(&password), "the project keeps no password");
+}

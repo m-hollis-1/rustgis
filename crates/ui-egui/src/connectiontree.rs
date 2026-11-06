@@ -336,6 +336,7 @@ fn what_label(what: &str) -> &'static str {
         "schema" => tl!("schema"),
         "table" => tl!("table"),
         "folder" => tl!("folder"),
+        "dataset" => tl!("feature dataset"),
         "service" => tl!("service"),
         "map" => tl!("map"),
         "vectorTiles" => tl!("vector tiles"),
@@ -490,7 +491,13 @@ fn branch(
     let open = state.is_open();
     let (mut clicked, mut refreshed) = (false, false);
     let mut header = state.show_header(ui, |ui| {
-        ui.label(RichText::new(what_label(child["what"].as_str().unwrap_or(""))).small().weak());
+        // A folder that carries its own children and no node of its own is a group a listing made
+        // up (a geodatabase's `Tables`): its name says what it is. A service folder, which is
+        // read when opened, says "folder".
+        let what = child["what"].as_str().unwrap_or("");
+        if !(what == "folder" && node.is_none()) {
+            ui.label(RichText::new(what_label(what)).small().weak());
+        }
         let r = ui.add(Label::new(child["name"].as_str().unwrap_or("")).sense(Sense::click()));
         clicked = r.clicked();
         if node.is_some() {

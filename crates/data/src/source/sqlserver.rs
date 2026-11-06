@@ -441,6 +441,9 @@ pub struct Table {
     pub alias: Option<String>,
     /// The geodatabase feature dataset the class is in (`None` from [`tables`]).
     pub dataset: Option<String>,
+    /// The geodatabase class's name without its owner and database (`Mains` for
+    /// `utility.sde.Mains`), when the catalog registers it (`None` from [`tables`]).
+    pub short: Option<String>,
 }
 
 impl Table {
@@ -552,6 +555,7 @@ pub fn tables(conn: &Conn) -> Result<Vec<Table>> {
                 several: false,
                 alias: None,
                 dataset: None,
+                short: None,
             })
         })
         .collect();

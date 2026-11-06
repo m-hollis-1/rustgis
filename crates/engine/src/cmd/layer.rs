@@ -2202,10 +2202,11 @@ impl LiveTable {
         }
     }
 
-    /// The name of the layer the table gives: a geodatabase class's alias, else its label.
+    /// The name of the layer the table gives: a geodatabase class's alias, else its short name
+    /// (as the connection tree shows it); any other table's label.
     fn display(&self) -> String {
         match self {
-            LiveTable::Sqlserver(t) => t.alias.clone().unwrap_or_else(|| t.label()),
+            LiveTable::Sqlserver(t) => t.alias.clone().or_else(|| t.short.clone()).unwrap_or_else(|| t.label()),
             t => t.label(),
         }
     }
@@ -2273,7 +2274,9 @@ impl LiveDb {
 
 /// A SQL Server table by name. In an enterprise geodatabase the catalog reads the name first, so
 /// a class is found by its short name or Pro's `db.schema.table` too, and its table carries the
-/// class alias and feature dataset; any other name is looked up as the database's own.
+/// class alias, feature dataset and short name; a class whose table has no native spatial column
+/// (SDEBINARY or other storage) is refused, saying so. Any other name is looked up as the
+/// database's own.
 #[cfg(not(target_arch = "wasm32"))]
 fn find_sqlserver(
     conn: &rustgis_data::source::sqlserver::Conn,
@@ -2283,16 +2286,34 @@ fn find_sqlserver(
     if let Some(catalog) = sqlserver::geodatabase(conn)
         && let Some(item) = catalog.find(name).filter(|i| i.kind == ItemKind::FeatureClass)
     {
-        let full = format!("{}.{}", item.schema, item.table);
-        let wanted = match &item.shape_column {
-            Some(column) => format!("{full}:{column}"),
-            None => full,
-        };
-        if let Ok(t) = sqlserver::find_table(conn, &wanted) {
-            return Ok(sqlserver::Table { alias: item.alias.clone(), dataset: item.dataset.clone(), ..t });
-        }
+        return class_table(item, &sqlserver::tables(conn)?);
     }
     sqlserver::find_table(conn, name)
+}
+
+/// The spatial column of the database's `tables` a registered feature class reads: its shape
+/// column, else its table's first, carrying the class alias, feature dataset and short name. A
+/// class with none is stored in a format RustGIS doesn't read (SDEBINARY or other storage).
+#[cfg(not(target_arch = "wasm32"))]
+fn class_table(
+    item: &rustgis_data::source::geodatabase::Item,
+    tables: &[rustgis_data::source::sqlserver::Table],
+) -> rustgis_data::Result<rustgis_data::source::sqlserver::Table> {
+    let full = format!("{}.{}", item.schema, item.table);
+    let named = |n: &str| tables.iter().find(|t| t.is_named(n));
+    let shape = item.shape_column.as_deref().and_then(|column| named(&format!("{full}:{column}")));
+    let Some(t) = shape.or_else(|| named(&full)) else {
+        return Err(rustgis_data::DataError::Unsupported(format!(
+            "{} is stored in a format RustGIS doesn't read (SDEBINARY or another non-native storage)",
+            item.name
+        )));
+    };
+    Ok(rustgis_data::source::sqlserver::Table {
+        alias: item.alias.clone(),
+        dataset: item.dataset.clone(),
+        short: Some(item.short_name().to_string()),
+        ..t.clone()
+    })
 }
 
 /// Adds a registered non-spatial table of an enterprise geodatabase as a standalone table,
@@ -3720,10 +3741,11 @@ mod tests {
     use super::LiveTable;
     use rustgis_data::source::sqlserver::Table;
 
-    /// A geodatabase class names its layer by its alias, else by its label.
+    /// A geodatabase class names its layer by its alias, else by its short name; a table the
+    /// catalog doesn't register, by its label.
     #[test]
     fn geodatabase_class_layer_name_is_its_alias() {
-        let table = |alias: Option<&str>| Table {
+        let table = |alias: Option<&str>, short: Option<&str>| Table {
             schema: "gis".into(),
             name: "MAINS".into(),
             column: "SHAPE".into(),
@@ -3732,8 +3754,49 @@ mod tests {
             several: false,
             alias: alias.map(str::to_string),
             dataset: None,
+            short: short.map(str::to_string),
         };
-        assert_eq!(LiveTable::Sqlserver(table(Some("Water Mains"))).display(), "Water Mains");
-        assert_eq!(LiveTable::Sqlserver(table(None)).display(), "gis.MAINS");
+        assert_eq!(LiveTable::Sqlserver(table(Some("Water Mains"), Some("Mains"))).display(), "Water Mains");
+        assert_eq!(LiveTable::Sqlserver(table(None, Some("Mains"))).display(), "Mains");
+        assert_eq!(LiveTable::Sqlserver(table(None, None)).display(), "gis.MAINS");
+    }
+
+    /// A registered class reads its shape column, named as the catalog names it; one whose table
+    /// has no native spatial column is refused, naming the storage.
+    #[test]
+    fn a_class_without_a_native_column_is_refused_by_its_storage() {
+        use rustgis_data::source::geodatabase::{Item, ItemKind, Versioning};
+        let item = Item {
+            name: "utility.gis.Mains".into(),
+            schema: "gis".into(),
+            table: "MAINS".into(),
+            kind: ItemKind::FeatureClass,
+            dataset: Some("Water".into()),
+            alias: None,
+            shape_column: Some("SHAPE".into()),
+            field_aliases: Vec::new(),
+            versioning: Versioning::Unversioned,
+            definition_ok: true,
+            family: None,
+            archived: false,
+            rowid_column: None,
+            srid: None,
+        };
+        let column = |column: &str| Table {
+            schema: "gis".into(),
+            name: "MAINS".into(),
+            column: column.into(),
+            kind: "geometry".into(),
+            current: false,
+            several: true,
+            alias: None,
+            dataset: None,
+            short: None,
+        };
+        let t = super::class_table(&item, &[column("EXTRA"), column("SHAPE")]).unwrap();
+        assert_eq!((t.column.as_str(), t.short.as_deref(), t.dataset.as_deref()), ("SHAPE", Some("Mains"), Some("Water")));
+        assert_eq!(LiveTable::Sqlserver(t).display(), "Mains");
+        let e = super::class_table(&item, &[]).unwrap_err().to_string();
+        assert!(e.contains("utility.gis.Mains is stored in a format RustGIS doesn't read (SDEBINARY"), "{e}");
     }
 }

@@ -889,6 +889,7 @@ mod tests {
             several: false,
             alias: None,
             dataset: None,
+            short: Some("Valves".into()),
         };
         let listing = GdbListing {
             datasets: Vec::new(),

@@ -261,7 +261,12 @@ pub(super) fn listing_of(catalog: &Catalog, spatial: Vec<Table>) -> GdbListing {
                 .iter()
                 .find(|t| same(t, item) && shape.is_some_and(|s| t.column.eq_ignore_ascii_case(s)))
                 .or_else(|| spatial.iter().find(|t| same(t, item)))
-                .map(|t| Table { alias: item.alias.clone(), dataset: item.dataset.clone(), ..t.clone() });
+                .map(|t| Table {
+                    alias: item.alias.clone(),
+                    dataset: item.dataset.clone(),
+                    short: Some(item.short_name().to_string()),
+                    ..t.clone()
+                });
             (item.clone(), table)
         })
         .collect();
@@ -327,6 +332,7 @@ pub fn read_table(conn: &Conn, item: &Item, limit: usize) -> Result<(Dataset, Re
         several: false,
         alias: None,
         dataset: None,
+        short: None,
     };
     let reading = reading_of(plan, &base, item, None)?;
     let (fields, sql) = table_select(&reading, &columns, limit);
@@ -369,6 +375,7 @@ mod tests {
             several: false,
             alias: None,
             dataset: None,
+            short: None,
         }
     }
 
@@ -527,7 +534,7 @@ mod tests {
         );
         assert_eq!(listing.datasets, ["Water"]);
         let mains = catalog.find("Mains").unwrap_or_else(|| panic!("Mains is registered"));
-        let expected = Table { dataset: Some("Water".into()), ..spatial("SDE", "MAINS", "SHAPE") };
+        let expected = Table { dataset: Some("Water".into()), short: Some("Mains".into()), ..spatial("SDE", "MAINS", "SHAPE") };
         assert_eq!(listing.classes, vec![(mains.clone(), Some(expected))]);
         let readings = catalog.find("Readings").unwrap_or_else(|| panic!("Readings is registered"));
         assert_eq!(listing.tables, vec![readings.clone()]);

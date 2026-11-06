@@ -26622,6 +26622,32 @@ fn retrying_an_sde_layer_through_a_quiet_connection_that_fails_keeps_it_broken()
 }
 
 #[test]
+fn retrying_all_tries_a_failing_quiet_connection_once() {
+    use crate::connections::Connection;
+    let mut s = world();
+    let (added, notes) = add_pro_map(&mut s, &sde_network_mapx(), None);
+    assert_eq!((added.layers, added.broken), (3, 3), "{notes:?}");
+    s.connections.connections.push(Connection {
+        id: "c1".into(),
+        name: "Utility Editor".into(),
+        kind: "sqlserver".into(),
+        address: "mssql://sde@127.0.0.1:9/utility".into(),
+        remembered: true,
+        ..Connection::default()
+    });
+    s.database_logins.set_session_password("c1", "made-up-pw");
+    // Mains and Valves fit the connection; Parcels (another database) has none.
+    let r = s.run("layer.retry", &json!({"all": true})).unwrap();
+    assert_eq!(r["opened"], 0, "{r}");
+    let errors: Vec<&str> = r["failed"].as_array().unwrap().iter().filter_map(|f| f["error"].as_str()).collect();
+    assert_eq!(errors.len(), 3, "{r}");
+    let again = errors.iter().filter(|e| e.contains("not tried again after Utility Editor failed")).count();
+    assert_eq!(again, 1, "{errors:?}");
+    assert!(errors.iter().all(|e| !e.contains("made-up-pw")), "{errors:?}");
+    assert!(errors.iter().filter(|e| e.contains("Repair Source")).count() == 1, "{errors:?}");
+}
+
+#[test]
 fn a_pro_map_opens_at_its_saved_camera() {
     use rustgis_geom::{Coord, lonlat_to_merc};
     let at = lonlat_to_merc(Coord::new(-97.0, 38.0));

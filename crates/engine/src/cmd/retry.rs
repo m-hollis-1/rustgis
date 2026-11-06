@@ -31,6 +31,8 @@ fn retry(s: &mut Session, p: &Value) -> CmdResult {
         return Err("name a layer (\"layer\"), or retry every broken layer (\"all\": true)".into());
     };
     let (mut retried, mut opened, mut failed) = (0, 0, Vec::new());
+    // The saved connections (id -> name) that failed in this run: not tried again for the next layer.
+    let mut dead = std::collections::HashMap::new();
     for id in ids {
         let Some(l) = s.map().layer(id) else { continue };
         let name = l.name.clone();
@@ -39,7 +41,7 @@ fn retry(s: &mut Session, p: &Value) -> CmdResult {
             continue;
         }
         retried += 1;
-        match retry_layer(s, id) {
+        match retry_layer(s, id, &mut dead) {
             Ok(Outcome::Opened) => {
                 opened += 1;
                 check_query(s, id);
@@ -108,13 +110,13 @@ fn broken(l: &rustgis_map::Layer) -> bool {
 
 /// Opens the broken layer `id`'s source again: its service added again, its geodatabase table
 /// through the one connection that opens quietly, else its file reopened.
-fn retry_layer(s: &mut Session, id: u32) -> Result<Outcome, String> {
+fn retry_layer(s: &mut Session, id: u32, dead: &mut std::collections::HashMap<String, String>) -> Result<Outcome, String> {
     let src = s.map().layer(id).and_then(|l| l.source.as_ref()).ok_or("the layer no longer exists")?;
     if let Some(service) = src.service.clone() {
         return retry_service(s, id, &service);
     }
     if let Some(g) = src.geodatabase.clone() {
-        return retry_geodatabase(s, id, &g);
+        return retry_geodatabase(s, id, &g, dead);
     }
     if src.path.is_none() {
         // (Repair Data Source isn't offered for it either: it has nothing to repair.)
@@ -193,16 +195,28 @@ fn adopt(s: &mut Session, id: u32, new_id: u32) -> Result<(), String> {
 /// Reads the broken geodatabase layer `id`'s table again through the one saved connection that
 /// opens without asking; with none, the layer stays broken and Repair Source… is the way in.
 #[cfg(not(target_arch = "wasm32"))]
-fn retry_geodatabase(s: &mut Session, id: u32, g: &rustgis_map::source::GeodatabaseOrigin) -> Result<Outcome, String> {
+fn retry_geodatabase(
+    s: &mut Session,
+    id: u32,
+    g: &rustgis_map::source::GeodatabaseOrigin,
+    dead: &mut std::collections::HashMap<String, String>,
+) -> Result<Outcome, String> {
     let Some(c) = super::geodatabase_open::quiet_connection(s, g) else {
         return Err(format!("needs a connection to the geodatabase on {}: use Repair Source…", g.server));
     };
+    // A connection that failed for an earlier layer of this run isn't tried (and waited for) again.
+    if let Some(named) = dead.get(&c.id) {
+        return Err(format!("not tried again after {} failed", named.chars().take(60).collect::<String>()));
+    }
     let name = s.map().layer(id).map(|l| l.name.clone()).ok_or("the layer no longer exists")?;
     // Adding a layer goes to it and makes it active; a retry leaves the view and the active
     // layer as they were. A registered table that came back stays out of the project's.
     let (camera, active) = (s.map().camera, s.active_layer);
     let tables: Vec<_> = s.project.tables.iter().map(|t| t.id).collect();
     let r = super::geodatabase_open::add_through(s, &c, g, &name);
+    if r.is_err() {
+        dead.insert(c.id.clone(), c.name.clone());
+    }
     s.map_mut().camera = camera;
     s.active_layer = active.filter(|a| s.map().layer(*a).is_some());
     let r = r?;
@@ -233,6 +247,11 @@ fn retry_geodatabase(s: &mut Session, id: u32, g: &rustgis_map::source::Geodatab
 }
 
 #[cfg(target_arch = "wasm32")]
-fn retry_geodatabase(_: &mut Session, _: u32, g: &rustgis_map::source::GeodatabaseOrigin) -> Result<Outcome, String> {
+fn retry_geodatabase(
+    _: &mut Session,
+    _: u32,
+    g: &rustgis_map::source::GeodatabaseOrigin,
+    _: &mut std::collections::HashMap<String, String>,
+) -> Result<Outcome, String> {
     Err(format!("needs a connection to the geodatabase on {}: use Repair Source…", g.server))
 }

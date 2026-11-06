@@ -33,11 +33,7 @@ pub enum Match {
 fn finish(host: &str, port: Option<u16>, instance: Option<&str>) -> ServerKey {
     let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
     let instance = instance.map(|i| i.trim().to_ascii_lowercase()).filter(|i| !i.is_empty());
-    ServerKey {
-        host: if host.is_empty() { "localhost".into() } else { host },
-        port: if port.is_none() && instance.is_none() { Some(DEFAULT_PORT) } else { port },
-        instance,
-    }
+    ServerKey { host, port: if port.is_none() && instance.is_none() { Some(DEFAULT_PORT) } else { port }, instance }
 }
 
 /// Splits `host`, `host:port` and `[v6]:port` (a bare IPv6 literal is all host).
@@ -52,10 +48,8 @@ fn host_port(text: &str) -> Option<(&str, &str)> {
     Some(text.rsplit_once(':').unwrap_or((text, "")))
 }
 
-/// The server text ArcGIS Pro wrote for a geodatabase: `host`, `host\inst`, `host,port`,
-/// `host:port`, or any of these after `sde:sqlserver:`. A port that isn't a number is ignored;
-/// with neither a port nor an instance the default port, 1433, is the one named.
-pub fn server_key(server: &str) -> ServerKey {
+/// The pieces of Pro's server text: the host as written, the port text if any, and the instance.
+fn split_server(server: &str) -> (&str, Option<&str>, Option<&str>) {
     let mut text = server.trim();
     if text.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("sde:"))
         && let Some((_, rest)) = text.get(4..).and_then(|r| r.split_once(':'))
@@ -71,8 +65,26 @@ pub fn server_key(server: &str) -> ServerKey {
         None => (name, None),
     };
     let (host, colon_port) = host_port(name.trim()).unwrap_or((name, ""));
-    let port = comma_port.unwrap_or(colon_port).trim().parse::<u16>().ok();
-    finish(host, port, instance)
+    let port = comma_port.or(Some(colon_port).filter(|p| !p.is_empty()));
+    (host, port, instance)
+}
+
+/// The server text ArcGIS Pro wrote for a geodatabase: `host`, `host\inst`, `host,port`,
+/// `host:port`, or any of these after `sde:sqlserver:`. A port that isn't a number is ignored;
+/// with neither a port nor an instance the default port, 1433, is the one named. Text that
+/// names no host gives an empty host, which [`matches`] never matches.
+pub fn server_key(server: &str) -> ServerKey {
+    let (host, port, instance) = split_server(server);
+    finish(host, port.and_then(|p| p.trim().parse::<u16>().ok()), instance)
+}
+
+/// The server key of an origin's server text, `None` when it names no host or a port that isn't
+/// a number: a guess at the server is never evidence enough to offer a saved connection.
+fn origin_server(server: &str) -> Option<ServerKey> {
+    let (host, port, _) = split_server(server);
+    let key = server_key(server);
+    let port_ok = port.is_none_or(|p| p.trim().parse::<u16>().is_ok());
+    (!host.trim().trim_matches(['[', ']']).is_empty() && port_ok).then_some(key)
 }
 
 /// The server and lower-case database a saved `mssql://` address names; `None` for another
@@ -91,6 +103,8 @@ pub fn address_key(address: &str) -> Option<(ServerKey, String)> {
     let hostport = hostport.split('/').next().unwrap_or("");
     let (host, port) = host_port(hostport)?;
     let port = if port.is_empty() { None } else { Some(port.parse::<u16>().ok()?) };
+    // An address that names no host reads the local server, as the connection reader does.
+    let host = if host.trim().is_empty() { "localhost" } else { host };
     let mut instance = None;
     for kv in query.split('&').filter(|kv| !kv.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
@@ -105,7 +119,7 @@ pub fn address_key(address: &str) -> Option<(ServerKey, String)> {
 /// platform isn't said) can match, and the database must be named on both sides. The server must
 /// agree on host, port and instance for an `Exact` match; the same database on another host is
 /// `Near`; the same host with another port or instance is another server, so `No`. The address's
-/// user is ignored.
+/// user is ignored. An origin whose server names no host, or a port that isn't a number, is `No`.
 pub fn matches(origin: &GeodatabaseOrigin, address: &str) -> Match {
     if !(origin.platform.is_empty() || origin.platform.eq_ignore_ascii_case("sqlserver")) || origin.database.trim().is_empty() {
         return Match::No;
@@ -114,7 +128,7 @@ pub fn matches(origin: &GeodatabaseOrigin, address: &str) -> Match {
     if !database.eq_ignore_ascii_case(origin.database.trim()) {
         return Match::No;
     }
-    let wanted = server_key(&origin.server);
+    let Some(wanted) = origin_server(&origin.server) else { return Match::No };
     if wanted == saved {
         Match::Exact
     } else if wanted.host != saved.host {
@@ -146,6 +160,7 @@ mod tests {
         assert_eq!(server_key("sde:sqlserver:gis-db"), key("gis-db", Some(1433), None));
         assert_eq!(server_key("SDE:SqlServer:GIS-DB\\Inst"), key("gis-db", None, Some("inst")));
         assert_eq!(server_key(" gis-db,x "), key("gis-db", Some(1433), None));
+        assert_eq!(server_key("sde:sqlserver:").host, "");
         assert_eq!(server_key("[::1]:1434"), key("::1", Some(1434), None));
     }
 
@@ -165,6 +180,17 @@ mod tests {
         let inst = origin("sqlserver", "gis-db\\inst", "utility");
         assert_eq!(matches(&inst, "mssql://sde@gis-db/utility?instance=INST"), Match::Exact);
         assert_eq!(matches(&inst, "mssql://sde@[::1]/utility?Instance=inst"), Match::Near);
+        // A server that names no host, or a malformed port, is no evidence of any server.
+        for server in ["", "  ", "sde:sqlserver:", ",1433", "gis-db,abc", "sde:sqlserver:gis-db:x"] {
+            let blank = origin("sqlserver", server, "utility");
+            for address in ["mssql://sde@localhost/utility", "mssql://sde@gis-db/utility", "mssql:///utility"] {
+                assert_eq!(matches(&blank, address), Match::No, "{server:?} {address}");
+            }
+        }
+        // A short name and its fully qualified name are not proof of the same server.
+        let fqdn = origin("sqlserver", "gis-db.corp.example", "utility");
+        assert_eq!(matches(&fqdn, "mssql://sde@gis-db/utility"), Match::Near);
+        assert_eq!(matches(&pro, "mssql://sde@gis-db.corp.example/utility"), Match::Near);
         for platform in ["postgresql", "oracle"] {
             let other = origin(platform, "gis-db", "utility");
             for address in ["mssql://sde@gis-db/utility", "mssql://sde@10.0.0.5/utility"] {

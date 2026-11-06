@@ -210,7 +210,7 @@ does today, with these differences, each decided by the catalog, not by the user
 |---|---|
 | Unversioned | the base table, as today |
 | Traditionally versioned | the versioned view `<OWNER>.<TABLE>_evw` (or `_vw` from 10.1), which the server joins with the delta tables; read without setting a version, so it is the current state of Default. The view is found in `INFORMATION_SCHEMA.VIEWS`; a versioned class whose view is missing is refused: "<class> is versioned but its versioned view is missing; ask the geodatabase administrator to enable SQL access for it" |
-| Branch versioned | the base table filtered to the Default branch's current rows (`GDB_BRANCH_ID = 0`, not deleted, open-ended `GDB_TO_DATE`). **Left to the builder** to confirm the exact predicate against Esri's documentation and a branch-versioned class |
+| Branch versioned | the Default branch's current rows: the latest row per ObjectID on `GDB_BRANCH_ID = 0` by `GDB_FROM_DATE`, left out when it is a delete (`GDB_IS_DELETE`); each edit inserts a row and older ones aren't marked (final review ruling; Task 17 confirms the columns against a branch-versioned class) |
 | Archived (`IsArchived`) and not versioned | the base table; the `_H` archive table is hidden |
 | SDEBINARY storage | refused with the storage named |
 

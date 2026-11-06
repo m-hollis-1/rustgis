@@ -458,7 +458,9 @@ geodatabase's catalog, it says so instead, and the database browses as plain SQL
 notice saying why.
 
 **From .sde file…** fills the form from a connection file saved by ArcGIS Pro: the server, the
-database, the user and the version. **The password is never read from the file**: RustGIS asks
+database, the user and the version. The server is taken with its instance or port when the file
+gives them (`gis-db\utility` or `gis-db,1433`), not just the machine's name.
+**The password is never read from the file**: RustGIS asks
 for it, unless the file says Windows sign-in. The file's name becomes the connection's name. A
 `.sde` file dropped on the window, opened with **Add Data** or double-clicked in the Browser
 starts the same dialog. A file for another platform is refused with its platform named, and one
@@ -474,7 +476,8 @@ The connection's tree shows what ArcGIS Pro shows, and none of the geodatabase's
 - **Other spatial tables**: spatial tables and views the geodatabase doesn't register, left out
   when there are none.
 
-A class is listed by its alias, and field aliases come through as the layer's field names. A
+A class is listed by its alias (else its name, without owner or database) and added as a layer
+of that name; field aliases come through as the layer's field names. A
 versioned class says "feature class · traditional" or "feature class · branch" on hover. The
 geodatabase's own tables (`GDB_*` and `SDE_*`, the delta tables, `_evw` views and archive tables)
 are hidden. Click a class to select it, double-click to add it, or right-click for **Add With
@@ -495,9 +498,12 @@ rustgis-cli run --cmd 'layer.addDatabase={"database":"mssql://gis@gis-db/utility
 versioned class is read through its versioned view, so edits not yet compressed into the base
 table are included; if the view is missing, the class is refused with "ask the geodatabase
 administrator to enable SQL access for it", rather than showing the base table's stale rows. A
-branch-versioned class is read at the default branch. A layer imported from a Pro map that was
-on another version is read at Default, with a note saying so. A class that isn't versioned is
-read from its table.
+branch-versioned class is read at the default branch: the latest row of each feature there,
+without the deleted ones (a class whose ObjectID column isn't registered is refused). A layer
+imported from a Pro map that was on another version is read at Default, with a note saying so. A
+class that isn't versioned is read from its table, or through its versioned view when it has
+one. A class whose geodatabase definition can't be read is refused ("how it is versioned is
+unknown") rather than guessed at.
 
 **Tables** without geometry add as standalone tables: **Add** loads the whole table, up to
 100,000 rows, with a notice when there are more. A versioned table is read through its versioned

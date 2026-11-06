@@ -12,16 +12,20 @@ user's environment go in this file.
       says "Enterprise geodatabase <release>, N tables with geometry"; Save with Remember ticked.
 - [ ] The same from one of the user's `.sde` files (From .sde file…, and by dropping the file on
       the window): Server, Database, User and the name come from the file; the password is asked
-      for; the connection saves.
+      for; the connection saves. Note whether the file holds `KEY=VALUE;` text or is a binary
+      property set (key strings each followed by a value): the property-set reading
+      (`sdefile::parse`'s fallback) is confirmed here. The server includes the instance or port
+      Pro's dialog shows (from `DB_CONNECTION_PROPERTIES`/`INSTANCE`), not just the machine name.
 - [ ] A `.sde` file for a PostgreSQL geodatabase (if one exists) is refused with the platform
       named; a plain SQL Server connection (non-geodatabase database) browses by schema as before.
 
 ## 2. Browsing
 
 - [ ] The tree shows Feature datasets (each with its classes), root classes, Tables, Other spatial
-      tables; no `GDB_*`, `SDE_*`, `A<n>`/`D<n>`, `_evw` or `_H` entries; classes named as Pro's
-      Catalog names them, aliases in tooltips; versioned classes marked "· traditional" /
-      "· branch".
+      tables; no `GDB_*`, `SDE_*`, `A<n>`/`D<n>`, `_evw` or `_H` entries; a class with an alias
+      is shown by its alias as its name (one without, by its short name, as Pro's Catalog names
+      it), and adding it gives a layer of that same name; versioned classes marked
+      "· traditional" / "· branch" on hover.
 - [ ] An account that can't read the catalog (if one exists) browses as plain SQL Server with the
       notice "the geodatabase catalog couldn't be read: …".
 
@@ -31,8 +35,10 @@ user's environment go in this file.
       feature count and a known feature match Pro.
 - [ ] Add a traditionally versioned class: count and a **recently edited** feature match Pro's
       Default version (not the base table).
-- [ ] Add a branch-versioned class (if any): the same; note whether deleted/historic rows appear
-      (confirms `BRANCH_DEFAULT_FILTER`).
+- [ ] Add a branch-versioned class (if any): the same; edit a feature twice and delete another in
+      Pro (Default), then check that the edited one appears once, as last edited, and the deleted
+      one not at all. This confirms the Default read (the latest row per ObjectID on
+      `GDB_BRANCH_ID = 0` by `GDB_FROM_DATE`, `GDB_IS_DELETE = 0`) and the column names.
 - [ ] Add a registered non-spatial table: a standalone table opens; a table over 100,000 rows
       shows the "first 100000 rows of N" notice.
 - [ ] A class whose spatial column's SRID is 0 (if any): the coordinate system comes from the
@@ -62,7 +68,10 @@ user's environment go in this file.
 ## 5. Other checks
 
 - [ ] Windows sign-in connection (if usable): connects from the tree this session; never opens
-      imported layers on its own; Repair Source… still works when picked.
+      imported layers on its own; Repair Source… → Connect and repair through it connects as you,
+      with no password asked for.
+- [ ] Connect and repair through a database-login connection with no saved password: the
+      connection's form opens for the password, and Save continues the repair.
 - [ ] `layer.retry {all: true}` on several broken SDE layers with the server unreachable tries
       the connection once.
 - [ ] The web build (CI): `cargo check --target wasm32-unknown-unknown` for `rustgis-ui-egui`

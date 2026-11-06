@@ -201,6 +201,7 @@ fn retry_geodatabase(
     g: &rustgis_map::source::GeodatabaseOrigin,
     dead: &mut std::collections::HashMap<String, String>,
 ) -> Result<Outcome, String> {
+    use super::geodatabase_open::AddError;
     let Some(c) = super::geodatabase_open::quiet_connection(s, g) else {
         return Err(format!("needs a connection to the geodatabase on {}: use Repair Source…", g.server));
     };
@@ -208,42 +209,15 @@ fn retry_geodatabase(
     if let Some(named) = dead.get(&c.id) {
         return Err(format!("not tried again after {} failed", named.chars().take(60).collect::<String>()));
     }
-    let name = s.map().layer(id).map(|l| l.name.clone()).ok_or("the layer no longer exists")?;
-    // Adding a layer goes to it and makes it active; a retry leaves the view and the active
-    // layer as they were. A registered table that came back stays out of the project's.
-    let (camera, active) = (s.map().camera, s.active_layer);
-    let tables: Vec<_> = s.project.tables.iter().map(|t| t.id).collect();
-    let r = super::geodatabase_open::add_through(s, &c, g, &name);
-    if r.is_err() {
-        dead.insert(c.id.clone(), c.name.clone());
+    match super::geodatabase_open::open_into(s, id, &c, g, None) {
+        Ok(()) => Ok(Outcome::Opened),
+        Err(AddError::Connect(e)) => {
+            // Not tried (and waited for) again for the next layer of this run.
+            dead.insert(c.id.clone(), c.name.clone());
+            Err(e)
+        }
+        Err(AddError::Add(e)) => Err(e),
     }
-    s.map_mut().camera = camera;
-    s.active_layer = active.filter(|a| s.map().layer(*a).is_some());
-    let r = r?;
-    let mut added: Vec<u32> = r
-        .get("layers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_u64)
-        .filter_map(|n| u32::try_from(n).ok())
-        .collect();
-    added.retain(|n| *n != id);
-    s.project.tables.retain(|t| tables.contains(&t.id));
-    let Some((&new_id, extra)) = added.split_first() else {
-        return Err(format!("{}: '{}' came back as no layer of features", g.server, g.table));
-    };
-    // A table of mixed geometry types comes as a layer per type: the first takes the broken
-    // layer's place.
-    for n in extra {
-        super::layer::remove(s, &json!({"layer": n}))?;
-    }
-    adopt(s, id, new_id)?;
-    if !g.is_default_version() {
-        let version = g.version.as_deref().unwrap_or_default();
-        s.notify(format!("{name}: read at the Default version, not {version}"), false);
-    }
-    Ok(Outcome::Opened)
 }
 
 #[cfg(target_arch = "wasm32")]

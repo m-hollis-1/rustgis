@@ -676,11 +676,13 @@ fn open_quietly(s: &mut Session, g: &GeodatabaseOrigin, name: &str, failed: &mut
     if let Some(named) = failed.get(&c.id) {
         return Some(Err(format!("not tried again after {} failed", shown(named))));
     }
+    use super::geodatabase_open::AddError;
     let added = super::geodatabase_open::add_through(s, &c, g, name);
-    if added.is_err() {
+    if matches!(added, Err(AddError::Connect(_))) {
+        // (A table that isn't there is no reason to leave the others unopened.)
         failed.insert(c.id.clone(), c.name.clone());
     }
-    Some(added)
+    Some(added.map_err(AddError::into_message))
 }
 
 #[cfg(target_arch = "wasm32")]

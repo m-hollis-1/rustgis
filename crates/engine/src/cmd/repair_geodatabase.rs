@@ -19,11 +19,13 @@ fn repair_geodatabase(s: &mut Session, p: &Value) -> CmdResult {
     Err(crate::connections::DESKTOP_ONLY.into())
 }
 
-/// Why a layer wasn't repaired: the server refused the connection's password (every layer would
-/// be refused the same), or anything else about this one layer.
+/// Why a layer wasn't repaired: the server refused the connection's password, signing in to the
+/// connection failed otherwise (every layer through it would fail the same way), or anything
+/// else about this one layer.
 #[cfg(not(target_arch = "wasm32"))]
 enum Fail {
     Refused(String),
+    Connect(String),
     Why(String),
 }
 
@@ -64,16 +66,24 @@ fn repair_geodatabase(s: &mut Session, p: &Value) -> CmdResult {
         return Err(format!("{} has no password to sign in with: sign in to it first (connection.login)", c.name));
     }
     let (mut repaired, mut skipped) = (Vec::new(), Vec::new());
+    // Once signing in to the connection has failed it isn't tried (and waited for) again.
+    let mut dead = false;
     for id in ids {
         let Some(name) = s.map().layer(id).map(|l| l.name.clone()) else { continue };
-        match repair_layer(s, &c, id) {
+        let tried = if dead { Err(Fail::Why(format!("not tried again after {} failed", shown(&c.name)))) } else { repair_layer(s, &c, id) };
+        match tried {
             Ok(()) => repaired.push(name),
             // The password is refused: nothing was repaired through it, nor will anything be.
             Err(Fail::Refused(why)) if repaired.is_empty() => return Err(why),
-            Err(Fail::Refused(why) | Fail::Why(why)) => {
-                if !all {
-                    return Err(format!("{name}: {why}"));
-                }
+            Err(Fail::Refused(why) | Fail::Connect(why) | Fail::Why(why)) if !all => return Err(format!("{name}: {why}")),
+            Err(fail) => {
+                let why = match fail {
+                    Fail::Refused(why) | Fail::Connect(why) => {
+                        dead = true;
+                        why
+                    }
+                    Fail::Why(why) => why,
+                };
                 skipped.push(json!({"layer": name, "why": why}));
             }
         }
@@ -89,74 +99,30 @@ fn repair_geodatabase(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"repaired": repaired, "skipped": skipped}))
 }
 
-/// Reads the broken layer `id`'s table through `c` as a new layer, and moves what it read into
-/// the layer when it fits the layer's style, labels and time slider. The added layer never stays.
+/// Reads the broken layer `id`'s table through `c` and moves what it read into the layer when it
+/// fits the layer's style, labels and time slider.
 #[cfg(not(target_arch = "wasm32"))]
 fn repair_layer(s: &mut Session, c: &crate::connections::Connection, id: u32) -> Result<(), Fail> {
-    let (name, g) = {
-        let l = s.map().layer(id).ok_or_else(|| Fail::Why("the layer no longer exists".into()))?;
-        let g = l.source.as_ref().filter(|src| src.is_broken()).and_then(|src| src.geodatabase.clone());
-        (l.name.clone(), g.ok_or_else(|| Fail::Why("isn't an enterprise geodatabase layer".into()))?)
-    };
-    // Adding a layer goes to it and makes it active; a repair leaves the view and the active
-    // layer as they were. A registered table that came back stays out of the project's.
-    let (camera, active) = (s.map().camera, s.active_layer);
-    let tables: Vec<_> = s.project.tables.iter().map(|t| t.id).collect();
+    use super::geodatabase_open::AddError;
+    let g = s.map().layer(id).and_then(|l| l.source.as_ref()).filter(|src| src.is_broken()).and_then(|src| src.geodatabase.clone());
+    let g = g.ok_or_else(|| Fail::Why("isn't an enterprise geodatabase layer".into()))?;
     let (had_session, was_rejected) = (s.database_logins.session_password(&c.id).is_some(), s.database_logins.is_rejected(&c.id));
-    let r = super::geodatabase_open::add_through(s, c, &g, &name);
-    let refused = r.is_err()
-        && ((had_session && s.database_logins.session_password(&c.id).is_none())
-            || (!was_rejected && s.database_logins.is_rejected(&c.id)));
-    let done = finish(s, c, id, &name, &g, r.map_err(|e| super::history::redacted_text(&e)), &tables);
-    s.map_mut().camera = camera;
-    s.active_layer = active.filter(|a| s.map().layer(*a).is_some());
-    done.map_err(|why| if refused { Fail::Refused(why) } else { Fail::Why(why) })
+    let fit = |old: &rustgis_map::Layer, info: &rustgis_data::source::SourceInfo| super::repair::fits(old, info, &c.name);
+    match super::geodatabase_open::open_into(s, id, c, &g, Some(&fit)) {
+        Ok(()) => Ok(()),
+        Err(AddError::Add(why)) => Err(Fail::Why(super::history::redacted_text(&why))),
+        Err(AddError::Connect(why)) => {
+            let why = super::history::redacted_text(&why);
+            // A refusal drops the session password or rejects the saved one.
+            let refused = (had_session && s.database_logins.session_password(&c.id).is_none())
+                || (!was_rejected && s.database_logins.is_rejected(&c.id));
+            Err(if refused { Fail::Refused(why) } else { Fail::Connect(why) })
+        }
+    }
 }
 
-/// What follows adding the layer: the fit check, then the move into the broken layer.
+/// A connection's name as the first 60 characters of it.
 #[cfg(not(target_arch = "wasm32"))]
-fn finish(
-    s: &mut Session,
-    c: &crate::connections::Connection,
-    id: u32,
-    name: &str,
-    g: &rustgis_map::source::GeodatabaseOrigin,
-    r: Result<Value, String>,
-    tables: &[u32],
-) -> Result<(), String> {
-    let r = r?;
-    let mut added: Vec<u32> = r
-        .get("layers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_u64)
-        .filter_map(|n| u32::try_from(n).ok())
-        .collect();
-    added.retain(|n| *n != id);
-    s.project.tables.retain(|t| tables.contains(&t.id));
-    let Some((&new_id, extra)) = added.split_first() else {
-        return Err(format!("'{}' came back as no layer of features", g.table));
-    };
-    // A table of mixed geometry types comes as a layer per type: the first takes the broken
-    // layer's place.
-    for n in extra {
-        super::layer::remove(s, &json!({"layer": n}))?;
-    }
-    let fit = {
-        let m = s.map();
-        let (Some(old), Some(new)) = (m.layer(id), m.layer(new_id)) else { return Err("the added layer no longer exists".into()) };
-        new.source.as_ref().and_then(|src| src.info()).map_or(Ok(()), |info| super::repair::fits(old, info, &c.name))
-    };
-    if let Err(why) = fit {
-        super::layer::remove(s, &json!({"layer": new_id}))?;
-        return Err(why);
-    }
-    super::retry::adopt(s, id, new_id)?;
-    super::retry::check_query(s, id);
-    if !g.is_default_version() {
-        let version = g.version.as_deref().unwrap_or_default();
-        s.notify(format!("{name}: read at the Default version, not {version}"), false);
-    }
-    Ok(())
+fn shown(name: &str) -> String {
+    name.chars().take(60).collect()
 }

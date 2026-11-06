@@ -27803,6 +27803,9 @@ fn repairing_all_through_a_server_that_fails_changes_nothing() {
     assert!(e.starts_with("nothing was repaired"), "{e}");
     assert!(e.contains("Mains") && e.contains("Valves") && !e.contains("Parcels"), "{e}");
     assert!(!e.contains("made-up-pw"), "{e}");
+    // The server is tried once: the second layer isn't tried again after the first failed.
+    assert_eq!(e.matches("not tried again after Utility Editor failed").count(), 1, "{e}");
+    assert!(e.contains("Valves: not tried again after Utility Editor failed") && !e.contains("Mains: not tried again"), "{e}");
     assert_eq!(s.map().layers.len(), layers);
     assert_eq!((s.map().camera, s.active_layer), (camera, active));
     for name in ["Mains", "Valves", "Parcels"] {

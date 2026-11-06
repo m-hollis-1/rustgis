@@ -4179,18 +4179,18 @@ fn every_connection_kind_has_a_source_and_an_origin() {
                 "Sde",
                 standard_connection(
                     "SDE",
-                    "ENCRYPTED_PASSWORD=00ff;SERVER=gis-db;INSTANCE=sde:sqlserver:gis-db;DBCLIENT=sqlserver;DATABASE=utility;USER=editor;VERSION=sde.DEFAULT",
+                    r"ENCRYPTED_PASSWORD=00ff;SERVER=gis-db;INSTANCE=sde:sqlserver:gis-db\GIS;DBCLIENT=sqlserver;DATABASE=utility;USER=editor;VERSION=sde.DEFAULT",
                     "utility.sde.Mains",
                 ),
             ),
             EnterpriseGeodatabase(GeodatabaseOrigin {
                 platform: "sqlserver".into(),
-                server: "gis-db".into(),
+                server: r"gis-db\GIS".into(),
                 database: "utility".into(),
                 table: "utility.sde.Mains".into(),
                 version: Some("sde.DEFAULT".into()),
             }),
-            "an SDE geodatabase on gis-db, database utility, table utility.sde.Mains",
+            r"an SDE geodatabase on gis-db\GIS, database utility, table utility.sde.Mains",
             LayerKind::Feature,
         ),
         (
@@ -4260,12 +4260,16 @@ fn an_sde_connection_without_dbclient_takes_the_instance_platform() {
     assert_eq!((o.platform.as_str(), o.server.as_str(), o.database.as_str()), ("postgresql", "pg", "d"));
     assert_eq!((o.table.as_str(), o.version.clone()), ("d.dbo.t", None));
     assert!(o.is_default_version());
-    // DBCLIENT wins (in lower case), SERVER wins over the instance, and nothing named is still a place.
+    // DBCLIENT wins (in lower case), the instance's host wins over SERVER, and nothing named is still a place.
     let o = origin("SERVER=gis-db;INSTANCE=sde:oracle:other;DBCLIENT=SQLServer;VERSION=editor.Plan");
-    assert_eq!((o.platform.as_str(), o.server.as_str(), o.version.as_deref()), ("sqlserver", "gis-db", Some("editor.Plan")));
+    assert_eq!((o.platform.as_str(), o.server.as_str(), o.version.as_deref()), ("sqlserver", "other", Some("editor.Plan")));
     assert!(!o.is_default_version());
     let o = origin("DB_CONNECTION_PROPERTIES=host;INSTANCE=sde:oracle:other");
     assert_eq!((o.platform.as_str(), o.server.as_str()), ("oracle", "host"));
+    // Pro's SERVER is often the bare machine; the connection properties or instance carry the rest.
+    assert_eq!(origin(r"SERVER=gis-db;DB_CONNECTION_PROPERTIES=gis-db\GIS;DATABASE=d").server, r"gis-db\GIS");
+    assert_eq!(origin("SERVER=gis-db;INSTANCE=sde:sqlserver:gis-db,1434;DATABASE=d").server, "gis-db,1434");
+    assert_eq!(origin("SERVER=gis-db;DATABASE=d").server, "gis-db");
     assert_eq!(origin("OTHER=1"), GeodatabaseOrigin { table: "d.dbo.t".into(), ..GeodatabaseOrigin::default() });
 }
 

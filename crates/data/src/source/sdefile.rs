@@ -1,9 +1,14 @@
 //! Esri `.sde` connection files: what ArcGIS Pro saves for an enterprise geodatabase. The file is
-//! an undocumented binary container that carries `KEY=VALUE;` connection properties as text
-//! (ASCII and/or UTF-16LE), so the few we need are scanned for by name rather than parsed. Only
-//! the server, database, user and version come out, enough to prefill a SQL Server connection;
-//! the encrypted password is never read, so it can't be shown or logged. Pure text, so the
-//! browser build has it too. The file is hostile input: its size is bounded by [`MAX_BYTES`].
+//! an undocumented binary container, so the few properties we need are scanned for by name rather
+//! than parsed. Some files carry them as `KEY=VALUE;` text (ASCII and/or UTF-16LE); others are a
+//! persisted ArcObjects property set, each key a UTF-16LE string followed by its value (a VARIANT,
+//! with binary between). Without a single `KEY=` pair the file is read the second way: each key
+//! found as a string of its own, its value the next printable run of text after it (Task 17,
+//! desktop verification, confirms that layout against a real file). Only the server, database,
+//! user and version come out, enough to prefill a SQL Server connection; the encrypted password
+//! is never looked up, so it can't be shown or logged. Pure text, so the browser build has it
+//! too. The file is hostile input: its size is bounded by [`MAX_BYTES`] and every scan by a value's
+//! length.
 
 /// Largest `.sde` file read.
 pub const MAX_BYTES: usize = 1 << 20;
@@ -44,7 +49,7 @@ pub struct SdeConnection {
     /// `sqlserver`, `postgresql`, `oracle` or another, in lower case: `DBCLIENT`, else the
     /// `sde:<platform>:` prefix of `INSTANCE`. Empty when the file doesn't say.
     pub platform: String,
-    /// `SERVER`, else `DB_CONNECTION_PROPERTIES`, else `INSTANCE` after its `sde:<platform>:` prefix.
+    /// As [`pick_server`] picks it.
     pub server: String,
     /// `DATABASE`; empty when the file doesn't name one.
     pub database: String,
@@ -56,28 +61,54 @@ pub struct SdeConnection {
     pub version: Option<String>,
 }
 
+/// The properties read; never a password's.
+const KEYS: [&str; 8] =
+    ["SERVER", "INSTANCE", "DBCLIENT", "DB_CONNECTION_PROPERTIES", "DATABASE", "USER", "AUTHENTICATION_MODE", "VERSION"];
+
+/// The names of the secrets a value must never run into or be.
+const SECRETS: [&str; 2] = ["ENCRYPTED_PASSWORD", "PASSWORD"];
+
 /// The connection a `.sde` file describes. An error is a sentence for the person, not a log line.
 pub fn parse(bytes: &[u8]) -> Result<SdeConnection, SdeError> {
     if bytes.len() > MAX_BYTES {
         return Err(SdeError::TooLarge);
     }
     let texts = Texts::new(bytes);
-    let instance = texts.value("INSTANCE");
-    let (instance_platform, instance_server) = instance.as_deref().map_or((None, None), split_instance);
-    let platform = texts.value("DBCLIENT").or(instance_platform).map(|p| p.to_ascii_lowercase()).unwrap_or_default();
-    let server = ["SERVER", "DB_CONNECTION_PROPERTIES"].iter().find_map(|k| texts.value(k)).or(instance_server);
+    let mut values: Vec<Option<String>> = KEYS.iter().map(|k| texts.value(k)).collect();
+    if values.iter().all(Option::is_none) {
+        values = KEYS.iter().map(|k| texts.property(k)).collect();
+    }
+    let value = |key: &str| KEYS.iter().position(|k| *k == key).and_then(|i| values.get(i)).cloned().flatten();
+    let instance = value("INSTANCE");
+    let instance_platform = instance.as_deref().and_then(|i| split_instance(i).0);
+    let platform = value("DBCLIENT").or(instance_platform).map(|p| p.to_ascii_lowercase()).unwrap_or_default();
+    let server = pick_server(value("SERVER").as_deref(), value("DB_CONNECTION_PROPERTIES").as_deref(), instance.as_deref());
     let Some(server) = server else {
         return Err(SdeError::NoServer);
     };
-    let os_auth = texts.value("AUTHENTICATION_MODE").is_some_and(|m| m.eq_ignore_ascii_case("OSA"));
+    let os_auth = value("AUTHENTICATION_MODE").is_some_and(|m| m.eq_ignore_ascii_case("OSA"));
     Ok(SdeConnection {
         platform,
         server,
-        database: texts.value("DATABASE").unwrap_or_default(),
-        user: if os_auth { None } else { texts.value("USER") },
+        database: value("DATABASE").unwrap_or_default(),
+        user: if os_auth { None } else { value("USER") },
         os_auth,
-        version: texts.value("VERSION"),
+        version: value("VERSION"),
     })
+}
+
+/// The server a connection names, from its `SERVER`, `DB_CONNECTION_PROPERTIES` and `INSTANCE`
+/// properties: `DB_CONNECTION_PROPERTIES`, else `INSTANCE` after its `sde:<platform>:` prefix,
+/// else `SERVER`, else an `INSTANCE` without the prefix. Pro often saves the bare machine name as
+/// `SERVER` while the others carry the instance or port (`gis-db\GIS`, `gis-db,1434`). Blank
+/// values don't count.
+pub fn pick_server(server: Option<&str>, properties: Option<&str>, instance: Option<&str>) -> Option<String> {
+    let clean = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let (prefixed, bare) = match instance.map(str::trim) {
+        Some(i) if i.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("sde:")) => (split_instance(i).1, None),
+        other => (None, clean(other)),
+    };
+    clean(properties).or(prefixed).or_else(|| clean(server)).or(bare)
 }
 
 /// The SQL Server address for a connection: `mssql://<user>@<host>[:port][/<database>][?instance=<i>]`.
@@ -174,6 +205,69 @@ impl Texts {
     fn value(&self, key: &str) -> Option<String> {
         self.0.iter().find_map(|text| text_value(text, key))
     }
+
+    /// The value of `key` in a property set: the key as a UTF-16LE string of its own, then the
+    /// first printable run within [`GAP`] characters after it (a one-character run, which may be
+    /// a VARIANT's length, only when no longer one follows). Never asked for a secret.
+    fn property(&self, key: &str) -> Option<String> {
+        self.0.get(1..)?.iter().find_map(|text| property_value(text, key))
+    }
+}
+
+/// How far past a property-set key its value may start: the VARIANT's type and length between.
+const GAP: usize = 64;
+
+/// A character a property-set value is made of: ASCII letters, digits and punctuation.
+fn printable(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c.is_ascii_punctuation()
+}
+
+fn property_value(text: &[char], key: &str) -> Option<String> {
+    let key: Vec<char> = key.chars().collect();
+    (0..text.len()).find_map(|at| {
+        let alone_before = at == 0 || text.get(at - 1).is_some_and(|c| !(c.is_ascii_alphanumeric() || *c == '_'));
+        let named = text.get(at..at + key.len()).is_some_and(|w| w.iter().zip(&key).all(|(a, b)| a.eq_ignore_ascii_case(b)));
+        // A string of its own ends where the key does.
+        let alone_after = text.get(at + key.len()).is_some_and(|c| *c == '\0' || c.is_control());
+        if !alone_before || !named || !alone_after {
+            return None;
+        }
+        let start = at + key.len();
+        let (mut i, mut short) = (start, None);
+        while i < start + GAP {
+            let rest = text.get(i..)?;
+            if !rest.first().copied().is_some_and(printable) {
+                i += 1;
+                continue;
+            }
+            // Look no further than a value can be long, so a key costs O(MAX_VALUE), not O(file).
+            let run = rest.iter().take(MAX_VALUE + 1).take_while(|c| printable(**c)).count();
+            if run > MAX_VALUE {
+                return None;
+            }
+            let found = rest.get(..run)?;
+            if run >= 2 {
+                return property_text(found);
+            }
+            short.get_or_insert(found);
+            i += run;
+        }
+        short.and_then(property_text)
+    })
+}
+
+/// A property-set value as kept: not another key's or a secret's name, cut before a secret's name.
+fn property_text(run: &[char]) -> Option<String> {
+    let mut value: String = run.iter().collect();
+    let upper = value.to_ascii_uppercase();
+    if KEYS.iter().chain(SECRETS.iter()).any(|k| *k == upper) {
+        return None;
+    }
+    if let Some(secret) = SECRETS.iter().filter_map(|k| upper.find(k)).min() {
+        value.truncate(secret);
+    }
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn text_value(text: &[char], key: &str) -> Option<String> {
@@ -193,7 +287,7 @@ fn text_value(text: &[char], key: &str) -> Option<String> {
         };
         let mut value: String = rest.get(..end)?.iter().collect();
         let upper = value.to_ascii_uppercase();
-        if let Some(secret) = ["ENCRYPTED_PASSWORD", "PASSWORD"].iter().filter_map(|k| upper.find(k)).min() {
+        if let Some(secret) = SECRETS.iter().filter_map(|k| upper.find(k)).min() {
             value.truncate(secret);
         }
         let value = value.trim();
@@ -269,6 +363,92 @@ mod tests {
         let c = parse(b"DB_CONNECTION_PROPERTIES=props-host;INSTANCE=sde:sqlserver:inst-host;DATABASE=d").unwrap();
         assert_eq!(c.server, "props-host");
         assert_eq!(c.platform, "sqlserver");
+    }
+
+    #[test]
+    fn the_server_prefers_the_connection_properties_and_instance() {
+        let server = |bytes: &[u8]| parse(bytes).unwrap().server;
+        assert_eq!(server(br"SERVER=gis-db;DB_CONNECTION_PROPERTIES=gis-db\GIS;DATABASE=d"), r"gis-db\GIS");
+        assert_eq!(server(b"SERVER=gis-db;INSTANCE=sde:sqlserver:gis-db,1434;DATABASE=d"), "gis-db,1434");
+        assert_eq!(server(b"SERVER=gis-db;DATABASE=d"), "gis-db");
+        assert_eq!(pick_server(Some("gis-db"), Some(r"gis-db\GIS"), Some("sde:sqlserver:gis-db,1434")).as_deref(), Some(r"gis-db\GIS"));
+        assert_eq!(pick_server(Some("gis-db"), Some(" "), Some("sde:sqlserver:gis-db,1434")).as_deref(), Some("gis-db,1434"));
+        assert_eq!(pick_server(Some("gis-db"), None, Some("5151")).as_deref(), Some("gis-db"), "a bare instance is the last resort");
+        assert_eq!(pick_server(None, None, Some("5151")).as_deref(), Some("5151"));
+        assert_eq!(pick_server(Some(""), None, None), None);
+    }
+
+    /// A property-set-like buffer: each key a UTF-16LE string ended by NUL, binary, then its value.
+    fn property_set(pairs: &[(&str, &str)], pad: usize) -> Vec<u8> {
+        let mut bytes = vec![0xD0, 0xCF, 0x11, 0xE0][..pad.min(4)].to_vec();
+        for (key, value) in pairs {
+            bytes.extend(utf16(key));
+            bytes.extend([0, 0, 0x08, 0x00, 0x16, 0x00, 0x00, 0x00]);
+            bytes.extend(utf16(value));
+            bytes.extend([0, 0, 0x03, 0x00, 0x01, 0x00]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_property_set_parses() {
+        let pairs = [
+            ("SERVER", r"gis-db\GIS"),
+            ("INSTANCE", r"sde:sqlserver:gis-db\GIS"),
+            ("DBCLIENT", "sqlserver"),
+            ("DATABASE", "utility"),
+            ("USER", "editor"),
+            ("ENCRYPTED_PASSWORD", "00ff"),
+            ("AUTHENTICATION_MODE", "DBMS"),
+            ("VERSION", "sde.DEFAULT"),
+        ];
+        for pad in [0, 1] {
+            let c = parse(&property_set(&pairs, pad)).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                (c.platform.as_str(), c.server.as_str(), c.database.as_str(), c.user.as_deref()),
+                ("sqlserver", r"gis-db\GIS", "utility", Some("editor"))
+            );
+            assert_eq!(c.version.as_deref(), Some("sde.DEFAULT"));
+            let shown = format!("{c:?}");
+            assert!(!shown.contains("00ff") && !shown.to_uppercase().contains("PASSWORD"), "{shown}");
+        }
+        // only the essentials, in the ruling's order
+        let c = parse(&property_set(
+            &[("SERVER", r"gis-db\GIS"), ("DATABASE", "utility"), ("USER", "editor"), ("ENCRYPTED_PASSWORD", "00ff")],
+            0,
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((c.server.as_str(), c.database.as_str(), c.user.as_deref()), (r"gis-db\GIS", "utility", Some("editor")));
+        assert!(!format!("{c:?}").contains("00ff"));
+    }
+
+    #[test]
+    fn a_property_set_fails_closed() {
+        // a key with no value before the next key gives nothing, not the next key's name
+        let c = parse(&property_set(&[("USER", ""), ("SERVER", "gis-db")], 0)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.user, None);
+        // no server, or a password only: refused
+        assert_eq!(parse(&property_set(&[("DATABASE", "utility"), ("ENCRYPTED_PASSWORD", "00ff")], 0)).unwrap_err(), SdeError::NoServer);
+        // a key inside a longer word isn't the key
+        assert_eq!(parse(&property_set(&[("MYSERVER", "gis-db")], 0)).unwrap_err(), SdeError::NoServer);
+        // a value longer than a value can be is junk
+        let long = "x".repeat(MAX_VALUE + 1);
+        assert_eq!(parse(&property_set(&[("SERVER", &long)], 0)).unwrap_err(), SdeError::NoServer);
+        // pairs win: a file with `KEY=` text isn't read as a property set
+        let mut bytes = property_set(&[("SERVER", "set-host")], 0);
+        bytes.extend(b"\x00DATABASE=d;");
+        assert_eq!(parse(&bytes).unwrap_err(), SdeError::NoServer);
+    }
+
+    #[test]
+    fn repeated_property_keys_are_cheap() {
+        let unit: Vec<u8> = [utf16("SERVER"), vec![0, 0], utf16(&"x".repeat(MAX_VALUE + 1)), vec![0, 0]].concat();
+        let bytes: Vec<u8> = unit.iter().copied().cycle().take(MAX_BYTES).collect();
+        let started = std::time::Instant::now();
+        let parsed = parse(&bytes);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // the cut-off unit at the end may give a short junk server; never a long one
+        assert!(parsed.map_or(true, |c| c.server.chars().count() <= MAX_VALUE));
     }
 
     #[test]

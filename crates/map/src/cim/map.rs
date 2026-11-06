@@ -702,9 +702,20 @@ fn joined(folder: &str, file: &str) -> String {
     format!("{folder}{sep}{file}")
 }
 
-/// An SDE connection's place, for people: "an SDE geodatabase on <SERVER>, database <DATABASE>".
+/// The server an SDE connection string names, as [`rustgis_data::source::sdefile::pick_server`]
+/// picks it (`DB_CONNECTION_PROPERTIES`, else `INSTANCE`'s host, else `SERVER`).
+fn sde_server(conn: &str) -> Option<String> {
+    let value = |key: &str| connection_value(conn, key);
+    rustgis_data::source::sdefile::pick_server(
+        value("SERVER").as_deref(),
+        value("DB_CONNECTION_PROPERTIES").as_deref(),
+        value("INSTANCE").as_deref(),
+    )
+}
+
+/// An SDE connection's place, for people: "an SDE geodatabase on <server>, database <DATABASE>".
 fn sde_place(conn: &str) -> String {
-    let server = ["SERVER", "DB_CONNECTION_PROPERTIES", "INSTANCE"].iter().find_map(|k| connection_value(conn, k));
+    let server = sde_server(conn);
     let mut place = format!("an SDE geodatabase on {}", server.as_deref().unwrap_or("a server not named"));
     if let Some(db) = connection_value(conn, "DATABASE") {
         place.push_str(&format!(", database {db}"));
@@ -717,23 +728,15 @@ fn geodatabase_origin(conn: &str, dataset: &str) -> GeodatabaseOrigin {
     // `INSTANCE=sde:<platform>:<host>` (the host may hold a `:`, a port).
     let instance = connection_value(conn, "INSTANCE");
     let prefixed = instance.as_deref().filter(|i| i.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("sde:"))).and_then(|i| i.get(4..));
-    let (in_platform, in_host) = match prefixed.and_then(|r| r.split_once(':')) {
-        Some((p, h)) => (Some(p.trim().to_string()), Some(h.trim().to_string())),
-        None => (None, None),
-    };
+    let in_platform = prefixed.and_then(|r| r.split_once(':')).map(|(p, _)| p.trim().to_string());
     let mut platform = connection_value(conn, "DBCLIENT").or(in_platform).unwrap_or_default().to_ascii_lowercase();
     // (Oracle's instances name its release: `oracle11g`.)
     if platform.starts_with("oracle") {
         platform = "oracle".to_string();
     }
-    let server = connection_value(conn, "SERVER")
-        .or_else(|| connection_value(conn, "DB_CONNECTION_PROPERTIES"))
-        .or(in_host.filter(|h| !h.is_empty()))
-        .or(instance)
-        .unwrap_or_default();
     GeodatabaseOrigin {
         platform,
-        server,
+        server: sde_server(conn).unwrap_or_default(),
         database: connection_value(conn, "DATABASE").unwrap_or_default(),
         table: dataset.to_string(),
         version: connection_value(conn, "VERSION"),

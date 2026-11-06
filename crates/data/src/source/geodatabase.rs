@@ -7,10 +7,13 @@
 //! by every platform; the queries that fetch the rows live with each connection.
 //!
 //! The rows and their XML are hostile input: lists are bounded by [`MAX_ITEMS`], a definition by
-//! [`MAX_DEFINITION_BYTES`], and one that is too large or isn't XML leaves its item listed with
-//! the definition's details unknown.
+//! [`MAX_DEFINITION_BYTES`], and one that is missing, too large or isn't XML leaves its item
+//! listed with the definition's details unknown (and [`read_plan`] then refuses to guess how it
+//! is versioned).
 
 use std::collections::HashMap;
+
+use super::Family;
 
 /// Most items (and registry, layer and coordinate system rows) a catalog keeps.
 pub const MAX_ITEMS: usize = 10_000;
@@ -21,12 +24,12 @@ pub const MAX_DEFINITION_BYTES: usize = 1 << 20;
 /// Most field aliases kept for one item.
 const MAX_FIELDS: usize = 4096;
 
-/// Branch-versioned Default rows: used by every platform (the builder confirms the predicate
-/// against Esri's docs).
-pub const BRANCH_DEFAULT_FILTER: &str = "GDB_BRANCH_ID = 0 AND GDB_IS_DELETE = 0 AND GDB_TO_DATE IS NULL";
-
-/// The columns a branch-versioned table holds, which reading its Default rows filters on.
-const BRANCH_COLUMNS: [&str; 3] = ["GDB_BRANCH_ID", "GDB_IS_DELETE", "GDB_TO_DATE"];
+/// The columns a branch-versioned table holds that reading its Default rows needs: each edit
+/// inserts a row on its branch (`GDB_BRANCH_ID`, 0 for Default) stamped `GDB_FROM_DATE`, a delete
+/// being a row with `GDB_IS_DELETE` set, so the Default rows are the latest row per ObjectID on
+/// branch 0 that isn't a delete. Task 17 (desktop verification) confirms the columns against a
+/// real branch-versioned class.
+const BRANCH_COLUMNS: [&str; 3] = ["GDB_BRANCH_ID", "GDB_IS_DELETE", "GDB_FROM_DATE"];
 
 /// What an item is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -67,8 +70,14 @@ pub struct Item {
     /// `(field name, alias)` for the fields whose alias differs from their name.
     pub field_aliases: Vec<(String, String)>,
     /// `Traditional` when the definition says `Versioned` is true; `Branch` when its
-    /// `VersioningType` names branch (or is `2`); else `Unversioned`.
+    /// `VersioningType` names branch (or is `2`); else `Unversioned` (which means unknown when
+    /// `definition_ok` is false).
     pub versioning: Versioning,
+    /// The definition was there, within [`MAX_DEFINITION_BYTES`] and parsed; when false, how the
+    /// item is versioned is unknown.
+    pub definition_ok: bool,
+    /// The kind of geometry the definition's `ShapeType` gives a feature class.
+    pub family: Option<Family>,
     /// The definition says `IsArchived` is true.
     pub archived: bool,
     /// `SDE_table_registry.rowid_column`.
@@ -137,6 +146,7 @@ struct Definition {
     field_aliases: Vec<(String, String)>,
     versioning: Option<Versioning>,
     archived: bool,
+    family: Option<Family>,
 }
 
 impl Catalog {
@@ -163,7 +173,9 @@ impl Catalog {
             .filter_map(|row| {
                 let kind = kind_of(&row.type_name)?;
                 let (schema, table) = split_physical(&row.physical);
-                let def = row.definition.as_deref().map(read_definition).unwrap_or_default();
+                let read = row.definition.as_deref().and_then(read_definition);
+                let definition_ok = read.is_some();
+                let def = read.unwrap_or_default();
                 let layer = layer_of.get(&key(schema, table));
                 let segments: Vec<&str> = row.path.split('\\').filter(|s| !s.is_empty()).collect();
                 let dataset = match (kind, segments.len().checked_sub(2)) {
@@ -179,6 +191,8 @@ impl Catalog {
                     shape_column: def.shape_column.or_else(|| layer.map(|l| l.0.clone()).filter(|c| !c.is_empty())),
                     field_aliases: def.field_aliases,
                     versioning: def.versioning.unwrap_or(Versioning::Unversioned),
+                    definition_ok,
+                    family: def.family,
                     archived: def.archived,
                     rowid_column: registry.get(&key(schema, table)).cloned().flatten(),
                     srid: layer.and_then(|l| l.1),
@@ -249,15 +263,22 @@ pub enum ReadPlan {
     Base,
     /// The versioned view (its name as the schema holds it), which shows the Default version.
     VersionedView(String),
-    /// The base table, filtered by [`BRANCH_DEFAULT_FILTER`].
-    Branch,
+    /// The base table's branch-versioned Default rows: the latest row per ObjectID (the column,
+    /// as the table names it) on branch 0 that isn't a delete. Each platform writes the SQL.
+    Branch(String),
     /// Not read, for this reason.
     Refused(String),
 }
 
 /// How a registered class is read, given whether its shape column is a native spatial column
 /// (`geometry` or `geography` in `INFORMATION_SCHEMA`; false for SDEBINARY and other storage), the
-/// views that exist in its schema and the columns of its base table.
+/// views named `<table>_evw` or `<table>_vw` that exist in its schema and the columns of its base
+/// table.
+///
+/// The table's own shape outranks its definition: a `GDB_BRANCH_ID` column makes it branch
+/// versioned whatever the definition says, and a versioned view makes a class the definition calls
+/// unversioned read through that view. A definition that couldn't be read is otherwise refused,
+/// as reading the base table of a versioned class would show rows that aren't the Default's.
 pub fn read_plan(item: &Item, native_spatial: bool, views: &[String], columns: &[String]) -> ReadPlan {
     if !native_spatial {
         return ReadPlan::Refused(format!(
@@ -265,30 +286,35 @@ pub fn read_plan(item: &Item, native_spatial: bool, views: &[String], columns: &
             item.name
         ));
     }
-    match item.versioning {
-        Versioning::Unversioned => ReadPlan::Base,
-        Versioning::Branch => {
-            let missing: Vec<&str> =
-                BRANCH_COLUMNS.iter().copied().filter(|need| !columns.iter().any(|c| c.eq_ignore_ascii_case(need))).collect();
-            if missing.is_empty() {
-                ReadPlan::Branch
-            } else {
-                ReadPlan::Refused(format!("{} is branch versioned but its table lacks {}", item.name, missing.join(", ")))
-            }
+    let has = |want: &str| columns.iter().find(|c| c.eq_ignore_ascii_case(want));
+    if item.versioning == Versioning::Branch || has("GDB_BRANCH_ID").is_some() {
+        let Some(rowid) = item.rowid_column.as_deref() else {
+            return ReadPlan::Refused(format!("{} is branch versioned but the geodatabase registers no ObjectID column for it", item.name));
+        };
+        let mut missing: Vec<&str> = BRANCH_COLUMNS.iter().copied().filter(|need| has(need).is_none()).collect();
+        let column = has(rowid);
+        if column.is_none() {
+            missing.push(rowid);
         }
-        Versioning::Traditional => {
-            let find = |suffix: &str| {
-                let want = format!("{}{suffix}", item.table);
-                views.iter().find(|v| v.eq_ignore_ascii_case(&want))
-            };
-            match find("_evw").or_else(|| find("_vw")) {
-                Some(view) => ReadPlan::VersionedView(view.clone()),
-                None => ReadPlan::Refused(format!(
-                    "{} is versioned but its versioned view is missing; ask the geodatabase administrator to enable SQL access for it",
-                    item.name
-                )),
-            }
-        }
+        return match column {
+            Some(column) if missing.is_empty() => ReadPlan::Branch(column.clone()),
+            _ => ReadPlan::Refused(format!("{} is branch versioned but its table lacks {}", item.name, missing.join(", "))),
+        };
+    }
+    if !item.definition_ok {
+        return ReadPlan::Refused(format!("{}: its geodatabase definition couldn't be read, so how it is versioned is unknown", item.name));
+    }
+    let find = |suffix: &str| {
+        let want = format!("{}{suffix}", item.table);
+        views.iter().find(|v| v.eq_ignore_ascii_case(&want))
+    };
+    match (item.versioning, find("_evw").or_else(|| find("_vw"))) {
+        (_, Some(view)) => ReadPlan::VersionedView(view.clone()),
+        (Versioning::Traditional, None) => ReadPlan::Refused(format!(
+            "{} is versioned but its versioned view is missing; ask the geodatabase administrator to enable SQL access for it",
+            item.name
+        )),
+        _ => ReadPlan::Base,
     }
 }
 
@@ -328,12 +354,24 @@ fn kind_of(type_name: &str) -> Option<ItemKind> {
     }
 }
 
-/// Reads a `Definition`; one that is too large or not XML says nothing.
-fn read_definition(xml: &str) -> Definition {
-    if xml.len() > MAX_DEFINITION_BYTES {
-        return Definition::default();
+/// The kind of geometry an `esriGeometryType` names (`esriGeometryPolyline` gives lines); `None`
+/// for any other.
+fn family_of(shape_type: &str) -> Option<Family> {
+    let t = shape_type.trim();
+    match t.strip_prefix("esriGeometry").unwrap_or(t).to_ascii_lowercase().as_str() {
+        "point" | "multipoint" => Some(Family::Points),
+        "polyline" => Some(Family::Lines),
+        "polygon" | "multipatch" => Some(Family::Polygons),
+        _ => None,
     }
-    let Ok(doc) = crate::xml::parse(xml, roxmltree::ParsingOptions::default()) else { return Definition::default() };
+}
+
+/// Reads a `Definition`; `None` for one that is too large or not XML.
+fn read_definition(xml: &str) -> Option<Definition> {
+    if xml.len() > MAX_DEFINITION_BYTES {
+        return None;
+    }
+    let doc = crate::xml::parse(xml, roxmltree::ParsingOptions::default()).ok()?;
     let named = |n: &roxmltree::Node, name: &str| n.is_element() && n.tag_name().name() == name;
     let text = |n: roxmltree::Node| n.text().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     // Element names differ by root (`DEFeatureClassInfo`, `DETableInfo`, ...), so descendants are
@@ -359,13 +397,14 @@ fn read_definition(xml: &str) -> Definition {
     } else {
         None
     };
-    Definition {
+    Some(Definition {
         alias: item_value("AliasName"),
         shape_column: item_value("ShapeFieldName"),
         field_aliases,
         versioning,
         archived: flag("IsArchived"),
-    }
+        family: item_value("ShapeType").as_deref().and_then(family_of),
+    })
 }
 
 #[cfg(test)]
@@ -417,8 +456,10 @@ mod tests {
             shape_column: None,
             field_aliases: vec![],
             versioning,
+            definition_ok: true,
+            family: None,
             archived: false,
-            rowid_column: None,
+            rowid_column: Some("OBJECTID".into()),
             srid: None,
         }
     }
@@ -500,12 +541,16 @@ mod tests {
     #[test]
     fn a_bad_definition_leaves_the_item_listed() {
         let big = format!("<DEFeatureClassInfo><AliasName>Big</AliasName></DEFeatureClassInfo>{}", " ".repeat(MAX_DEFINITION_BYTES));
-        for def in ["<not xml".to_string(), big] {
-            let rows = vec![row("sde.Mains", "SDE.MAINS", "\\Mains", "Feature Class", Some(&def))];
+        for def in [Some("<not xml".to_string()), Some(big), None] {
+            let rows = vec![row("sde.Mains", "SDE.MAINS", "\\Mains", "Feature Class", def.as_deref())];
             let c = Catalog::from_rows("sde", None, rows, vec![], vec![], vec![]);
             assert_eq!(c.items.len(), 1);
-            assert_eq!(c.items.first().and_then(|i| i.alias.clone()), None);
+            let item = c.items.first().unwrap();
+            assert_eq!(item.alias, None);
+            assert!(!item.definition_ok, "{def:?}");
         }
+        let rows = vec![row("sde.Mains", "SDE.MAINS", "\\Mains", "Feature Class", Some("<DEFeatureClassInfo/>"))];
+        assert!(Catalog::from_rows("sde", None, rows, vec![], vec![], vec![]).items.first().unwrap().definition_ok);
         let rows: Vec<ItemRow> = (0..=MAX_ITEMS).map(|i| row(&format!("sde.T{i}"), &format!("SDE.T{i}"), "\\T", "Table", None)).collect();
         assert_eq!(Catalog::from_rows("sde", None, rows, vec![], vec![], vec![]).items.len(), MAX_ITEMS);
     }
@@ -523,6 +568,25 @@ mod tests {
         assert_eq!(versioning("<Versioned>false</Versioned>"), Some(Versioning::Unversioned));
         assert_eq!(versioning("<Versioned>true</Versioned><VersioningType>1</VersioningType>"), Some(Versioning::Traditional));
         assert_eq!(versioning(""), Some(Versioning::Unversioned));
+    }
+
+    #[test]
+    fn shape_types_give_families() {
+        let family = |shape_type: &str| {
+            let def = format!("<DEFeatureClassInfo><ShapeType>{shape_type}</ShapeType></DEFeatureClassInfo>");
+            let rows = vec![row("sde.T", "SDE.T", "\\T", "Feature Class", Some(&def))];
+            Catalog::from_rows("sde", None, rows, vec![], vec![], vec![]).items.first().and_then(|i| i.family)
+        };
+        assert_eq!(family("esriGeometryPoint"), Some(Family::Points));
+        assert_eq!(family("esriGeometryMultipoint"), Some(Family::Points));
+        assert_eq!(family("esriGeometryPolyline"), Some(Family::Lines));
+        assert_eq!(family("esriGeometryPolygon"), Some(Family::Polygons));
+        assert_eq!(family("esriGeometryMultiPatch"), Some(Family::Polygons));
+        assert_eq!(family(" esriGeometryPOLYLINE "), Some(Family::Lines));
+        assert_eq!(family("esriGeometryNull"), None);
+        assert_eq!(family(""), None);
+        let rows = vec![row("sde.T", "SDE.T", "\\T", "Table", Some("<DETableInfo/>"))];
+        assert_eq!(Catalog::from_rows("sde", None, rows, vec![], vec![], vec![]).items.first().and_then(|i| i.family), None);
     }
 
     #[test]
@@ -557,10 +621,16 @@ mod tests {
             ReadPlan::Refused(why) => assert!(why.contains("versioned view is missing"), "{why}"),
             other => panic!("{other:?}"),
         }
-        let all = strings(&["OBJECTID", "gdb_branch_id", "GDB_IS_DELETE", "GDB_TO_DATE"]);
-        assert_eq!(read_plan(&branch, true, &[], &all), ReadPlan::Branch);
+        let all = strings(&["objectid", "gdb_branch_id", "GDB_IS_DELETE", "GDB_FROM_DATE"]);
+        assert_eq!(read_plan(&branch, true, &[], &all), ReadPlan::Branch("objectid".into()));
         match read_plan(&branch, true, &[], &strings(&["GDB_BRANCH_ID", "GDB_IS_DELETE"])) {
-            ReadPlan::Refused(why) => assert!(why.contains("GDB_TO_DATE") && !why.contains("GDB_IS_DELETE"), "{why}"),
+            ReadPlan::Refused(why) => {
+                assert!(why.contains("GDB_FROM_DATE") && why.contains("OBJECTID") && !why.contains("GDB_IS_DELETE"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        match read_plan(&Item { rowid_column: None, ..branch.clone() }, true, &[], &all) {
+            ReadPlan::Refused(why) => assert!(why.contains("no ObjectID column"), "{why}"),
             other => panic!("{other:?}"),
         }
         match read_plan(&base, false, &[], &[]) {
@@ -568,5 +638,41 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(read_plan(&base, true, &[], &[]), ReadPlan::Base);
+    }
+
+    #[test]
+    fn an_unreadable_definition_is_refused() {
+        let unknown = Item { definition_ok: false, ..plain("sde.Mains", "MAINS", Versioning::Unversioned) };
+        match read_plan(&unknown, true, &[], &["OBJECTID".to_string()]) {
+            ReadPlan::Refused(why) => {
+                assert_eq!(why, "sde.Mains: its geodatabase definition couldn't be read, so how it is versioned is unknown")
+            }
+            other => panic!("{other:?}"),
+        }
+        // non-native storage is still the first thing said
+        match read_plan(&unknown, false, &[], &[]) {
+            ReadPlan::Refused(why) => assert!(why.contains("SDEBINARY"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_table_outranks_its_definition() {
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let branch_columns = strings(&["OBJECTID", "GDB_BRANCH_ID", "GDB_IS_DELETE", "GDB_FROM_DATE", "SHAPE"]);
+        // A branch table is read as one whatever the definition says, even an unreadable one.
+        for item in [
+            plain("sde.Mains", "MAINS", Versioning::Unversioned),
+            plain("sde.Mains", "MAINS", Versioning::Traditional),
+            Item { definition_ok: false, ..plain("sde.Mains", "MAINS", Versioning::Unversioned) },
+        ] {
+            assert_eq!(read_plan(&item, true, &strings(&["MAINS_evw"]), &branch_columns), ReadPlan::Branch("OBJECTID".into()));
+        }
+        // A class called unversioned that has a versioned view is read through it.
+        let unversioned = plain("sde.Mains", "MAINS", Versioning::Unversioned);
+        let columns = strings(&["OBJECTID", "SHAPE"]);
+        assert_eq!(read_plan(&unversioned, true, &strings(&["mains_evw"]), &columns), ReadPlan::VersionedView("mains_evw".into()));
+        assert_eq!(read_plan(&unversioned, true, &strings(&["MAINS_vw"]), &columns), ReadPlan::VersionedView("MAINS_vw".into()));
+        assert_eq!(read_plan(&unversioned, true, &strings(&["OTHER_evw"]), &columns), ReadPlan::Base);
     }
 }

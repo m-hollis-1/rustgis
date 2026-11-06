@@ -874,6 +874,8 @@ mod tests {
             shape_column: Some("Shape".into()),
             field_aliases: Vec::new(),
             versioning: Versioning::Unversioned,
+            definition_ok: true,
+            family: None,
             archived: false,
             rowid_column: None,
             srid: None,

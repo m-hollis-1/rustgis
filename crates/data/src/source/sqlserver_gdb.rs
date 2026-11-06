@@ -1,18 +1,18 @@
 //! The Esri enterprise geodatabase a SQL Server database may hold: finding its owner (`sde` or
 //! `dbo`), reading its system tables into a [`Catalog`], and deciding how a registered class is
-//! read (its base table, its versioned view, or its branch-versioned Default rows).
+//! read (its base table, its versioned view, or its branch-versioned Default rows). A reading's
+//! FROM target may be a derived table, so every statement gives it an alias (`FROM <from> t`).
 //!
 //! The catalog rows are hostile input like any other server answer: every list is bounded by
-//! [`MAX_ITEMS`] or `LIST_LIMIT`, and the owner is never taken from the server or the user as SQL:
+//! [`MAX_ITEMS`] or a small `TOP`, and the owner is never taken from the server or the user as SQL:
 //! only the two names [`owner_prefix`] knows are written into a statement.
 
-use super::{Conn, LIST_LIMIT, PROBE_TIMEOUT, Table, at, attr_of, field_cast, first_count, id_of, ident, int_of, text_of};
+use super::{Conn, PROBE_TIMEOUT, Table, at, attr_of, field_cast, first_count, id_of, ident, int_of, text_of};
 use crate::raster::Crs;
-use crate::source::clamp_limit;
 use crate::source::geodatabase::{
-    self, BRANCH_DEFAULT_FILTER, Catalog, Item, ItemKind, ItemRow, LayerRow, MAX_ITEMS, ReadPlan, RegistryRow, Srs, Versioning,
-    is_machinery,
+    self, Catalog, Item, ItemKind, ItemRow, LayerRow, MAX_DEFINITION_BYTES, MAX_ITEMS, ReadPlan, RegistryRow, Srs, is_machinery,
 };
+use crate::source::{Family, clamp_limit};
 use crate::{DataError, Dataset, Feature, Features, Field, GeometryType, ReadReport, Result};
 
 /// The owner as it may be written into a statement: only `sde` and `dbo` (what [`detect_owner`]
@@ -37,9 +37,11 @@ pub(super) struct Queries {
 /// The catalog statements for an owner; `None` for an owner [`owner_prefix`] refuses.
 pub(super) fn queries(owner: &str) -> Option<Queries> {
     let o = owner_prefix(owner)?;
+    // An over-size definition is left on the server (nvarchar is two bytes a character).
+    let cap = 2 * MAX_DEFINITION_BYTES;
     Some(Queries {
         items: format!(
-            "SELECT TOP ({MAX_ITEMS}) i.Name, i.PhysicalName, i.Path, t.Name, CAST(i.Definition AS nvarchar(max)) FROM {o}.GDB_ITEMS i JOIN {o}.GDB_ITEMTYPES t ON t.UUID = i.Type WHERE t.Name IN ('Feature Dataset', 'Feature Class', 'Table')"
+            "SELECT TOP ({MAX_ITEMS}) i.Name, i.PhysicalName, i.Path, t.Name, CASE WHEN DATALENGTH(i.Definition) > {cap} THEN NULL ELSE CAST(i.Definition AS nvarchar(max)) END FROM {o}.GDB_ITEMS i JOIN {o}.GDB_ITEMTYPES t ON t.UUID = i.Type WHERE t.Name IN ('Feature Dataset', 'Feature Class', 'Table')"
         ),
         registry: format!("SELECT TOP ({MAX_ITEMS}) owner, table_name, rowid_column FROM {o}.SDE_table_registry"),
         layers: format!("SELECT TOP ({MAX_ITEMS}) owner, table_name, spatial_column, srid FROM {o}.SDE_layers"),
@@ -102,10 +104,9 @@ pub(super) fn read_catalog(conn: &Conn, owner: &str) -> Result<Catalog> {
 /// How a registered class is read.
 #[derive(Debug)]
 pub(super) struct Reading {
-    /// The FROM target: the base table or the versioned view, quoted.
+    /// The FROM target, without an alias: the base table or the versioned view, quoted, or the
+    /// derived table of a branch-versioned class's Default rows.
     pub from: String,
-    /// A predicate every read adds (the branch-versioned Default rows).
-    pub filter: Option<String>,
     /// The registered ObjectID column.
     pub rowid: Option<String>,
     /// The class alias.
@@ -129,15 +130,50 @@ pub(super) fn reading(conn: &Conn, table: &Table, columns: &[String]) -> Result<
     reading_of(plan, table, item, srs).map(Some)
 }
 
-/// The views of `schema` a traditionally versioned `item` may be read through; none for any
-/// other item, which is read without one.
+/// The versioned views of a registered `item` that exist in `schema` (`<table>_evw` and
+/// `<table>_vw`), asked for whatever its definition says, so a class whose definition calls it
+/// unversioned is still read through the view it has.
 fn views_of(conn: &Conn, item: &Item, schema: &str) -> Result<Vec<String>> {
-    if item.versioning != Versioning::Traditional {
-        return Ok(Vec::new());
-    }
-    let rows =
-        conn.query(&format!("SELECT TOP ({LIST_LIMIT}) TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = @P1"), &[schema])?;
+    let (evw, vw) = (format!("{}_evw", item.table), format!("{}_vw", item.table));
+    let rows = conn.query(
+        "SELECT TOP (2) TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME IN (@P2, @P3)",
+        &[schema, &evw, &vw],
+    )?;
     Ok(rows.iter().filter_map(|r| text_of(at(r, 0))).collect())
+}
+
+/// What a geometry-kind probe of a registered class needs: the kind its definition gives, or else
+/// the FROM target its rows are read through.
+pub(super) enum Probe {
+    Known(Family),
+    From(String),
+}
+
+/// How the kinds of geometry of `table` are found when the catalog registers it; Ok(None) for an
+/// unregistered table (probed as it is). A class whose definition names its shape type is that
+/// kind; any other is probed through its reading (its versioned view or Default rows), not its
+/// base table, whose rows may still be in the delta tables.
+pub(super) fn probe(conn: &Conn, table: &Table) -> Result<Option<Probe>> {
+    let Some(catalog) = super::geodatabase(conn) else { return Ok(None) };
+    let Some(item) = catalog.find(&format!("{}.{}", table.schema, table.name)) else { return Ok(None) };
+    if let Some(family) = item.family {
+        return Ok(Some(Probe::Known(family)));
+    }
+    let names: Vec<String> = columns_of(conn, &table.schema, &table.name)?.into_iter().map(|(n, _)| n).collect();
+    let views = views_of(conn, item, &table.schema)?;
+    let plan = geodatabase::read_plan(item, native_spatial(table), &views, &names);
+    Ok(Some(Probe::From(reading_of(plan, table, item, None)?.from)))
+}
+
+/// The derived table of a branch-versioned class's Default rows: the latest row per ObjectID on
+/// branch 0 (Default) that isn't a delete. Each edit inserts a row; the older rows of the same
+/// ObjectID aren't marked, so the latest is picked by `GDB_FROM_DATE`. Task 17 (desktop
+/// verification) confirms the columns against a real branch-versioned class.
+fn branch_default_from(base: &str, rowid: &str) -> String {
+    format!(
+        "(SELECT * FROM (SELECT b.*, ROW_NUMBER() OVER (PARTITION BY b.{} ORDER BY b.GDB_FROM_DATE DESC) AS rustgis_rn FROM {base} b WHERE b.GDB_BRANCH_ID = 0) r WHERE r.rustgis_rn = 1 AND r.GDB_IS_DELETE = 0)",
+        ident(rowid)
+    )
 }
 
 /// The `(name, lower-case data type)` of every column of a table or view, in table order.
@@ -169,17 +205,15 @@ pub(super) fn catalog_note(problem: Option<&str>) -> Option<String> {
 /// The reading a plan gives, worked out without a server.
 pub(super) fn reading_of(plan: ReadPlan, table: &Table, item: &Item, srs: Option<&Srs>) -> Result<Reading> {
     let mut notes = Vec::new();
-    let (from, filter) = match plan {
-        ReadPlan::Base => (table.sql_from(), None),
+    let from = match plan {
+        ReadPlan::Base => table.sql_from(),
         ReadPlan::VersionedView(view) => {
             notes.push(format!("versioned: read through its view {view}, which shows the Default version"));
-            (format!("{}.{}", ident(&table.schema), ident(&view)), None)
+            format!("{}.{}", ident(&table.schema), ident(&view))
         }
-        ReadPlan::Branch => {
+        ReadPlan::Branch(rowid) => {
             notes.push("branch versioned: the Default version's rows are read".into());
-            // The predicate is geodatabase::BRANCH_DEFAULT_FILTER, to be confirmed against Esri's
-            // branch-versioning documentation (Task 17 desktop verification).
-            (table.sql_from(), Some(BRANCH_DEFAULT_FILTER.to_string()))
+            branch_default_from(&table.sql_from(), &rowid)
         }
         ReadPlan::Refused(why) => return Err(DataError::Unsupported(why)),
     };
@@ -191,7 +225,6 @@ pub(super) fn reading_of(plan: ReadPlan, table: &Table, item: &Item, srs: Option
     });
     Ok(Reading {
         from,
-        filter,
         rowid: item.rowid_column.clone(),
         alias: item.alias.clone(),
         field_aliases: item.field_aliases.clone(),
@@ -268,10 +301,7 @@ fn table_select(reading: &Reading, columns: &[(String, String)], limit: usize) -
         fields.push(field);
         select.push(cast);
     }
-    let mut sql = format!("SELECT TOP ({limit}) {} FROM {}", select.join(", "), reading.from);
-    if let Some(filter) = &reading.filter {
-        sql.push_str(&format!(" WHERE {filter}"));
-    }
+    let mut sql = format!("SELECT TOP ({limit}) {} FROM {} t", select.join(", "), reading.from);
     if let Some(id) = rowid {
         sql.push_str(&format!(" ORDER BY {id}"));
     }
@@ -311,10 +341,7 @@ pub fn read_table(conn: &Conn, item: &Item, limit: usize) -> Result<(Dataset, Re
         })
         .collect();
     let mut report = ReadReport { skipped: 0, messages: reading.notes.clone() };
-    let mut count_sql = format!("SELECT COUNT_BIG(*) FROM {}", reading.from);
-    if let Some(filter) = &reading.filter {
-        count_sql.push_str(&format!(" WHERE {filter}"));
-    }
+    let count_sql = format!("SELECT COUNT_BIG(*) FROM {} t", reading.from);
     let count = conn.query_within(&count_sql, &[], PROBE_TIMEOUT).ok().flatten().and_then(|r| first_count(&r));
     if let Some(count) = count.filter(|c| *c > limit as u64) {
         report.messages.push(format!("the first {limit} rows of {count}"));
@@ -328,7 +355,7 @@ pub fn read_table(conn: &Conn, item: &Item, limit: usize) -> Result<(Dataset, Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::geodatabase::ItemKind;
+    use crate::source::geodatabase::{ItemKind, Versioning};
 
     const WGS84: &str = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
 
@@ -356,6 +383,8 @@ mod tests {
             shape_column: Some("SHAPE".into()),
             field_aliases: vec![("DIAMETER".into(), "Diameter (in)".into())],
             versioning: Versioning::Traditional,
+            definition_ok: true,
+            family: Some(Family::Lines),
             archived: false,
             rowid_column: Some("OBJECTID".into()),
             srid: Some(3),
@@ -379,6 +408,14 @@ mod tests {
         }
         assert!(q.items.contains("dbo.GDB_ITEMTYPES"), "{}", q.items);
         assert!(q.release.contains("TOP (1)"), "{}", q.release);
+        assert!(
+            q.items.contains(&format!(
+                "CASE WHEN DATALENGTH(i.Definition) > {} THEN NULL ELSE CAST(i.Definition AS nvarchar(max)) END",
+                2 * MAX_DEFINITION_BYTES
+            )),
+            "{}",
+            q.items
+        );
         assert!(queries("sde").is_some_and(|q| q.items.contains("sde.GDB_ITEMS")));
         assert!(queries("x]y").is_none());
         assert_eq!(owner_prefix("sde"), Some("sde"));
@@ -395,7 +432,7 @@ mod tests {
         assert!(!native_spatial(&Table { kind: "varbinary".into(), ..table() }));
         let views = ["MAINS_evw".to_string()];
         let unversioned = Item { versioning: Versioning::Unversioned, ..item() };
-        assert_eq!(geodatabase::read_plan(&unversioned, native_spatial(&second), &views, &[]), ReadPlan::Base);
+        assert_eq!(geodatabase::read_plan(&unversioned, native_spatial(&second), &[], &[]), ReadPlan::Base);
         assert_eq!(geodatabase::read_plan(&item(), native_spatial(&second), &views, &[]), ReadPlan::VersionedView("MAINS_evw".into()));
     }
 
@@ -414,17 +451,21 @@ mod tests {
     fn readings_map_plans_to_sql() {
         let (t, i) = (table(), item());
         let r = reading_of(ReadPlan::VersionedView("MAINS_evw".into()), &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!((r.from.as_str(), r.filter.as_deref()), ("[SDE].[MAINS_evw]", None));
+        assert_eq!(r.from, "[SDE].[MAINS_evw]");
         assert_eq!(r.rowid.as_deref(), Some("OBJECTID"));
         assert_eq!(r.alias.as_deref(), Some("Water Mains"));
         assert_eq!(r.field_aliases, vec![("DIAMETER".to_string(), "Diameter (in)".to_string())]);
         assert_eq!(r.srid_fallback, None);
 
-        let r = reading_of(ReadPlan::Branch, &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!((r.from.as_str(), r.filter.as_deref()), ("[SDE].[MAINS]", Some(BRANCH_DEFAULT_FILTER)));
+        let r = reading_of(ReadPlan::Branch("OBJECTID".into()), &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            r.from,
+            "(SELECT * FROM (SELECT b.*, ROW_NUMBER() OVER (PARTITION BY b.[OBJECTID] ORDER BY b.GDB_FROM_DATE DESC) AS rustgis_rn FROM [SDE].[MAINS] b WHERE b.GDB_BRANCH_ID = 0) r WHERE r.rustgis_rn = 1 AND r.GDB_IS_DELETE = 0)"
+        );
+        assert!(!r.from.contains("GDB_TO_DATE"), "{}", r.from);
 
         let r = reading_of(ReadPlan::Base, &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!((r.from.as_str(), r.filter.as_deref()), ("[SDE].[MAINS]", None));
+        assert_eq!(r.from, "[SDE].[MAINS]");
 
         let refused = reading_of(ReadPlan::Refused("not readable".into()), &t, &i, None);
         assert!(matches!(refused, Err(DataError::Unsupported(ref why)) if why == "not readable"), "{refused:?}");
@@ -531,21 +572,25 @@ mod tests {
         let (fields, sql) = table_select(&reading, &columns, 50);
         assert_eq!(
             sql,
-            "SELECT TOP (50) CAST([OBJECTID] AS BIGINT), CAST([OBJECTID] AS BIGINT), CAST([DIAMETER] AS FLOAT), CAST([NOTE] AS NVARCHAR(MAX)) FROM [SDE].[MAINS_evw] ORDER BY [OBJECTID]"
+            "SELECT TOP (50) CAST([OBJECTID] AS BIGINT), CAST([OBJECTID] AS BIGINT), CAST([DIAMETER] AS FLOAT), CAST([NOTE] AS NVARCHAR(MAX)) FROM [SDE].[MAINS_evw] t ORDER BY [OBJECTID]"
         );
         let names: Vec<(&str, Option<&str>)> = fields.iter().map(|f| (f.name.as_str(), f.alias.as_deref())).collect();
         assert_eq!(names, [("OBJECTID", None), ("DIAMETER", Some("Diameter (in)")), ("NOTE", None)]);
 
-        // Without a registered row id the rows are numbered; a branch table adds its filter.
-        let branch = reading_of(ReadPlan::Branch, &t, &Item { rowid_column: None, ..item() }, None).unwrap_or_else(|e| panic!("{e}"));
+        // A branch table reads from its Default rows' derived table, aliased.
+        let branch = reading_of(ReadPlan::Branch("OBJECTID".into()), &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
         let (_, sql) = table_select(&branch, &columns, 5);
+        assert!(sql.ends_with(&format!("FROM {} t ORDER BY [OBJECTID]", branch.from)), "{sql}");
+
+        // Without a registered row id the rows are numbered.
+        let unnumbered = Reading { rowid: None, ..reading_of(ReadPlan::Base, &t, &i, None).unwrap_or_else(|e| panic!("{e}")) };
+        let (_, sql) = table_select(&unnumbered, &columns, 5);
         assert!(sql.starts_with("SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), "), "{sql}");
-        assert!(sql.ends_with(&format!("FROM [SDE].[MAINS] WHERE {BRANCH_DEFAULT_FILTER}")), "{sql}");
 
         // A row id column the table lacks, or that isn't an integer, is no ordering.
         let missing = Reading { rowid: Some("GONE".into()), ..reading_of(ReadPlan::Base, &t, &i, None).unwrap_or_else(|e| panic!("{e}")) };
-        assert!(table_select(&missing, &columns, 5).1.ends_with("FROM [SDE].[MAINS]"));
+        assert!(table_select(&missing, &columns, 5).1.ends_with("FROM [SDE].[MAINS] t"));
         let text = Reading { rowid: Some("note".into()), ..missing };
-        assert!(table_select(&text, &columns, 5).1.ends_with("FROM [SDE].[MAINS]"));
+        assert!(table_select(&text, &columns, 5).1.ends_with("FROM [SDE].[MAINS] t"));
     }
 }

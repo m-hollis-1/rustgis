@@ -575,9 +575,17 @@ pub fn find_table(conn: &Conn, name: &str) -> Result<Table> {
         .ok_or_else(|| DataError::Format(format!("no table '{name}' with a geometry column")))
 }
 
+/// The kinds of geometry a spatial column holds. A registered geodatabase class is the kind its
+/// definition's shape type names, else is probed through how it is read (its versioned view or
+/// Default rows), so a class whose rows are all still in its delta tables isn't taken for empty.
 pub fn families(conn: &Conn, table: &Table) -> Result<Vec<Family>> {
+    let from = match gdb::probe(conn, table)? {
+        Some(gdb::Probe::Known(family)) => return Ok(vec![family]),
+        Some(gdb::Probe::From(from)) => from,
+        None => table.sql_from(),
+    };
     let g = ident(&table.column);
-    let sql = format!("SELECT DISTINCT {g}.STDimension() FROM {} WHERE {g} IS NOT NULL", table.sql_from());
+    let sql = format!("SELECT DISTINCT {g}.STDimension() FROM {from} t WHERE {g} IS NOT NULL");
     let Some(rows) = conn.query_within(&sql, &[], PROBE_TIMEOUT)? else {
         return Ok(Family::ALL.to_vec());
     };
@@ -602,11 +610,9 @@ pub struct SqlServerSource {
     info: SourceInfo,
     conn: Arc<Conn>,
     table: Table,
-    /// The FROM target of reads and counts: the base table, or a geodatabase class's versioned
-    /// view.
+    /// The FROM target of reads and counts, without an alias: the base table, a geodatabase
+    /// class's versioned view, or the derived table of a branch-versioned class's Default rows.
     from: String,
-    /// A predicate every read and count adds (a branch-versioned class's Default rows).
-    extra_filter: Option<String>,
     family: Option<Family>,
     raw_srid: u32,
     geography: bool,
@@ -689,7 +695,7 @@ impl SqlServerSource {
         {
             notes.push(note);
         }
-        let rows = conn.query(&format!("SELECT TOP (1) {g}.STSrid FROM {from} WHERE {g} IS NOT NULL"), &[])?;
+        let rows = conn.query(&format!("SELECT TOP (1) {g}.STSrid FROM {from} t WHERE {g} IS NOT NULL"), &[])?;
         let raw_srid =
             rows.first().and_then(|r| int_of(at(r, 0))).and_then(|n| u32::try_from(n).ok()).unwrap_or(if geography { 4326 } else { 0 });
         if raw_srid != 0 {
@@ -729,7 +735,6 @@ impl SqlServerSource {
         }
         let (mut fields, projection) = projection(&table.column, columns, key.as_deref());
         let mut name = table.label();
-        let mut extra_filter = None;
         if let Some(r) = reading {
             for f in &mut fields {
                 if let Some((_, alias)) = r.field_aliases.iter().find(|(n, _)| n.eq_ignore_ascii_case(&f.name)) {
@@ -739,7 +744,6 @@ impl SqlServerSource {
             if let Some(alias) = r.alias {
                 name = alias;
             }
-            extra_filter = r.filter;
             notes.extend(r.notes);
         }
         if projection.numbered {
@@ -763,7 +767,6 @@ impl SqlServerSource {
             conn,
             table,
             from,
-            extra_filter,
             family,
             raw_srid,
             geography,
@@ -798,7 +801,7 @@ impl SqlServerSource {
             Some(n) if n >= EXACT_COUNT_BELOW => Some(n),
             _ => self
                 .conn
-                .query_within(&format!("SELECT COUNT_BIG(*) FROM {} WHERE {}", self.from, self.filter(None)), &[], PROBE_TIMEOUT)
+                .query_within(&format!("SELECT COUNT_BIG(*) FROM {} t WHERE {}", self.from, self.filter(None)), &[], PROBE_TIMEOUT)
                 .ok()
                 .flatten()
                 .and_then(|r| first_count(&r)),
@@ -826,11 +829,6 @@ impl SqlServerSource {
                 Family::Polygons => 2,
             };
             w.push_str(&format!(" AND {g}.STDimension() = {dim}"));
-        }
-        // A branch-versioned class's Default rows: geodatabase::BRANCH_DEFAULT_FILTER, to be
-        // confirmed against Esri's branch-versioning documentation (Task 17 desktop verification).
-        if let Some(extra) = &self.extra_filter {
-            w.push_str(&format!(" AND ({extra})"));
         }
         w
     }
@@ -875,7 +873,7 @@ impl SqlServerSource {
             (matched, rows)
         } else {
             // Concurrent edits may change the rows between this count and the read.
-            let matched = first_count(&query(&format!("SELECT COUNT_BIG(*) FROM {from} WHERE {filter}"))?).unwrap_or(0);
+            let matched = first_count(&query(&format!("SELECT COUNT_BIG(*) FROM {from} t WHERE {filter}"))?).unwrap_or(0);
             let step = stride(matched, limit);
             let sql = if step <= 1 && !self.projection.numbered {
                 format!("SELECT TOP ({limit}) {cols} FROM (SELECT {} FROM {from} t WHERE {filter}) s", self.projection.raw)
@@ -1148,7 +1146,15 @@ mod tests {
             }
         }
         for t in &all {
-            let fams = families(&conn, t).unwrap_or_else(|e| panic!("{}: {e}", t.label()));
+            let fams = match families(&conn, t) {
+                Ok(fams) => fams,
+                // A geodatabase class RustGIS refuses to read is refused by its probe too.
+                Err(DataError::Unsupported(why)) if sde.is_some() => {
+                    println!("{}: {why}", t.label());
+                    continue;
+                }
+                Err(e) => panic!("{}: {e}", t.label()),
+            };
             for f in fams {
                 let src = match SqlServerSource::open(conn.clone(), t.clone(), Some(f), None) {
                     Ok(src) => src,

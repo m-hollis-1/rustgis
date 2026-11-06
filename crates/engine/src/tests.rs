@@ -27392,3 +27392,86 @@ fn adopt_token_reports_broken_layers_and_keeps_no_token() {
     s.run("arcgis.signOut", &json!({"portal": "https://adopteng.maps.arcgis.com"})).unwrap();
     assert_eq!(arcgis_auth::authorization(url), None);
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+mod sde_file_connections {
+    use super::*;
+
+    const ASCII: &[u8] = b"\x00\x01SERVER=gis-db;INSTANCE=sde:sqlserver:gis-db;DBCLIENT=sqlserver;DB_CONNECTION_PROPERTIES=gis-db;DATABASE=utility;USER=editor;ENCRYPTED_PASSWORD=00ff;VERSION=sde.DEFAULT;AUTHENTICATION_MODE=DBMS;\x00";
+
+    fn fixture(file: &str, bytes: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rustgis-sde-{}-{}", std::process::id(), file.trim_end_matches(".sde")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file);
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn a_connection_comes_from_an_sde_file() {
+        let (dir, path) = fixture("utility-editor.sde", ASCII);
+        let mut s = Session::new(Project::default());
+        let out = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy()}));
+        let listed = s.run("connection.list", &json!({}));
+        let shown = serde_json::to_string(&s.connections).unwrap();
+        let named =
+            s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy(), "name": "Mine", "group": "Work"}));
+        let wrong_kind = s.run("connection.new", &json!({"kind": "postgres", "sdeFile": path.to_string_lossy()}));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = out.unwrap();
+        assert_eq!(out["address"], "mssql://editor@gis-db/utility");
+        assert_eq!(out["name"], "utility-editor");
+        assert_eq!(out["needsPassword"], true);
+        assert_eq!(out["osAuth"], false);
+        assert_eq!(out["user"], "editor");
+        assert_eq!(out["version"], "sde.DEFAULT");
+        let listed = listed.unwrap();
+        assert_eq!(listed["connections"][0]["name"], "utility-editor");
+        assert_eq!(listed["connections"][0]["address"], "mssql://editor@gis-db/utility");
+        assert!(!shown.contains("00ff") && !shown.to_uppercase().contains("PASSWORD"), "{shown}");
+        let named = named.unwrap();
+        assert_eq!((named["name"].as_str(), named["group"].as_str()), (Some("Mine"), Some("Work")));
+        assert!(wrong_kind.unwrap_err().contains("sqlserver"));
+    }
+
+    #[test]
+    fn an_sde_file_with_os_authentication_needs_no_password() {
+        let bytes: &[u8] = b"SERVER=gis-db;DBCLIENT=sqlserver;DATABASE=utility;AUTHENTICATION_MODE=OSA;";
+        let (dir, path) = fixture("os.sde", bytes);
+        let mut s = Session::new(Project::default());
+        let out = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy()}));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = out.unwrap();
+        assert_eq!(out["address"], "mssql://gis-db/utility");
+        assert_eq!((out["needsPassword"].clone(), out["osAuth"].clone()), (json!(false), json!(true)));
+        assert!(out["user"].is_null() && out["version"].is_null());
+    }
+
+    #[test]
+    fn an_sde_file_for_another_platform_is_refused() {
+        let bytes: &[u8] = b"SERVER=pg-host;DBCLIENT=postgresql;DATABASE=utility;USER=editor;VERSION=sde.DEFAULT;";
+        let (dir, path) = fixture("pg.sde", bytes);
+        let mut s = Session::new(Project::default());
+        let err = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy()})).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err, "pg.sde: a PostgreSQL geodatabase; RustGIS reads SQL Server geodatabases");
+        assert!(s.connections.connections.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_sde_file_is_refused_by_name() {
+        let (dir, path) = fixture("empty.sde", b"DATABASE=utility;");
+        let mut s = Session::new(Project::default());
+        let no_server = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": path.to_string_lossy()})).unwrap_err();
+        let huge = dir.join("huge.sde");
+        std::fs::write(&huge, vec![b'x'; rustgis_data::source::sdefile::MAX_BYTES + 10]).unwrap();
+        let too_large = s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": huge.to_string_lossy()})).unwrap_err();
+        let missing =
+            s.run("connection.new", &json!({"kind": "sqlserver", "sdeFile": dir.join("none.sde").to_string_lossy()})).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(no_server, "empty.sde: this .sde file isn't one RustGIS can read; enter the server and database instead");
+        assert!(too_large.starts_with("huge.sde: ") && too_large.contains("too large"), "{too_large}");
+        assert!(missing.starts_with("none.sde: ") && !missing.contains(&*dir.to_string_lossy()), "{missing}");
+        assert!(s.connections.connections.is_empty());
+    }
+}

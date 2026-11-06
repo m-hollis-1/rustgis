@@ -93,7 +93,7 @@ pub fn mssql_address(c: &SdeConnection) -> Result<String, String> {
 }
 
 /// A platform for people, with its article: "a PostgreSQL geodatabase".
-fn platform_phrase(platform: &str) -> String {
+pub fn platform_phrase(platform: &str) -> String {
     match platform {
         "postgresql" => "a PostgreSQL geodatabase".into(),
         "oracle" => "an Oracle geodatabase".into(),

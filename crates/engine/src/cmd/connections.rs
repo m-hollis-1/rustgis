@@ -30,7 +30,7 @@ pub fn commands() -> Vec<C> {
             r#"{"kind"?: "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "group"?: text}"#,
         ),
         C::new("connection.new", "New Connection", "Home › Add › Data Sources", new).view().params(
-            r#"{"kind": "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "address"?: "as the kind's add command takes it, without its password or token (postgres:host=… dbname=… user=…, mysql://user@host/db, mssql://user@host/db, a service's or STAC API's https:// address, an S3 endpoint: AWS when absent)", "name"?: "unique (default from the address)", "group"?: text, "options"?: {"region"?: text, "buckets"?: "a,b", "credentials"?: "keys"|"profile"|"environment"|"none", "profile"?: text} (S3 only)}"#,
+            r#"{"kind": "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "address"?: "as the kind's add command takes it, without its password or token (postgres:host=… dbname=… user=…, mysql://user@host/db, mssql://user@host/db, a service's or STAC API's https:// address, an S3 endpoint: AWS when absent)", "sdeFile"?: "an ArcGIS Pro .sde connection file (desktop, kind sqlserver): its server, database and user make the address, replacing any address given; the password is asked for. Adds needsPassword, user, version and osAuth to the result", "name"?: "unique (default from the address; from the file's name with sdeFile)", "group"?: text, "options"?: {"region"?: text, "buckets"?: "a,b", "credentials"?: "keys"|"profile"|"environment"|"none", "profile"?: text} (S3 only)}"#,
         ),
         C::new("connection.edit", "Edit Connection", "Home › Add › Data Sources", edit).view().params(
             r#"{"id": "a connection's id or name", "name"?: text, "group"?: text, "address"?: text, "options"?: "as connection.new (replaces them)", "kind"?: "its kind (unchanged)"}"#,
@@ -159,7 +159,7 @@ fn list(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn new(s: &mut Session, p: &Value) -> CmdResult {
-    let c = Connection {
+    let mut c = Connection {
         kind: ps(p, "kind").ok_or_else(|| format!("kind is required ({})", KINDS.join(", ")))?.trim().into(),
         address: ps(p, "address").unwrap_or("").into(),
         name: ps(p, "name").unwrap_or("").into(),
@@ -167,10 +167,71 @@ fn new(s: &mut Session, p: &Value) -> CmdResult {
         options: p.get("options").map(options).transpose()?.unwrap_or_default(),
         ..Connection::default()
     };
+    let from_file = match ps(p, "sdeFile") {
+        Some(path) => Some(sde_connection(&mut c, path)?),
+        None => None,
+    };
     let explicit = !c.name.trim().is_empty();
     let (c, stripped) = s.connections.add(c, explicit)?;
     resolve_keys(s, &address_keys(&c.address));
-    Ok(shown_stripped(s, &c, stripped))
+    let mut out = shown_stripped(s, &c, stripped);
+    if let Some(file) = from_file {
+        out["needsPassword"] = json!(!file.os_auth);
+        out["user"] = json!(file.user);
+        out["version"] = json!(file.version);
+        out["osAuth"] = json!(file.os_auth);
+    }
+    Ok(out)
+}
+
+/// Fill `c` from the `.sde` file at `path`: its address, and its file stem as the name unless one
+/// was given. Returns what the file said besides the address. Nothing else is kept.
+fn sde_connection(c: &mut Connection, path: &str) -> Result<rustgis_data::source::sdefile::SdeConnection, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (c, path);
+        Err(DESKTOP_ONLY.into())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rustgis_data::source::sdefile;
+        if c.kind != "sqlserver" {
+            return Err("sdeFile makes a SQL Server connection: give kind \"sqlserver\"".into());
+        }
+        let path = std::path::Path::new(path.trim());
+        let shown = path.file_name().map_or_else(|| "the .sde file".into(), |n| n.to_string_lossy().into_owned());
+        let file = read_sde_file(path).map_err(|e| format!("{shown}: {e}"))?;
+        c.address = sdefile::mssql_address(&file).map_err(|e| {
+            if file.platform == "sqlserver" {
+                format!("{shown}: {e}")
+            } else {
+                format!("{shown}: {}; RustGIS reads SQL Server geodatabases", sdefile::platform_phrase(&file.platform))
+            }
+        })?;
+        if c.name.trim().is_empty() {
+            c.name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        }
+        Ok(file)
+    }
+}
+
+/// Read a `.sde` file (at most `MAX_BYTES` and a byte more, so a larger one is refused rather than
+/// read whole) and parse it. An error doesn't name the file.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_sde_file(path: &std::path::Path) -> Result<rustgis_data::source::sdefile::SdeConnection, String> {
+    use std::io::Read;
+
+    use rustgis_data::source::sdefile;
+    let file = std::fs::File::open(path).map_err(|e| format!("couldn't be opened ({})", e.kind()))?;
+    let mut bytes = Vec::new();
+    file.take(sdefile::MAX_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("couldn't be read ({})", e.kind()))?;
+    sdefile::parse(&bytes).map_err(|e| {
+        if e.contains("name a server") {
+            "this .sde file isn't one RustGIS can read; enter the server and database instead".into()
+        } else {
+            e
+        }
+    })
 }
 
 fn shown_stripped(s: &Session, c: &Connection, stripped: bool) -> Value {

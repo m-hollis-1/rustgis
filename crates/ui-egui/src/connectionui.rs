@@ -53,6 +53,12 @@ pub struct State {
     pub sign_in: String,
     pub user: String,
     pub database: String,
+    /// The Name or Group was typed since the form was last filled from a .sde file: only what a
+    /// person typed is sent with the next file, never what the engine made from the last one.
+    pub typed_name: bool,
+    /// The connection the last From .sde file... made, while this dialog is still bound to it: the
+    /// next file replaces it, so choosing the right file after a wrong one leaves no orphan.
+    pub sde_id: Option<String>,
 }
 
 /// What an `mssql://` connection address says, to fill the form with.
@@ -704,7 +710,12 @@ fn save(app: &mut RustGisApp) -> Result<(), String> {
         // Repair Source… is waiting for this connection: with Windows sign-in there is no
         // password to wait for, and with a database user it can't go on without one.
         if app.ui.connection.continue_repair.is_some() && app.ui.connection.kind == "sqlserver" {
-            let windows = definition(&app.ui.connection)["address"].as_str().and_then(parse_mssql).is_some_and(|m| m.user.is_none());
+            let st = &app.ui.connection;
+            let windows = if st.form {
+                st.sign_in == "windows"
+            } else {
+                definition(st)["address"].as_str().and_then(parse_mssql).is_some_and(|m| m.user.is_none())
+            };
             if !windows {
                 return Err(tl!("Type the password to connect").into());
             }
@@ -835,12 +846,16 @@ fn geodatabase_rows(ui: &mut egui::Ui, st: &mut State) -> bool {
     ui.end_row();
     let input_label = ui.label(tl!("Name"));
     let default = i18n::fmt("Geodatabase on {server}", &[("server", st.server.trim())]);
-    changed |=
+    let edited =
         ui.add(egui::TextEdit::singleline(&mut st.name).hint_text(default).desired_width(360.0)).labelled_by(input_label.id).changed();
+    st.typed_name |= edited;
+    changed |= edited;
     ui.end_row();
     let input_label = ui.label(tl!("Group"));
-    changed |=
+    let edited =
         ui.add(egui::TextEdit::singleline(&mut st.group).hint_text(tl!("None")).desired_width(360.0)).labelled_by(input_label.id).changed();
+    st.typed_name |= edited;
+    changed |= edited;
     ui.end_row();
     changed
 }
@@ -851,10 +866,21 @@ fn geodatabase_rows(ui: &mut egui::Ui, st: &mut State) -> bool {
 pub(crate) fn fill_from_sde(app: &mut RustGisApp, path: &str) -> Result<(), String> {
     let st = &app.ui.connection;
     let mut p = json!({"kind": "sqlserver", "sdeFile": path});
-    for (key, value) in [("name", st.name.trim()), ("group", st.group.trim())] {
-        if !value.is_empty() {
-            p[key] = json!(value);
+    if st.typed_name {
+        for (key, value) in [("name", st.name.trim()), ("group", st.group.trim())] {
+            if !value.is_empty() {
+                p[key] = json!(value);
+            }
         }
+    }
+    // The connection an earlier file made in this dialog gives way to this one, so a wrong file
+    // followed by the right one leaves a single connection (and its name is free again).
+    if let Some(old) = app.ui.connection.sde_id.take()
+        && app.ui.connection.id.as_deref() == Some(old.as_str())
+    {
+        app.run("connection.remove", json!({"id": old}))?;
+        app.ui.connection.id = None;
+        crate::connectiontree::refresh(app, None);
     }
     let v = app.run("connection.new", p)?;
     let id = v["id"].as_str().map(str::to_owned).ok_or_else(|| "connection.new returned no id".to_string())?;
@@ -865,6 +891,8 @@ pub(crate) fn fill_from_sde(app: &mut RustGisApp, path: &str) -> Result<(), Stri
     use_form(st, None, None);
     st.kind = "sqlserver".into();
     st.id = Some(id.clone());
+    st.sde_id = Some(id.clone());
+    st.typed_name = false;
     st.name = v["name"].as_str().unwrap_or_default().to_owned();
     st.group = v["group"].as_str().unwrap_or_default().to_owned();
     st.server = parsed.as_ref().map(|m| m.server.clone()).unwrap_or_default();
@@ -922,16 +950,20 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         ui.label(tl!(label(&st.kind)));
         ui.end_row();
         let input_label = ui.label(tl!("Name"));
-        changed |= ui
+        let edited = ui
             .add(egui::TextEdit::singleline(&mut st.name).hint_text(tl!("From the address")).desired_width(360.0))
             .labelled_by(input_label.id)
             .changed();
+        st.typed_name |= edited;
+        changed |= edited;
         ui.end_row();
         let input_label = ui.label(tl!("Group"));
-        changed |= ui
+        let edited = ui
             .add(egui::TextEdit::singleline(&mut st.group).hint_text(tl!("None")).desired_width(360.0))
             .labelled_by(input_label.id)
             .changed();
+        st.typed_name |= edited;
+        changed |= edited;
         ui.end_row();
         if database {
             let input_label = ui.label(tl!("Connection"));
@@ -1458,6 +1490,42 @@ mod tests {
         // Save is now an edit: the same connection, not a second one.
         save(&mut app).unwrap();
         assert_eq!(app.session.connections.connections.iter().filter(|c| c.kind == "sqlserver").count(), 1);
+    }
+
+    #[test]
+    fn a_second_sde_file_replaces_the_first_and_is_named_from_itself() {
+        let (_a, first) = sde_file("First.sde", b"SERVER=gis-db;DBCLIENT=sqlserver;DATABASE=one;USER=editor;");
+        let (_b, second) = sde_file("Second.sde", b"SERVER=gis-db2;DBCLIENT=sqlserver;DATABASE=two;USER=reader;");
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.connection", json!({"kind": "sqlserver", "form": true, "sdeFile": first})).unwrap();
+        let old = app.ui.connection.id.clone().unwrap();
+        fill_from_sde(&mut app, &second).unwrap();
+        let st = &app.ui.connection;
+        assert_eq!((st.name.as_str(), st.database.as_str(), st.user.as_str()), ("Second", "two", "reader"));
+        let list = &app.session.connections.connections;
+        assert_eq!(list.len(), 1, "no orphan from the first pick");
+        assert_ne!(st.id.as_deref(), Some(old.as_str()));
+        assert_eq!(list.first().map(|c| c.name.as_str()), Some("Second"));
+        // The same file again is no duplicate of itself, and a name the person typed is kept.
+        fill_from_sde(&mut app, &second).unwrap();
+        assert_eq!(app.session.connections.connections.len(), 1);
+        app.ui.connection.name = "Mine".into();
+        app.ui.connection.typed_name = true;
+        fill_from_sde(&mut app, &first).unwrap();
+        assert_eq!(app.session.connections.connections.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Mine"]);
+        // Once filled, that name is the engine's again: the next file is named from itself.
+        fill_from_sde(&mut app, &second).unwrap();
+        assert_eq!(app.session.connections.connections.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Second"]);
+    }
+
+    #[test]
+    fn a_sql_login_with_no_user_does_not_continue_a_repair() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.connection", json!({"kind": "sqlserver", "form": true, "server": "gis-db", "database": "utility"})).unwrap();
+        app.ui.connection.continue_repair = Some(7);
+        // The form composes an address with no user: that is not Windows sign-in.
+        assert_eq!(save(&mut app).unwrap_err(), "Type the password to connect");
+        assert_eq!(app.ui.connection.continue_repair, Some(7));
     }
 
     #[test]

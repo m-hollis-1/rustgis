@@ -77,6 +77,35 @@ user's environment go in this file.
 - [ ] The web build (CI): `cargo check --target wasm32-unknown-unknown` for `rustgis-ui-egui`
       and `rustgis-web` passes (this machine lacks clang for zstd-sys).
 
+## Follow-ons noted by the reviews (not blocking; revisit after the desktop run)
+
+- A base column literally named `rustgis_rn` makes a branch-versioned read fail with a SQL error
+  (fails closed; document or rename the window column).
+- `INSTANCE=sde:x` (two parts) beats `SERVER` in `pick_server`; a bare numeric `INSTANCE` never
+  wins.
+- Repair Source… still offers **Log in…** after a Windows sign-in connection fails for a reason
+  other than a login.
+- Branch-versioned reads recompute `ROW_NUMBER` over the whole branch-0 table per request, so
+  the spatial index goes unused on a large branch class: time it; a materialised view or a
+  rowid pre-filter would fix it.
+- The `sys.partitions` row estimate over-counts branch tables of 2M+ rows (history rows).
+- `families()`/counts for a traditionally versioned class go through the view (fixed), but
+  `has_index` still looks at the base table (fine: the index is there).
+- Registered non-spatial tables: ids are row numbers unless the rowid is an integer; the
+  "first N rows of M" notice has no table name; `read_table` doesn't check the item kind.
+- `listing_of` is quadratic over 10k × 10k in the worst case (fine in practice).
+- INFORMATION_SCHEMA is queried with the catalog's casing (case-sensitive collations).
+- Empty feature datasets aren't listed (rows carry none); a hand-built `schema:` node on a
+  geodatabase lists registered tables beside classes.
+- A refused second `.sde` pick leaves the first connection removed and the form unbound.
+- A failed quiet open at a non-default version gets no version note; a server error in a
+  broken reason may name the login user.
+- The import's `failed` set is per map, not per multi-map import.
+- `fits()` messages say "choose a file" in a connection repair; "1 tables" wording.
+- New UI strings ("feature dataset", the form, the repair copy) have no `.tsv` translations.
+- PostgreSQL geodatabases (the catalog seam is ready), named versions, editing, subtype and
+  domain descriptions: spec follow-ons.
+
 ## Findings
 
 (record here)

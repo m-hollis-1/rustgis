@@ -22,7 +22,7 @@ use rustgis_map::cim::{
 };
 use rustgis_map::layout::{ElementKind, MAX_FRAME_SCALE, MIN_FRAME_SCALE};
 use rustgis_map::qgis::{NoteKind, QGIS_SCALE};
-use rustgis_map::source::{ServiceOrigin, SourceLayer};
+use rustgis_map::source::{GeodatabaseOrigin, ServiceOrigin, SourceLayer};
 use rustgis_map::symbology::{ImageRef, Marker};
 use serde_json::{Value, json};
 
@@ -382,6 +382,8 @@ struct Origin {
     path: Option<String>,
     table: Option<String>,
     service: Option<ServiceOrigin>,
+    /// The enterprise geodatabase table, for Repair Source… to connect to.
+    geodatabase: Option<GeodatabaseOrigin>,
 }
 
 /// An import's state while it adds entries.
@@ -566,7 +568,7 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
     let service = |url: &str, kind: &str, layer: &str| ServiceOrigin { url: url.to_string(), kind: kind.into(), layer: layer.to_string() };
     let (added, from) = match &l.source {
         LayerSource::File { path, table } => {
-            let from = Origin { path: Some(resolve(path, a.dir)), table: table.clone(), service: None };
+            let from = Origin { path: Some(resolve(path, a.dir)), table: table.clone(), ..Origin::default() };
             let opened = local_path(path, a.dir).and_then(|path| {
                 // A JPEG or PNG would be read as a photo: one with a world file is a raster.
                 if l.kind == LayerKind::Raster && georeferenced_picture(&path) {
@@ -600,13 +602,24 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
         LayerSource::VectorTiles { url } => {
             (s.run_part("map.addTiles", &json!({"url": style_url(url), "kind": "style", "name": name, "overlay": true})), Origin::default())
         }
-        // (The reader said why, in one skipped note.)
-        LayerSource::Unopenable | LayerSource::EnterpriseGeodatabase(_) | LayerSource::Missing(_) => {
-            // An SDE layer is opened through a connection in a later step; for now it says so as
-            // the reader once did, so the notes and the notice stay as they were.
-            if matches!(l.source, LayerSource::EnterpriseGeodatabase(_)) {
-                report.skipped(name, "data in SDE workspaces, which RustGIS can't open");
+        LayerSource::EnterpriseGeodatabase(g) => {
+            let from = Origin { geodatabase: Some(g.clone()), ..Origin::default() };
+            match open_quietly(s, g, name) {
+                Some(added) => (added, from),
+                None => {
+                    // Noted once as skipped, as the reader notes data it can't open, and counted
+                    // so the notice says it's in the map broken, not left out.
+                    let dropped = report.dropped();
+                    report.skipped(name, "in an enterprise geodatabase, which needs a connection (Repair Source…)");
+                    if report.dropped() == dropped {
+                        a.added.skipped_for_broken += 1;
+                    }
+                    return broken_layer(s, l, from, "in an enterprise geodatabase: connect to it with Repair Source…".into(), a);
+                }
             }
+        }
+        // (The reader said why, in one skipped note.)
+        LayerSource::Unopenable | LayerSource::Missing(_) => {
             // The reader's note came before anything this import notes; with nothing dropped
             // yet it was kept. (Once the report is full, it may not have been: then it isn't
             // taken off, so the notice never takes off more than was noted.)
@@ -621,7 +634,17 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
         }
     };
     match added {
-        Ok(r) => opened(s, l, &r, before, within, a, report),
+        Ok(r) => {
+            let placed = opened(s, l, &r, before, within, a, report);
+            // Read through the connection as it is: a version other than Default isn't chosen.
+            if let LayerSource::EnterpriseGeodatabase(g) = &l.source
+                && !g.is_default_version()
+                && let Some(version) = &g.version
+            {
+                report.approximated(name, format!("read at the Default version, not {}", shown(version)));
+            }
+            placed
+        }
         Err(e) => {
             // In the map, drawing nothing until repaired: not left out.
             let dropped = report.dropped();
@@ -633,6 +656,19 @@ fn add_layer(s: &mut Session, l: &LayerImport, within: Option<&str>, a: &mut Add
             broken_layer(s, l, from, e, a)
         }
     }
+}
+
+/// Opens an SDE layer through the one saved connection it may use without asking, as `name`;
+/// `None` when there's no such connection (always on the web: there are no database connections).
+#[cfg(not(target_arch = "wasm32"))]
+fn open_quietly(s: &mut Session, g: &GeodatabaseOrigin, name: &str) -> Option<CmdResult> {
+    let c = super::geodatabase_open::quiet_connection(s, g)?;
+    Some(super::geodatabase_open::add_through(s, &c, g, name))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn open_quietly(_: &mut Session, _: &GeodatabaseOrigin, _: &str) -> Option<CmdResult> {
+    None
 }
 
 /// Whether `path` is a JPEG or PNG with a world file (`.jgw`, `.jgwx`, `.pgw`, `.pgwx`) or an
@@ -752,9 +788,7 @@ fn unapplied_query(l: &LayerImport, report: &mut Report) {
 fn broken_layer(s: &mut Session, l: &LayerImport, from: Origin, error: String, a: &mut Adding) -> Placed {
     let origin = if l.origin.trim().is_empty() { "an ArcGIS Pro layer whose source isn't known".to_string() } else { l.origin.clone() };
     let mut src = SourceLayer::broken(origin, from.path, from.table, from.service, error);
-    if let LayerSource::EnterpriseGeodatabase(g) = &l.source {
-        src.geodatabase = Some(g.clone());
-    }
+    src.geodatabase = from.geodatabase;
     let id = s.map_mut().add_streamed(l.name.clone(), src);
     // Active, as a layer just added is (the layer commands that follow work on it).
     s.active_layer = Some(id);
@@ -811,9 +845,10 @@ fn add_tables(s: &mut Session, m: &MapImport, dir: Option<&str>, report: &mut Re
                     report.skipped(&t.name, format!("the table couldn't be opened ({e}), left out"));
                 }
             }
+            LayerSource::EnterpriseGeodatabase(_) => {
+                report.skipped(&t.name, "a table in an enterprise geodatabase, not added; add it from Data Sources")
+            }
             // (The reader said why it can't be opened.)
-            // (An SDE table is opened through a connection in a later step; for now it is noted.)
-            LayerSource::EnterpriseGeodatabase(_) => report.skipped(&t.name, "data in SDE workspaces, which RustGIS can't open"),
             LayerSource::Unopenable | LayerSource::Missing(_) => {}
             _ => report.skipped(&t.name, format!("a table on a service ({}), which RustGIS doesn't add", shown(&t.origin))),
         }

@@ -26398,6 +26398,85 @@ fn a_pro_map_adds_its_groups_layers_and_broken_layers() {
 }
 
 #[test]
+fn an_sde_layer_comes_in_broken_with_its_geodatabase_origin() {
+    use rustgis_map::source::GeodatabaseOrigin;
+    let mut s = world();
+    let (_, notes) = add_pro_map(&mut s, &pro_mapx(), None);
+    let src = s.map().layer_by_name("Mains").unwrap().source.clone().unwrap();
+    assert!(src.is_broken());
+    let want = GeodatabaseOrigin {
+        platform: "sqlserver".into(),
+        server: "gis-db".into(),
+        database: "utility".into(),
+        table: "utility.dbo.mains".into(),
+        version: None,
+    };
+    assert_eq!(src.geodatabase.as_ref(), Some(&want));
+    let why = src.why_broken().unwrap_or_default();
+    assert!(why.contains("Repair Source"), "{why}");
+    let origin = src.origin.as_deref().unwrap();
+    assert!(origin.contains("gis-db"), "{origin}");
+    for secret in ["swordfish", "editor"] {
+        assert!(!origin.contains(secret) && !why.contains(secret), "{origin} {why}");
+        assert!(!notes.iter().any(|n| n.contains(secret)), "{notes:?}");
+    }
+    // Saved and reopened, the origin is still there for Repair Source….
+    let text = serde_json::to_string(&s.project).unwrap();
+    assert!(!text.contains("swordfish") && !text.contains("editor"));
+    let mut t = world();
+    t.run("project.openText", &json!({"text": text})).unwrap();
+    let map = t.project.maps.iter().find(|m| m.name == "Site Plan").unwrap();
+    let back = map.layer_by_name("Mains").and_then(|l| l.source.as_ref()).and_then(|src| src.geodatabase.clone());
+    assert_eq!(back, Some(want));
+}
+
+#[test]
+fn table_names_lose_the_database_prefix() {
+    use crate::cmd::geodatabase_open::table_name;
+    assert_eq!(table_name("utility.sde.Mains"), "sde.Mains");
+    assert_eq!(table_name("sde.Mains"), "sde.Mains");
+    assert_eq!(table_name("Mains"), "Mains");
+}
+
+#[test]
+fn a_quiet_connection_needs_an_exact_remembered_sql_login() {
+    use crate::cmd::geodatabase_open::quiet_connection;
+    use crate::connections::Connection;
+    use rustgis_map::source::GeodatabaseOrigin;
+    let g = GeodatabaseOrigin {
+        platform: "sqlserver".into(),
+        server: "sde:sqlserver:gis-db".into(),
+        database: "utility".into(),
+        table: "utility.sde.Mains".into(),
+        version: None,
+    };
+    let saved = |id: &str, address: &str, remembered: bool| Connection {
+        id: id.into(),
+        name: id.into(),
+        kind: "sqlserver".into(),
+        address: address.into(),
+        remembered,
+        ..Connection::default()
+    };
+    let with = |cs: Vec<Connection>| {
+        let mut s = Session::new(Project::default());
+        s.connections.connections = cs;
+        quiet_connection(&s, &g).map(|c| c.id)
+    };
+    assert_eq!(with(vec![saved("c1", "mssql://sde@gis-db/utility", true)]), Some("c1".to_string()));
+    assert_eq!(with(vec![saved("c1", "mssql://sde@gis-db/utility", false)]), None);
+    // Signing in as the Windows user (no user in the address) never opens quietly.
+    assert_eq!(with(vec![saved("c1", "mssql://gis-db/utility", true)]), None);
+    // Two that fit are the user's choice.
+    assert_eq!(with(vec![saved("c1", "mssql://sde@gis-db/utility", true), saved("c2", "mssql://editor@gis-db/utility", true)]), None);
+    // One that fits beside one on another server still opens.
+    assert_eq!(
+        with(vec![saved("c1", "mssql://sde@gis-db/utility", true), saved("c2", "mssql://sde@10.0.0.5/utility", true)]),
+        Some("c1".to_string())
+    );
+}
+
+#[test]
 fn a_pro_map_opens_at_its_saved_camera() {
     use rustgis_geom::{Coord, lonlat_to_merc};
     let at = lonlat_to_merc(Coord::new(-97.0, 38.0));

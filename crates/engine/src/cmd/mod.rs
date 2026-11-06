@@ -16,6 +16,7 @@ pub mod edit;
 pub mod effects;
 pub mod embeddings;
 pub mod geocode;
+pub(crate) mod geodatabase_open;
 pub mod geolibre;
 pub mod gp;
 pub mod gpkg;

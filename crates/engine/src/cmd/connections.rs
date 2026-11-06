@@ -762,7 +762,7 @@ fn resolve_s3(s: &mut Session, p: &Value) -> CmdResult {
     crate::s3_connections::choose(s, source, id)
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn activate(s: &mut Session, c: &Connection, password: &str) {
+pub(super) fn activate(s: &mut Session, c: &Connection, password: &str) {
     if let Some((_, key)) = crate::connections::database_key(&c.address) {
         rustgis_data::source::duckdb::set_connection_password(&key, &c.id, Some(password));
         s.database_logins.note_activation(&key, &c.id);
@@ -777,7 +777,7 @@ fn activate(s: &mut Session, c: &Connection, password: &str) {
 /// password, so a project can't name a new address to receive it. The flag is `true` for a saved
 /// password (the server's refusal rejects it), `false` for the others.
 #[cfg(not(target_arch = "wasm32"))]
-fn credential(s: &mut Session, c: &Connection) -> Result<Option<(rustgis_data::secrets::Secret, bool)>, String> {
+pub(super) fn credential(s: &mut Session, c: &Connection) -> Result<Option<(rustgis_data::secrets::Secret, bool)>, String> {
     if let Some(pw) = s.database_logins.session_password(&c.id) {
         return Ok(Some((pw.clone(), false)));
     }

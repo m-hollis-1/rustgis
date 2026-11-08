@@ -33,17 +33,36 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     with labels on every edge of a sheet.
     The north arrow, the legend (sized to what it lists), the scale bar with the numeric scale
     under it and the locator sit in the frame's corners, clear of the graticule's
-    labels. Each takes the corner where it covers the least of what the map draws (its layers and
-    labels, not the basemap), so a legend leaves a corner the data fills; when it makes no
-    difference they keep theirs: the locator at the top left, the arrow at the top right, the
-    legend at the bottom left and the scale at the bottom right. With more surrounds than free
-    corners, one warning names those left on the data, to move by hand if that matters (data
-    under every corner alike, such as a context layer filling the frame, isn't worth a warning);
-    two that overlap (a frame too small) are said too.
+    labels. The **arrangement** says which corner is each one's. `classic` (the default favourite) puts the
+    locator at the top left, the arrow at the top right, the legend at the bottom left and the
+    scale at the bottom right. `mirrored` swaps left and right, `legendRight` swaps the legend and
+    the scale, and `legendTop` swaps the legend and the locator. `"arrangement"` also takes a
+    corner for each (`{"locator": "top-left", "northArrow": "top-right", "legend": "bottom-left",
+    "scaleBar": "bottom-right"}`).
+    A surround over what the map draws in its corner (its layers and labels, not the basemap; more
+    than 0.5 % of the surround) moves off the corner, to the freest place in the frame. It keeps
+    2 mm clear of the others, stays near its corner, and lines up with the frame's edges or centre or
+    with another surround. The largest is placed first (the legend, as a rule), so it takes the
+    freest place, and a smaller one whose corner it took moves out of its way.
+    Your favourite arrangement, set with **`layout.arrangement {"favourite": …}`** and kept with
+    the app's preferences, is the one tried first. `"arrangement": "best"`, the default, lays out
+    the favourite and every arrangement by name, and keeps the one that moves the least
+    (by area, so moving the north arrow costs less than moving the legend), then the one leaving
+    the least over the data; the favourite wins a tie. `"favourite"` always takes the favourite.
+    The answer names the arrangement taken (`"arrangement"`) and the surrounds
+    moved off their corners (`"moved"`). Where nowhere is freer, a surround stays. One warning
+    names those left with more than a quarter of their area on the data while a corner of their
+    size had more than a quarter less, to move by hand if that matters (data under every corner
+    alike, such as a context layer filling the frame, isn't worth a warning); two that overlap (a
+    frame too small) are said too.
     The top visible raster gets a colorbar beneath the vector legend if its renderer has a colour
-    scale; RGB and untinted hillshade do not. If the legend or colorbar cannot fit, the result
-    warns about clipping or resizing. A streamed layer still loading gets a fixed-size legend
-    to adjust by hand.
+    scale; RGB and untinted hillshade do not. The legend takes the fewest columns, up to three,
+    that fit the largest rectangle the map leaves free; when none fits, a long one is laid in more
+    when that shows more of it, or as much while covering at least a quarter less of what the map
+    draws (the answer's `legendColumns`); in a side column it stays in one. Polygon layers with no
+    fill and no labels, such as neighbouring borders, don't count as what the map draws here, unless
+    nothing else is shown. If the legend or colorbar cannot fit, the result warns about clipping or
+    resizing. A streamed layer still loading gets a fixed-size legend to adjust by hand.
   - **Decimal comma**: `"decimal": ","` prints the graticule, scale bar and colorbar numbers and
     `{scale}` with a decimal comma and points between thousands (`0,05`, `1:6.300.000`).
     `layout.page={"decimal": ","}` sets it on any layout; `"."` restores decimal points.
@@ -143,8 +162,10 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   properties pick its **Style** (classic arrow, compass rose, triangle or star) and its **Fill**
   and **Outline** colours (`"style":"compass","fill":"#B91C1C"`). A scale bar's pick its
   **Style** (alternating bar, stepped line or single line), its **Units** (metres or kilometres
-  to suit the scale, or kilometres, metres, miles or feet) and its **Divisions** (1 to 10), each
-  labelled where there is room (`"style":"line","units":"miles","divisions":2`). A scale bar also
+  to suit the scale, or kilometres, metres, miles or feet), its **Divisions** (1 to 10), each
+  labelled where there is room, its **Color** (the lines, the dark divisions and the labels) and
+  its **Fill** (the alternating bar's light divisions)
+  (`"style":"line","units":"miles","divisions":2,"color":"#1F4E79"`). A scale bar also
   sets **Subdivisions** (0 to 10: parts the first division is cut into, not labelled),
   **Divisions before zero** (0 to 2: whole divisions left of zero, labelled with negatives),
   **Decimals** (0 to 3 for the division labels; 0 gives each the decimals it needs), **Label
@@ -159,40 +180,54 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `unitLabelPosition` (`afterBar`, `afterLabels`, `above`, `below`) and `fit`
   (`adjustDivisionValue`, `adjustDivision`, `adjustWidth`). A north arrow imported from an ArcGIS
   Pro point symbol keeps that symbol: its pane shows **Custom symbol (from import)** in place of
-  the style and colours, and **Clear** (`"symbol": null`) draws it in a style again. A legend shows what
-  its frame draws: only layers with a feature at the frame's scale (through their definition
-  query, display filters and scale range) and, for Unique Values, only the classes those features
-  have, with `<all other values>` only when some feature falls in it and its symbol is not fully
-  transparent. Graduated Colors and
-  Proportional Symbols list their classes as they are (they are taken from the kept features when
-  the symbology is applied). A layer that draws
-  nothing there, such as an empty one, is left out, in layouts saved before this too. Tick **All
-  classes** in its properties (`"allClasses": true`) to list every class of every visible layer
-  instead, and **Hide other values** (`"hideOther": true`) to leave `<all other values>` out of
-  the legend in either mode (the features it stands for are still drawn). A visible WMS or WMTS
-  layer with a legend is listed by its name over its service's legend picture, the one for the
-  frame's scale (as the Layers pane shows it), a pixel a point and narrowed to fit the legend's
-  width, in the order the map draws its layers (as the Layers pane lists them); one whose picture
-  can't be loaded (or is wider or taller than 2048 pixels) is left out. Exporting waits up to
-  half a minute for the pictures, as it waits for the map's tiles; in the browser the page is
-  drawn with those that have arrived, and again as the others arrive. Its **Layers** section
-  has a checkbox for each layer of the frame's map (and each WMS or WMTS layer with a legend): untick one to leave it out of the legend
-  while the map still draws it (a mask, a highlight, a basemap-like layer). Scripts give the same
-  with `"exclude": ["Graticule"]` on `layout.addElement` or `layout.update` (`[]` lists every
-  layer again); a renamed layer stays left out. **Columns** (`"columns": 1` to `6`) runs the rows
-  down the box and on into the next column, shared out so the columns are about as tall as each
-  other (a box taller than they need does not leave the later columns empty); a layer's
-  name is never left at the foot of a column without its first class. **Fit** says what the legend
-  does when its rows don't fit the box (`"fit"`): `manual` (the default) draws the rows that fit
-  and cuts the rest, `adjustSize` shrinks the text together, down to 6 pt, until they fit,
-  `adjustColumns` adds columns up to six, `adjustColumnsAndSize` adds columns and then shrinks the
-  text if six are not enough, and `adjustFrame` draws at the natural size over the edges of the
-  box (the box is not resized). A legend that still doesn't fit at the smallest size or six
-  columns is cut as `manual` cuts it. A row wider than its column (in every fit, one column
-  included) is cut at the column's edge and ends in "…" so the cut shows, never drawn over the
-  next, and the fits that add columns add only as many as fit across the box.
-  Untick **Layer names** (`"showLayerNames": false`) to list
-  only the classes: a layer drawn in a single symbol keeps its name, which labels its swatch.
+  the style and colours, and **Clear** (`"symbol": null`) draws it in a style again. A legend's
+  parts:
+  - **What a legend lists**: what its frame draws: only layers with a feature at the frame's
+    scale (through their definition query, display filters and scale range) and, for Unique
+    Values, only the classes those features have, with `<all other values>` only when some
+    feature falls in it and its symbol is not fully transparent. Graduated Colors and
+    Proportional Symbols list their classes as they are (they are taken from the kept features
+    when the symbology is applied). A layer that draws nothing there, such as an empty one, is
+    left out, in layouts saved before this too. Tick **All classes** in its properties
+    (`"allClasses": true`) to list every class of every visible layer instead, and **Hide other
+    values** (`"hideOther": true`) to leave `<all other values>` out of the legend in either
+    mode (the features it stands for are still drawn).
+  - **Columns** (`"columns"`, 1 to 6): the rows run down the box and on into the next column,
+    shared out so the columns are about as tall as each other (a box taller than they need does
+    not leave the later columns empty); a layer's name is never left at the foot of a column
+    without its first class. Giving `columns`, `fit` or `showLayerNames` says when a legend left
+    to its box loses rows or cuts long labels.
+  - **Fit** (`"fit"`): what the legend does when its rows don't fit the box: `manual` (the
+    default) draws the rows that fit and cuts the rest, `adjustSize` shrinks the text together,
+    down to 6 pt, until they fit, `adjustColumns` adds columns up to six, `adjustColumnsAndSize`
+    adds columns and then shrinks the text if six are not enough, and `adjustFrame` draws at the
+    natural size over the edges of the box (the box is not resized). A legend that still doesn't
+    fit at the smallest size or six columns is cut as `manual` cuts it. A row wider than its
+    column (in every fit, one column included) is cut at the column's edge and ends in "…" so the
+    cut shows, never drawn over the next, and the fits that add columns add only as many as fit
+    across the box.
+  - **Layer names**: untick it (`"showLayerNames": false`) to list only the classes: a layer drawn
+    in a single symbol keeps its name, which labels its swatch.
+  - **Point symbols**: a point layer's symbol is drawn as the map draws it: its marker or the
+    stacked marks of its class or layer, its size and outline, the transparency of the layer and
+    its groups, and its reference scale at the frame's scale, unturned. A row has one symbol, so
+    it leaves out what changes from feature to feature (a symbol by expression, a marker's
+    rotation by a field), and it doesn't take the layer's blend mode. The row and the column of
+    symbols grow to hold a large one, up to 2048 points, past which the symbol is cut. A legend
+    left to its box (`manual`) keeps its size, so with a larger symbol its last rows may be cut:
+    make it larger, or give it another fit.
+  - **Web layers**: a visible WMS or WMTS layer with a legend is listed by its name over its
+    service's legend picture, the one for the frame's scale (as the Layers pane shows it), a
+    pixel a point and narrowed to fit the legend's width, in the order the map draws its layers
+    (as the Layers pane lists them); one whose picture can't be loaded (or is wider or taller
+    than 2048 pixels) is left out. Exporting waits up to half a minute for the pictures, as it
+    waits for the map's tiles; in the browser the page is drawn with those that have arrived,
+    and again as the others arrive.
+  - **Its Layers section**: a checkbox for each layer of the frame's map (and each WMS or WMTS
+    layer with a legend): untick one to leave it out of the legend while the map still draws it
+    (a mask, a highlight, a basemap-like layer). Scripts give the same with
+    `"exclude": ["Graticule"]` on `layout.addElement` or `layout.update` (`[]` lists every layer
+    again); a renamed layer stays left out.
 - **Colorbar**: the colour scale of a raster layer in the frame's map, as the map draws it (its
   stretch, colour ramp and enhancement): a gradient bar for a stretch or a tinted hillshade,
   steps labelled at their breaks for Classify, and a block per value for Unique Values and colour
@@ -212,6 +247,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   rounded corners (`"radius"`, in mm), and a line's colour, width, arrowheads and angle. From a
   command:
   `layout.addElement={"kind":"line","dir":"falling","color":"#C0392B","width":2}`.
+  A colour goes only to the elements that draw it, and is refused for the others. `color` is a
+  text's, a line's, an arrow's or a scale bar's, and sets a shape's outline unless `outline` is
+  also given; when adding, it is also an extent indicator's or a grid's. `fill` is a north
+  arrow's, a shape's or a scale bar's, and `outline` a north arrow's or a shape's. A legend,
+  picture, table and the like take none.
 - **Arrows**: **Arrow** adds an arrow pointing right. Drag the round handle above a selected arrow
   or line to turn it about its centre: it snaps to level, upright and diagonal within 3°, and
   **Shift** turns it in 15° steps. **Angle** in its properties sets it exactly (0° points right,
@@ -256,8 +296,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   damaged) is drawn in the fallback too, and the command that names it says so. The fallback
   starts as the family's own class (a serif's is Serif).
   Scripts give the family's name: `"font": "Garamond"`, with `"fallback": "serif"` if wanted;
-  `labels.fonts` lists the installed families. The project keeps the name, never a file, and no
-  font goes into a PNG or PDF export (their pages are pictures).
+  `labels.fonts` lists the installed families. The project keeps the name, never a file. A PDF
+  sets its text in the letters' own outlines, so it shows the family wherever it is opened, and
+  the text can still be searched and copied; no font file goes into it.
 
   A text's **Paragraph** section sets how its lines sit in the element. **Frame** picks the map
   frame whose map the `{scale}`, `{map}`, `{crs}` and `{extent}` tokens read (the default, First
@@ -284,7 +325,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
 - Click an element to select it, drag to move, drag its handles to resize, and edit it in the
   **Format** pane, which opens as a tab beside the other right-hand panes. Closing the pane keeps
   the element selected; selecting an element, or clicking the selected one, opens it again. The
-  wheel zooms the page. **Delete** (or **Backspace**, the delete key on a
+  wheel zooms the page, and each layout keeps its own zoom and pan while the project is open.
+  **Delete** (or **Backspace**, the delete key on a
   Mac) deletes the selected element, and **Ctrl+D** (**⌘D** on a Mac) duplicates it: the copy is
   placed 5 mm down and to the right, on top, and selected. The **arrow keys** nudge it 1 mm, or
   10 mm with **Shift**, and keep it moving while held; a run of nudges is one step to undo.
@@ -318,12 +360,24 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   the other elements' edges and centres, and the line it snapped to is highlighted. Hold Alt to
   place an element freely, or turn **Snap** off in the Page group.
 - **Export** writes PDF (every map series page by default, up to 500), or PNG or SVG of the current page.
+  A PDF keeps the page as vectors: text, shapes, surrounds and map frames (their features, labels
+  and grids, turned with the frame) stay sharp at any zoom or print size, and linear and radial
+  gradient fills are PDF gradients. What is pixels by nature is a picture in it at the export's
+  `dpi`, keeping its layer's opacity and blend mode: rasters, web tile layers, pictures, legend
+  images from map services, a masked layer, and a frame that is tilted, on the globe or with view
+  effects. Hatch and dot fills, shapeburst fills, and sweeping, repeating or reflected gradients
+  are pictures cut to their shape. The `dpi` also sets how fine the vectors' detail is kept, as a
+  PNG at that resolution would show it. A frame or page whose vectors would pass 256 MB (64 MB
+  in the browser) is drawn as a picture instead, and the export says which.
   In SVG each element is a group (an Inkscape layer) named after it: text stays text and rectangles,
-  ellipses and lines stay shapes, while map frames and the other surrounds are pictures at the export
-  resolution, so the page can be finished in a vector editor. SVG text uses the viewer's
+  ellipses and lines stay shapes, and map frames and the other surrounds are kept as vectors as in a
+  PDF (their labels as the letters' shapes, each run labelled with its text), so the page can be
+  finished in a vector editor. What a PDF keeps as pictures is a picture in the SVG too, at the
+  export's `dpi`, and a frame whose vectors would pass the budget is drawn as a picture, with a
+  notice. A text element uses the viewer's
   font (a named family where the viewer has it, else its serif or sans-serif), so its alignment
   and line widths can differ from PNG/PDF and can
-  change when edited. Embedded pictures are clipped to their element boxes;
+  change when edited. A picture standing for a whole element is clipped to its box;
   `layout.export` accepts `dpi` and `"allPages": false` for just the current PDF
   page. **Print** opens the PDF in the system viewer on desktop; **Save Layout File** and
   **Import Layout** move layouts between projects (`.rgislayout`).
@@ -344,6 +398,10 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   differences. `layout.inspect` answers, for a file, which map each frame shows, without
   importing it. The layouts of a Pro project (`.aprx`) are chosen in its picker, with their maps
   (`project.importArcgis`).
+- **Capture To Clipboard** copies an image of the current page at 192 dpi, with any text still being
+  typed. A page that would pass 16 million pixels, or 12,000 pixels on a side, is copied at a lower
+  dpi, and the notice says so; a page that would need less than 36 dpi is too large to copy, so
+  export it instead.
 
 ## Reports
 
@@ -362,7 +420,8 @@ previews it and sets it up.
   relationship, listed beneath it).
 - A where clause or the layer's selection limits the records; a sort field orders them within
   their groups.
-- **Publish › Report**: **Export Report** writes a PDF (or the first page as PNG); **Save As Report
+- **Publish › Report**: **Export Report** writes a PDF, kept as vectors as a layout's is (or
+  the first page as PNG); **Save As Report
   File** keeps the report, and **Report Template** its design without the data source, to start
   reports on other layers (**Publish › Import Report**).
 
@@ -376,7 +435,8 @@ previews, edits and plays it.
   URL with an optional poster picture.
 - Each page has a title, speaker notes and a duration (for **Play**), and can move up or down.
 - **Publish › Output › Presentation › Export Presentation** writes an HTML slideshow (arrow
-  keys, `N` for notes, `P` to play; videos play in place), a PDF, or the first page as PNG.
+  keys, `N` for notes, `P` to play; videos play in place), a PDF (kept as vectors as a layout's
+  is), or the first page as PNG.
   Video sources remain file paths or URLs, so keep them accessible beside the exported slideshow.
   **Save As Presentation File** in the same menu keeps it to import into other projects (`.rgispres`).
 

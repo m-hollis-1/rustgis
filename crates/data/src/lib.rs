@@ -4,11 +4,15 @@
 //! bad features are skipped and counted in [`ReadReport`].
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod address;
+pub mod cityjson;
+mod citymodel;
 pub mod color;
 mod dbf;
 pub mod diagnostics;
 pub mod dirs;
 pub mod dxf;
+pub mod esripbf;
 pub mod export;
 pub mod filegdb;
 mod footprint;
@@ -16,16 +20,21 @@ pub mod geometry;
 pub mod georss;
 pub mod gml;
 pub mod gpx;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http;
 pub mod interop;
 pub mod io;
 pub mod kml;
 pub mod landxml;
 pub mod lidar;
+pub mod login_address;
 pub mod mapinfo;
 pub mod mbtiles;
+pub mod memory;
 pub mod ogc;
 pub mod osm;
 pub mod photo;
+pub mod progress;
 pub mod query;
 pub mod raster;
 pub mod s3_address;
@@ -50,7 +59,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
     #[error("i/o: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
     #[error("{0}")]
     Format(String),
     /// The server refused the login: no password, or a wrong one.
@@ -62,9 +71,23 @@ pub enum DataError {
     /// which Zarr reads as its fill value, told apart from a slice that can't be read.
     #[error("{0}: none of the slice's chunks could be read")]
     NoChunks(String),
+    /// Stopped because its run was cancelled ([`progress`]).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, DataError>;
+
+/// An I/O error, or [`DataError::Cancelled`] when it carries one: a write that only returns I/O
+/// errors stops with it for a cancelled run ([`progress`]).
+impl From<std::io::Error> for DataError {
+    fn from(e: std::io::Error) -> Self {
+        if e.get_ref().and_then(|inner| inner.downcast_ref::<DataError>()).is_some_and(|d| matches!(d, DataError::Cancelled)) {
+            return DataError::Cancelled;
+        }
+        DataError::Io(e)
+    }
+}
 
 /// Replaces `secret` in `message` with asterisks; the text itself when it holds none.
 fn without_secret(message: String, secret: &str) -> String {
@@ -97,6 +120,7 @@ impl DataError {
                 DataError::Io(std::io::Error::new(e.kind(), without_secret(e.to_string(), secret)))
             }
             DataError::Io(e) => DataError::Io(e),
+            DataError::Cancelled => DataError::Cancelled,
         }
     }
 }
@@ -373,12 +397,16 @@ fn layer_list(names: &[&str]) -> String {
     format!("{} layers ({shown}{more})", names.len())
 }
 
-/// What an export of `layers` (each with its whole extent, longitude/latitude, which for a layer
-/// read in place is its source's) written in `crs` says its geometry lacks, one notice per kind:
-/// Z or M values dropped on import ([`zm_export_note`]); positions only approximate, as their
-/// system had no shift to WGS 84 ([`raster::Crs::lacks_datum_shift`]; none when written back in
-/// it); and coordinates that aren't longitude/latitude (beyond ±180.5° or ±90.5°, as the
-/// readers check), which an export writes as if they were. `target` names what was written.
+/// What an export of `layers` written in `crs` says its geometry lacks, one notice per kind. Each
+/// layer comes with its whole extent in longitude/latitude (for a layer read in place, its
+/// source's). `target` names what was written. The notices:
+/// - Z or M values dropped on import ([`zm_export_note`]).
+/// - Positions only approximate, because their system had no shift to WGS 84
+///   ([`raster::Crs::lacks_datum_shift`]). Nothing is said when they are written back in it.
+/// - Another body's longitude/latitude written as the Earth's, or its system written without the
+///   body's name ([`raster::Crs::is_planetary`]).
+/// - Coordinates that aren't longitude/latitude (beyond ±180.5° or ±90.5°, as the readers check),
+///   which an export writes as if they were.
 pub fn export_notes<'a>(
     layers: impl IntoIterator<Item = (&'a Dataset, rustgis_geom::Extent)>,
     target: &str,
@@ -400,6 +428,36 @@ pub fn export_notes<'a>(
             layer_list(&many.iter().map(|ds| ds.name.as_str()).collect::<Vec<_>>())
         )),
     }
+    // Another body's layers. Written in an Earth system, their longitude/latitude become the
+    // Earth's. Written in another body's system, its WKT gives the datum only by the ellipsoid's
+    // axes (`raster::wkt::to_wkt`).
+    let other_bodies: Vec<&Dataset> = layers.iter().map(|(ds, _)| *ds).filter(|ds| ds.crs.is_some_and(raster::Crs::is_planetary)).collect();
+    let (in_planetary_system, as_earth) = if crs.is_planetary() { (other_bodies, Vec::new()) } else { (Vec::new(), other_bodies) };
+    let written = if crs == raster::Crs::LonLat { "WGS 84 (EPSG:4326)".to_string() } else { crs.label() };
+    match as_earth.as_slice() {
+        [] => {}
+        [one] => notes.push(format!(
+            "{target}: {} is on another body than the Earth ({}), but its longitude/latitude are written as {written}",
+            one.name,
+            one.crs.map(raster::Crs::label).unwrap_or_default()
+        )),
+        many => notes.push(format!(
+            "{target}: {} are on other bodies than the Earth, but their longitude/latitude are written as {written}",
+            layer_list(&many.iter().map(|ds| ds.name.as_str()).collect::<Vec<_>>())
+        )),
+    }
+    match in_planetary_system.as_slice() {
+        [] => {}
+        [one] => notes.push(format!(
+            "{target}: the coordinate system of {} ({}) is another body's, and the file gives its datum only by the ellipsoid's axes, without the body's or the datum's name",
+            one.name,
+            one.crs.map(raster::Crs::label).unwrap_or_default()
+        )),
+        many => notes.push(format!(
+            "{target}: the coordinate systems of {} are other bodies', and the file gives their datums only by the ellipsoids' axes, without the bodies' or the datums' names",
+            layer_list(&many.iter().map(|ds| ds.name.as_str()).collect::<Vec<_>>())
+        )),
+    }
     let outside = |e: &rustgis_geom::Extent| !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5);
     let names: Vec<&str> = layers.iter().filter(|(_, e)| outside(e)).map(|(ds, _)| ds.name.as_str()).collect();
     match names.as_slice() {
@@ -413,6 +471,13 @@ pub fn export_notes<'a>(
         )),
     }
     notes
+}
+
+/// Why exporting `ds` in `crs` would write other data than the layer's: a layer on another body
+/// projected onto another ellipsoid ([`raster::planetary::export_error`]). `None` when the export
+/// writes its numbers, which [`export_notes`] says when they go under another system's name.
+pub fn export_error(ds: &Dataset, crs: raster::Crs) -> Option<String> {
+    ds.crs.and_then(|from| raster::planetary::export_error(from, crs)).map(|e| format!("{}: {e}", ds.name))
 }
 
 impl Dataset {
@@ -499,19 +564,47 @@ impl Dataset {
         r
     }
 
-    /// Distinct display values of a field over the features `rows` keeps, sorted, capped at `limit`.
+    /// Distinct display values of a field over the features `rows` keeps, the first `limit` in
+    /// Unique Values' order ([`value::sort_class_values`]: by number when they read as numbers).
     pub fn unique_values(&self, field: usize, rows: &[bool], limit: usize) -> Vec<String> {
-        let mut v: Vec<String> = self.kept_features(rows).map(|f| f.attrs.get(field).map(|x| x.to_string()).unwrap_or_default()).collect();
-        v.sort();
-        v.dedup();
+        self.unique_values_counted(field, rows, limit).0
+    }
+
+    /// [`Dataset::unique_values`], and what is past them: how many of the kept features with a
+    /// geometry have a value past the first `limit`, and whether those were taken by number.
+    pub fn unique_values_counted(&self, field: usize, rows: &[bool], limit: usize) -> (Vec<String>, value::PastClasses) {
+        let mut drawn: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for f in self.kept_features(rows) {
+            let text = f.attrs.get(field).map(|x| x.to_string()).unwrap_or_default();
+            *drawn.entry(text).or_insert(0) += usize::from(f.geometry.is_some());
+        }
+        // Each value read as a number once, not on every comparison.
+        let mut v: Vec<(value::ClassText, usize)> = drawn.into_iter().map(|(t, n)| (value::ClassText::new(t), n)).collect();
+        let by_number = value::ClassText::numeric(v.iter().map(|(t, _)| t));
+        let order = |a: &(value::ClassText, usize), b: &(value::ClassText, usize)| {
+            if by_number { a.0.cmp(&b.0) } else { a.0.text().cmp(b.0.text()) }
+        };
+        // Only the first `limit` need sorting: the rest are set apart in linear time.
+        if limit < v.len() {
+            v.select_nth_unstable_by(limit, order);
+        }
+        let features = v.get(limit..).unwrap_or_default().iter().map(|(_, n)| n).sum();
         v.truncate(limit);
-        v
+        v.sort_by(order);
+        (v.into_iter().map(|(t, _)| t.into_text()).collect(), value::PastClasses { features, by_number })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_io_error_keeps_its_source() {
+        let e = DataError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        let source = std::error::Error::source(&e).map(ToString::to_string);
+        assert_eq!(source.as_deref(), Some("gone"));
+    }
 
     #[test]
     fn features_are_shared_until_changed() {
@@ -559,6 +652,40 @@ mod tests {
         assert_eq!(d.numeric_range(0, &[false, false]), None);
         assert_eq!(d.unique_values(0, &[true, false], 10), vec!["5"]);
         assert_eq!(d.value(99, 99), &Value::Null);
+    }
+
+    /// #1340: a numeric field's distinct values are in numeric order, and the first `limit` kept
+    /// are the smallest; a text field's keep text order.
+    #[test]
+    fn unique_values_of_a_numeric_field_are_in_numeric_order() {
+        let point = || Some(Geometry::Point(Coord::new(0.0, 0.0)));
+        let fields = vec![Field::new("i", FieldType::Integer), Field::new("r", FieldType::Double), Field::new("t", FieldType::Text)];
+        let mut d = Dataset::new("t", GeometryType::Point, fields);
+        for (i, r, t) in [(100, 10.0, "b"), (9, 2.5, "A"), (10, -1.0, "10"), (9, 10.0, "9")] {
+            d.push(point(), vec![Value::Int(i), Value::Float(r), Value::Text(t.into())]);
+        }
+        d.push(point(), vec![Value::Null, Value::Null, Value::Null]);
+        assert_eq!(d.unique_values(0, &[], 10), ["9", "10", "100", "<Null>"]);
+        assert_eq!(d.unique_values(1, &[], 10), ["-1", "2.5", "10", "<Null>"]);
+        assert_eq!(d.unique_values(2, &[], 10), ["10", "9", "<Null>", "A", "b"], "text keeps its order");
+        // The first two are the two smallest, and the features past them are counted.
+        let (first, past) = d.unique_values_counted(0, &[], 2);
+        assert_eq!(first, ["9", "10"]);
+        assert_eq!(past, value::PastClasses { features: 2, by_number: true });
+        assert_eq!(d.unique_values_counted(0, &[], 10).1.features, 0);
+        assert_eq!(d.unique_values_counted(2, &[], 10).1, value::PastClasses { features: 0, by_number: false });
+        // Only kept features count, and only those with a geometry (one without draws nothing).
+        d.push(None, vec![Value::Int(500)]);
+        assert_eq!(d.unique_values_counted(0, &[], 2).1.features, 2);
+        assert_eq!(d.unique_values_counted(0, &[true, true, true, true, false], 2).1.features, 1);
+        // (A row past the end of `rows` is kept.)
+        assert_eq!(d.unique_values(0, &[false, false, true, false, false, false], 10), ["10"]);
+        // A text value in a numeric field (a hostile file) orders the field as text, and says so
+        // though the values kept are numbers.
+        d.push(point(), vec![Value::Text("x".into())]);
+        let (first, past) = d.unique_values_counted(0, &[], 3);
+        assert_eq!(first, ["10", "100", "500"]);
+        assert_eq!(past, value::PastClasses { features: 4, by_number: false });
     }
 
     #[test]

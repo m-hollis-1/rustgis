@@ -268,7 +268,14 @@ class Layer:
         collection = self.to_geojson(selected)
         return gpd.GeoDataFrame.from_features(collection["features"], crs="EPSG:4326")
 
-    def to_file(self, path: PathLike, crs: Optional[str] = None) -> Any:
+    def to_file(
+        self,
+        path: PathLike,
+        crs: Optional[str] = None,
+        *,
+        mode: Optional[str] = None,
+        table_name: Optional[str] = None,
+    ) -> Any:
         """Writes the layer's features to a file (``share.exportLayer``).
 
         Args:
@@ -276,10 +283,19 @@ class Layer:
                 ``.gpkg``, ``.parquet``, ``.shp``, ``.zip``, ``.kml``, ``.kmz`` or ``.gpx``.
             crs: The coordinate system of a GeoPackage, Shapefile or FlatGeobuf, e.g.
                 ``"EPSG:3857"`` (the one the layer was read in when left out).
+            mode: For a GeoPackage: ``"newFile"`` (the default; an existing file is refused),
+                ``"addTable"`` (one more table in an existing GeoPackage, or a new file when
+                there is none) or ``"replaceTable"`` (replacing its table of that name, which
+                must be there).
+            table_name: The GeoPackage table (the layer's name when left out).
         """
         params: Dict[str, Any] = {"layer": self.id, "path": os.fspath(path)}
         if crs is not None:
             params["crs"] = crs
+        if mode is not None:
+            params["mode"] = mode
+        if table_name is not None:
+            params["tableName"] = table_name
         return self.session.run("share.exportLayer", params)
 
     def __eq__(self, other: object) -> bool:
@@ -339,18 +355,25 @@ class _Api:
 
     def _outputs(self, result: Any) -> Any:
         """A command's result as layers: the :class:`Layer` it added, a list when it added
-        several, else the result as it is.
+        several, else the result as it is (when it added no layer, only tables, say).
+
+        A file of several layers (the tables of a GeoPackage, a GDAL file split by geometry
+        type) reports the first as ``"layer"`` and every one as ``"layers"``, so ``"layers"``
+        decides. Standalone tables added with the layers are in :meth:`info`, not returned.
 
         Args:
             result: The command's result.
         """
         if isinstance(result, dict):
+            many = result.get("layers")
+            ids = [i for i in many if isinstance(i, int) and not isinstance(i, bool)] if isinstance(many, list) else []
+            if len(ids) > 1:
+                return [Layer._of(self, i) for i in ids]
             added = result.get("layer")
             if isinstance(added, int) and not isinstance(added, bool):
                 return Layer._of(self, added)
-            many = result.get("layers")
-            if isinstance(many, list) and many and not result.get("tables"):
-                return [Layer._of(self, i) for i in many if isinstance(i, int) and not isinstance(i, bool)]
+            if ids:
+                return Layer._of(self, ids[0])
         return result
 
     # Commands ------------------------------------------------------------------------------
@@ -533,7 +556,8 @@ class _Api:
                 GeoPackage, ``x=`` and ``y=`` for a CSV's coordinate columns.
 
         Returns:
-            The new :class:`Layer`, or the command's result for a table.
+            The new :class:`Layer`, a list of them when the file adds several (the tables
+            of a GeoPackage, or a GDAL file's layers), or the command's result for a table.
         """
         command, args = self._data_command(path)
         if name is not None:
@@ -585,7 +609,10 @@ class _Api:
             **params: More ``map.addTiles`` parameters (``kind``, ``attribution``, ...).
 
         Returns:
-            The tile layer's position, kind and name.
+            The tile layer's position, kind and name. An archive (PMTiles or MBTiles)
+            added without an ``id`` also reports ``zoomed``, whether its bounds framed
+            the map by the time the call returned (``False`` while its metadata is
+            still loading, which can frame the map later).
         """
         if name is not None:
             params["name"] = name
@@ -612,7 +639,8 @@ class _Api:
             **params: More ``map.addTiles`` parameters, e.g. ``opacity`` or ``attribution``.
 
         Returns:
-            The tile layer's position, kind and name, as for :meth:`add_tiles`.
+            The tile layer's position, kind and name, as for :meth:`add_tiles`. Without
+            an ``id``, also ``zoomed``, indicating whether its bounds framed the map immediately.
         """
         params["kind"] = "pmtiles"
         if source_layers is not None:

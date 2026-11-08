@@ -9,6 +9,7 @@ use super::{b, ps};
 use crate::connections::{Connection, DATABASE_KINDS, DESKTOP_ONLY, KINDS};
 use crate::render::rustgis_tiles::{s3, stac};
 use crate::s3_keys as keys;
+use crate::service_logins as web;
 use crate::{CmdResult, CommandSpec as C, Session};
 
 #[path = "connection_browse.rs"]
@@ -26,31 +27,34 @@ pub(in crate::cmd) use connection_use::{listing_result, sqlserver_listing};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("connection.list", "List Connections", "Home › Add › Data Sources", list).view().params(
+        C::new("connection.list", "List Connections", "Home › Add › Data Sources", list).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
             r#"{"kind"?: "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "group"?: text}"#,
         ),
-        C::new("connection.new", "New Connection", "Home › Add › Data Sources", new).view().params(
-            r#"{"kind": "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "address"?: "as the kind's add command takes it, without its password or token (postgres:host=… dbname=… user=…, mysql://user@host/db, mssql://user@host/db, a service's or STAC API's https:// address, an S3 endpoint: AWS when absent)", "sdeFile"?: "an ArcGIS Pro .sde connection file (desktop, kind sqlserver): its server, database and user make the address, replacing any address given; the password is asked for. Adds needsPassword, user, version and osAuth to the result", "name"?: "unique (default from the address; from the file's name with sdeFile)", "group"?: text, "options"?: {"region"?: text, "buckets"?: "a,b", "credentials"?: "keys"|"profile"|"environment"|"none", "profile"?: text} (S3 only)}"#,
+        C::new("connection.new", "New Connection", "Home › Add › Data Sources", new).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
+            r#"{"kind": "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "address"?: "as the kind's add command takes it, without its password or token (postgres:host=… dbname=… user=…, mysql://user@host/db, mssql://user@host/db, a service's or STAC API's https:// address, an S3 endpoint: AWS when absent)", "sdeFile"?: "an ArcGIS Pro .sde connection file (desktop, kind sqlserver): its server, database and user make the address, replacing any address given; the password is asked for. Adds needsPassword, user, version and osAuth to the result", "name"?: "unique (default from the address; from the file's name with sdeFile)", "group"?: text, "options"?: {"region"?: text, "buckets"?: "a,b", "credentials"?: "keys"|"profile"|"environment"|"none", "profile"?: text} (S3 only), "auth"?: "none"|"basic"|"header": how a web-service connection logs in (basic authentication or an API key in a header; the password or key is given to connection.login, never kept here), "user"?: "the basic login's user name", "keyName"?: "the header the API key goes in, e.g. X-API-Key"}"#,
         ),
-        C::new("connection.edit", "Edit Connection", "Home › Add › Data Sources", edit).view().params(
-            r#"{"id": "a connection's id or name", "name"?: text, "group"?: text, "address"?: text, "options"?: "as connection.new (replaces them)", "kind"?: "its kind (unchanged)"}"#,
+        C::new("connection.edit", "Edit Connection", "Home › Add › Data Sources", edit).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
+            r#"{"id": "a connection's id or name", "name"?: text, "group"?: text, "address"?: text, "options"?: "as connection.new (replaces them)", "auth"?: "as connection.new", "user"?: text, "keyName"?: text, "kind"?: "its kind (unchanged)"} (another origin, login method, user or key name ends the web connection's session login)"#,
         ),
-        C::new("connection.duplicate", "Duplicate Connection", "Home › Add › Data Sources", duplicate).view().params(r#"{"id": "a connection's id or name", "name"?: text}"#),
-        C::new("connection.remove", "Remove Connection", "Home › Add › Data Sources", remove).view().params(r#"{"id": "a connection's id or name"}"#),
-        C::new("connection.login", "Log In to Connection", "Home › Add › Data Sources", login_command).view().params(
-            r#"{"id": "a connection's id or name; blank credentials explicitly use this ID's session or saved credentials", "password"?: "a database password, session-only by default", "accessKeyId"?: text, "secretAccessKey"?: text, "sessionToken"?: "temporary S3 credentials, never persisted", "remember"?: "boolean, default false: opt into this computer's credential store for a newly typed database password or complete S3 key pair (saved keys mode only). No credentials are stored in connections or projects; a failed save preserves the session login"}"#,
+        C::new("connection.duplicate", "Duplicate Connection", "Home › Add › Data Sources", duplicate).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(r#"{"id": "a connection's id or name", "name"?: text}"#),
+        C::new("connection.remove", "Remove Connection", "Home › Add › Data Sources", remove).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(r#"{"id": "a connection's id or name"} (deletes its saved database password or S3 keys; ends its web-service session login)"#),
+        C::new("connection.login", "Log In to Connection", "Home › Add › Data Sources", login_command).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
+            r#"{"id": "a connection's id or name; blank credentials explicitly use this ID's session credentials (or saved credentials for database/S3 connections)", "password"?: "a database password, or a web service's basic-authentication password", "apiKey"?: "a web service's API key (auth header)", "allowInsecure"?: "boolean, default false: confirms sending a web service's login to its plain http:// address, unencrypted", "accessKeyId"?: text, "secretAccessKey"?: text, "sessionToken"?: "temporary S3 credentials, never persisted", "remember"?: "boolean, default false: opt into this computer's credential store for a newly typed database password or complete S3 key pair (saved keys mode only). Web-service credentials are session-only and reject remember:true. No credentials are stored in connections or projects; a failed database/S3 save preserves the session login"} (a web service's login is sent only with this session's requests bound to that connection and only to its address's origin: the same scheme, host and port; logging in to one of several connections chooses it for unassigned requests to that address)"#,
         ),
-        C::new("connection.forgetSavedKeys", "Forget Saved Keys", "Home › Add › Data Sources", forget_saved_keys).view().params(
+        C::new("connection.logout", "Log Out of Connection", "Home › Add › Data Sources", logout).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
+            r#"{"id": "a web-service connection's id or name"} (clears this session's login and its password or key, which is no longer sent)"#,
+        ),
+        C::new("connection.forgetSavedKeys", "Forget Saved Keys", "Home › Add › Data Sources", forget_saved_keys).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
             r#"{"id": "a saved S3 connection's id or name"} (deletes stored keys; a login in this session keeps working)"#,
         ),
-        C::new("connection.resolveS3", "Choose S3 Connection", "Home › Add › Data Sources", resolve_s3).view().params(
-            r#"{"source": "a pending project S3 source address", "id": "a candidate saved connection id"} → {id, reopened, failed}: explicitly grants this bucket and opens only its waiting sources"#,
+        C::new("connection.resolveS3", "Choose S3 Connection", "Home › Add › Data Sources", resolve_s3).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files)).view().params(
+            r#"{"source": "a pending project S3 source address", "id": "a candidate saved connection id"} → {id, reopened, failed, reading}: explicitly grants this bucket and opens only its waiting sources; reading counts the rasters read in place whose overview is still being read (the desktop doesn't wait for it: it lands as the map draws, and one that fails is said then)"#,
         ),
-        C::new("connection.forgetPassword", "Forget Saved Password", "Home › Add › Data Sources", forget_password).view().params(r#"{"id": "a database connection's id or name"}"#),
-        C::new("connection.test", "Test Connection", "Home › Add › Data Sources", test).view().params(
-            r#"{"id"?: "a connection's id or name", "kind"?: "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "name"?: text, "group"?: text, "address"?: text, "options"?: "an unsaved connection, as connection.new (when no id)", "password"?: "for a named database, authentication refusal restores prior session credentials; a later listing failure keeps the new password; never persisted", "accessKeyId"?: text, "secretAccessKey"?: text, "sessionToken"?: "as connection.login (logs in first)", "probe"?: "true: only the address the test reads, {fetch} (null for databases, which their driver tests)", "answer"?: "non-database kinds only: what that address returned, when the app fetched it (no network request then); databases ignore answer and test through their driver"} → a database's result has {count, layers}, and for an Esri enterprise geodatabase on SQL Server geodatabase: {owner, release}, or geodatabaseProblem: why its catalog couldn't be read"#,
+        C::new("connection.forgetPassword", "Forget Saved Password", "Home › Add › Data Sources", forget_password).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(r#"{"id": "a database connection's id or name"}"#),
+        C::new("connection.test", "Test Connection", "Home › Add › Data Sources", test).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
+            r#"{"id"?: "a connection's id or name", "kind"?: "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "name"?: text, "group"?: text, "address"?: text, "options"?: "an unsaved connection, as connection.new (when no id)", "auth"?: text, "user"?: text, "keyName"?: "as connection.new (when no id)", "password"?: "for a named database, authentication refusal restores prior session credentials; a later listing failure keeps the new password; never persisted. A saved web service's: as connection.login (logs in first)", "apiKey"?: "a saved web service's, as connection.login (logs in first)", "allowInsecure"?: "as connection.login", "accessKeyId"?: text, "secretAccessKey"?: text, "sessionToken"?: "as connection.login (logs in first)", "probe"?: "true: only the address the test reads, {fetch} (null for databases, which their driver tests)", "answer"?: "non-database kinds only: what that address returned, when the app fetched it (no network request then); databases ignore answer and test through their driver"} → a database's result has {count, layers}, and for an Esri enterprise geodatabase on SQL Server geodatabase: {owner, release}, or geodatabaseProblem: why its catalog couldn't be read"#,
         ),
-        C::new("connection.browse", "Browse Connection", "Home › Add › Data Sources", browse::browse).view().params(
+        C::new("connection.browse", "Browse Connection", "Home › Add › Data Sources", browse::browse).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files)).view().params(
             r#"{"id": "a connection's id or name", "node"?: "a child's node, as a listing gives it (the connection's top level when absent)", "probe"?: "true: only the address this level reads, {fetch} (null: read without a fetch, or by the database driver); an S3 connection logs in first, as connection.test does", "answer"?: "what that address returned, when the app fetched it", "documents"?: [{"url": "a further document a listing asked for (next)", "text": "its answer"}]} → {connection, node, children: [{key, name, what, detail?, node? (browse it), children? (listed already), add? {command, params}: the command that adds it}], truncated?, matched?, notes?, service? {url, type}, next? (fetch it, then ask again with answer and documents)}. Database roots list schemas; open a schema node to list its tables. A geodatabase's root lists feature datasets, feature classes, tables and other spatial tables (open a feature dataset node to list its classes); if its catalog couldn't be read, the database browses as plain SQL Server, with a note."#,
         ),
     ]
@@ -59,7 +63,13 @@ pub fn commands() -> Vec<C> {
 fn shown(s: &Session, c: &Connection) -> Value {
     let database = DATABASE_KINDS.contains(&c.kind.as_str());
     let available = !database || !cfg!(target_arch = "wasm32");
-    let logged_in = if c.kind == "s3" { s.has_s3_login(&c.id) } else { database && s.database_logins.known_password(&c.id).is_some() };
+    let logged_in = if c.kind == "s3" {
+        s.has_s3_login(&c.id)
+    } else if web::is_service(c) {
+        web::logged_in(s, c)
+    } else {
+        database && s.database_logins.known_password(&c.id).is_some()
+    };
     let add_with = "connection.browse {id}, then {id, node} for a child's node; run a dataset's add {command, params}";
     let mut out = serde_json::to_value(c).unwrap_or(Value::Null);
     out["available"] = json!(available);
@@ -72,7 +82,17 @@ fn shown(s: &Session, c: &Connection) -> Value {
     if c.kind == "s3" {
         out["savedKeys"] = json!(c.saved_keys);
     }
-    out["remembered"] = json!(c.remembered);
+    if web::is_service(c) {
+        if let Some(out) = out.as_object_mut() {
+            out.remove("remembered");
+        }
+    } else {
+        out["remembered"] = json!(c.remembered);
+    }
+    // A web login over plain http:// is sent only once confirmed (`allowInsecure`).
+    if !c.auth.is_empty() && c.address.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
+        out["insecure"] = json!(true);
+    }
     out["addWith"] = json!(add_with);
     out
 }
@@ -88,6 +108,25 @@ fn options(p: &Value) -> Result<BTreeMap<String, String>, String> {
         .iter()
         .map(|(k, v)| v.as_str().map(|t| (k.clone(), t.to_owned())).ok_or_else(|| "options is an object of texts".into()))
         .collect()
+}
+
+/// The login method's fields a command gives (`auth`, `user`, `keyName`), each text.
+fn login_fields(p: &Value, c: &mut Connection) -> Result<(), String> {
+    for (key, field) in [("auth", &mut c.auth), ("user", &mut c.user), ("keyName", &mut c.key_name)] {
+        if let Some(value) = p.get(key) {
+            *field = value.as_str().ok_or_else(|| format!("{key} is text"))?.into();
+        }
+    }
+    Ok(())
+}
+
+/// Logs the project's layers read from these connections' origins in again (a connection was
+/// added, changed or removed: what is clear for each origin may have changed).
+fn resolve_origins(s: &mut Session, cs: &[&Connection]) {
+    let origins: std::collections::BTreeSet<String> = cs.iter().filter_map(|c| crate::connections::login_origin(c)).collect();
+    if !origins.is_empty() {
+        web::resolve(s, Some(&origins));
+    }
 }
 
 /// Saved database connections, in list order, with how many project layers wait for their login.
@@ -152,10 +191,15 @@ fn list(s: &mut Session, p: &Value) -> CmdResult {
             }
             out
         }).collect::<Vec<_>>(),
-        "loginRequests": s.database_logins.requests(s.opened).map(|r| json!({
-            "reason":r.reason.name(), "database":crate::connections::database_label(r.kind, &r.key),
-            "connections":r.connections, "layers":r.layers.len()
-        })).collect::<Vec<_>>() }))
+        "loginRequests": s.database_logins.requests(s.opened).map(|r| {
+            let mut out = json!({"reason":r.reason.name(), "connections":r.connections, "layers":r.layers.len() + r.tiles});
+            if r.kind == crate::connections::WEB {
+                out["origin"] = json!(r.key);
+            } else {
+                out["database"] = json!(crate::connections::database_label(r.kind, &r.key));
+            }
+            out
+        }).collect::<Vec<_>>() }))
 }
 
 fn new(s: &mut Session, p: &Value) -> CmdResult {
@@ -167,6 +211,7 @@ fn new(s: &mut Session, p: &Value) -> CmdResult {
         options: p.get("options").map(options).transpose()?.unwrap_or_default(),
         ..Connection::default()
     };
+    login_fields(p, &mut c)?;
     // A name filled in from the file is a default, as one made from an address is.
     let explicit = !c.name.trim().is_empty();
     let from_file = match ps(p, "sdeFile") {
@@ -175,6 +220,7 @@ fn new(s: &mut Session, p: &Value) -> CmdResult {
     };
     let (c, stripped) = s.connections.add(c, explicit)?;
     resolve_keys(s, &address_keys(&c.address));
+    resolve_origins(s, &[&c]);
     let mut out = shown_stripped(s, &c, stripped);
     if let Some(file) = from_file {
         out["needsPassword"] = json!(!file.os_auth);
@@ -262,9 +308,12 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(v) = p.get("options") {
         c.options = options(v)?;
     }
+    login_fields(p, &mut c)?;
     // Validate everything, then locate the commit target before touching the store.
     let (mut prepared, stripped) = s.connections.prepare_update(&old.id, c)?;
     let database_changed = DATABASE_KINDS.contains(&old.kind.as_str()) && old.address != prepared.address;
+    // A web login is for one origin, method, user and key name.
+    let login_changed = web::is_service(&old) && !crate::connections::same_login(&old, &prepared);
     let credentials_changed = database_changed
         || (old.kind == "s3"
             && (endpoint_changed(&old, &prepared)
@@ -279,6 +328,12 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     let c = crate::connections::Connections::commit_update(slot, &mut s.connections.generation, prepared);
     if database_changed {
         clear_identity(s, &old.id);
+    }
+    if login_changed {
+        web::forget(s, &old);
+    }
+    if web::is_service(&c) && (login_changed || old.address != c.address) {
+        resolve_origins(s, &[&old, &c]);
     }
     if old.address != c.address {
         // Only the two databases this definition names can change: another database's layers
@@ -306,6 +361,7 @@ fn duplicate(s: &mut Session, p: &Value) -> CmdResult {
     // A copy has no saved keys: `add` starts it without any.
     let (c, _) = s.connections.add(c, explicit)?;
     resolve_keys(s, &address_keys(&c.address));
+    resolve_origins(s, &[&c]);
     Ok(shown(s, &c))
 }
 
@@ -314,6 +370,9 @@ fn remove(s: &mut Session, p: &Value) -> CmdResult {
     if DATABASE_KINDS.contains(&c.kind.as_str()) || c.kind == "s3" {
         delete_account(&mut s.database_logins, &c)?;
     }
+    if web::is_service(&c) {
+        web::forget(s, &c);
+    }
     if DATABASE_KINDS.contains(&c.kind.as_str()) {
         clear_identity(s, &c.id);
     }
@@ -321,6 +380,7 @@ fn remove(s: &mut Session, p: &Value) -> CmdResult {
     // The removed definition named one database: only its layers can change. The requests naming
     // it went with `clear_identity`.
     resolve_keys(s, &address_keys(&c.address));
+    resolve_origins(s, &[&c]);
     if c.kind == "s3" {
         s3::disconnect(&c.name);
         s.s3_bindings.remove(&c.id);
@@ -338,6 +398,16 @@ fn forget_saved_keys(s: &mut Session, p: &Value) -> CmdResult {
     delete_account(&mut s.database_logins, &c)?;
     s.connections.set_saved_keys(&c.id, false);
     let c = s.connections.find(&c.id).cloned().unwrap_or(c);
+    Ok(shown(s, &c))
+}
+
+/// Ends this session's login of a web-service connection and clears its transient secret.
+fn logout(s: &mut Session, p: &Value) -> CmdResult {
+    let c = found(s, p)?.clone();
+    if !web::is_service(&c) {
+        return Err(format!("{} connections don't log out: only web-service connections do", c.kind));
+    }
+    web::logout(s, &c);
     Ok(shown(s, &c))
 }
 
@@ -418,12 +488,26 @@ struct Reopened {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn reopen(s: &mut Session, c: &Connection, saved: bool, session: bool, all_unopened: bool) -> Reopened {
+#[derive(Clone, Copy)]
+enum ReopenMode {
+    Automatic,
+    Login { all_unopened: bool },
+}
+
+/// Reopens this connection's database sources and aggregates refusals. Automatic resolution
+/// preserves peer reconnect barriers; only an explicit matching login releases them.
+#[cfg(not(target_arch = "wasm32"))]
+fn reopen(s: &mut Session, c: &Connection, saved: bool, session: bool, mode: ReopenMode) -> Reopened {
     let Some(key) = crate::connections::database_key(&c.address) else { return Reopened::default() };
     let mut result = Reopened::default();
     let mut first_error = None;
     for layer in s.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
-        let Some(src) = layer.source.as_mut().filter(|src| src.login || all_unopened && !src.is_open()) else { continue };
+        let Some(src) = layer.source.as_mut().filter(|src| match mode {
+            ReopenMode::Automatic => !src.reconnect_required() && !src.is_open(),
+            ReopenMode::Login { all_unopened } => src.login || src.reconnect_required() || all_unopened && !src.is_open(),
+        }) else {
+            continue;
+        };
         let Some((kind, database)) = crate::connections::layer_database(src) else { continue };
         if kind != key.0 || crate::connections::database_key(&crate::sources::redact(database)).as_ref() != Some(&key) {
             continue;
@@ -435,6 +519,9 @@ fn reopen(s: &mut Session, c: &Connection, saved: bool, session: bool, all_unope
             src.error = first_error.clone();
             result.failed += 1;
             continue;
+        }
+        if matches!(mode, ReopenMode::Login { .. }) {
+            src.allow_reconnect();
         }
         src.error = None;
         match src.open() {
@@ -474,6 +561,7 @@ fn reopen(s: &mut Session, c: &Connection, saved: bool, session: bool, all_unope
             key: key.1.clone(),
             connections: vec![c.id.clone()],
             layers,
+            tiles: 0,
             opened: s.opened,
             prompted: false,
         });
@@ -593,7 +681,7 @@ fn login(s: &mut Session, c: &Connection, p: &Value) -> Result<Reopened, String>
                     &key.1,
                     &c.id,
                     pw,
-                    || reopen(s, c, false, false, all_unopened),
+                    || reopen(s, c, false, false, ReopenMode::Login { all_unopened }),
                     |result| result.refused,
                 )
             } else {
@@ -606,7 +694,7 @@ fn login(s: &mut Session, c: &Connection, p: &Value) -> Result<Reopened, String>
                     activate(s, c, password.expose());
                 }
                 let session = password.is_some() && !saved;
-                reopen(s, c, saved, session, all_unopened)
+                reopen(s, c, saved, session, ReopenMode::Login { all_unopened })
             };
             if let Some(pw) = &typed
                 && !result.refused
@@ -627,6 +715,9 @@ fn login(s: &mut Session, c: &Connection, p: &Value) -> Result<Reopened, String>
             }
             return Ok(result);
         }
+    }
+    if web::is_service(c) {
+        return service_login(s, c, p, remember);
     }
     if c.kind != "s3" {
         return Err(format!("{} connections don't log in yet", c.kind));
@@ -725,7 +816,15 @@ fn login(s: &mut Session, c: &Connection, p: &Value) -> Result<Reopened, String>
 
 fn login_command(s: &mut Session, p: &Value) -> CmdResult {
     let c = found(s, p)?.clone();
+    // Logging in is the user's answer to a request waiting at this origin (the login ends it).
+    let answers = web::is_service(&c) && web::answers(s, &c);
     let result = login(s, &c, p)?;
+    if web::is_service(&c) {
+        if answers {
+            web::adopt(s, &c);
+        }
+        resolve_origins(s, &[&c]);
+    }
     let c = s.connections.find(&c.id).cloned().unwrap_or(c);
     let mut out = shown(s, &c);
     if let Some(saved) = result.password_saved {
@@ -798,11 +897,82 @@ pub(super) fn credential(s: &mut Session, c: &Connection) -> Result<Option<(rust
     }
 }
 
+/// `allowInsecure` of a login: only `true` or `false`.
+fn insecure_flag(p: &Value) -> Result<bool, String> {
+    match p.get("allowInsecure") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err("allowInsecure is true or false".into()),
+    }
+}
+
+/// Logs in to a saved web-service connection with the password (basic) or key (header)
+/// typed, or else the one given this session. The login is sent to the connection's origin,
+/// and this connection is chosen for it. A connection without a login method is chosen for
+/// its origin, which then gets no login.
+fn service_login(s: &mut Session, c: &Connection, p: &Value, remember: bool) -> Result<Reopened, String> {
+    if remember {
+        return Err(web::SESSION_ONLY.into());
+    }
+    let insecure = insecure_flag(p)?;
+    if c.id.is_empty() {
+        return Err(web::UNSAVED.into());
+    }
+    let password = ps(p, "password").filter(|t| !t.is_empty());
+    let key = ps(p, "apiKey").filter(|t| !t.is_empty());
+    let typed = match (c.auth.as_str(), password, key) {
+        ("", None, None) => {
+            web::activate(s, c, None, false)?;
+            return Ok(Reopened::default());
+        }
+        ("", ..) => return Err("this connection has no login method: set auth (basic or header) with connection.edit first".into()),
+        ("basic", typed, None) => typed,
+        ("basic", _, Some(_)) => return Err("a basic login takes a password, not an apiKey".into()),
+        (_, None, typed) => typed,
+        (_, Some(_), _) => return Err("an API-key login takes an apiKey, not a password".into()),
+    };
+    let origin = crate::connections::login_origin(c).ok_or(web::NO_ORIGIN)?;
+    let Some(typed) = typed else {
+        // Already logged in: choose it again, keeping its binding and its cached tiles.
+        if web::logged_in(s, c) {
+            web::reselect(s, c, &origin);
+            return Ok(Reopened::default());
+        }
+        // Only the active login given this session can be reused.
+        let secret = web::known_secret(s, c)?;
+        web::activate(s, c, Some(&secret), true)?;
+        return Ok(Reopened::default());
+    };
+    web::check_login_secret(c, typed)?;
+    if origin.starts_with("http://") && !insecure {
+        return Err(web::INSECURE.into());
+    }
+    let secret = rustgis_data::secrets::Secret::new(typed);
+    web::activate(s, c, Some(&secret), insecure)?;
+    s.database_logins.set_session_password(&c.id, typed);
+    Ok(Reopened::default())
+}
+
 fn tested(s: &Session, p: &Value) -> Result<Connection, String> {
     if ps(p, "id").is_some() {
-        return Ok(found(s, p)?.clone());
+        let c = found(s, p)?;
+        // Only a web-service login is tied to its saved definition; other kinds test as saved.
+        if web::is_service(c) {
+            for (field, saved) in
+                [("kind", c.kind.as_str()), ("address", &c.address), ("auth", &c.auth), ("user", &c.user), ("keyName", &c.key_name)]
+            {
+                if let Some(value) = p.get(field) {
+                    let value = value.as_str().ok_or(web::SAVE_BEFORE_TEST)?.trim();
+                    let value = if field == "auth" && value == "none" { "" } else { value };
+                    if value != saved {
+                        return Err(web::SAVE_BEFORE_TEST.into());
+                    }
+                }
+            }
+        }
+        return Ok(c.clone());
     }
-    let c = Connection {
+    let mut c = Connection {
         kind: ps(p, "kind").ok_or_else(|| format!("id, or kind and address, is required ({})", KINDS.join(", ")))?.trim().into(),
         address: ps(p, "address").unwrap_or("").into(),
         name: ps(p, "name").unwrap_or("").into(),
@@ -810,6 +980,7 @@ fn tested(s: &Session, p: &Value) -> Result<Connection, String> {
         options: p.get("options").map(options).transpose()?.unwrap_or_default(),
         ..Connection::default()
     };
+    login_fields(p, &mut c)?;
     Ok(crate::connections::clean(c)?.0)
 }
 
@@ -817,7 +988,7 @@ fn first_bucket(c: &Connection) -> Option<String> {
     c.options.get("buckets")?.split(',').map(str::trim).find(|b| !b.is_empty()).map(str::to_owned)
 }
 
-fn probe_url(s: &Session, c: &Connection) -> Result<Option<String>, String> {
+fn probe_url(s: &mut Session, c: &Connection) -> Result<Option<String>, String> {
     let url = match c.kind.as_str() {
         "postgres" | "mysql" | "sqlserver" => return Ok(None),
         "service" => rustgis_data::ogc::capabilities_url(&c.address, None),
@@ -840,16 +1011,17 @@ fn probe_url(s: &Session, c: &Connection) -> Result<Option<String>, String> {
         }
         _ => return Err(format!("unknown kind '{}'", c.kind)),
     };
+    let url = if web::is_service(c) { web::request(s, (!c.id.is_empty()).then_some(c.id.as_str()), &url)? } else { url };
     Ok(Some(url))
 }
 
 fn answered(s: &mut Session, c: &Connection, text: &str) -> CmdResult {
     match c.kind.as_str() {
-        "service" => super::service::layers(s, &json!({"url": c.address, "text": text})),
+        "service" => super::service::layers(s, &json!({"url": c.address, "connection":c.id, "text": text})),
         "wms" | "wmts" | "wfs" | "wcs" | "ogcapi" | "arcgis" => {
-            super::service::layers(s, &json!({"url": c.address, "type": c.kind, "text": text}))
+            super::service::layers(s, &json!({"url": c.address, "connection":c.id, "type": c.kind, "text": text}))
         }
-        "csw" => super::service::catalog_search(s, &json!({"url": c.address, "text": text})),
+        "csw" => super::service::catalog_search(s, &json!({"url": c.address, "connection":c.id, "text": text})),
         "stac" => super::stac::collections_json(&stac::api(Some(&c.address))?, text.as_bytes()),
         "s3" => {
             if let Some(bucket) = first_bucket(c) {
@@ -865,10 +1037,20 @@ fn answered(s: &mut Session, c: &Connection, text: &str) -> CmdResult {
 
 fn test(s: &mut Session, p: &Value) -> CmdResult {
     let c = tested(s, p)?;
+    // An unsaved web service reads anonymously, whatever saved connection shares its origin.
+    let anonymous = web::is_service(&c) && c.id.is_empty();
+    web::anonymously(s, anonymous, |s| test_connection(s, p, c)).unwrap_or_else(|_| Err("connection.test failed unexpectedly".into()))
+}
+
+fn test_connection(s: &mut Session, p: &Value, c: Connection) -> CmdResult {
+    if web::is_service(&c) && c.id.is_empty() && !c.auth.is_empty() {
+        return Err(web::UNSAVED.into());
+    }
     if DATABASE_KINDS.contains(&c.kind.as_str()) && b(p, "probe").unwrap_or(false) {
         return Ok(json!({"connection":c.id, "fetch":null}));
     }
-    let secrets = ["password", "accessKeyId", "secretAccessKey", "sessionToken"].iter().any(|k| ps(p, k).is_some_and(|v| !v.is_empty()));
+    let secrets =
+        ["password", "apiKey", "accessKeyId", "secretAccessKey", "sessionToken"].iter().any(|k| ps(p, k).is_some_and(|v| !v.is_empty()));
     if !DATABASE_KINDS.contains(&c.kind.as_str()) && secrets {
         let mut input = p.clone();
         if let Some(o) = input.as_object_mut() {
@@ -883,6 +1065,10 @@ fn test(s: &mut Session, p: &Value) -> CmdResult {
         if !keys_mode || (!c.id.is_empty() && !s.has_s3_login(&c.id)) {
             login(s, &c, &Value::Null)?;
         }
+    }
+    // Missing or unusable session logins must not look like a successful anonymous test.
+    if web::is_service(&c) && !c.auth.is_empty() && !c.id.is_empty() && !secrets && !web::logged_in(s, &c) {
+        login(s, &c, &Value::Null)?;
     }
     let mut out = json!({});
     if !c.id.is_empty() {
@@ -913,10 +1099,12 @@ fn test(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
         }
-        "service" => super::service::layers(s, &json!({"url": c.address}))?,
-        "wms" | "wmts" | "wfs" | "wcs" | "ogcapi" | "arcgis" => super::service::layers(s, &json!({"url": c.address, "type": c.kind}))?,
-        "csw" => super::service::catalog_search(s, &json!({"url": c.address}))?,
-        "stac" => super::stac::collections(s, &json!({"url": c.address}))?,
+        "service" => super::service::layers(s, &json!({"url": c.address, "connection":c.id}))?,
+        "wms" | "wmts" | "wfs" | "wcs" | "ogcapi" | "arcgis" => {
+            super::service::layers(s, &json!({"url": c.address, "connection":c.id, "type": c.kind}))?
+        }
+        "csw" => super::service::catalog_search(s, &json!({"url": c.address, "connection":c.id}))?,
+        "stac" => super::stac::collections(s, &json!({"url": c.address, "connection":c.id}))?,
         "s3" => {
             s3::connection(&c.name).ok_or("log in first: connection.login {id, accessKeyId, secretAccessKey}")?;
             let mut q = json!({"connection": c.name, "limit": 100});

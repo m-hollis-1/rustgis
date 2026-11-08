@@ -1,6 +1,6 @@
 //! ASCII grids (`.asc`): a short header, then rows of numbers.
 
-use super::{ColorHint, Crs, Exact, GeoTransform, MAX_SAMPLES, Raster, Uncounted};
+use super::{ColorHint, Crs, Exact, GeoTransform, Raster, Uncounted, max_samples};
 use crate::{DataError, Result};
 
 /// Reads an ASCII grid. Without a known coordinate system, coordinates that fit in degrees are
@@ -59,7 +59,7 @@ pub(super) fn read_with_nodata(text: &str, name: &str, crs: Option<Crs>, sidecar
         if v >= 1.0 && v <= u32::MAX as f64 && v.fract() == 0.0 { Ok(v as u32) } else { Err(bad(&format!("bad {what}"))) }
     };
     let (w, h) = (size(ncols, "ncols")?, size(nrows, "nrows")?);
-    let n = (w as usize).checked_mul(h as usize).filter(|n| *n <= MAX_SAMPLES).ok_or_else(|| bad("too large"))?;
+    let n = (w as usize).checked_mul(h as usize).filter(|n| *n <= max_samples()).ok_or_else(|| bad("too large"))?;
     // CELLSIZE takes precedence over DX/DY, as in GDAL's ASCII grid reader.
     let (dx, dy) = if let Some(cell) = cell { (Some(cell), Some(cell)) } else { (dx, dy) };
     let dx = dx.filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| bad("missing or invalid cell width"))?;
@@ -92,6 +92,7 @@ pub(super) fn read_with_nodata(text: &str, name: &str, crs: Option<Crs>, sidecar
     };
     let gt = GeoTransform { origin_x: x, origin_y: top, pixel_width: dx, pixel_height: -dy };
     let mut r = Raster::new(name, w, h, vec![data], gt, crs, nodata, ColorHint::Gray, "Float32")?;
+    r.lost.extend(super::planetary::note_of(crs));
     if rounded > 0 {
         r.rounded = vec![rounded];
     }

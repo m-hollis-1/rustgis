@@ -37,13 +37,13 @@ const SHOWN: usize = 64;
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("layout.inspect", "Inspect Layout File", "Home › Project", inspect).view().params(
+        C::new("layout.inspect", "Inspect Layout File", "Home › Project", inspect).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"path"?: "*.pagx", "text"?: a .pagx file's text} → {"frames": [{"name", "map": the embedded map it shows | null (the layout doesn't say)}], "maps": [embedded map names]}"#,
         ),
-        C::new("project.inspectArcgis", "Inspect ArcGIS Pro Project", "Project › Import", inspect_project).view().params(
+        C::new("project.inspectArcgis", "Inspect ArcGIS Pro Project", "Project › Import", inspect_project).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"path"?: "*.aprx|*.mapx|*.lyrx", "text"?: "a .mapx or .lyrx file's text", "data"?: "an .aprx, .mapx or .lyrx file, base64"} → {"kind": "project"|"map"|"layers", "maps": [{"name", "open": bool (its pane was open when saved; the first open one is the one shown), "arcmap": bool (saved by ArcMap: it can't be imported)}], "layouts": [{"name", "maps": [the names of the maps its frames show], "arcmap": bool}]}"#,
         ),
-        C::new("project.importArcgis", "Import ArcGIS Pro Project", "Project › Import", import_project).params(
+        C::new("project.importArcgis", "Import ArcGIS Pro Project", "Project › Import", import_project).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files)).params(
             r#"{"path"?: "*.aprx|*.mapx|*.lyrx", "text"?: "a .mapx or .lyrx file's text", "data"?: "an .aprx, .mapx or .lyrx file, base64", "maps"?: [names] (an .aprx: the maps to import; with none of these and no layouts, nothing is imported and "holds" says what the file holds, as project.inspectArcgis does), "layouts"?: [names] (an .aprx: the layouts to import, each with the maps its frames show), "dir"?: "the folder its relative paths start from (default: the file's)"} → the names of the maps and layouts added, the layers added and how many came in broken, notes on what wasn't carried over, and, when nothing was asked for, "holds": what the file holds"#,
         ),
     ]
@@ -51,6 +51,15 @@ pub fn commands() -> Vec<C> {
 
 /// Whether a layout file is an ArcGIS Pro one: a `.pagx` `path`, or text that is a JSON object
 /// naming `CIMLayoutDocument` near its start (Pro writes the type first).
+/// Whether `layout.import`'s parameters name an ArcGIS Pro layout: a `.pagx` path, or the text of one.
+pub(crate) fn pagx_params(p: &Value) -> bool {
+    let path = p.get("path").and_then(Value::as_str);
+    match p.get("text").and_then(Value::as_str) {
+        Some(text) => is_pagx(text, None),
+        None => path.is_some_and(|path| is_pagx("", Some(path))),
+    }
+}
+
 pub(crate) fn is_pagx(text: &str, path: Option<&str>) -> bool {
     if path.is_some_and(|p| p.trim().to_ascii_lowercase().ends_with(".pagx")) {
         return true;
@@ -783,7 +792,7 @@ fn settle(s: &mut Session, id: u32, l: &LayerImport, a: &Adding, report: &mut Re
                 Err(e) => report.skipped(name, format!("its definition query `{}` ({e}), dropped", shown(q))),
             }
         }
-        qgis::check_fields(layer, name, &[], report);
+        qgis::check_fields(layer, name, &[], None, &[], report);
     }
     step(s, "layer.expand", &json!({"layer": id, "on": l.expanded}), name, "its expanded state", report);
     if !raster

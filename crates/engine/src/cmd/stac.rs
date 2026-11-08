@@ -11,21 +11,27 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("stac.collections", "List STAC Collections", "Home › Add › Web Data › STAC Search", collections)
+        C::new("stac.collections", "List STAC Collections", "Home › Add › Web Data › STAC Search", collections).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network))
             .view()
-            .params(r#"{"url"?: "a STAC API (default: Earth Search, https://earth-search.aws.element84.com/v1; Planetary Computer: https://planetarycomputer.microsoft.com/api/stac/v1), or a static catalog's catalog.json or collection.json (its child catalogs and collections are listed)"}"#),
-        C::new("stac.search", "STAC Search", "Home › Add › Web Data › STAC Search", search).params(
-            r#"{"url"?: "a STAC API (default: Earth Search), or a static catalog's catalog.json or collection.json (walked from there, at most 400 documents)", "collections"?: id | [ids] (APIs), "bbox"?: [west, south, east, north] | "view" (the map's extent), "datetime"?: "2024-06-01" | "2024-06-01/2024-06-30", "limit"?: 1–200 (default 10), "maxCloud"?: percent, "sortby"?: "eo:cloud_cover" | "-datetime" (APIs that sort), "phase"?: "pre" | "post" (static catalogs of events), "properties"?: bool (every property of each item, not only its date and cloud cover; default false), "footprints"?: bool (adds the items' footprints as a layer, default true)}"#,
+            .params(r#"{"url"?: "a STAC API (default: Earth Search, https://earth-search.aws.element84.com/v1; Planetary Computer: https://planetarycomputer.microsoft.com/api/stac/v1), or a static catalog's catalog.json or collection.json (its child catalogs and collections are listed)", "connection"?: "as service.add: the saved web-service connection whose login the request uses"}"#),
+        C::new("stac.search", "STAC Search", "Home › Add › Web Data › STAC Search", search).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
+            r#"{"url"?: "a STAC API (default: Earth Search), or a static catalog's catalog.json or collection.json (walked from there, at most 400 documents)", "collections"?: id | [ids] (APIs), "bbox"?: [west, south, east, north] | "view" (the map's extent), "datetime"?: "2024-06-01" | "2024-06-01/2024-06-30", "limit"?: 1–200 (default 10), "maxCloud"?: percent, "sortby"?: "eo:cloud_cover" | "-datetime" (APIs that sort), "phase"?: "pre" | "post" (static catalogs of events), "properties"?: bool (every property of each item, not only its date and cloud cover; default false), "footprints"?: bool (adds the items' footprints as a layer, default true), "connection"?: "as service.add: the saved web-service connection whose login the request uses"}"#,
         ),
-        C::new("stac.addFootprints", "Add STAC Footprints", "Home › Add › Web Data › STAC Search", add_footprints_cmd)
+        C::new("stac.addFootprints", "Add STAC Footprints", "Home › Add › Web Data › STAC Search", add_footprints_cmd).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"footprints": GeoJSON FeatureCollection (items' footprints, as STAC Search finds them), "name"?: text}"#),
-        C::new("stac.addCube", "Add STAC Data Cube", "Home › Add › Web Data › STAC Search", add_cube).params(
-            r#"{"url"?: a STAC API (default: Earth Search), "collection": id, "asset": key (a band, such as NDVI), "bbox"?: [west, south, east, north] | "view" (default: the map's extent), "start", "end": dates, "maxCloud"?: percent, "range"?: [low, high] (the values shown from black to white, in the asset's own units after its raster:bands scale and offset, the same for every date and tile; default: each file's 2nd–98th percentile), "name"?: text} → a tile layer per tile of the grid the items cover, each a file per date following the time slider, which turns on over their dates when it is off (desktop)"#,
+        C::new("stac.addCube", "Add STAC Data Cube", "Home › Add › Web Data › STAC Search", add_cube).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
+            r#"{"url"?: a STAC API (default: Earth Search), or the collection.json of a static collection laid out by date (JAXA Earth's), "collection": id, "asset": key (a band, such as NDVI), "bbox"?: [west, south, east, north] | "view" (default: the map's extent), "start", "end": dates, "maxCloud"?: percent, "range"?: [low, high] (the values shown from black to white, in the asset's own units after its raster:bands scale and offset, the same for every date and tile; default: each file's 2nd–98th percentile), "name"?: text, "connection"?: "as service.add: the saved web-service connection whose login the request uses"} → a tile layer per tile of the grid the items cover, each a file per date following the time slider, which turns on over their dates when it is off (desktop)"#,
         ),
-        C::new("stac.addAsset", "Add STAC Asset", "Home › Add › Web Data › STAC Search", add_asset).params(
-            r#"{"item": a STAC item (as stac.search returns it) | "url": an item's address (Planetary Computer assets are signed), "asset"?: key (default: visual, else the first GeoTIFF, else the first data asset), "name"?: text}"#,
+        C::new("stac.addAsset", "Add STAC Asset", "Home › Add › Web Data › STAC Search", add_asset).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
+            r#"{"item": a STAC item (as stac.search returns it) | "url": an item's address (Planetary Computer assets are signed), "asset"?: key (default: visual, else the first GeoTIFF, else the first data asset), "name"?: text, "connection"?: "as service.add"}"#,
         ),
     ]
+}
+
+fn request_api(s: &mut Session, p: &Value) -> Result<String, String> {
+    let bound = crate::service_logins::request_params(s, p)?;
+    let api = stac::api(ps(bound.as_ref(), "url"))?;
+    crate::service_logins::request(s, ps(bound.as_ref(), "connection"), &api)
 }
 
 /// The search a command describes (`view` is the map's current extent).
@@ -107,8 +113,8 @@ pub(crate) fn add_collection(s: &mut Session, fc: &Value, name: &str) -> Result<
     Ok(Some(id))
 }
 
-pub(super) fn collections(_s: &mut Session, p: &Value) -> CmdResult {
-    let api = stac::api(ps(p, "url"))?;
+pub(super) fn collections(s: &mut Session, p: &Value) -> CmdResult {
+    let api = request_api(s, p)?;
     #[cfg(target_arch = "wasm32")]
     {
         let _ = api;
@@ -139,7 +145,7 @@ pub(super) fn collections_json(api: &str, bytes: &[u8]) -> CmdResult {
 }
 
 fn search(s: &mut Session, p: &Value) -> CmdResult {
-    let api = stac::api(ps(p, "url"))?;
+    let api = request_api(s, p)?;
     if stac::catalog::is_static(&api) {
         return search_static(s, p, &api);
     }
@@ -240,13 +246,42 @@ fn item(p: &Value) -> Result<Item, String> {
 }
 
 fn add_asset(s: &mut Session, p: &Value) -> CmdResult {
+    let bound = crate::service_logins::request_params(s, p)?;
+    let p = bound.as_ref();
     let i = item(p)?;
     let (key, href) = i.asset_href(ps(p, "asset"))?;
+    // Codes for a failed retrieval (JAXA Earth's `dn.error`), which a data cube skips but a
+    // single file draws as values: of the asset `asset_href` picked, by the same selector.
+    let codes = i.pick(ps(p, "asset")).ok().map(|a| (a.invalid.clone(), a.codes_unread)).unwrap_or_default();
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| format!("{} {key}", i.id));
     // A Planetary Computer asset is read with its storage container's token.
     #[cfg(not(target_arch = "wasm32"))]
     let href = stac::sign_blocking(&href)?;
-    super::layer::add_url(s, &json!({"url": href, "name": name}))
+    let mut add = json!({"url": href, "name": name});
+    if let Some(connection) = p.get("connection") {
+        add["connection"] = connection.clone();
+    }
+    let added = super::layer::add_url(s, &add)?;
+    match codes {
+        (_, true) => s.warn(format!(
+            "{name}: its metadata's codes for a failed retrieval (je:rasters dn.error) couldn't be read whole (not a list of numbers, or too many), so the map draws any such codes in the file as values"
+        )),
+        (invalid, false) if !invalid.is_empty() => {
+            // The first few, large ones (a float's lowest, -3.4e38) in exponent form.
+            const SHOWN: usize = 5;
+            let code = |v: &f64| if v.abs() >= 1e6 { format!("{v:e}") } else { v.to_string() };
+            let mut listed = invalid.iter().take(SHOWN).map(code).collect::<Vec<_>>().join(", ");
+            if invalid.len() > SHOWN {
+                listed.push_str(&format!(" and {} more", invalid.len() - SHOWN));
+            }
+            s.warn(format!(
+                "{name}: its metadata marks failed retrievals with {} code(s) ({listed}), which the map draws as values",
+                invalid.len()
+            ));
+        }
+        _ => {}
+    }
+    Ok(added)
 }
 
 /// The most items a data cube on the time slider takes (its search is paged up to this).
@@ -271,9 +306,10 @@ pub struct CubeFiles {
     /// Each file's own (scale, offset), by its address: a trend reads each date's values as its
     /// own metadata says to (#579).
     pub scales: std::collections::HashMap<String, (f64, f64)>,
-    /// Each file's no-data value from its asset's metadata, where it names one (MODIS NDVI's
-    /// -3000 at the Brazil Data Cube), skipped as the file's own header no-data is.
-    pub nodata: std::collections::HashMap<String, f64>,
+    /// Each file's stored values that aren't values, from its asset's metadata, where it names
+    /// them (MODIS NDVI's -3000 at the Brazil Data Cube, JAXA Earth's codes for a failed
+    /// retrieval), skipped as the file's own header no-data is.
+    pub nodata: std::collections::HashMap<String, Vec<f64>>,
     /// The items found, and those left out (no date, or no such asset).
     pub items: usize,
     pub without: usize,
@@ -283,6 +319,8 @@ pub struct CubeFiles {
     pub duplicates: usize,
     /// Whether the assets' scale or offset differ from the first one's.
     pub scales_differ: bool,
+    /// Files whose metadata names codes for a failed retrieval (JAXA Earth's `dn.error`).
+    pub coded: usize,
     pub collection: String,
     pub asset: String,
 }
@@ -308,11 +346,8 @@ pub(crate) fn period_after(v: &Value) -> Option<f64> {
 /// groups the items' asset by tile and day: `{"url"?, "collection", "asset", "bbox"? | "view",
 /// "start", "end", "maxCloud"?}`.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn cube_files(s: &Session, p: &Value, max_items: usize) -> Result<CubeFiles, String> {
-    let api = stac::api(ps(p, "url"))?;
-    if stac::catalog::is_static(&api) {
-        return Err("a data cube needs a STAC API's search; a static catalog can't be searched".into());
-    }
+pub fn cube_files(s: &mut Session, p: &Value, max_items: usize) -> Result<CubeFiles, String> {
+    let api = request_api(s, p)?;
     let collection = ps(p, "collection").map(str::trim).filter(|c| !c.is_empty()).ok_or("collection is required")?;
     let asset = ps(p, "asset").map(str::trim).filter(|a| !a.is_empty()).ok_or("asset is required (a band, such as NDVI)")?;
     let date = |k: &str| {
@@ -343,11 +378,31 @@ pub fn cube_files(s: &Session, p: &Value, max_items: usize) -> Result<CubeFiles,
     // Every page of the search, up to the cap.
     let mut items: Vec<Item> = Vec::new();
     // An empty page, or a next link back to a page already read, ends it; so does the page cap.
-    let mut next = Some(stac::search_url(&api, &search)?);
+    let mut next = if stac::catalog::is_static(&api) {
+        // A static collection has no search: read by its layout, and no pages follow.
+        crate::render::rustgis_tiles::address::check(&api, None)?;
+        let filter = stac::catalog::Filter::from_search(&search, None)?;
+        let found = stac::dated::search_blocking(&api, &filter, (&day(start), &day(end)), max_items)?;
+        // Its items say which collection it is; another name given is a mistake.
+        if let Some(other) = found.items.iter().map(|i| i.collection.as_str()).find(|c| !c.is_empty() && *c != collection) {
+            return Err(format!("{api} holds {other}, not {collection}"));
+        }
+        if found.unread > 0 {
+            s.warn(format!(
+                "{collection}: {} document(s) couldn't be read, were refused or weren't read whole, so some of its dates or tiles may be missing from the cube",
+                found.unread
+            ));
+        }
+        items = found.items;
+        None
+    } else {
+        Some(stac::search_url(&api, &search)?)
+    };
     let mut read: Vec<String> = Vec::new();
     // Pages are read from the API's own host: a next link elsewhere ends the search.
     // Scheme, user part, host and port compared: `https://host:443`, never another host or http.
     let host = |u: &str| {
+        let u = crate::render::rustgis_tiles::logins::inner(u);
         u.split_once("://").map(|(scheme, r)| {
             let authority = r.split(['/', '?', '#']).next().unwrap_or("");
             let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h).to_ascii_lowercase();
@@ -385,8 +440,10 @@ pub fn cube_files(s: &Session, p: &Value, max_items: usize) -> Result<CubeFiles,
     let mut tiles: std::collections::BTreeMap<String, std::collections::BTreeMap<i64, String>> = Default::default();
     let mut scale: Option<(f64, f64)> = None;
     let mut scales: std::collections::HashMap<String, (f64, f64)> = Default::default();
-    let mut nodata: std::collections::HashMap<String, f64> = Default::default();
+    let mut nodata: std::collections::HashMap<String, Vec<f64>> = Default::default();
     let mut scales_differ = false;
+    let mut coded = 0usize;
+    let mut codes_unread = 0usize;
     let mut duplicates = 0usize;
     let mut without = 0usize;
     // Each public bucket's region, found once ([`public_web`]).
@@ -400,6 +457,12 @@ pub fn cube_files(s: &Session, p: &Value, max_items: usize) -> Result<CubeFiles,
             without += 1;
             continue;
         };
+        // Its codes for a failed retrieval not read whole: its values can't be told from them.
+        if a.codes_unread {
+            codes_unread += 1;
+            without += 1;
+            continue;
+        }
         let key = i.tile.clone().unwrap_or_else(|| match i.bbox {
             Some([w, so, e, n]) => format!("{w:.2},{so:.2},{e:.2},{n:.2}"),
             None => i.id.clone(),
@@ -412,22 +475,37 @@ pub fn cube_files(s: &Session, p: &Value, max_items: usize) -> Result<CubeFiles,
             continue;
         }
         // The file's address without a fragment of its own, so the range look is the only one.
-        let href = a.href.split('#').next().unwrap_or(&a.href).to_string();
+        let href = crate::render::rustgis_tiles::logins::inherit(&api, a.href.split('#').next().unwrap_or(&a.href));
         // A public bucket's `s3://` file (Digital Earth Australia's, the Copernicus DEM's) is read
         // anonymously at its web address, as a cube's files are kept.
         let href = if s3::is_s3(&href) { public_web(&href, &mut regions)? } else { href };
         // No scale or offset in the metadata reads as 1 and 0, the values as stored.
         let this = (a.scale.unwrap_or(1.0), a.offset.unwrap_or(0.0));
         scales.insert(href.clone(), this);
-        if let Some(n) = a.nodata {
-            nodata.insert(href.clone(), n);
+        let stored: Vec<f64> = a.nodata.iter().chain(&a.invalid).copied().collect();
+        if !stored.is_empty() {
+            nodata.insert(href.clone(), stored);
         }
+        coded += usize::from(!a.invalid.is_empty());
         by_day.insert(d, href);
         scales_differ |= scale.is_some_and(|s| s != this);
         scale.get_or_insert(this);
     }
+    // Items left out for their codes: said, in the error when nothing else is left.
+    let unread_codes = (codes_unread > 0).then(|| {
+        format!(
+            "{codes_unread} item(s) left out, as their codes for a failed retrieval couldn't be read whole (one isn't a number, or there are more than {} of them)",
+            stac::MAX_INVALID
+        )
+    });
     if tiles.is_empty() {
-        return Err(format!("no item of {collection} has an asset {asset}"));
+        return Err(match unread_codes {
+            Some(why) => format!("{collection}: {why}"),
+            None => format!("no item of {collection} has an asset {asset}"),
+        });
+    }
+    if let Some(why) = unread_codes {
+        s.warn(format!("{collection}: {why}"));
     }
     // Files reached through signed addresses (Planetary Computer's) expire within hours, so a
     // cube of them couldn't be kept in a project or read a day later.
@@ -456,6 +534,7 @@ pub fn cube_files(s: &Session, p: &Value, max_items: usize) -> Result<CubeFiles,
         without,
         duplicates,
         scales_differ,
+        coded,
         collection: collection.to_string(),
         asset: asset.to_string(),
     })
@@ -517,8 +596,9 @@ thread_local! {
 #[cfg(not(target_arch = "wasm32"))]
 pub struct StacCube {
     dates: Vec<f64>,
-    /// Each date's files, with their (scale, offset) and the no-data value their metadata names.
-    files: Vec<Vec<(String, (f64, f64), Option<f64>)>>,
+    /// Each date's files, with their (scale, offset) and the stored values their metadata says
+    /// aren't values.
+    files: Vec<Vec<(String, (f64, f64), Vec<f64>)>>,
     /// The level read (0: the full images), and how many of its pixels a cell's side takes: 1
     /// when the cells are that level's own pixels (`"resampling": "nearest"`, an overview as the
     /// file stores it), more when a cell is the mean of the full images' pixels in it.
@@ -577,7 +657,7 @@ pub fn piece_rows(width: u32, height: u32, dates: usize, tile_height: u32, max: 
 /// Prepares a STAC collection's band as a cube: the search (as `stac.addCube` makes it), the
 /// overview level for `cellSize`, the area's grid, and the pieces it is read in.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn stac_cube(s: &Session, p: &Value) -> Result<StacCube, String> {
+pub fn stac_cube(s: &mut Session, p: &Value) -> Result<StacCube, String> {
     use crate::render::rustgis_tiles::cog;
     // The parameters read here, before the search and the first header are waited for.
     let size = match p.get("cellSize").filter(|v| !v.is_null()) {
@@ -618,14 +698,14 @@ pub fn stac_cube(s: &Session, p: &Value) -> Result<StacCube, String> {
     if let Some(o) = searched.as_object_mut() {
         o.insert("bbox".into(), json!(bbox));
     }
-    let CubeFiles { tiles, scales, nodata, collection, asset, .. } =
-        cube_files(s, &searched, if s.long_runs.is_some() { MAX_SERIES_ITEMS } else { MAX_CUBE_ITEMS })?;
+    let max_items = if s.long_runs.is_some() { MAX_SERIES_ITEMS } else { MAX_CUBE_ITEMS };
+    let CubeFiles { tiles, scales, nodata, collection, asset, .. } = cube_files(s, &searched, max_items)?;
     // Every tile's file for a date, by day.
-    let mut by_day: std::collections::BTreeMap<i64, Vec<(String, (f64, f64), Option<f64>)>> = Default::default();
+    let mut by_day: std::collections::BTreeMap<i64, Vec<(String, (f64, f64), Vec<f64>)>> = Default::default();
     for days in tiles.values() {
         for (d, href) in days {
             let scale = scales.get(href).copied().unwrap_or((1.0, 0.0));
-            by_day.entry(*d).or_default().push((href.clone(), scale, nodata.get(href).copied()));
+            by_day.entry(*d).or_default().push((href.clone(), scale, nodata.get(href).cloned().unwrap_or_default()));
         }
     }
     if by_day.len() > super::cube::MAX_DATES {
@@ -801,7 +881,7 @@ impl super::cube::TimeCube for StacCube {
         };
         let (wf, top_f, hf) = (i64::from(w) * i64::from(f), i64::from(top) * i64::from(f), i64::from(h) * i64::from(f));
         for (href, (k, o), fill) in files {
-            let fill = fill.map(|v| v as f32);
+            let fill: Vec<f32> = fill.iter().map(|v| *v as f32).collect();
             // Cached per address for the process (`with_info`, a failure too, for a while), so a
             // file's header is fetched once however many pieces and dates read it.
             let info = cog::info_blocking(href)?;
@@ -833,7 +913,7 @@ impl super::cube::TimeCube for StacCube {
                     let col = ((fc0 - dx) as usize + c) / f as usize;
                     let cell = row * w as usize + col;
                     if v.is_finite()
-                        && Some(*v) != fill
+                        && !fill.contains(v)
                         && let (Some(s), Some(n)) = (sum.get_mut(cell), count.get_mut(cell))
                     {
                         *s += f64::from(*v) * k + o;
@@ -876,6 +956,8 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let bound = crate::service_logins::request_params(s, p)?;
+        let p = bound.as_ref();
         let range = match p.get("range").filter(|v| !v.is_null()) {
             None => None,
             Some(v) => {
@@ -888,8 +970,26 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
         };
-        let CubeFiles { tiles, scale, scales: _, nodata: _, items, named_tiles, without, duplicates, scales_differ, collection, asset } =
-            cube_files(s, p, MAX_CUBE_ITEMS)?;
+        let CubeFiles {
+            tiles,
+            scale,
+            scales: _,
+            nodata: _,
+            items,
+            named_tiles,
+            without,
+            duplicates,
+            scales_differ,
+            coded,
+            collection,
+            asset,
+        } = cube_files(s, p, MAX_CUBE_ITEMS)?;
+        // A tile layer's look has no way to name them, so on the map they are values.
+        if coded > 0 {
+            s.warn(format!(
+                "{collection}: {coded} file(s) mark failed retrievals with codes, which the map draws as values (inside its range or stretch); Trend Analysis and cube summaries skip them"
+            ));
+        }
         // One range can't hold if the files store their values alike no longer (a processing
         // change of scale or offset partway).
         if range.is_some() && scales_differ {
@@ -945,8 +1045,9 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
         // Every file a web address of sane length, as a project keeps them (TileLayer::repair),
         // so the cube reopens as it was made.
         if let Some(bad) = tiles.values().flat_map(|by_day| by_day.values()).find(|h| {
-            let lower = h.to_ascii_lowercase();
-            !(lower.starts_with("https://") || lower.starts_with("http://")) || h.len() > 4000
+            let plain = crate::render::rustgis_tiles::logins::inner(h);
+            let lower = plain.to_ascii_lowercase();
+            !(lower.starts_with("https://") || lower.starts_with("http://")) || plain.len() > 4000
         }) {
             return Err(format!(
                 "{}: a data cube's files are read in place from web addresses (http, https)",
@@ -958,7 +1059,7 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
             dates.extend(urls.iter().map(|(d, _)| *d));
             let Some((_, first)) = urls.first() else { continue };
             let name = if many { format!("{base} {tile}") } else { base.clone() };
-            let r = match super::layer::add_url(s, &json!({"url": first, "name": name})) {
+            let r = match super::layer::add_url(s, &json!({"url": first, "name": name, "cube": true, "connection": p.get("connection")})) {
                 Ok(r) => r,
                 Err(e) => {
                     undo(s);
@@ -1065,5 +1166,68 @@ mod tests {
         assert_eq!(super::offset_in(&above, &file), Some((10, -2)), "a grid above the file starts before its first row");
         assert_eq!(super::offset_in(&GeoTransform { origin_x: grid.origin_x + 400.0, ..grid }, &file), None);
         assert_eq!(super::offset_in(&GeoTransform { pixel_width: 463.3, ..grid }, &file), None);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod deferred_asset_tests {
+    use super::*;
+
+    #[test]
+    fn a_deferred_asset_download_keeps_its_connection_on_the_finished_layer() {
+        let mut s = Session::new(crate::Project::default());
+        let connection = s
+            .run(
+                "connection.new",
+                &json!({
+                    "kind": "stac", "name": "Public catalog", "auth": "none",
+                    "address": "https://deferred757.example.org/stac"
+                }),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let pending = s
+            .run_leaving_downloads(
+                "stac.addAsset",
+                &json!({
+                    "connection": connection, "asset": "data", "name": "Downloaded asset", "as": "not-forwarded",
+                    "item": {"type": "Feature", "stac_version": "1.0.0", "id": "scene",
+                        "geometry": {"type": "Point", "coordinates": [1, 2]},
+                        "properties": {"datetime": "2025-01-01T00:00:00Z"},
+                        "links": [], "assets": {"data": {
+                            "href": "https://deferred757.example.org/data.geojson",
+                            "type": "application/geo+json", "roles": ["data"]
+                        }}}
+                }),
+            )
+            .unwrap();
+        assert_eq!(pending["pending"], true);
+        let mut requests = s.take_url_requests();
+        assert_eq!(requests.len(), 1);
+        let request = requests.remove(0);
+        let mut params = request.params().clone();
+        let download = s.download_started_for(&request).unwrap();
+        assert!(
+            s.download_landed(
+                download,
+                json!({
+                    "type": "FeatureCollection", "features": [{
+                        "type": "Feature", "geometry": {"type": "Point", "coordinates": [1, 2]},
+                        "properties": {"name": "landed"}
+                    }]
+                })
+                .to_string()
+                .into_bytes()
+            )
+        );
+        params["id"] = json!(download);
+        let added = s.complete_download(download, &params).unwrap();
+        let layer = s.map().layer(added["layer"].as_u64().unwrap() as u32).unwrap();
+        assert_eq!(layer.connection, connection);
+        assert_eq!(layer.name, "Downloaded asset");
+        assert_eq!(layer.dataset.features.len(), 1);
     }
 }

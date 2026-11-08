@@ -54,6 +54,11 @@ enum DragKind {
         row: usize,
         origin: Pos2,
     },
+    /// Moving a layer's label with the Move Label tool: where the press was. The label, and what
+    /// it labels, are in `MapView::moving_label`.
+    Label {
+        origin: Pos2,
+    },
 }
 
 /// Graphic shapes drawn by dragging rather than clicking.
@@ -251,6 +256,10 @@ pub struct MapView {
     /// Where on a tilted map's ground each label is (the camera's coordinates), so it stays there
     /// while the map moves.
     label_map: Vec<Option<Coord>>,
+    /// Where each label's callout starts (its feature), as `label_lonlat` and `label_map` keep the
+    /// labels: its line stays on its feature while the map moves.
+    callout_lonlat: Vec<Option<Coord>>,
+    callout_map: Vec<Option<Coord>>,
     /// The camera the labels were placed for.
     label_camera: Camera,
     /// The map revision whose GPU scene had only live tile layers (#635): tiles arriving draw
@@ -262,6 +271,8 @@ pub struct MapView {
     view_px: [usize; 2],
     resized_at: f64,
     drag: Option<(Pos2, DragKind)>,
+    /// The label being moved with the Move Label tool.
+    moving_label: Option<MovingLabel>,
     sketch: Vec<Coord>,
     selection_gesture: Option<SelectionGesture>,
     radius_preview: Option<(Coord, f64, Vec<Option<Pos2>>)>,
@@ -277,6 +288,12 @@ pub struct MapView {
     pub(crate) vertex_drag_owner: Option<crate::vertexedit::DragOwner>,
     /// Session-only opt-in for coincident polygon moves; never saved with a project or preference.
     pub move_shared_vertices: bool,
+    /// A sketch vertex clicked on an edge follows that edge from the previous vertex (Trace);
+    /// session only.
+    pub trace_edges: bool,
+    /// A notice said the sketch reached the drawn-line limit (a trace refused, or a full sketch):
+    /// once per sketch.
+    sketch_full_said: bool,
     /// The magnifying lens follows the pointer.
     pub magnifier: bool,
     pub popup: Option<Popup>,
@@ -285,11 +302,15 @@ pub struct MapView {
     /// A map or layout waiting for the user to confirm its deletion.
     pub deleting: Option<Deletion>,
     pub pointer_lonlat: Option<Coord>,
+    /// The last pointer position seen over a map, kept for the status bar readout after the
+    /// pointer leaves the map; with the map's instance and the session's `opened` it belongs to.
+    kept_lonlat: Option<(Coord, u64, u64)>,
     /// Where the map's context menu was opened: the pointer leaves the map for the menu.
     pub menu_lonlat: Option<Coord>,
     /// The text graphic the context menu was opened on (layer id, row), for Edit Text.
     pub menu_text: Option<(u32, usize)>,
-    pub dms: bool,
+    /// How the pointer's coordinates read (status bar, right-click menu); a preference.
+    pub coord_format: crate::CoordReadout,
     pub render_ms: u64,
     pub notices_seen: usize,
     pub toasts: Vec<Toast>,
@@ -360,12 +381,15 @@ impl Default for MapView {
             motion_cost: 0.0,
             labels: Vec::new(),
             label_lonlat: Vec::new(),
+            callout_lonlat: Vec::new(),
+            callout_map: Vec::new(),
             label_camera: Camera::world(),
             live_rev: None,
             last_interaction: -10.0,
             view_px: [0, 0],
             resized_at: -10.0,
             drag: None,
+            moving_label: None,
             sketch: Vec::new(),
             selection_gesture: None,
             radius_preview: None,
@@ -375,14 +399,17 @@ impl Default for MapView {
             vertex_drag: None,
             vertex_drag_owner: None,
             move_shared_vertices: false,
+            trace_edges: false,
+            sketch_full_said: false,
             magnifier: false,
             popup: None,
             popup_rev: 0,
             deleting: None,
             pointer_lonlat: None,
+            kept_lonlat: None,
             menu_lonlat: None,
             menu_text: None,
-            dms: false,
+            coord_format: crate::CoordReadout::Decimal,
             render_ms: 0,
             notices_seen: 0,
             toasts: Vec::new(),
@@ -414,6 +441,18 @@ impl Default for MapView {
 }
 
 impl MapView {
+    /// The position the status bar shows: the last one over this map, kept while the pointer is
+    /// elsewhere. A position from another map or project no longer applies, so it is dropped.
+    pub fn kept_pointer_lonlat(&mut self, map_instance: u64, opened: u64) -> Option<Coord> {
+        match self.kept_lonlat {
+            Some((c, m, o)) if m == map_instance && o == opened => Some(c),
+            _ => {
+                self.kept_lonlat = None;
+                None
+            }
+        }
+    }
+
     /// Whether an exact frame is being composed off the UI thread, or the frame shown waits for
     /// tile pictures still to be drawn.
     pub fn drawing(&self) -> bool {
@@ -479,12 +518,22 @@ impl MapView {
     pub fn cancel_sketch(&mut self) {
         self.sketch.clear();
         self.sketch_done = false;
+        self.sketch_full_said = false;
         if self.drag.is_some_and(|(_, kind)| matches!(kind, DragKind::SelectLasso | DragKind::SelectRadius)) {
             self.drag = None;
         }
         self.selection_gesture = None;
         self.radius_preview = None;
         self.cancel_vertex_drag();
+        self.cancel_label_drag();
+    }
+
+    /// Drops a label being moved with the Move Label tool, leaving it where it was.
+    pub(crate) fn cancel_label_drag(&mut self) {
+        self.moving_label = None;
+        if self.drag.is_some_and(|(_, kind)| matches!(kind, DragKind::Label { .. })) {
+            self.drag = None;
+        }
     }
 
     /// Cancels a vertex preview and its pending release together, leaving other map gestures
@@ -762,13 +811,21 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     WAKER.call_once(|| {
         let ctx = ui.ctx().clone();
         rustgis_engine::render::rustgis_tiles::cache::set_waker(move || ctx.request_repaint());
+        // A read that failed is tried again when its wait is over, though nothing else moves.
+        let ctx = ui.ctx().clone();
+        rustgis_engine::render::rustgis_tiles::cache::set_alarm(move |after| ctx.request_repaint_after(after));
         let ctx = ui.ctx().clone();
         rustgis_engine::map::source::set_waker(move || ctx.request_repaint());
     });
     let mut key = key;
     // A scene whose tile layers are all live places them for every frame: tiles arriving need no
     // new scene (#635).
-    if gpu_ok && cam.bearing == 0.0 && cam.pitch == 0.0 && app.map.live_rev == Some(app.session.revision) {
+    if gpu_ok
+        && cam.bearing == 0.0
+        && cam.pitch == 0.0
+        && app.map.live_rev == Some(app.session.revision)
+        && !reads_in_place(app.session.map())
+    {
         key.tiles = 0;
     } else if fetches_tiles(app.session.map()) {
         key.tiles = rustgis_engine::render::rustgis_tiles::cache::generation();
@@ -824,6 +881,8 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         app.map.labels.clear();
         app.map.label_lonlat.clear();
         app.map.label_map.clear();
+        app.map.callout_lonlat.clear();
+        app.map.callout_map.clear();
     }
     let settling = (tilted || globe_view || tiled_flat) && !moving && app.ws.playing.is_none() && !hold;
     let mut tilt_draped = tilt_draped;
@@ -1186,9 +1245,11 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let placed = app.map.label_camera;
     if globe_view && (placed.center != cam.center || placed.res != cam.res) {
         let g = Globe::new(&cam, w, h);
-        for (l, c) in app.map.labels.iter().zip(&app.map.label_lonlat) {
-            if let Some((x, y)) = c.and_then(|c| g.forward(c)) {
-                draw_label(&painter, l, rect.min + vec2(x as f32, y as f32));
+        let screen = |c: &Option<Coord>| c.and_then(|c| g.forward(c)).map(|(x, y)| rect.min + vec2(x as f32, y as f32));
+        for (i, (l, c)) in app.map.labels.iter().zip(&app.map.label_lonlat).enumerate() {
+            if let Some(at) = screen(c) {
+                let feature = app.map.callout_lonlat.get(i).and_then(screen);
+                draw_label(&painter, &callout_from(l, at, feature), at);
             }
         }
     } else if (tilt_draped || (app.map.gpu_frame.is_some() && !app.map.label_map.is_empty())) && placed != cam {
@@ -1201,20 +1262,25 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             cam.try_to_screen(m, w, h).map(|(x, y)| (x as f32, y as f32))
         };
         let turns = placed.bearing != cam.bearing || placed.pitch != cam.pitch;
-        for (l, m) in app.map.labels.iter().zip(&app.map.label_map) {
-            if let Some((x, y)) = m.and_then(|m| cam.try_to_screen(m, w, h)).filter(|s| sky.is_none_or(|sky| s.1 > sky)) {
+        let screen = |m: &Option<Coord>| m.and_then(|m| cam.try_to_screen(m, w, h)).map(|(x, y)| rect.min + vec2(x as f32, y as f32));
+        for (i, (l, m)) in app.map.labels.iter().zip(&app.map.label_map).enumerate() {
+            if let Some(pos) = screen(m).filter(|p| sky.is_none_or(|sky| f64::from(p.y - rect.min.y) > sky)) {
                 let moved = turns.then(|| {
                     let mut l = l.clone();
                     rustgis_engine::render::turn_label(&mut l, &at);
                     l
                 });
-                draw_label(&painter, moved.as_ref().unwrap_or(l), rect.min + vec2(x as f32, y as f32));
+                let feature = app.map.callout_map.get(i).and_then(screen);
+                draw_label(&painter, &callout_from(moved.as_ref().unwrap_or(l), pos, feature), pos);
             }
         }
     } else {
         let s = if globe_view { 1.0 } else { (old.res / cam.res) as f32 };
         for l in &app.map.labels {
-            draw_label(&painter, l, tex_rect.min + vec2(l.x, l.y) * s);
+            let at = tex_rect.min + vec2(l.x, l.y) * s;
+            // A callout's feature moves with the map, its text's end with the text.
+            let feature = l.collide.callout.filter(|_| s != 1.0).map(|c| tex_rect.min + vec2(l.x + c[0], l.y + c[1]) * s);
+            draw_label(&painter, &callout_from(l, at, feature), at);
         }
     }
     if app.map.hide_overlays {
@@ -1237,6 +1303,13 @@ fn drape_state(app: &RustGisApp) -> (crate::globe_drape::DrapeKey, u64) {
 fn fetches_tiles(m: &rustgis_engine::map::Map) -> bool {
     !m.tiles.is_empty()
         || m.view.terrain.as_ref().is_some_and(|t| matches!(t.source, rustgis_engine::map::view::TerrainSource::Tiles { .. }))
+        || reads_in_place(m)
+}
+
+/// Whether the map has raster layers read in place: the part in view arrives a tile at a time,
+/// through the tile cache, and the map is drawn again as it does.
+fn reads_in_place(m: &rustgis_engine::map::Map) -> bool {
+    m.layers.iter().any(|l| l.raster.as_ref().is_some_and(|r| r.in_place))
 }
 
 /// Uploads a composed GPU scene, whether built in place or by the frame worker.
@@ -1262,7 +1335,10 @@ fn show_gpu_frame(app: &mut RustGisApp, scene: rustgis_engine::render::gpu_scene
     app.map.label_lonlat.clear();
     // Where its labels stand: a turn starting from a north-up frame is draped too (on the CPU,
     // when the GPU doesn't turn the map), and they stay on their ground through it.
-    app.map.label_map = app.map.labels.iter().map(|l| cam.try_to_map(l.x as f64, l.y as f64, view.width, view.height)).collect();
+    app.map.callout_lonlat.clear();
+    let to_map = |x: f32, y: f32| cam.try_to_map(x as f64, y as f64, view.width, view.height);
+    app.map.label_map = app.map.labels.iter().map(|l| to_map(l.x, l.y)).collect();
+    app.map.callout_map = app.map.labels.iter().map(|l| l.collide.callout.and_then(|c| to_map(l.x + c[0], l.y + c[1]))).collect();
     app.map.label_camera = cam;
     app.map.attribution = scene.attribution;
     app.map.last_render = time;
@@ -1302,18 +1378,28 @@ fn show_frame(
     if !(globe_view && key.draft) {
         app.map.labels = r.labels;
         app.map.labels.splice(0..0, r.unplaced);
-        app.map.label_lonlat = match globe_view {
+        (app.map.label_lonlat, app.map.callout_lonlat) = match globe_view {
             true => {
                 let g = Globe::new(&cam, w, h);
-                app.map.labels.iter().map(|l| g.inverse(l.x as f64, l.y as f64)).collect()
+                let at = |x: f32, y: f32| g.inverse(x as f64, y as f64);
+                (
+                    app.map.labels.iter().map(|l| at(l.x, l.y)).collect(),
+                    app.map.labels.iter().map(|l| l.collide.callout.and_then(|c| at(l.x + c[0], l.y + c[1]))).collect(),
+                )
             }
-            false => Vec::new(),
+            false => (Vec::new(), Vec::new()),
         };
         // Where its labels stand while its drape moves (a north-up frame's too: a turn starting
         // from it is draped).
-        app.map.label_map = match !globe_view {
-            true => app.map.labels.iter().map(|l| cam.try_to_map(l.x as f64, l.y as f64, view.width, view.height)).collect(),
-            false => Vec::new(),
+        (app.map.label_map, app.map.callout_map) = match !globe_view {
+            true => {
+                let to_map = |x: f32, y: f32| cam.try_to_map(x as f64, y as f64, view.width, view.height);
+                (
+                    app.map.labels.iter().map(|l| to_map(l.x, l.y)).collect(),
+                    app.map.labels.iter().map(|l| l.collide.callout.and_then(|c| to_map(l.x + c[0], l.y + c[1]))).collect(),
+                )
+            }
+            false => (Vec::new(), Vec::new()),
         };
         app.map.label_camera = cam;
     }
@@ -1436,7 +1522,105 @@ fn place_galley(anchor: Align2, at: Pos2, g: &egui::Galley) -> (Pos2, Rect) {
     (r.min - g.rect.min.to_vec2(), r)
 }
 
+/// A label being moved with the Move Label tool: as it was drawn when grabbed (in the view's
+/// points), what it labels, and the map and label class it is of, named then (so it lands in
+/// those, whatever is reordered or shown while it moves).
+struct MovingLabel {
+    label: PlacedLabel,
+    layer: u32,
+    feature: u64,
+    class: String,
+    project: u64,
+    map: usize,
+}
+
+/// The layer's label drawn at a point of the map view (relative to it as `rect` is), topmost first:
+/// what the Move Label tool grabs, as it is drawn now. Labels not of a layer's features aren't;
+/// nor any while a moving globe or tilted map draws them from where they were placed.
+fn label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
+    label_at_where(app, rect, p, |_| true)
+}
+
+/// The topmost moved label under the pointer, even beneath one never moved (Show all labels).
+fn pinned_label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
+    label_at_where(app, rect, p, |l| l.collide.pinned)
+}
+
+/// The topmost label under the pointer that `keep` accepts.
+fn label_at_where(app: &RustGisApp, rect: Rect, p: Pos2, keep: impl Fn(&PlacedLabel) -> bool) -> Option<PlacedLabel> {
+    if app.map.key.is_none_or(|key| key.rev != app.session.revision || key.sources != rustgis_engine::map::source::generation()) {
+        return None;
+    }
+    let cam = app.session.map().camera;
+    let placed = app.map.label_camera;
+    // A flat map moving draws the labels placed last with its frame: shifted, and spread apart
+    // or closed up as it zooms (as `main_view` does).
+    let (shift, s) = if placed == cam {
+        (app.map.tex_rect.min - rect.min, 1.0)
+    } else if app.session.map().projection != Projection::Globe && placed.pitch == 0.0 && cam.pitch == 0.0 && placed.bearing == cam.bearing
+    {
+        (app.map.tex_rect.min - rect.min, (app.map.tex_camera.res / cam.res) as f32)
+    } else {
+        return None;
+    };
+    if !(s.is_finite() && s > 0.0) {
+        return None;
+    }
+    let at = p - rect.min;
+    app.map.labels.iter().rev().filter(|l| l.collide.source.is_some() && !l.text.is_empty() && keep(l)).find_map(|l| {
+        let mut l = l.clone();
+        // Where it is drawn now: its text at its own size, its callout's feature where it is.
+        (l.x, l.y) = (shift.x + l.x * s, shift.y + l.y * s);
+        l.collide.callout_anchor = l.collide.callout_anchor.map(|[ax, ay]| [ax * s, ay * s]);
+        l.collide.callout = l.collide.callout.map(|[x0, y0, x1, y1]| [x0 * s, y0 * s, x1, y1]);
+        let e = rustgis_engine::render::label_extent(&l)?;
+        let r = Rect::from_min_max(pos2(e[0], e[1]), pos2(e[2], e[3])).expand(3.0);
+        r.contains(pos2(at.x, at.y)).then_some(l)
+    })
+}
+
+/// A label drawn at `at` while the map moves, its callout's line starting at its feature where
+/// that now is (none: as it was placed).
+fn callout_from(l: &PlacedLabel, at: Pos2, feature: Option<Pos2>) -> std::borrow::Cow<'_, PlacedLabel> {
+    match (l.collide.callout, feature) {
+        (Some([_, _, x1, y1]), Some(f)) => {
+            let mut l = l.clone();
+            l.collide.callout = Some([f.x - at.x, f.y - at.y, x1, y1]);
+            std::borrow::Cow::Owned(l)
+        }
+        _ => std::borrow::Cow::Borrowed(l),
+    }
+}
+
+/// A label moved by `d` (points): its text there, its feature where it was, and its callout's line
+/// from the feature to the text when its class has callouts.
+fn moved_label(l: &PlacedLabel, d: egui::Vec2) -> PlacedLabel {
+    let mut m = l.clone();
+    m.x += d.x;
+    m.y += d.y;
+    m.collide.callout_anchor = l.collide.callout_anchor.map(|[ax, ay]| [ax - d.x, ay - d.y]);
+    m.collide.callout = rustgis_engine::render::callout_to(&m);
+    m
+}
+
+/// The name of a layer's label class by its place in the labeling order.
+fn label_class_name(app: &RustGisApp, layer: u32, class: u32) -> Option<String> {
+    app.session.map().layer(layer)?.labels.in_order().nth(class as usize).map(|c| c.name.clone())
+}
+
+/// Paints a label (on the map, or a moved one's preview), keeping callouts below text and curved
+/// glyph halos below ink.
 fn draw_label(p: &egui::Painter, l: &PlacedLabel, at: Pos2) {
+    // A callout's line, from its feature to the edge of the text, under the text (its halo
+    // under the line, so it shows over the map).
+    if let Some([x0, y0, x1, y1]) = l.collide.callout {
+        let ends = [at + vec2(x0, y0), at + vec2(x1, y1)];
+        let width = rustgis_engine::render::CALLOUT_WIDTH;
+        if let Some(h) = l.halo {
+            p.line_segment(ends, Stroke::new(width + 2.0, crate::theme::c32(h)));
+        }
+        p.line_segment(ends, Stroke::new(width, crate::theme::c32(l.color)));
+    }
     // Curved along a line: each character turned into its place, every character's halo first,
     // so none covers the letter before it.
     if !l.glyphs.is_empty() {
@@ -2099,6 +2283,9 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
     let time = now(ui);
     let hover = resp.hover_pos();
     app.map.pointer_lonlat = hover.and_then(|p| screen_to_lonlat(app, rect, p));
+    if let Some(c) = app.map.pointer_lonlat.filter(|c| c.is_finite()) {
+        app.map.kept_lonlat = Some((c, app.session.map().instance_id(), app.session.opened));
+    }
     let tool = app.session.tool;
     cancel_changed_selection(app, rect);
 
@@ -2247,8 +2434,17 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             .then(|| text_graphic_at(app, ui.ctx(), rect, origin))
             .flatten()
             .filter(|hit| crate::graphicformat::selected(app) == Some(*hit));
+        // With the Move Label tool, a layer's label grabbed by its text moves; elsewhere the map pans.
+        let label = (tool == Tool::MoveLabel && !middle).then(|| label_at(app, rect, origin)).flatten();
         let kind = if let Some((layer, row)) = grabbed {
             DragKind::Text { layer, row, origin }
+        } else if let Some(l) = label
+            && let Some((layer, feature, class)) = l.collide.source
+            && let Some(class) = label_class_name(app, layer, class)
+        {
+            let (project, map) = (app.session.opened, app.session.project.active_map);
+            app.map.moving_label = Some(MovingLabel { label: l, layer, feature, class, project, map });
+            DragKind::Label { origin }
         } else if middle {
             DragKind::Pan
         } else if tool == Tool::EditVertices && crate::vertexedit::drag_start(app, rect, origin) {
@@ -2288,6 +2484,47 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         } else {
             app.map.sketch.truncate(1);
             app.map.sketch.push(c);
+        }
+    }
+    // A label being moved shows where it will land, its callout's line following it; it is kept
+    // there, as one undo step, on release.
+    // Esc, another tool, or another map or project shown drops it where it was.
+    if let Some((_, DragKind::Label { origin })) = app.map.drag {
+        let same = app.map.moving_label.as_ref().is_some_and(|m| {
+            m.project == app.session.opened && m.map == app.session.project.active_map && app.session.tool == Tool::MoveLabel
+        });
+        if !same || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.map.cancel_label_drag();
+            return;
+        }
+        let end = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos()));
+        let moved = app.map.moving_label.as_ref().zip(end).map(|(m, end)| moved_label(&m.label, end - origin));
+        if resp.drag_stopped() {
+            app.map.drag = None;
+            let to = moved.as_ref().and_then(|l| screen_to_lonlat(app, rect, rect.min + vec2(l.x, l.y)));
+            // Over a tilted map's sky or past the globe's edge there is no place to keep it at.
+            if moved.is_some() && to.is_none() {
+                app.session.notify(tl!("No place there to move the label to; it stays where it was."), true);
+            }
+            if let (Some(c), Some(m)) = (to, app.map.moving_label.take())
+                && let Err(e) = app.run("labels.move", json!({"layer": m.layer, "class": m.class, "feature": m.feature, "to": [c.x, c.y]}))
+            {
+                app.session.notify(e, true);
+            }
+            app.map.moving_label = None;
+            return;
+        }
+        if let Some(l) = moved {
+            let t = Tokens::get(ui.ctx());
+            let painter =
+                ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("label_drag"))).with_clip_rect(rect);
+            draw_label(&painter, &l, rect.min + vec2(l.x, l.y));
+            if let Some(e) = rustgis_engine::render::label_extent(&l) {
+                let r = Rect::from_min_max(rect.min + vec2(e[0], e[1]), rect.min + vec2(e[2], e[3]));
+                painter.rect_stroke(r, 2.0, egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Outside);
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.ctx().request_repaint();
         }
     }
     // A dragged text shows where it will land; it is placed there, as one undo step, on release.
@@ -2417,7 +2654,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
 
     // Clicks.
     if resp.double_clicked() {
-        if matches!(tool, Tool::CreateLine | Tool::CreatePolygon | Tool::Measure | Tool::MeasureArea) || vertex_shape(tool) {
+        if matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit() || vertex_shape(tool) {
             finish_sketch(app);
         } else if tool == Tool::EditVertices {
             // Its two clicks chose a vertex or a feature; zooming would lose the place.
@@ -2489,8 +2726,22 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             return;
         }
         // Sketch vertices snap to features when snapping is on.
-        let c = if tool.creates() || matches!(tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea) { snapped(app, c) } else { c };
+        let c = if tool.creates() || tool.draws_edit() || matches!(tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea) {
+            snapped(app, c)
+        } else {
+            c
+        };
         match tool {
+            // Labels move by dragging them; Shift-clicking a moved one puts it back.
+            Tool::MoveLabel => {
+                if shift
+                    && let Some((layer, feature, class)) = pinned_label_at(app, rect, p).and_then(|l| l.collide.source)
+                    && let Some(name) = label_class_name(app, layer, class)
+                    && let Err(error) = app.run("labels.move", json!({"layer": layer, "class": name, "feature": feature, "to": null}))
+                {
+                    app.session.notify(error, true);
+                }
+            }
             Tool::Explore => {
                 let r = app.session.run("identify", &json!({"lon": c.x, "lat": c.y, "tolerancePx": 5}));
                 app.map.popup = match r {
@@ -2542,14 +2793,20 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             }
             // Dragged shapes ignore plain clicks.
             Tool::Graphic(s) if !vertex_shape(Tool::Graphic(s)) => {}
-            Tool::Measure | Tool::MeasureArea | Tool::CreateLine | Tool::CreatePolygon | Tool::Graphic(_) => {
+            Tool::Measure
+            | Tool::MeasureArea
+            | Tool::CreateLine
+            | Tool::CreatePolygon
+            | Tool::CutPolygon
+            | Tool::Reshape
+            | Tool::Graphic(_) => {
                 if app.map.sketch_done {
                     app.map.cancel_sketch();
                 }
                 // A double-click arrives as two clicks first; ignore the duplicate vertex.
                 let dup = app.map.sketch.last().and_then(|l| lonlat_to_screen(app, rect, *l)).is_some_and(|s| (s - p).length() < 3.0);
                 if !dup {
-                    app.map.sketch.push(c);
+                    add_vertex(app, tool, c);
                 }
             }
         }
@@ -2567,14 +2824,13 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
     if let Some(c) = app.map.menu_lonlat {
         resp.context_menu(|ui| crate::mapmenu::show(app, ui, c));
     }
-    if hover.is_some()
-        && matches!(tool, Tool::Measure | Tool::MeasureArea | Tool::CreateLine | Tool::CreatePolygon)
-        && !app.map.sketch.is_empty()
-    {
+    if hover.is_some() && (matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit()) && !app.map.sketch.is_empty() {
         ui.ctx().request_repaint();
     }
 }
 
+/// Finishes the sketch (a double-click): ends a measurement, adds the drawn feature, or runs Cut
+/// Polygon or Reshape on the drawn line, then clears the sketch.
 fn finish_sketch(app: &mut RustGisApp) {
     let tool = app.session.tool;
     let pts = app.map.sketch.clone();
@@ -2593,6 +2849,12 @@ fn finish_sketch(app: &mut RustGisApp) {
             let _ = app.run("edit.addFeature", with_template(app, json!({"geometry": {"type": "Polygon", "coordinates": [coords]}})));
             app.map.cancel_sketch();
         }
+        Tool::CutPolygon | Tool::Reshape if pts.len() >= 2 => {
+            let coords: Vec<[f64; 2]> = pts.iter().map(|c| [c.x, c.y]).collect();
+            let id = if tool == Tool::CutPolygon { "edit.cutPolygon" } else { "edit.reshape" };
+            let _ = app.run(id, json!({"line": {"type": "LineString", "coordinates": coords}}));
+            app.map.cancel_sketch();
+        }
         Tool::Graphic(shape) => {
             let min = if shape == "polygon" { 3 } else { 2 };
             if pts.len() >= min {
@@ -2601,6 +2863,49 @@ fn finish_sketch(app: &mut RustGisApp) {
         }
         _ => {}
     }
+}
+
+/// Adds a clicked vertex to the sketch: along the edge from the last vertex when Trace finds one,
+/// and never past the drawn-line limit of Cut Polygon and Reshape (a notice says so).
+fn add_vertex(app: &mut RustGisApp, tool: Tool, c: Coord) {
+    let limit = rustgis_engine::cmd::design::MAX_LINE;
+    let capped = matches!(tool, Tool::CutPolygon | Tool::Reshape);
+    if capped && app.map.sketch.len() >= limit {
+        // Said once per sketch: further clicks on a full sketch add nothing, quietly.
+        if !app.map.sketch_full_said {
+            app.map.sketch_full_said = true;
+            app.session.notify(tl!("Not added: a drawn line holds at most 10,000 points"), false);
+        }
+        return;
+    }
+    let last = app.map.sketch.last().copied().filter(|_| app.map.trace_edges && tool.draws_edit());
+    match last.and_then(|from| traced(app, from, c)) {
+        // The path starts where the last vertex meets the edge: it replaces it.
+        Some(path) if !capped || app.map.sketch.len() - 1 + path.len() <= limit => {
+            app.map.sketch.pop();
+            app.map.sketch.extend(path);
+        }
+        Some(_) => {
+            // Said once per sketch, like a full sketch.
+            if !app.map.sketch_full_said {
+                app.map.sketch_full_said = true;
+                app.session.notify(tl!("Not traced: a drawn line holds at most 10,000 points"), false);
+            }
+            app.map.sketch.push(c);
+        }
+        None => app.map.sketch.push(c),
+    }
+}
+
+/// The path along the edge under both the last sketch vertex and a new click (Trace), when there
+/// is one: from where the last vertex meets the edge to the click. A click with no edge under
+/// both points is an ordinary vertex: Trace only follows edges.
+fn traced(app: &mut RustGisApp, from: Coord, to: Coord) -> Option<Vec<Coord>> {
+    // Asked directly, not as a command: a click away from an edge isn't a failed command.
+    let path = rustgis_engine::cmd::design::trace_between(&mut app.session, from, to)?;
+    // Both clicks on the same point of the edge trace nothing: the click is an ordinary vertex.
+    let apart = path.first().zip(path.last()).is_some_and(|(a, b)| a != b);
+    (path.len() >= 2 && apart).then_some(path)
 }
 
 /// A point snapped to nearby features (when snapping is on).
@@ -2639,6 +2944,17 @@ pub fn finish_graphic(app: &mut RustGisApp, shape: &str, pts: Vec<Coord>) {
     }
 }
 
+/// The credit in the map's corner: Natural Earth's where the built-in world outline is drawn, then
+/// the sources drawn.
+fn attribution(map: &rustgis_engine::map::Map, sources: &[String]) -> String {
+    map.draws_world_outline()
+        .then_some("Natural Earth")
+        .into_iter()
+        .chain(sources.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// Paints map decorations and interactive readouts, including measurements on the map's body.
 fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t: &Tokens) {
     let accent = t.accent;
@@ -2653,7 +2969,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     if editing.settings.enabled
         && editing.settings.show_vertices
         && app.session.tool != Tool::EditVertices
-        && (app.session.tool.creates() || app.ui.right == Some(crate::RightPane::Editing))
+        && (app.session.tool.creates() || app.session.tool.draws_edit() || app.ui.right == Some(crate::RightPane::Editing))
     {
         let mut verts: Vec<Coord> = Vec::new();
         for l in app.session.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster() && !l.graphics) {
@@ -2747,6 +3063,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     // Where a click would snap to.
     if app.session.map().editing.snapping.enabled
         && (app.session.tool.creates()
+            || app.session.tool.draws_edit()
             || matches!(app.session.tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea)
             || app.map.vertex_drag.is_some())
         && let Some(c) = app.map.pointer_lonlat
@@ -2820,7 +3137,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         let closed = matches!(tool, Tool::MeasureArea | Tool::CreatePolygon | Tool::Graphic("polygon" | "lasso"));
         let placed: Vec<Option<Pos2>> = pts.iter().map(|c| lonlat_to_screen(app, rect, *c)).collect();
         let screen: Vec<Pos2> = placed.iter().flatten().copied().collect();
-        let color = if tool.creates() { Color32::from_rgb(0x16, 0x9A, 0x5A) } else { Color32::from_rgb(0xE5, 0x6A, 0x1A) };
+        let color =
+            if tool.creates() || tool.draws_edit() { Color32::from_rgb(0x16, 0x9A, 0x5A) } else { Color32::from_rgb(0xE5, 0x6A, 0x1A) };
         let all_visible = screen.len() == placed.len();
         if closed && all_visible && screen.len() >= 3 {
             p.add(egui::Shape::closed_line(screen.clone(), Stroke::new(2.0, color)));
@@ -2891,6 +3209,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         Tool::CreatePoint => Some("Click the map to add a point"),
         Tool::CreateLine => Some("Click to add vertices · double-click to finish the line"),
         Tool::CreatePolygon => Some("Click to add vertices · double-click to close the polygon"),
+        Tool::CutPolygon => Some("Draw a line across the selected polygons · double-click to cut them"),
+        Tool::Reshape => Some("Draw a line across the selected feature's edge · double-click to reshape it"),
         Tool::Select => Some("Click or drag a box · Shift adds · Ctrl removes"),
         Tool::SelectPolygon => {
             Some("Click vertices · click the start or double-click to select · Shift adds · Ctrl/Cmd removes · Esc cancels")
@@ -2902,6 +3222,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         }
         Tool::EditVertices => Some("Click a feature, then drag its vertices · click an edge to add one"),
         Tool::ZoomIn => Some("Drag a box or click to zoom in"),
+        Tool::MoveLabel => Some("Drag a label to where it should be · drag the map to pan · Esc to stop"),
         Tool::Graphic("point") => Some("Click the map to place a point"),
         Tool::Graphic("text") => Some("Click the map to place text"),
         Tool::Graphic("line" | "curve") => Some("Click to add vertices · double-click to finish"),
@@ -2943,14 +3264,13 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     }
     north_arrow(p, rect, t, bearing, pitch);
     // Attribution.
-    // The built-in world outline is Natural Earth's, drawn only on the Earth.
-    let earth = app.session.map().body().is_earth();
-    let att =
-        earth.then_some("Natural Earth").into_iter().chain(app.map.attribution.iter().map(String::as_str)).collect::<Vec<_>>().join(" | ");
-    let g = p.layout(att, regular(10.5), t.text_dim, (rect.width() - 240.0).max(120.0));
-    let r = Rect::from_min_size(pos2(rect.max.x - g.size().x - 14.0, rect.max.y - g.size().y - 6.0), g.size() + vec2(10.0, 4.0));
-    p.rect_filled(r, CornerRadius::same(3), t.ribbon.gamma_multiply(0.75));
-    p.galley(r.min + vec2(5.0, 2.0), g, t.text_dim);
+    let att = attribution(app.session.map(), &app.map.attribution);
+    if !att.is_empty() {
+        let g = p.layout(att, regular(10.5), t.text_dim, (rect.width() - 240.0).max(120.0));
+        let r = Rect::from_min_size(pos2(rect.max.x - g.size().x - 14.0, rect.max.y - g.size().y - 6.0), g.size() + vec2(10.0, 4.0));
+        p.rect_filled(r, CornerRadius::same(3), t.ribbon.gamma_multiply(0.75));
+        p.galley(r.min + vec2(5.0, 2.0), g, t.text_dim);
+    }
     // Navigation buttons (zoom in/out/full) in the top-right corner.
     let mut y = rect.min.y + 12.0;
     for (icon, id, tip) in
@@ -4060,6 +4380,27 @@ mod picture_tests {
 mod tests {
     use super::*;
 
+    /// Natural Earth is credited only where its world outline is drawn: not on a blank basemap or
+    /// another body, whose sources are still credited.
+    #[test]
+    fn natural_earth_is_credited_only_where_drawn() {
+        use rustgis_engine::map::Basemap;
+        let mut map = RustGisApp::with_sample().session.map().clone();
+        let tiles = ["OpenStreetMap".to_string()];
+        for basemap in [Basemap::Paper, Basemap::Midnight, Basemap::Ocean, Basemap::Atlas] {
+            map.basemap = basemap;
+            assert_eq!(attribution(&map, &[]), "Natural Earth");
+            assert_eq!(attribution(&map, &tiles), "Natural Earth | OpenStreetMap");
+        }
+        map.basemap = Basemap::Blank;
+        assert_eq!(attribution(&map, &[]), "");
+        assert_eq!(attribution(&map, &tiles), "OpenStreetMap");
+        map.basemap = Basemap::Paper;
+        map.body = "mars".into();
+        assert_eq!(attribution(&map, &[]), "");
+        assert_eq!(attribution(&map, &tiles), "OpenStreetMap");
+    }
+
     /// The pop-up stays on the result shown as answers come and results go, the second of two
     /// identical ones too, and goes to the first when that one is left out.
     #[test]
@@ -4223,6 +4564,126 @@ mod tests {
 
     fn selection_rows(h: &egui_kittest::Harness<'_, RustGisApp>) -> Vec<usize> {
         h.state().session.map().layer_by_name("Points").unwrap().selection.clone()
+    }
+
+    /// The Move Label tool: a label dragged and let go is kept where it was put, as one undo
+    /// step; Esc while dragging, or another tool, drops it where it was; Shift-click puts a moved
+    /// label back and leaves one never moved (no undo step).
+    #[test]
+    fn move_label_drags_cancels_and_puts_back() {
+        let mut h = selection_harness();
+        for (i, point) in [[0.5, 0.5], [3.5, 2.0], [2.5, 0.5], [1.0, 4.0]].into_iter().enumerate() {
+            let p = json!({"layer": "Labelled", "geometry": {"type": "Point", "coordinates": point}, "attributes": {"name": format!("Place {i}")}});
+            if i == 0 {
+                h.state_mut().run("layer.template", json!({"template": "points", "name": "Labelled"})).unwrap();
+            }
+            h.state_mut().run("edit.addFeature", p).unwrap();
+        }
+        let id = h.state().session.map().layer_by_name("Labelled").unwrap().id;
+        if let Some(l) = h.state_mut().session.map_mut().layer_mut(id) {
+            l.labels.enabled = true;
+            l.labels.default.field = "name".into();
+        }
+        h.state_mut().run("tool.set", json!({"tool": "moveLabel"})).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !h.state().map.labels.iter().any(|l| l.text == "Place 3") || h.state().map.drawing() {
+            assert!(std::time::Instant::now() < end, "labels never drawn");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.step();
+        }
+        let rect = h.state().map.view_rect.unwrap().0;
+        let grab = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            let l = h.state().map.labels.iter().find(|l| l.text == "Place 3").unwrap();
+            rect.min + vec2(l.x, l.y)
+        };
+        // Hit testing follows a retained frame's origin and refuses its old source window.
+        let at = grab(&h);
+        let retained = h.state().map.tex_rect;
+        let shift = vec2(80.0, 80.0);
+        h.state_mut().map.tex_rect = retained.translate(shift);
+        assert_eq!(label_at(h.state(), rect, at + shift).unwrap().text, "Place 3");
+        h.state_mut().map.tex_rect = retained;
+        let key = h.state().map.key;
+        h.state_mut().map.key.as_mut().unwrap().sources = rustgis_engine::map::source::generation().wrapping_add(1);
+        assert!(label_at(h.state(), rect, at).is_none());
+        h.state_mut().map.key = key;
+        let moved = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer(id).unwrap().labels.default.moved.clone();
+        let none = egui::Modifiers::NONE;
+        let drag = |h: &mut egui_kittest::Harness<'_, RustGisApp>, escape: bool| {
+            let at = grab(h);
+            selection_pointer(h, at, None, none);
+            selection_pointer(h, at, Some(true), none);
+            for i in 1..=6 {
+                selection_pointer(h, at + vec2(0.0, -8.0 * i as f32), None, none);
+            }
+            if escape {
+                h.event(egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: none });
+                h.step();
+            }
+            selection_pointer(h, at + vec2(0.0, -48.0), Some(false), none);
+        };
+        // Esc mid-drag: nothing saved.
+        drag(&mut h, true);
+        assert!(moved(&h).is_empty(), "Esc cancels the move");
+        assert!(h.state().map.moving_label.is_none());
+        // Dragged and let go: kept.
+        h.state_mut().run("tool.set", json!({"tool": "moveLabel"})).unwrap();
+        h.step();
+        drag(&mut h, false);
+        assert_eq!(moved(&h).len(), 1, "the move is kept");
+        // Shift-click on the moved one: put back, and moved again by undo.
+        let pinned = h.state().map.labels.iter().find(|l| l.collide.pinned).map(|l| rect.min + vec2(l.x, l.y));
+        let shift = egui::Modifiers { shift: true, ..none };
+        let at = pinned.expect("the moved label drawn");
+        // A label never moved drawn over the moved one doesn't hide it from Shift-click.
+        let mut over = h.state().map.labels.iter().find(|l| l.collide.pinned).cloned().expect("the moved label");
+        (over.collide.pinned, over.text) = (false, "Over".into());
+        h.state_mut().map.labels.push(over);
+        assert_eq!(label_at(h.state(), rect, at).map(|l| l.text), Some("Over".into()), "the unmoved label is on top");
+        assert!(pinned_label_at(h.state(), rect, at).is_some_and(|l| l.collide.pinned), "the moved one is still found");
+        // Clicked with the unmoved label still on top: the moved one is put back.
+        selection_pointer(&mut h, at, None, shift);
+        selection_pointer(&mut h, at, Some(true), shift);
+        selection_pointer(&mut h, at, Some(false), shift);
+        assert!(moved(&h).is_empty(), "put back");
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert_eq!(moved(&h).len(), 1, "undone");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !h.state().map.labels.iter().any(|l| l.collide.pinned) || h.state().map.drawing() {
+            assert!(std::time::Instant::now() < end, "labels never drawn again");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.step();
+        }
+        // Shift-click on a label never moved: no undo step, so undo takes back the move.
+        let other = h.state().map.labels.iter().find(|l| l.text == "Place 1" && !l.collide.pinned).map(|l| rect.min + vec2(l.x, l.y));
+        let at = other.expect("another label drawn");
+        selection_pointer(&mut h, at, Some(true), shift);
+        selection_pointer(&mut h, at, Some(false), shift);
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert!(moved(&h).is_empty(), "the Shift-click left no step of its own");
+    }
+
+    /// #1321: the double-click delay applies to the map too, and its 1.2 s ceiling holds however
+    /// slow the frames: two clicks 1.5 s apart at 0.75 s a frame stay two, and don't zoom.
+    #[test]
+    fn map_clicks_past_the_double_click_ceiling_do_not_zoom() {
+        let app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_step_dt(0.75).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        let at = h.state().map.view_rect.unwrap().0.center();
+        let res = h.state().session.map().camera.res;
+        crate::click_in_one_frame(&mut h, at, 0.75);
+        crate::click_in_one_frame(&mut h, at, 1.5);
+        assert_eq!(h.state().session.map().camera.res, res, "two separate clicks");
+        crate::click_in_one_frame(&mut h, at, 1.0);
+        assert_eq!(h.state().session.map().camera.res, res / 2.0, "a double-click inside the ceiling zooms in");
     }
 
     #[test]
@@ -4436,6 +4897,7 @@ mod tests {
     /// included, so every step of a slider drag made the map flicker.
     #[test]
     fn a_style_change_over_tiles_keeps_the_frame_instead_of_a_preview() {
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         // Nothing listens there: the tiles fail, the map still draws.
         app.run("map.addTiles", json!({"url": "http://127.0.0.1:9/{z}/{x}/{y}.png", "name": "Offline"})).expect("tile layer");
@@ -4667,5 +5129,138 @@ mod tests {
         assert_eq!(probe(&app), hit);
         app.run("group.set", json!({"group": "Notes", "transparency": 100})).unwrap();
         assert_eq!(probe(&app), None, "on a fully transparent layer");
+    }
+
+    /// Trace follows the edge under two clicks; finishing a Reshape or Cut Polygon sketch (what a
+    /// double-click does) runs its command on the drawn line and clears the sketch.
+    #[test]
+    fn trace_and_finishing_reshape_and_cut_sketches_edit_the_selection() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.template", json!({"template": "polygons", "name": "Parcels"})).unwrap();
+        let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+        app.run("edit.addFeature", json!({"layer": "Parcels", "geometry": square})).unwrap();
+        app.session.zoom_to(&rustgis_engine::geom::Extent::new(-1.0, -1.0, 2.0, 2.0));
+        assert_eq!(
+            traced(&mut app, Coord::new(0.5, 0.0), Coord::new(1.0, 0.5)),
+            Some(vec![Coord::new(0.5, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 0.5)])
+        );
+        // From just off the edge, the path starts on it (and replaces the last vertex).
+        let off = traced(&mut app, Coord::new(0.5, -0.001), Coord::new(1.0, 0.5)).unwrap();
+        assert!(off[0].y.abs() < 1e-9 && (off[0].x - 0.5).abs() < 1e-9, "{off:?}");
+        let count = |app: &RustGisApp| app.session.map().layer_by_name("Parcels").unwrap().dataset.features.len();
+        app.run("tool.set", json!({"tool": "reshape"})).unwrap();
+        app.map.sketch = vec![Coord::new(0.2, 0.2), Coord::new(-0.5, 0.2), Coord::new(-0.5, 0.8), Coord::new(0.2, 0.8)];
+        finish_sketch(&mut app);
+        assert!(app.map.sketch.is_empty());
+        let e = app.session.map().layer_by_name("Parcels").unwrap().dataset.features[0].geometry.as_ref().unwrap().extent();
+        assert!((e.min_x + 0.5).abs() < 1e-9, "{e:?}");
+        app.run("tool.set", json!({"tool": "cutPolygon"})).unwrap();
+        app.map.sketch = vec![Coord::new(0.5, -1.0), Coord::new(0.5, 2.0)];
+        finish_sketch(&mut app);
+        assert!(app.map.sketch.is_empty());
+        assert_eq!(count(&app), 2);
+    }
+
+    /// A unit-square parcel on the map, with Trace on and the Create Polygon tool.
+    fn trace_harness() -> egui_kittest::Harness<'static, RustGisApp> {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.template", json!({"template": "polygons", "name": "Parcels"})).unwrap();
+        let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+        app.run("edit.addFeature", json!({"layer": "Parcels", "geometry": square})).unwrap();
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_step_dt(0.016).with_max_steps(10_000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+        h.step();
+        h.state_mut().run("map.zoomToExtent", json!({"extent": [-1, -1, 2, 2]})).unwrap();
+        for _ in 0..5 {
+            h.step();
+        }
+        h.state_mut().run("ui.traceEdges", json!({"on": true})).unwrap();
+        h.state_mut().run("tool.set", json!({"tool": "createPolygon"})).unwrap();
+        h
+    }
+
+    /// With Trace on, two clicks on a polygon's edges draw the edge between them: the corner
+    /// between the clicks joins the sketch.
+    #[test]
+    fn clicks_with_trace_on_follow_the_edge_round_a_corner() {
+        let mut h = trace_harness();
+        selection_click(&mut h, [0.5, 0.0]);
+        for _ in 0..30 {
+            h.step();
+        }
+        selection_click(&mut h, [1.0, 0.5]);
+        let sketch = h.state().map.sketch.clone();
+        assert_eq!(sketch.len(), 3, "{sketch:?}");
+        assert_eq!(sketch[1], Coord::new(1.0, 0.0), "the corner, exactly");
+        assert!(sketch[0].y.abs() < 1e-9 && (sketch[2].x - 1.0).abs() < 1e-9, "both ends on the edge: {sketch:?}");
+    }
+
+    /// A first click just off the edge, then one on it with Trace on: the sketch starts on the edge.
+    #[test]
+    fn a_trace_from_a_click_just_off_the_edge_starts_on_it() {
+        let mut h = trace_harness();
+        selection_click(&mut h, [0.5, -0.005]);
+        for _ in 0..30 {
+            h.step();
+        }
+        selection_click(&mut h, [1.0, 0.5]);
+        let sketch = h.state().map.sketch.clone();
+        assert_eq!(sketch.len(), 3, "{sketch:?}");
+        assert!(sketch[0].y.abs() < 1e-9, "the first vertex moved onto the edge: {sketch:?}");
+    }
+
+    /// A click with Trace on but no edge near is a plain vertex, with no notice. A Cut Polygon sketch
+    /// reaches the 10,000-point limit through a trace, but not past it: a
+    /// trace that would pass it adds the click alone, and a full sketch takes no more points.
+    #[test]
+    fn a_cut_sketch_stops_at_the_line_limit() {
+        let limit = rustgis_engine::cmd::design::MAX_LINE;
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.template", json!({"template": "polygons", "name": "Parcels"})).unwrap();
+        let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+        app.run("edit.addFeature", json!({"layer": "Parcels", "geometry": square})).unwrap();
+        app.session.zoom_to(&rustgis_engine::geom::Extent::new(-1.0, -1.0, 2.0, 2.0));
+        app.map.trace_edges = true;
+        // A click away from any edge is an ordinary vertex: no trace, and no notice.
+        app.map.sketch = vec![Coord::new(5.0, 5.0)];
+        let mark = app.session.notice_mark();
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(6.0, 6.0));
+        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (2, 0));
+        let start = |n: usize| {
+            let mut v = vec![Coord::new(0.5, -0.5); n - 1];
+            v.push(Coord::new(0.5, 0.0));
+            v
+        };
+        // The trace (start, corner, click) replaces the last vertex: exactly the limit.
+        app.map.sketch = start(limit - 2);
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(1.0, 0.5));
+        assert_eq!(app.map.sketch.len(), limit);
+        assert_eq!(app.map.sketch[limit - 2], Coord::new(1.0, 0.0), "traced");
+        // One more would pass it: the click alone, and a notice.
+        app.map.sketch = start(limit - 1);
+        let mark = app.session.notice_mark();
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(1.0, 0.5));
+        assert_eq!(app.map.sketch.len(), limit);
+        assert_eq!(app.session.notices_since(mark).len(), 1);
+        // Full: nothing more is added, and the limit was already said for this sketch.
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(0.2, 0.2));
+        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (limit, 1));
+        // A new sketch that fills up says so once, for Reshape too.
+        app.map.cancel_sketch();
+        app.map.sketch = start(limit);
+        let mark = app.session.notice_mark();
+        add_vertex(&mut app, Tool::Reshape, Coord::new(0.2, 0.2));
+        add_vertex(&mut app, Tool::Reshape, Coord::new(0.3, 0.3));
+        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (limit, 1));
+        // Drawing a new feature doesn't have the limit.
+        add_vertex(&mut app, Tool::CreateLine, Coord::new(0.2, 0.2));
+        assert_eq!(app.map.sketch.len(), limit + 1);
     }
 }

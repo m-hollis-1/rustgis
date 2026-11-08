@@ -58,7 +58,7 @@ pub fn add_file(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
         return app.run_by_user(command, json!({"path": path}));
     }
     if !(app.ui.ask_layers && lists_layers(path)) {
-        return app.run("layer.addData", json!({"path": path}));
+        return add(app, json!({"path": path}));
     }
     // Listed off the frame: a geodatabase's or GDAL's listing can take a while.
     let slot: crate::Slot<Result<Value, String>> = crate::Slot::default();
@@ -74,11 +74,20 @@ pub fn add_file(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
     Ok(json!({"choosing": path}))
 }
 
+/// Adds a file, read on a thread of its own when the desktop app reads it so ([`crate::readjob`]).
+fn add(app: &mut RustGisApp, p: Value) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return crate::readjob::run(app, "layer.addData", p);
+    #[cfg(target_arch = "wasm32")]
+    app.run("layer.addData", p)
+}
+
 /// Adds the layers ticked, each by name (a failure is told, by the command, and the rest still
 /// added).
 fn add_chosen(app: &mut RustGisApp, path: &str, layers: &[String]) {
+    // After any file read before them, in turn.
     for layer in layers {
-        let _ = app.run("layer.addData", json!({"path": path, "layer": layer}));
+        let _ = add(app, json!({"path": path, "layer": layer}));
     }
     app.map.invalidate();
 }
@@ -103,7 +112,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 let path = c.path.clone();
                 app.ui.choosing.remove(0);
                 // A failure is told by the command.
-                let _ = app.run("layer.addData", json!({"path": path}));
+                let _ = add(app, json!({"path": path}));
                 app.map.invalidate();
                 return;
             }
@@ -238,6 +247,22 @@ mod tests {
             assert_eq!(app.session.map().name, "Dropped map");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file in Recent or Favourites with several layers asks which to add, as Add Data does; one
+    /// recorded with its layer adds that layer.
+    #[test]
+    fn a_recent_file_with_several_layers_asks_which() {
+        let mut app = RustGisApp::new(Session::new(Project::default()));
+        let gdb = std::env::temp_dir().join("rustgis-recent-asks.gdb").display().to_string();
+        let file =
+            |extra: Value| rustgis_engine::sources::Source { kind: "file".into(), name: "Parcels".into(), address: gdb.clone(), extra };
+        crate::sourcespane::open(&mut app, &file(Value::Null)).unwrap();
+        assert_eq!(app.ui.choosing.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), [gdb.as_str()]);
+        app.ui.choosing.clear();
+        // (The geodatabase isn't there, so adding its layer fails: but it asks nothing.)
+        let _ = crate::sourcespane::open(&mut app, &file(json!({"layer": "roads"})));
+        assert!(app.ui.choosing.is_empty());
     }
 
     /// A file with several layers lists them, all ticked, and adds the ones chosen, each by name;

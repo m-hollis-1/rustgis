@@ -12,8 +12,13 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
 - **Single Symbol**: one fill, outline and marker for every feature.
 - **Unique Values**: one colour per distinct value of a field. If no field is chosen, the current
   renderer's field is kept when available; otherwise the first available field is used, including
-  text fields. The Layers pane and layout legends list only the
-  classes that drawn features use (after the definition query and display filters);
+  text fields. There are up to 64 classes: the first values in numeric order when every value is
+  a number (9, 10, 100, as on a numeric field or a text field of codes), otherwise in text order
+  (by character, so `B` before `a`). Features with a value past them draw as
+  `<all other values>`, and a notice says how many and in which order the classes were taken. The
+  legend lists the classes by number when every class is a number, a class renamed by hand in its
+  value's place, and otherwise by label without regard to case. The Layers pane and layout
+  legends list only the classes that drawn features use (after the definition query and display filters);
   `<all other values>` appears only when a drawn feature falls outside the classes and its symbol
   is not fully transparent. A layout legend can leave it out with **Hide other values** (see
   [Layouts](layouts.md)). Instead of a field, Unique Values can class by an
@@ -170,10 +175,14 @@ With Unique Values or Graduated Colors, each class in the Symbology pane's list 
 and a legend label. Pick a colour and opacity to give that class its own. Type a label to show in the Layers
 pane and in layout legends instead of the value or range (for example `High income` for
 `1. High income: OECD`); clear it to show the value again. `<all other values>` can be edited the
-same way. Applying the symbology again on the same field keeps the colours, outlines and labels
-you set by hand on the classes that are still there (the others take the scheme's colours again);
-picking another colour scheme recolours every class but keeps the labels. A Graduated Colors
-class keeps its colour and label while its range stays the same. By command:
+same way. The list shows up to 200 classes. A style imported with more says below the list how many
+it leaves out: the list's limit doesn't change how they're drawn, and `layer.classStyle` edits them,
+a Unique Values class by its `value` (a value listed twice is drawn, and edited, as its first class)
+and a Graduated Colors class by its `index`. Applying the symbology again on the same field keeps
+the colours, outlines and labels you set by hand on the classes that are still there (the others
+take the scheme's colours again); picking another colour scheme recolours every class but keeps the
+labels. A Graduated Colors class keeps its colour and label while its range stays the same. By
+command:
 
 ```text
 layer.classStyle={"layer":"Countries","value":"1. High income: OECD","color":"#2E6B4F","label":"High income"}
@@ -198,6 +207,34 @@ same field, ranges and scheme also preserves opacity, including edits that chang
 As with other class colour edits, changing the field or graduated ranges starts fresh; choosing
 a different scheme through `layer.symbology` resets polygon opacity to its default.
 Layer/group transparency still applies on top of the symbol's opacity in maps and exports.
+
+**Invert Color Ramp** (Symbology pane, or `layer.invertRamp`) reverses the colours of a Graduated
+Colors or Unique Values layer's classes along the legend's order, so the highest class takes the
+lowest class's colour. Colours edited by hand travel with the reversal, but a polygon fill's
+opacity stays with its position in the legend, as it does when a colour scheme is applied: a
+semi-transparent fill picked for the first class is still the first class's opacity afterwards.
+Applying it twice gives the original back. The `<all other values>` swatch is no colour of the
+scheme and stays as it is. With fewer than two classes showing the scheme there is nothing to
+reverse, and the command says so instead of succeeding.
+
+A class whose own stack hides its symbol keeps it, and the others reverse among themselves; a
+notice says how many classes with a stack of their own were left as they are. A stack hides the
+symbol when it is drawn (stacked fills on a polygon layer, stacked strokes on a line or point
+layer; a polygon's stacked strokes and a line's stacked fills are not drawn) and every layer of it
+sets a colour of its own. A layer of a stack left on "follow the class" shows the class's colour,
+so that class reverses with the rest: a road's black casing over a core that follows the class.
+When the layer's own stack (the one classes without a stack of their own are drawn from) sets a
+colour in every layer, the classes show those colours and little of the colour scheme: the colours
+are reversed all the same, and a notice says so. On a layer that holds several kinds of geometry,
+the reversal treats every class as the layer's main kind, as choosing a colour scheme does.
+A fill or stroke colour from **Symbol by Expression** is drawn over the classes' colours wherever
+the expression gives one, so the reversal shows only where it gives none, and a notice says so.
+
+Choosing a colour scheme again starts from the scheme's own order, but classing the layer again
+on the same field, ranges and scheme keeps the reversed colours, as it keeps other colours edited
+by hand. On a Stretch raster the command switches the existing "Invert color scheme" option. A
+graphics layer draws each feature in its own style, so it has no colour scheme to invert and the
+command says so.
 
 ### Line strokes
 
@@ -395,6 +432,40 @@ its own copy of the ramp it uses, so layer files, map files and packages keep th
 projects that don't have the ramp, and deleting a ramp from the project leaves layers that use
 it unchanged.
 
+## Diagrams
+
+A diagram draws a small chart on each feature from **several numeric fields**, over the renderer's
+own symbol, as ArcGIS Pro's Chart symbology and QGIS's Diagrams draw: a polygon layer of
+administrative units can keep a Graduated Colors fill underneath while a pie on each feature shows
+its split of, say, male and female population. The categories take colours in turn from the palette
+new layers take; a feature where every category is null or zero draws nothing. A pie's slice
+angles are each category's share of the total; a bar chart's bars rise from a baseline, one per
+category. The size is a fixed radius or height in points, the same for every feature, or one grown
+with the categories' sum: from the smallest size to the largest, by the square root of the total's
+share of the range, as Proportional Symbols grow. By command:
+
+```text
+layer.diagram={"layer":"Regions","kind":"pie","fields":["pop_male","pop_female"]}
+layer.diagram={"kind":"bar","fields":[{"field":"under18","color":"#4A90D9"},{"field":"over65","color":"#E07B39"}],"size":{"from":6,"to":40},"labels":"both","background":"#FFFFFFCC","outline":{"color":"#4D4D4D","width":0.75}}
+layer.diagramInfo={"layer":"Regions"}
+layer.clearDiagram={"layer":"Regions"}
+```
+
+Each slice or bar can say something beside it (`"labels"`): `"none"` (the default), `"value"` (the
+feature's number, in the legend's number format — 52K, 1.2M), `"percent"` (its share of the
+feature's total, a whole percent or one decimal below ten), or `"both"` (`52K (52%)`). The label
+draws just past a pie's crust on the slice's mid-angle, or above a bar's top, in a small haloed
+dark text; culling makes room for it, so labelled charts stay visible to their last letter.
+
+The categories list under the layer's classes in layout legends — the printed map's legend lists
+them the same way. Clearing the diagram leaves the renderer as it is.
+
+Charts lie flat on the map. On extruded polygons they draw over the extrusion while a flat map is
+untilted, but not while it is tilted; the globe draws extruded polygons flat, charts and all. On a
+point layer in a tilted view the markers stay on the ground under their charts rather than standing
+up, and aggregated points draw their bins, not the charts. Setting a diagram, aggregation or
+extrusion that can hide the charts says so.
+
 ## Labeling
 
 The **Labeling pane** brings together the label classes and the chosen class's field, SQL
@@ -480,6 +551,31 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   Lock keeps the ones placed. The distance grows with the labels at a reference scale
   (`labels.placement={"layer": "Rivers", "position": "curved", "repeat": 144}`; `null` or `0` is
   the one at the middle).
+- **Show all labels** (Labeling pane › Position): labels among the view's 20,000 highest-priority
+  candidates are drawn, over the others where
+  they crowd, rather than some left out (`labels.placement={"layer": "Cities", "showAll": true}`).
+- **Callouts** (Labeling pane › Position): a label crowded off its spot moves to the nearest free
+  spot nearby, and a line is drawn from its feature to the text, as QGIS's callouts. **at most**
+  sets how long the line may be (5 to 500 points, 40 to start with): a label with no free spot
+  that close is left out, or drawn over the others with Show all labels. The line takes the
+  label's colour, over its halo. Labels along lines and labels with an icon aren't moved
+  (`labels.placement={"layer": "Cities", "callout": 60}`; `true` keeps the length, `false` turns
+  them off).
+- **Move Label** (Labeling tab › Label Placement): drag a label to where it should be, as with
+  QGIS's Move Label tool. It stays there as the map moves (kept by its feature, in longitude and
+  latitude, and saved with the project), is drawn whatever is under it, and the other labels keep
+  off it; with Callouts on, its line follows it back to its feature, however far it went.
+  Shift-click a moved label to put it back, or **Reset Moved** for all of the layer's. Dragging
+  anything else pans the map; Esc leaves the tool
+  (`labels.move={"layer": "Cities", "feature": 12, "to": [2.5, 49.1]}`; `"to": null` puts it back;
+  `labels.resetMoved={"layer": "Cities", "all": true}`).
+  Deleting a feature removes its saved move; Undo restores it. Service refresh and Repair Data Source reset saved
+  moves and old label locks because replacement data can reuse feature ids, with a counted notice
+  and undo restoration. Opening a project, importing a map or styles, or adding a layer file
+  reports invalid, duplicate or excess moved-label entries that were ignored, callout lengths that
+  were adjusted, and Show all labels settings that were not true or false. A callout length given
+  to `labels.placement` outside 5 to 500 points is brought within range with a notice. Clean
+  settings give no such notice.
 - **Font**: the labels' font family, any installed on the computer (Labeling pane › Symbol
   › **Font**; type part of a name to find it), or the label font the interface uses. Bold and
   italic take the family's own bold and italic faces where it has them. The family is saved by
@@ -509,11 +605,20 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
 - **Other places round points**: a point's label whose place another label takes tries the
   other places round the point, corners first (above right, above left, below right, below left,
   right, left, above, below, leaving out its own), and goes to the first where
-  all of it shows; where none is free it is left out, as before (Labeling pane › Position ›
+  all of it shows; where none does, it stays at its own place and shows what fits there (an icon
+  without its text, say), or is left out if nothing fits (Labeling pane › Position ›
   **Try other places round the point**, for point layers). Off by default: a label that moves can
   take the place a less important one had. The class's offset applies to every place, and Lock
   keeps the place each label took
   (`labels.placement={"layer": "Cities", "otherPositions": true}`).
+- **Other places along lines**: a Parallel or Curved label whose place at the middle is taken, or
+  (curved) where the line bends too sharply, tries up to seven others along the same stretch,
+  nearest the middle first, and goes to the first that will do (Labeling pane › Position › Along
+  lines › **Try other places along the line**). If none will, it is left out, as with this off. A
+  line with a repeat keeps its repeats where they are, so the box is hidden while Repeat is on, and
+  the setting does nothing there or at a position off the line. Off by default, for the same reason
+  as round points, and Lock keeps the place each label took
+  (`labels.placement={"layer": "Rivers", "position": "curved", "otherPositions": true}`).
 - **Lock** keeps the labelled features fixed while you pan and zoom; **Pause** stops drawing
   labels for faster navigation; **View Unplaced** draws the labels that didn't fit in red. They
   apply to the whole map, so they are on the ribbon (Labeling › Map Labeling), not in the pane.

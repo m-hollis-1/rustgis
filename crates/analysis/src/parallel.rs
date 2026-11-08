@@ -18,8 +18,18 @@ const STACK_BYTES: usize = 8 << 20;
 /// cell-point pairs for IDW (about 30 ns each, so some 5 ms of it), the same plus each cell's
 /// system for kriging, ray steps for a viewshed. Starting a thread costs tens of microseconds.
 pub(crate) const MIN_ROW_WORK: usize = 200_000;
-/// The scratch memory a raster tool's threads may take together, beyond one thread's.
-const SCRATCH_BUDGET: usize = 256 << 20;
+/// The scratch memory a tool's threads may take together beyond one thread's, in the browser and
+/// at least on the desktop ([`scratch_budget`]).
+const SCRATCH_FLOOR: usize = 256 << 20;
+/// The most [`scratch_budget`] allows, however much memory the computer has.
+const SCRATCH_CEILING: usize = 4 << 30;
+
+/// The scratch memory a tool's threads may take together beyond one thread's: on the desktop a
+/// sixteenth of the computer's memory, on top of the quarter its input and output limits plan for,
+/// from [`SCRATCH_FLOOR`] up to [`SCRATCH_CEILING`] (#1291 step 2).
+pub fn scratch_budget() -> usize {
+    rustgis_data::memory::scaled(rustgis_data::memory::physical().map(|m| m / 4), SCRATCH_FLOOR, SCRATCH_CEILING, 1)
+}
 
 /// How many threads to make `items` items on: one below `min_items`, always one in the browser,
 /// and no more than there are batches.
@@ -30,17 +40,39 @@ pub(crate) fn threads_for(items: usize, min_items: usize) -> usize {
     cores().min(items.div_ceil(BATCH)).max(1)
 }
 
+/// [`threads_for`], each thread holding up to `scratch_bytes` at its peak (a feature's raster
+/// masks, say): beyond one thread's, no more than [`scratch_budget`] holds.
+pub(crate) fn threads_for_scratch(items: usize, min_items: usize, scratch_bytes: usize) -> usize {
+    threads_for(items, min_items).min(1 + scratch_budget() / scratch_bytes.max(1))
+}
+
 /// How many threads to make `rows` raster rows on, `work` in all, each thread taking
 /// `scratch_bytes` of scratch: one below [`MIN_ROW_WORK`] and in the browser, no more than there
-/// are rows, and no more than [`SCRATCH_BUDGET`] holds (a scratch per point, for millions of
+/// are rows, and, beyond one thread's scratch, no more than [`scratch_budget`] holds (a scratch per point, for millions of
 /// points, is large).
 pub(crate) fn threads_for_rows(rows: usize, work: usize, scratch_bytes: usize) -> usize {
     if cfg!(target_arch = "wasm32") || work < MIN_ROW_WORK {
         return 1;
     }
-    let affordable = 1 + SCRATCH_BUDGET / scratch_bytes.max(1);
+    let affordable = 1 + scratch_budget() / scratch_bytes.max(1);
     cores().min(rows).min(affordable).max(1)
 }
+
+/// A work cap tuned for one thread (a second or two of its work) for a run on `threads` threads:
+/// as many times larger, since the threads share the work and the run takes about as long
+/// (#1291 step 2). On one thread, and so in the browser, the cap as it is. None for a run that
+/// can be stopped while it goes ([`crate::control::uncapped`]): its progress shows, and Cancel
+/// stops it.
+pub(crate) fn work_cap(one_thread: usize, threads: usize) -> usize {
+    if crate::control::uncapped() { usize::MAX } else { one_thread.saturating_mul(threads.max(1)) }
+}
+
+/// What a refusal past [`work_cap`] adds: where the work isn't capped. Nothing in the browser.
+pub(crate) const UNCAPPED_HINT: &str = if cfg!(target_arch = "wasm32") {
+    ""
+} else {
+    " (or run it from its pane in the desktop app, which takes any amount of work and can be cancelled)"
+};
 
 /// The cores to use, at most [`MAX_THREADS`].
 fn cores() -> usize {
@@ -73,28 +105,31 @@ pub(crate) fn for_each_row<T: Send, S>(
         return Ok(());
     }
     let run = control::current();
+    let still = rustgis_data::source::remote::current_still();
     let rows = std::sync::Mutex::new(rows.enumerate());
     let failed = AtomicBool::new(false);
     let work = || {
-        let _stop = StopOnPanic(&failed);
-        let _run = control::install(run.clone());
-        let mut s = scratch();
-        let mut taken = Vec::with_capacity(BATCH);
-        while !failed.load(Ordering::Relaxed) && !control::cancelled() {
-            // The lock is held only to take rows; a poisoned one means a thread panicked.
-            if let Ok(mut r) = rows.lock() {
-                let take = (r.len() / threads.saturating_mul(BATCH)).clamp(1, BATCH);
-                taken.extend(r.by_ref().take(take));
+        rustgis_data::source::remote::with_optional_still(still.clone(), || {
+            let _stop = StopOnPanic(&failed);
+            let _run = control::install(run.clone());
+            let mut s = scratch();
+            let mut taken = Vec::with_capacity(BATCH);
+            while !failed.load(Ordering::Relaxed) && !control::cancelled() {
+                // The lock is held only to take rows; a poisoned one means a thread panicked.
+                if let Ok(mut r) = rows.lock() {
+                    let take = (r.len() / threads.saturating_mul(BATCH)).clamp(1, BATCH);
+                    taken.extend(r.by_ref().take(take));
+                }
+                if taken.is_empty() {
+                    break;
+                }
+                let n = taken.len();
+                for (i, row) in taken.drain(..) {
+                    f(&mut s, i, row);
+                }
+                control::advance(n);
             }
-            if taken.is_empty() {
-                break;
-            }
-            let n = taken.len();
-            for (i, row) in taken.drain(..) {
-                f(&mut s, i, row);
-            }
-            control::advance(n);
-        }
+        })
     };
     std::thread::scope(|scope| {
         let others: Vec<_> =
@@ -150,33 +185,37 @@ pub(crate) fn try_map_on<T: Sync, S, R: Send, E: Send + From<Cancelled>>(
             .collect();
     }
     let run = control::current();
+    let still = rustgis_data::source::remote::current_still();
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let work = || {
-        let _stop = StopOnPanic(&failed);
-        let _run = control::install(run.clone());
-        let mut s = scratch();
-        let mut made = Vec::new();
-        while !failed.load(Ordering::Relaxed) {
-            let from = next.fetch_add(BATCH, Ordering::Relaxed);
-            let Some(batch) = items.get(from..items.len().min(from.saturating_add(BATCH))).filter(|b| !b.is_empty()) else { break };
-            if control::cancelled() {
-                failed.store(true, Ordering::Relaxed);
-                return Err((from, Cancelled.into()));
-            }
-            for (k, item) in batch.iter().enumerate() {
-                match f(&mut s, from + k, item) {
-                    Ok(r) => made.push((from + k, r)),
-                    Err(e) => {
+        rustgis_data::source::remote::with_optional_still(still.clone(), || {
+            let _stop = StopOnPanic(&failed);
+            let _run = control::install(run.clone());
+            let mut s = scratch();
+            let mut made = Vec::new();
+            while !failed.load(Ordering::Relaxed) {
+                let from = next.fetch_add(BATCH, Ordering::Relaxed);
+                let Some(batch) = items.get(from..items.len().min(from.saturating_add(BATCH))).filter(|b| !b.is_empty()) else { break };
+                // Cancel is looked at, and progress counted, item by item, as on one thread: an item
+                // can take long (a large zone, say), so a batch of them would hold both back.
+                for (k, item) in batch.iter().enumerate() {
+                    if control::cancelled() {
                         failed.store(true, Ordering::Relaxed);
-                        return Err((from + k, e));
+                        return Err((from + k, Cancelled.into()));
                     }
+                    match f(&mut s, from + k, item) {
+                        Ok(r) => made.push((from + k, r)),
+                        Err(e) => {
+                            failed.store(true, Ordering::Relaxed);
+                            return Err((from + k, e));
+                        }
+                    }
+                    control::advance(1);
                 }
             }
-            // Counted a batch at a time: the threads share one count.
-            control::advance(batch.len());
-        }
-        Ok(made)
+            Ok(made)
+        })
     };
 
     let mut parts = Vec::with_capacity(threads);
@@ -224,6 +263,46 @@ impl Drop for StopOnPanic<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The raster row workers inherit the initiating predicate, rather than creating a root
+    /// request context on a new thread.
+    #[test]
+    fn raster_rows_keep_their_request_context() {
+        let mut rows = vec![0u8; 256];
+        rustgis_data::source::remote::with_still(std::sync::Arc::new(|| true), || {
+            assert_eq!(
+                for_each_row(
+                    rows.chunks_mut(1),
+                    4,
+                    || (),
+                    |_, _, row| {
+                        assert!(rustgis_data::source::remote::current_still().is_some());
+                        row[0] = 1;
+                    }
+                ),
+                Ok(())
+            );
+            let items = try_map_on(
+                &rows,
+                4,
+                || (),
+                |_, _, value| {
+                    assert!(rustgis_data::source::remote::current_still().is_some());
+                    Ok::<_, Cancelled>(*value)
+                },
+            );
+            assert_eq!(items, Ok(vec![1; 256]));
+        });
+        assert!(rustgis_data::source::remote::current_still().is_none());
+    }
+
+    #[test]
+    fn a_work_cap_grows_with_the_threads_a_run_takes() {
+        assert_eq!(work_cap(400, 1), 400);
+        assert_eq!(work_cap(400, 16), 6400);
+        assert_eq!(work_cap(400, 0), 400, "no threads counts as one");
+        assert_eq!(work_cap(usize::MAX, 2), usize::MAX, "no overflow");
+    }
 
     /// The infallible case, for the tests.
     fn map_on<T: Sync, S, R: Send>(
@@ -367,7 +446,7 @@ mod tests {
         assert_eq!(threads_for_rows(100, MIN_ROW_WORK - 1, 0), 1);
         assert!(threads_for_rows(3, usize::MAX, 0) <= 3);
         // Scratch larger than the budget: one thread more than it holds, none beyond.
-        assert!(threads_for_rows(100, usize::MAX, SCRATCH_BUDGET) <= 2);
+        assert!(threads_for_rows(100, usize::MAX, scratch_budget()) <= 2);
         assert_eq!(threads_for_rows(100, usize::MAX, usize::MAX), 1);
     }
 

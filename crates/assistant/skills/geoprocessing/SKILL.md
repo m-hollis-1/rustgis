@@ -21,10 +21,17 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
      or field value)
    - generalization: `dissolve` (`input`, `field`, `statistics`: summary fields over each
      group's records, as in `summaryStatistics`), `simplify` (`input`, `tolerance`)
-   - geometry: `convexHull`, `featureToPoint`, `featureVerticesToPoints`, `xyTableToPoint`
+   - geometry: `convexHull`, `featureToPoint`, `featureVerticesToPoints`, `pointsAlongLines`
+     (`input`, `distance`, `units`, `startOffset`, `endOffset`, `includeEnd`), `xyTableToPoint`
      (`input`, `x`, `y`, `crs`), `calculateGeometry`; `polygonToLine`, `splitLineAtVertices`,
      `featureEnvelopeToPolygon`, `unsplitLine` (`input`, optional `output`; see the user guide
-     for envelope axes and endpoint-joining rules)
+     for envelope axes and endpoint-joining rules); `checkGeometry` (`input`: a layer of the
+     features with invalid geometry, saying what is wrong with each); `repairGeometry` (`input`:
+     every feature with its geometry made valid where it can be, and a field saying what was
+     repaired; features with a missing or non-finite coordinate, even in a hole, or left with no
+     usable points or, for polygons, no area once repaired are written without geometry; valid
+     points and lines are kept; other features too complex to check, or whose repair fails,
+     are written unchanged)
    - selection: `selectByLocation` (`input`, `select`, `distance`, `invert`), `selectByAttributes`
      (`input`, `where`)
    - statistics: `countPoints` (Summarize Within: `polygons`, `points`, `statistics`: summary

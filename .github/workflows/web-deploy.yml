@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -39,10 +39,16 @@ jobs:
         id: built
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Shared with the pull request previews' build of the same app (docs-preview.yml),
+          # which restores this cache and saves none of its own. Saved from main's pushes only: a
+          # run started by hand may build another ref, which the previews would then restore.
+          shared-key: web
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Build the web app
         run: |

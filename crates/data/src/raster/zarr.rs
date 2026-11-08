@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
-use super::{ColorHint, Crs, Exact, GeoTransform, MAX_SAMPLES, Raster};
+use super::{ColorHint, Crs, Exact, GeoTransform, Raster, max_samples};
 use crate::{DataError, Result};
 
 /// The metadata files a store may have at its root: Zarr 3's `zarr.json`, Zarr 2's consolidated
@@ -996,8 +996,9 @@ pub fn plan(store: &Store, sel: &Selection) -> Result<Plan> {
     let (y, x) = map_dims(a);
     let (h, w) = (a.shape.get(y).copied().unwrap_or(0), a.shape.get(x).copied().unwrap_or(0));
     let cells = h.checked_mul(w).ok_or_else(|| bad("too large"))?;
-    if cells == 0 || cells > MAX_SAMPLES as u64 {
-        return Err(bad(format!("{} is {w} × {h}, more than a raster holds", a.path)));
+    let max = max_samples();
+    if cells == 0 || cells > max as u64 {
+        return Err(bad(format!("{} is {w} × {h}, more than the {max} cells a raster holds on this computer", a.path)));
     }
     a.chunk_values()?;
     let mut fixed = vec![0u64; a.shape.len()];
@@ -1059,7 +1060,6 @@ fn values_1d(a: &Array, chunks: &HashMap<String, Vec<u8>>) -> Result<Vec<f64>> {
     Ok(out)
 }
 
-/// A number attribute (`scale_factor`, `_FillValue`).
 /// A JSON number exactly: a whole one as one.
 fn exact_number(n: &serde_json::Number) -> Option<Exact> {
     n.as_i64()
@@ -1086,6 +1086,7 @@ fn attr_exact(a: &Array, k: &str) -> Option<Exact> {
     }
 }
 
+/// A number attribute (`scale_factor`, `_FillValue`).
 fn attr_f64(a: &Array, k: &str) -> Option<f64> {
     match a.attrs.get(k)? {
         Value::Number(n) => n.as_f64(),

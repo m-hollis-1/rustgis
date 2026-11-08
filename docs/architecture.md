@@ -133,10 +133,19 @@ model listing.
   the requested bucket's explicit-grant status. Copy only that login and grant boolean, not
   the grant list; parse and validate addresses and prepare signatures outside the lock.
   Keychain calls and network I/O never run under the registry lock.
+- **Web-service login bindings.** Session-only Basic and API-key-header logins use 128-bit
+  cryptographically random bearer capabilities, encoded as 32 lowercase hex digits. Native
+  builds use `getrandom`'s OS source; browser builds enable its `wasm_js` backend, which calls
+  `globalThis.crypto.getRandomValues` in both windows and workers. No initialization hook or
+  time/counter/hash fallback is used. A missing or throwing secure source returns a fixed,
+  non-secret activation error before installing an entry or replacing the session's prior
+  login. Collisions retry at most four times without overwriting a live entry.
 - **Earthdata Login token.** `rustgis_tiles::earthdata::set_secret_store` gets `Services::secrets`
   from `RustGisApp::with_services`, and `prefs::opt_in`'s store for the command line and Python. `earthdata.login` with
   `remember` keeps the token at `earthdata/token`, and without it (or when the store refuses
-  it) deletes the remembered one; `earthdata.logout` always deletes it. The token is read back
+  it) deletes the remembered one; `earthdata.logout` always deletes it and calls `cache::clear`,
+  as `arcgis.signOut` does, so what was read with the token is not served after it (a read still
+  under way then is kept when it ends, as at an ArcGIS sign-out). The token is read back
   once per store given, on the first
   request to an Earthdata data host or when the NASA Earthaccess pane opens (on a worker), never
   over a token typed this session. An expired token is deleted, not sent, and the pane and the

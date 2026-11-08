@@ -21,6 +21,9 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 - Report through `Session::notify` (app, CLI, Python `take_notices`) or `ToolResult::messages`,
   one notice per kind with a count; `eprintln!` alone doesn't count. Unusable results are errors.
 - Test both ways: lossy input gives the notice, clean input none. Existing silent losses are bugs.
+- A file or setting from a newer RustGIS is refused or kept unchanged, never saved again without
+  what this version couldn't read; a reader checks the version it is given
+  ([saved files](docs/maintaining.md#saved-files-and-settings)).
 
 ## Architecture
 | Layer | Crate | Job |
@@ -41,6 +44,11 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 - **Everything is a command**: a `CommandSpec` in `crates/engine/src/cmd/*.rs`. UI-only
   commands (`ui.*`) live in `crates/ui-egui/src/lib.rs`. The ribbon, shortcuts, command search
   and CLI dispatch by id. Commands never open dialogs.
+- **Command ingress**: root `Session::run` is trusted native User dispatch. Assistant, MCP,
+  plugin, imported-item and continuation adapters carry their named opaque policy scope;
+  scopes inherit or narrow, and `with_scope` rejects nested ingress. Peer project text uses
+  `open_peer_text`. See [embedding-page limitations](SECURITY.md#embedding-page-command-boundary)
+  when changing web message handlers.
 - **Ribbon placement** follows the
   [ribbon guidelines](docs/contributing.md#ribbon-guidelines): the tab's purpose, one button per
   destination, labels that say what happens, and what a ribbon pull request states.

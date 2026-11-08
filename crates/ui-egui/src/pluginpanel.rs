@@ -75,7 +75,7 @@ pub fn open(app: &mut RustGisApp, p: &Value) -> Result<Value, String> {
 }
 
 fn run(app: &mut RustGisApp, id: &str, p: Value) {
-    if let Err(e) = app.run(id, p) {
+    if let Err(e) = app.run_by_user(id, p) {
         app.session.notify(e, true);
     }
 }
@@ -576,6 +576,78 @@ mod tests {
         plugins::unload("ui-url");
     }
 
+    /// The real deferred request and probe loop refuse a withdrawn plugin before a fallback send.
+    #[test]
+    fn permission_policy_plugin_deferred_probe_refuses_before_fallback() {
+        let _turn = crate::fetching::turn();
+        use rustgis_engine::{plugins, render::rustgis_tiles::cache};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let callbacks = held.clone();
+        cache::set_fetcher(move |_, done| {
+            count.fetch_add(1, Ordering::SeqCst);
+            callbacks.lock().unwrap().push(done);
+        });
+        let mut app = RustGisApp::with_sample();
+        let load = || {
+            plugins::load(plugins::Package::from_zip(&plugins::testing::package("ui-policy-probe", &["edit", "network"])).unwrap(), "test")
+                .unwrap()
+        };
+        let p = json!({"url":"http://127.0.0.1:9/policy-held.fgb","name":"Held source"});
+        load();
+        app.run("plugin:ui-policy-probe/f", json!({"op":"layer.addUrl","params":p})).unwrap();
+        plugins::unload("ui-policy-probe");
+        assert!(app.session.take_url_requests().is_empty());
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        load();
+        app.run("plugin:ui-policy-probe/f", json!({"op":"layer.addUrl","params":p})).unwrap();
+        let request = app.session.take_url_requests().pop().unwrap();
+        app.add_url(request.params(), Some(&request), None).unwrap();
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "the actual probe starts under the live owner");
+        assert_eq!(app.ui.cog_probes.len(), 1);
+        plugins::unload("ui-policy-probe");
+        *app.ui.cog_probes[0].2.lock().unwrap() = Some(Ok(false));
+        app.poll_data_downloads();
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "revoked probe starts no whole-file fallback");
+        assert!(app.session.map().layer_by_name("Held source").is_none());
+        for done in std::mem::take(&mut *held.lock().unwrap()) {
+            done(Err("probe revoked".into()));
+        }
+        // The same real probe can succeed while its owner remains loaded. Reuse the built-in
+        // FGB writer and installed fetcher; no server or replacement completion token is needed.
+        let bytes = rustgis_engine::data::source::fgb::write(&app.session.map().layer_by_name("Cities").unwrap().dataset).unwrap();
+        cache::set_fetcher(move |url, done| {
+            let (url, _) = cache::split_download_limit(&url);
+            let (_, range) = cache::split_range(url);
+            let answer = match range {
+                Some((a, b)) => bytes.get(a as usize..b.saturating_add(1).min(bytes.len() as u64) as usize).unwrap_or_default().to_vec(),
+                None => bytes.clone(),
+            };
+            done(Ok(answer));
+        });
+        load();
+        let p = json!({"url":"http://127.0.0.1:9/policy-recorded.fgb", "name":"Recorded source"});
+        app.run("plugin:ui-policy-probe/f", json!({"op":"layer.addUrl", "params":p})).unwrap();
+        let request = app.session.take_url_requests().pop().unwrap();
+        app.ws.recording = Some(Vec::new());
+        app.add_url(request.params(), Some(&request), None).unwrap();
+        assert_eq!(app.ui.cog_probes.len(), 1, "the actual live probe still lands through its UI receiver");
+        app.poll_data_downloads();
+        let steps = app.ws.recording.as_ref().unwrap();
+        assert!(app.session.map().layer_by_name("Recorded source").is_some());
+        assert_eq!(steps.len(), 1, "successful in-place delivery records its replayable command");
+        assert_eq!(steps[0].command, "layer.addUrl");
+        assert_eq!(steps[0].params["url"], p["url"]);
+        assert!(steps[0].params.get("id").is_none(), "opaque completion ids are not replay parameters");
+        assert!(steps[0].params.get("request").is_none(), "request receipts are not replay parameters");
+        plugins::unload("ui-policy-probe");
+    }
+
     /// A GeoTIFF asked for as a scan keeps only its pixels: the app downloads it whole, once,
     /// without first reading its header to see whether it could be read in place.
     #[test]
@@ -621,5 +693,520 @@ mod tests {
         assert!(h.state().ui.cog_probes.is_empty());
         assert_eq!(asked.load(Ordering::Relaxed), 1, "one download, no probe first");
         plugins::unload("ui-scan");
+    }
+
+    /// A download that lands after its plugin command stopped waiting for it isn't added, and
+    /// that is said once, with its address, whether or not that holds a key (#1202).
+    #[test]
+    fn a_late_download_is_refused_in_one_notice() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::isolate_account_test("pluginpanel::tests::a_late_download_is_refused_in_one_notice") {
+            return;
+        }
+        use rustgis_engine::plugins;
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-late-said", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        for first in ["https://x.org/first.csv", "https://x.org/first.csv?token=hunter2"] {
+            let mut app = RustGisApp::with_sample();
+            app.run("plugin:ui-late-said/f", json!({"op": "layer.addUrl", "params": {"url": first}})).unwrap();
+            // The app takes it and starts downloading; the command is run again for another
+            // address, so nothing waits for the first now.
+            let taken = app.session.take_url_requests();
+            assert_eq!(taken.len(), 1);
+            let id = app.session.download_started_for(&taken[0]).unwrap();
+            app.run("plugin:ui-late-said/f", json!({"op": "layer.addUrl", "params": {"url": "https://x.org/second.csv"}})).unwrap();
+            let mark = app.session.notice_mark();
+            let layers = app.session.map().layers.len();
+            let landed = crate::serviceui::Landed { id, url: first.to_string(), params: taken[0].params().clone(), origin: None };
+            app.add_landed(landed, b"name,lon,lat\nA,10,50\n".to_vec());
+            assert_eq!(app.session.map().layers.len(), layers, "not added");
+            let said: Vec<String> = app.session.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(said[0].starts_with("https://x.org/first.csv") && said[0].contains("stopped waiting"), "{said:?}");
+            assert!(!said[0].contains("hunter2"), "{said:?}");
+        }
+        plugins::unload("ui-late-said");
+    }
+
+    /// A download that fails answers the command waiting for it at once, not when the wait runs
+    /// out, from what the app keeps of the request: a file read whole, and a service's page (#1202).
+    #[test]
+    fn a_failed_download_answers_the_command_waiting_at_once() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::isolate_account_test("pluginpanel::tests::a_failed_download_answers_the_command_waiting_at_once") {
+            return;
+        }
+        use rustgis_engine::plugins;
+        use rustgis_engine::render::rustgis_tiles::cache;
+        let _turn = crate::fetching::turn();
+        cache::set_fetcher(|_, done| done(Err("404 Not Found".into())));
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-fail", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        for params in [json!({"url": "https://x.org/a.csv"}), json!({"url": "https://x.org/collections/a/items", "service": true})] {
+            let mut app = RustGisApp::with_sample();
+            app.run("plugin:ui-fail/f", json!({"op": "layer.addUrl", "params": params})).unwrap();
+            let taken = app.session.take_url_requests();
+            assert_eq!(taken.len(), 1);
+            app.add_url(taken[0].params(), Some(&taken[0]), None).unwrap();
+            let ctx = egui::Context::default();
+            let mut ran = Vec::new();
+            for _ in 0..400 {
+                app.poll_data_downloads();
+                crate::serviceui::poll_pages(&mut app, &ctx);
+                ran = app.session.poll_plugin_retries();
+                if !ran.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(ran.len(), 1, "{params}: {ran:?}");
+            assert!(ran[0].1.as_ref().is_err_and(|e| e.contains("404")), "{params}: {ran:?}");
+            assert!(!app.session.plugin_retries_waiting(), "{params}");
+        }
+        plugins::unload("ui-fail");
+    }
+
+    /// What a server was asked and hasn't answered yet.
+    type Held = std::sync::Arc<std::sync::Mutex<Vec<(String, rustgis_engine::render::rustgis_tiles::cache::Done)>>>;
+
+    /// A service that answers only when told to ([`answer_held`]): what the window does meanwhile
+    /// can't be waiting for it. A test with no turn may start a download meanwhile: that one isn't
+    /// counted as asked here, and is answered at once, as a fetcher must.
+    fn hold_requests() -> Held {
+        let held = Held::default();
+        let keep = held.clone();
+        rustgis_engine::render::rustgis_tiles::cache::set_fetcher(move |url, done| {
+            if url.contains(".example.") {
+                keep.lock().unwrap().push((url, done));
+            } else {
+                done(Err("not this test's service".into()));
+            }
+        });
+        held
+    }
+
+    /// Answers what was asked by `answer`, and says what that was.
+    fn answer_held(held: &Held, answer: &dyn Fn(&str) -> Result<Vec<u8>, String>) -> Vec<String> {
+        let asked: Vec<_> = held.lock().unwrap().drain(..).collect();
+        asked
+            .into_iter()
+            .map(|(url, done)| {
+                done(answer(&url));
+                url
+            })
+            .collect()
+    }
+
+    /// What the frame loop does for a waiting command: starts what it asked for, adds what came
+    /// in, and runs it again when it can.
+    fn frame(app: &mut RustGisApp) -> Vec<(String, Result<Value, String>)> {
+        for request in app.session.take_url_requests() {
+            let _ = app.add_url(request.params(), Some(&request), None);
+        }
+        app.poll_data_downloads();
+        crate::serviceui::poll_pages(app, &egui::Context::default());
+        app.session.poll_plugin_retries()
+    }
+
+    /// Frames until the command stops waiting: every address asked for, in order, and how it ended.
+    fn run_out(
+        app: &mut RustGisApp,
+        held: &Held,
+        answer: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+    ) -> (Vec<String>, Result<Value, String>) {
+        let mut asked = Vec::new();
+        let mut end = Err("it never ran again".to_string());
+        for _ in 0..50 {
+            asked.extend(answer_held(held, answer));
+            if let Some((_, r)) = frame(app).pop() {
+                end = r;
+            }
+            if !app.session.plugin_retries_waiting() && held.lock().unwrap().is_empty() {
+                return (asked, end);
+            }
+        }
+        panic!("it still waits: {asked:?} {end:?}");
+    }
+
+    const WFS: &str = r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="https://wfs.example.org/wfs?"/></HTTP></DCP></Operation></OperationsMetadata>
+<FeatureTypeList><FeatureType><Name>solos</Name><Title>Solos</Title><DefaultCRS>urn:ogc:def:crs:OGC:1.3:CRS84</DefaultCRS><WGS84BoundingBox><LowerCorner>-74 -34</LowerCorner><UpperCorner>-34 6</UpperCorner></WGS84BoundingBox></FeatureType></FeatureTypeList></WFS_Capabilities>"#;
+    const FEATURES: &str = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[-43,-5]},"properties":{"n":1}}]}"#;
+
+    /// The WFS above: its capabilities, how many features it has, and its features.
+    fn wfs(url: &str) -> Result<Vec<u8>, String> {
+        Ok(if url.contains("GetCapabilities") {
+            WFS
+        } else if url.contains("RESULTTYPE=hits") {
+            r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" numberMatched="1" numberReturned="0"/>"#
+        } else {
+            FEATURES
+        }
+        .as_bytes()
+        .to_vec())
+    }
+
+    fn solos(bbox: Value) -> Value {
+        json!({"op": "service.add", "params": {"url": "https://wfs.example.org/wfs", "type": "wfs", "layer": "solos", "name": "Solos", "bbox": bbox}})
+    }
+
+    /// The requests for a layer's features among `asked`, leaving out asking how many there are.
+    fn feature_requests(asked: &[String]) -> Vec<&String> {
+        asked.iter().filter(|u| u.contains("GetFeature") && !u.contains("RESULTTYPE=hits")).collect()
+    }
+
+    /// Whether `r` answers the area `e`, as near as it is written.
+    fn area_is(r: &Value, e: [f64; 4]) -> bool {
+        r["area"].as_array().is_some_and(|a| a.len() == 4 && a.iter().zip(e).all(|(v, x)| v.as_f64().is_some_and(|v| (v - x).abs() < 1e-3)))
+    }
+
+    fn whole_layer_notices(app: &RustGisApp, mark: u64) -> usize {
+        app.session.notices_since(mark).iter().filter(|n| n.text.contains("so the whole layer is asked for")).count()
+    }
+
+    /// A plugin's `service.add` waits for nothing on the frame (#1319): its command answers with
+    /// the server still silent, the window says it is running, and the command runs again for each
+    /// thing that comes in, going on with the layer. An area its request carries is said nowhere.
+    #[test]
+    fn a_plugins_service_add_reads_off_the_frame() {
+        use rustgis_engine::plugins;
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-wfs", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        // An error from before doesn't hide that it has started.
+        app.session.notify("an old error".to_string(), true);
+        let mark = app.session.notice_mark();
+        let layers = app.session.map().layers.len();
+        let r = app.run("plugin:ui-wfs/f", solos(json!([-44, -6, -42, -4]))).unwrap();
+        // Nothing has answered, and the command has.
+        assert_eq!(r["pending"], true, "{r}");
+        assert!(r["downloading"][0].as_str().unwrap().contains("GetCapabilities"), "{r}");
+        assert!(frame(&mut app).is_empty());
+        assert!(frame(&mut app).is_empty(), "it waits, frame after frame");
+        assert_eq!(held.lock().unwrap().len(), 1, "one request, for the capabilities");
+        assert_eq!(app.session.map().layers.len(), layers);
+        assert!(crate::pluginstart::running(&app).is_some_and(|t| t.contains("Running")));
+        // An error said meanwhile isn't hidden by it.
+        app.session.notify("something else went wrong".to_string(), true);
+        assert_eq!(crate::pluginstart::running(&app), None);
+        app.session.notify("back to normal".to_string(), false);
+        // The capabilities in, it asks for the features, off the frame too.
+        assert_eq!(answer_held(&held, &wfs).len(), 1);
+        let again = frame(&mut app);
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!(again[0].1.as_ref().unwrap()["pending"], true, "{again:?}");
+        assert!(frame(&mut app).is_empty());
+        assert_eq!(held.lock().unwrap().len(), 1, "one request, for the features");
+        assert_eq!(app.session.map().layers.len(), layers, "not added before it comes");
+        let (asked, end) = run_out(&mut app, &held, &wfs);
+        let r = end.unwrap();
+        let features = feature_requests(&asked);
+        assert!(features.len() == 1 && features[0].contains("BBOX=-44,-6,-42,-4"), "{asked:?}");
+        // It goes on with the layer as if `service.add` had waited: added once, known by its address.
+        let added = app.session.map().layer_by_name("Solos").unwrap();
+        assert_eq!(r["layer"], json!(added.id), "{r}");
+        assert_eq!(r["area"], json!([-44.0, -6.0, -42.0, -4.0]), "{r}");
+        assert!(added.dataset.source.as_deref().is_some_and(|s| s.contains("GetFeature")));
+        assert_eq!(app.session.map().layers.len(), layers + 1);
+        assert_eq!(whole_layer_notices(&app, mark), 0, "{:?}", app.session.notices_since(mark));
+        assert_eq!(crate::pluginstart::running(&app), None);
+        // Its capabilities given by the command: only its features are asked for.
+        let mut given = solos(json!([-44, -6, -42, -4]));
+        given["params"]["text"] = json!(WFS);
+        given["params"]["name"] = json!("Given");
+        let r = app.run("plugin:ui-wfs/f", given).unwrap();
+        assert_eq!(r["pending"], true, "{r}");
+        let (asked, end) = run_out(&mut app, &held, &wfs);
+        assert!(asked.iter().all(|u| !u.contains("GetCapabilities")) && feature_requests(&asked).len() == 1, "{asked:?}");
+        assert!(end.is_ok() && app.session.map().layer_by_name("Given").is_some(), "{end:?}");
+        plugins::unload("ui-wfs");
+    }
+
+    /// An area its request can't carry is said once, not once for each time the command runs.
+    #[test]
+    fn a_whole_layer_asked_for_is_said_once_by_a_command_run_again() {
+        use rustgis_engine::plugins;
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-whole", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        let mark = app.session.notice_mark();
+        app.run("plugin:ui-whole/f", solos(json!([170, -6, -170, -4]))).unwrap();
+        let (asked, end) = run_out(&mut app, &held, &wfs);
+        let r = end.unwrap();
+        let features = feature_requests(&asked);
+        assert!(features.len() == 1 && !features[0].contains("BBOX"), "{asked:?}");
+        assert!(r.get("area").is_none() && r["layer"].is_u64(), "{r}");
+        assert_eq!(whole_layer_notices(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+        plugins::unload("ui-whole");
+    }
+
+    /// A service that fails answers the command at once, and that is said once: its capabilities,
+    /// and its features after them.
+    #[test]
+    fn a_service_that_fails_answers_a_plugins_service_add() {
+        use rustgis_engine::plugins;
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-down", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        // Its features failing is said by the download, with the address, then by the command.
+        let down: [(&dyn Fn(&str) -> Result<Vec<u8>, String>, usize); 2] = [
+            (&|_| Err("502 Bad Gateway".to_string()), 1),
+            (&|url| if url.contains("GetCapabilities") { wfs(url) } else { Err("502 Bad Gateway".to_string()) }, 2),
+        ];
+        for (answer, said) in down {
+            let mut app = RustGisApp::with_sample();
+            let mark = app.session.notice_mark();
+            let layers = app.session.map().layers.len();
+            app.run("plugin:ui-down/f", solos(json!([-44, -6, -42, -4]))).unwrap();
+            let (_, end) = run_out(&mut app, &held, answer);
+            let e = end.unwrap_err();
+            assert!(e.contains("502"), "{e}");
+            assert_eq!(app.session.map().layers.len(), layers);
+            let notices = app.session.notices_since(mark);
+            let told = notices.iter().filter(|n| n.error && n.text.contains("502")).count();
+            assert_eq!(told, said, "{notices:?}");
+            assert!(frame(&mut app).is_empty(), "nothing left to run");
+        }
+        plugins::unload("ui-down");
+    }
+
+    /// The window answers while a command waits, so the user may move the map or resize the window:
+    /// the command asking for the view runs again with the one it began with, and asks for no other
+    /// area. The user's view stays, and the layer comes once.
+    #[test]
+    fn a_view_moved_while_a_command_waits_asks_for_no_other_area() {
+        use rustgis_engine::plugins;
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-view", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        let layers = app.session.map().layers.len();
+        app.session.run("map.zoomToExtent", &json!({"extent": [-44, -6, -42, -4]})).unwrap();
+        let began = rustgis_engine::cmd::workspace::view_extent(&app.session);
+        app.run("plugin:ui-view/f", solos(json!("view"))).unwrap();
+        let mut moved = app.session.map().camera;
+        moved.center.x += 1_000_000.0;
+        app.session.map_mut().camera = moved;
+        app.session.view_size = (600.0, 300.0);
+        assert_ne!(rustgis_engine::cmd::workspace::view_extent(&app.session), began);
+        let (asked, end) = run_out(&mut app, &held, &wfs);
+        let r = end.unwrap();
+        let features = feature_requests(&asked);
+        assert!(features.len() == 1 && features[0].contains("BBOX"), "{asked:?}");
+        assert!(r["layer"].is_u64(), "{r}");
+        assert!(area_is(&r, [began.min_x, began.min_y, began.max_x, began.max_y]), "{r} {began:?}");
+        assert_eq!(app.session.map().layers.len(), layers + 1);
+        assert_eq!(app.session.map().camera, moved, "the user's view stays");
+        assert_eq!(app.session.view_size, (600.0, 300.0));
+        plugins::unload("ui-view");
+    }
+
+    /// Another map shown while a command waits: its run belongs to the map it began on, so it
+    /// isn't run again (#1461). It stops with that error, said once, asks for no features and adds
+    /// nothing, and the map shown keeps its view.
+    #[test]
+    fn another_map_shown_while_a_command_waits_stops_it() {
+        use rustgis_engine::plugins;
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-other-map", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        app.session.run("map.zoomToExtent", &json!({"extent": [-44, -6, -42, -4]})).unwrap();
+        app.run("plugin:ui-other-map/f", solos(json!("view"))).unwrap();
+        app.session.run("map.new", &json!({"name": "Second"})).unwrap();
+        app.session.run("map.activate", &json!({"name": "Second"})).unwrap();
+        let mut second = app.session.map().camera;
+        second.center.x += 1_000_000.0;
+        app.session.map_mut().camera = second;
+        let mark = app.session.notice_mark();
+        let (asked, end) = run_out(&mut app, &held, &wfs);
+        let e = end.unwrap_err();
+        assert!(e.contains("another map"), "{e}");
+        let said = app.session.notices_since(mark).iter().filter(|n| n.error && n.text.contains("another map")).count();
+        assert_eq!(said, 1);
+        assert!(feature_requests(&asked).is_empty(), "{asked:?}");
+        assert!(app.session.project.maps.iter().all(|m| m.layer_by_name("Solos").is_none()));
+        assert_eq!(app.session.map().camera, second, "that map's view stays");
+        assert!(!app.session.plugin_retries_waiting());
+        plugins::unload("ui-other-map");
+    }
+
+    /// A box given moves the view when the layer is in, whatever the user did meanwhile: what the
+    /// command itself does to the view stands.
+    #[test]
+    fn a_box_given_frames_the_layer_once_it_is_in() {
+        use rustgis_engine::plugins;
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-box", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        app.run("plugin:ui-box/f", solos(json!([-44, -6, -42, -4]))).unwrap();
+        let mut moved = app.session.map().camera;
+        moved.center.x += 1_000_000.0;
+        app.session.map_mut().camera = moved;
+        let (_, end) = run_out(&mut app, &held, &wfs);
+        end.unwrap();
+        assert_ne!(app.session.map().camera, moved);
+        let center = app.session.map().camera.center_lonlat();
+        assert!((center.x + 43.0).abs() < 0.01 && (center.y + 5.0).abs() < 0.01, "{center:?}");
+        plugins::unload("ui-box");
+    }
+
+    /// A map layer needs only its service's documents: its capabilities, and an OGC API layer's
+    /// tilesets, all off the frame; what it answers once they are in adds it.
+    #[test]
+    fn a_map_layer_of_a_plugins_service_add_needs_only_its_documents() {
+        use rustgis_engine::plugins;
+        const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><CRS>EPSG:3857</CRS><Layer><Name>roads</Name><Title>Roads</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+        const API: &str = r#"{"collections": [{"id": "relief", "links": [{"rel": "tilesets-map", "href": "https://maps.example.com/relief/map/tiles"}]}]}"#;
+        const TILESETS: &str = r#"{"tilesets": [{"tileMatrixSetId": "WebMercatorQuad", "links": [{"rel": "self", "href": "https://maps.example.com/relief/map/tiles/smerc"}]}]}"#;
+        const TILESET: &str = r#"{"links": [{"rel": "item", "type": "image/png", "href": "https://maps.example.com/relief/{tileMatrix}/{tileRow}/{tileCol}.png"}]}"#;
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-map", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        let wms = json!({"op": "service.add", "params": {"url": "https://maps.example.com/wms", "type": "wms", "layer": "roads"}});
+        assert_eq!(app.run("plugin:ui-map/f", wms).unwrap()["pending"], true);
+        assert!(app.session.map().tiles.iter().all(|t| t.name != "Roads"));
+        let (asked, end) = run_out(&mut app, &held, &|_| Ok(WMS.as_bytes().to_vec()));
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(end.is_ok() && app.session.map().tiles.iter().any(|t| t.name == "Roads"), "{end:?}");
+        // An OGC API layer: its collections, the tileset list, then the tileset with its template.
+        let api = json!({"op": "service.add", "params": {"url": "https://maps.example.com/collections", "type": "ogcapi", "layer": "relief (map tiles)"}});
+        assert_eq!(app.run("plugin:ui-map/f", api).unwrap()["pending"], true);
+        let (asked, end) = run_out(&mut app, &held, &|url| {
+            Ok(if url.contains("smerc") {
+                TILESET
+            } else if url.contains("/relief/") {
+                TILESETS
+            } else {
+                API
+            }
+            .as_bytes()
+            .to_vec())
+        });
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert!(end.is_ok(), "{end:?}");
+        assert!(app.session.map().tiles.iter().any(|t| t.url == "https://maps.example.com/relief/{z}/{y}/{x}.png"));
+        let standard = |app: &RustGisApp, mark| {
+            app.session.notices_since(mark).iter().filter(|n| n.text.contains("the standard tile address is used")).count()
+        };
+        assert_eq!(standard(&app, 0), 0, "the tiles it names are used");
+        // Its tile sets not read: the standard address, and that is said, once.
+        let mark = app.session.notice_mark();
+        let api = json!({"op": "service.add", "params": {"url": "https://maps.example.com/collections", "type": "ogcapi", "layer": "relief (map tiles)", "name": "Standard"}});
+        assert_eq!(app.run("plugin:ui-map/f", api).unwrap()["pending"], true);
+        let (_, end) = run_out(&mut app, &held, &|url| {
+            if url.contains("/relief/") { Err("502 Bad Gateway".to_string()) } else { Ok(API.as_bytes().to_vec()) }
+        });
+        assert!(end.is_ok(), "{end:?}");
+        assert_eq!(standard(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+        plugins::unload("ui-map");
+    }
+
+    /// A coverage: its capabilities and description off the frame, then downloaded and added as
+    /// Add From Service does, and the command goes on with it; the service's error is its answer.
+    #[test]
+    fn a_coverage_of_a_plugins_service_add_reads_off_the_frame() {
+        use rustgis_engine::data::raster as r;
+        use rustgis_engine::plugins;
+        const WCS: &str = r#"<wcs:Capabilities version="2.0.1" xmlns:wcs="http://www.opengis.net/wcs/2.0" xmlns:ows="http://www.opengis.net/ows/2.0">
+<ows:ServiceIdentification><ows:Title>Soils</ows:Title></ows:ServiceIdentification>
+<wcs:Contents><wcs:CoverageSummary><wcs:CoverageId>soc</wcs:CoverageId><ows:Title>Soil carbon</ows:Title>
+<ows:WGS84BoundingBox><ows:LowerCorner>5 49.2</ows:LowerCorner><ows:UpperCorner>5.8 50</ows:UpperCorner></ows:WGS84BoundingBox>
+</wcs:CoverageSummary></wcs:Contents></wcs:Capabilities>"#;
+        const DESCRIBE: &str = r#"<CoverageDescriptions><CoverageDescription><Envelope srsName="http://www.opengis.net/def/crs/EPSG/0/4326" axisLabels="Lat Long">
+<lowerCorner>49.2 5</lowerCorner><upperCorner>50 5.8</upperCorner></Envelope></CoverageDescription></CoverageDescriptions>"#;
+        let raster = r::Raster::new(
+            "soc",
+            8,
+            8,
+            vec![vec![3.0; 64]],
+            r::GeoTransform { origin_x: 5.0, origin_y: 50.0, pixel_width: 0.1, pixel_height: -0.1 },
+            r::Crs::LonLat,
+            None,
+            r::ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        let tif = r::geotiff::write(&raster, 0).unwrap();
+        let _turn = crate::fetching::turn();
+        let held = hold_requests();
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-wcs", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        let add = |name: &str| json!({"op": "service.add", "params": {"url": "https://wcs.example.org/wcs", "type": "wcs", "layer": "soc", "name": name, "bbox": [5, 49.2, 5.4, 50]}});
+        assert_eq!(app.run("plugin:ui-wcs/f", add("Carbon")).unwrap()["pending"], true);
+        let doc = |url: &str| {
+            (if url.contains("GetCapabilities") {
+                Some(WCS)
+            } else if url.contains("DescribeCoverage") {
+                Some(DESCRIBE)
+            } else {
+                None
+            })
+            .map(str::as_bytes)
+            .map(<[u8]>::to_vec)
+        };
+        let (asked, end) = run_out(&mut app, &held, &|url| Ok(doc(url).unwrap_or_else(|| tif.clone())));
+        let r = end.unwrap();
+        assert!(asked.len() == 3 && asked[2].contains("GetCoverage"), "{asked:?}");
+        let added = app.session.map().layer_by_name("Carbon").unwrap();
+        assert!(added.is_raster() && r["layer"] == json!(added.id), "{r}");
+        assert!(added.dataset.source.as_deref().is_some_and(|s| s.contains("GetCoverage")));
+        // An address ending in .tif is a coverage too: downloaded whole, as a raster.
+        let tif_address = json!({"op": "service.add", "params": {"url": "https://wcs.example.org/soc.tif", "type": "wcs", "layer": "soc", "name": "Named", "bbox": [5, 49.2, 5.8, 50]}});
+        assert_eq!(app.run("plugin:ui-wcs/f", tif_address).unwrap()["pending"], true);
+        let (asked, end) = run_out(&mut app, &held, &|url| Ok(doc(url).unwrap_or_else(|| tif.clone())));
+        let r = end.unwrap();
+        assert_eq!(asked.len(), 3, "the coverage asked for once, not probed: {asked:?}");
+        assert!(app.session.map().layer_by_name("Named").is_some_and(|l| l.is_raster() && r["layer"] == json!(l.id)), "{r}");
+        // The service answers with its own error, not a GeoTIFF.
+        assert_eq!(app.run("plugin:ui-wcs/f", add("Refused")).unwrap()["pending"], true);
+        let (_, end) =
+            run_out(
+                &mut app,
+                &held,
+                &|url| Ok(doc(url).unwrap_or_else(|| b"<ServiceExceptionReport>no</ServiceExceptionReport>".to_vec())),
+            );
+        assert!(end.is_err() && app.session.map().layer_by_name("Refused").is_none(), "{end:?}");
+        plugins::unload("ui-wcs");
+    }
+
+    /// A service's page that fails is what the plugin command that asked for it is answered, when
+    /// it fails, not the wait running out (#1202).
+    #[test]
+    fn a_failed_service_read_answers_the_command_waiting() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::isolate_account_test("pluginpanel::tests::a_failed_service_read_answers_the_command_waiting") {
+            return;
+        }
+        use rustgis_engine::plugins;
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-pages", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut app = RustGisApp::with_sample();
+        let url = "https://x.org/collections/a/items";
+        app.run("plugin:ui-pages/f", json!({"op": "layer.addUrl", "params": {"url": url, "service": true}})).unwrap();
+        let taken = app.session.take_url_requests();
+        assert_eq!(taken.len(), 1);
+        let id = app.session.download_started_for(&taken[0]).unwrap();
+        let landed = crate::serviceui::Landed { id, url: url.to_string(), params: taken[0].params().clone(), origin: None };
+        crate::serviceui::go_on(&mut app, landed, 0, rustgis_engine::data::ogc::Step::Failed("its second page failed".into()));
+        let ran = app.session.poll_plugin_retries();
+        assert_eq!(ran.len(), 1, "{ran:?}");
+        assert!(ran[0].1.as_ref().is_err_and(|e| e.contains("its second page failed")), "{ran:?}");
+        assert!(!app.session.plugin_retries_waiting());
+        plugins::unload("ui-pages");
     }
 }

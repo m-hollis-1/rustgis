@@ -3,8 +3,9 @@
 //! an interval counts from the line's start and its middle is the whole line's however much of it
 //! shows; only the marks near the image are drawn.
 
+use crate::Canvas;
 use rustgis_map::{LineMark, LineMarkers, Marker, Placements, Rgba};
-use tiny_skia::{FillRule, LineCap, Path, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{FillRule, LineCap, Path, PathBuilder, Stroke, Transform};
 
 use crate::{marker_path, marker_reach, paint};
 
@@ -208,7 +209,7 @@ fn places(run: &Run, m: &LineMarkers, ppp: f64, near: Window, room: usize) -> Ve
 
 /// Draws a stroke's marks (`m`) along each of `runs`: in `color`, `width` their outline's or a hash
 /// mark's line's, `offset` points to the right of the line. `ppp` is pixels per point.
-pub(crate) fn draw(pm: &mut Pixmap, runs: &[Run], m: &LineMarkers, color: Rgba, width: f32, offset: f32, ppp: f32) {
+pub(crate) fn draw(pm: &mut Canvas, runs: &[Run], m: &LineMarkers, color: Rgba, width: f32, offset: f32, ppp: f32) {
     let outline = m.outline.filter(|c| c.a() > 0 && width > 0.0);
     let hash = matches!(m.mark, LineMark::Hash);
     let size = m.size.max(0.0) * ppp;
@@ -343,6 +344,7 @@ mod tests {
 mod drawn_tests {
     use super::*;
     use rustgis_map::{PathPart, PathRef, PathShape};
+    use tiny_skia::Pixmap;
 
     #[test]
     fn a_drawn_marker_along_a_line_keeps_its_parts_and_colours() {
@@ -364,7 +366,9 @@ mod drawn_tests {
         let mut pm = Pixmap::new(100, 80).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
         // No stroke colour: the parts' own colours still draw.
-        draw(&mut pm, &[Run::new([(10.0, 40.0), (70.0, 40.0)]).unwrap()], &m, Rgba::new(0, 0, 0, 0), 0.0, 0.0, 1.0);
+        crate::canvas::with_canvas(&mut pm, |c| {
+            draw(c, &[Run::new([(10.0, 40.0), (70.0, 40.0)]).unwrap()], &m, Rgba::new(0, 0, 0, 0), 0.0, 0.0, 1.0)
+        });
         let red = |x, y| {
             let p = pm.pixel(x, y).unwrap();
             (p.red(), p.green(), p.blue()) == (255, 0, 0)

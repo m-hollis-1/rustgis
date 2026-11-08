@@ -47,9 +47,19 @@ The browser app doesn't ask yet; it warns before you leave a page with unsaved c
 default), RustGIS keeps your changes as a [recovery copy](#autosave-and-recovery) and offers them
 back the next time it starts; with autosave off, they are lost, so save before you quit.
 
-Saved layer addresses omit passwords, access keys, tokens and signatures. The open session
-keeps them, but after restarting RustGIS a protected source may need you to sign in to its
-connection again or add it again with credentials.
+Saving removes recognized credentials from supported layer and video addresses and from
+recognized task, model, notebook and history parameters. Notices count detected removals and
+content that could not be checked. Unrecognized credentials can remain in addresses without a
+notice. Diagnostic logging uses a broader sensitive-name list: a parameter named `auth` or
+`jwt` may be hidden in a diagnostic message while remaining in a saved address. Inspect
+shared addresses when a service uses names outside the recognized saved-credential rules.
+The open session keeps its credentials, but a saved workflow or protected source may
+need them again when reopened. User notes, feature data and opaque content are preserved.
+Review addresses and preserved content before sharing a file; see
+[Sharing projects and generated items](https://github.com/opengeos/RustGIS/blob/main/SECURITY.md#sharing-projects-and-generated-items)
+for the supported scope.
+A cloud-optimised GeoTIFF's look in its address (`#bands=…`, `#range=…`, `#dequantize=aef`, a data
+cube's fixed range too) is saved; any other `#` part isn't.
 
 ### Autosave and recovery
 
@@ -57,7 +67,7 @@ The desktop app keeps a recovery copy of unsaved work. While the project has cha
 saved, it writes a copy every few minutes (5 by default), and only when something changed since
 the last one. Choose how often, or turn it off, in **Settings › Autosave**
 (`ui.autosave={"minutes": 10}`; `0` is off). The copy is written in the background, so a large
-project doesn't hold up the app. It leaves out layer passwords, keys and tokens, as a saved project
+project doesn't hold up the app. It removes recognized layer credentials, as a saved project
 does. It is kept in the `recovery` folder of the app's
 [data folder](../installation.md#settings-data-and-cache-folders), not beside your project.
 Saving, opening or starting another project, and choosing **Don't Save** when you quit remove it.
@@ -93,6 +103,16 @@ whether it worked. It is an audit trail of the session, for reviewing work or re
 run; it runs nothing again (History's Copy as code and recorded tasks do that). Every
 front end goes into it alike: the app, scripts, the AI Assistant, the command line, Python and MCP.
 
+In the app, the **History** pane has two views: **Tool runs**, the tools run on the project (saved
+with it, and each can run again), and **Session log**, which shows the log newest first: each
+command with whether it worked, when it started (UTC), how long it took, its error and its
+parameters (on one line; all of them on hover, and a right-click copies them). It lists the newest
+200 that match and says how many there are; type part of a command's id (`layer.`, `export`) to
+filter, or tick **Failed only**. **Save Log As…** writes the whole log as CSV or JSON Lines, as
+the name's extension says (CSV without one; in the browser it is downloaded as CSV, and the
+download isn't itself an entry in the log, as a saved file is). **Clear Log** empties it and
+**Log Commands** turns it off or on.
+
 - **What goes in:** each command that changes the project, and each that names a file, folder,
   address or connection, reads included (an export, a download, a save, opening a file), plus
   undo and redo, with the step they took back or brought back. Reading and looking around within
@@ -118,7 +138,8 @@ front end goes into it alike: the app, scripts, the AI Assistant, the command li
   as plain words, with no name or address form (a password typed into a note), isn't recognised:
   look at an exported log before sharing it. Each entry's parameters are clipped to about 4 KB of
   JSON (a long text is cut, a list keeps its first 100 items), its error to 500 characters and a
-  `…`, and the log keeps its last 10,000 entries, the oldest dropped first. Plugins' commands take
+  `…`, and the log keeps its last 10,000 entries, the oldest dropped first (the pane and an
+  export say how many were dropped, and which: the oldest, or older plugin entries). Plugins' commands take
   at most 1,000 of those places: past that, a plugin's new entry pushes out an older plugin entry,
   not one of the user's.
 
@@ -187,7 +208,12 @@ file sources cannot be resolved and are listed in the import notes.
 Each layer keeps its look:
 
 - **Renderers**: single symbol, categorized (as Unique Values, a category's merged values each a
-  class, its "all other values" category the rest), graduated (as Graduated Colors), and
+  class, its "all other values" category the rest; by a field, or by an expression as Unique
+  Values by that [expression](cartography.md), its boolean categories matching true and false;
+  one that can't be read on the layer draws every feature with the first category's symbol
+  that's switched on, or nothing when no category is, noted),
+  graduated (as Graduated Colors, by a field: ranges by an expression are noted and drawn with
+  the first range's symbol), and
   rule-based: as Unique Values on a field where every rule picks values of that field at every
   scale (an else rule the rest), else as Unique Values by an
   [expression](cartography.md) that gives each feature the first rule it meets, each rule a class
@@ -561,8 +587,8 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
       **Delete**. A recorded tool's step is named after the tool.
     - In the Browser pane, a click on a task opens its steps; **Run All Steps** is in its context
       menu.
-    - A task from a file (`.rgistask`, or inside a project or a package) can't read or write files
-      or run scripts. Its built-in analysis tools may still name their output layers with a plain
+    - A task from a file (`.rgistask`, or inside a project or a package) can't read or write files,
+      use the network, run other software or perform actions reserved to the user. Its built-in analysis tools may still name their output layers with a plain
       name: one with `/`, `\`, `.` or `:` (a folder, an extension or a drive) makes the task count
       as writing files, so write `Buffer 1500 m` rather than `Buffer 1.5 km`. GeoLibre and plugin
       tools' outputs are refused.
@@ -622,8 +648,12 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
 - **Plugins**: **Plugins › Plugin Manager** installs, updates and removes [plugins](../plugins.md)
   from the registry at [plugins.rustgis.app](https://plugins.rustgis.app) or from a file.
 - **Language**: **Settings › Language** switches the interface among
-  [19 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
+  [20 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
   borders.
+- **Theme**: **Settings › Theme** picks the interface colours, spacing and text sizes, from the
+  built-in Light and Dark themes, a theme [file](../themes.md) in the desktop app’s themes folder, or
+  **Follow the System** where the platform reports its own theme. **Interface Scale** beside it
+  sets the whole interface from 80% to 200%.
 - **Autosave**: **Settings › Autosave** sets how often the desktop app keeps a
   [recovery copy](#autosave-and-recovery) of unsaved work, or turns it off.
 - **Start-up**: **Settings › Start-up** sets what RustGIS opens with: **Start With** the World Atlas

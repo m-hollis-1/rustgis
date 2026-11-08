@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::Canvas;
 use base64::Engine;
 use rustgis_data::{Dataset, Value};
 use rustgis_map::ImageRef;
@@ -112,7 +113,7 @@ fn small(pm: Pixmap) -> Pixmap {
 }
 
 /// Draws row `row`'s picture into the pixel rectangle (x0, y0)–(x1, y1).
-pub fn draw(pm: &mut Pixmap, ds: &Dataset, row: usize, (x0, y0, x1, y1): (f32, f32, f32, f32), opacity: f32) {
+pub fn draw(pm: &mut Canvas, ds: &Dataset, row: usize, (x0, y0, x1, y1): (f32, f32, f32, f32), opacity: f32) {
     let Some(Value::Text(b64)) = ds.field_index("image").map(|fi| ds.value(row, fi)) else { return };
     let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
     if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 || w > 1e5 || h > 1e5 {

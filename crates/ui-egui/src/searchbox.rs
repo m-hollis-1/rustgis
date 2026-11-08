@@ -41,6 +41,8 @@ pub struct State {
     places: Places,
     pending: Option<(Geocoder, Answer)>,
     open: bool,
+    /// The row picked, waiting a pass for the field that had the focus to set its number.
+    held_pick: Option<Row>,
     /// The row the arrow keys are on, and whether the list scrolls to it.
     active: usize,
     scroll: bool,
@@ -228,8 +230,17 @@ fn boxed(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if show_list && let Some(r) = list_area(app, ui, frame_r, &list, t) {
         picked = Some(r);
     }
-    if let Some(r) = picked {
-        pick(app, r);
+    if let Some(r) = picked.or(app.ui.search.held_pick.take()) {
+        // A number being typed elsewhere is set on its own layer before a pick can change the
+        // active one: the field lets go now and the pick waits for the next pass (#1194).
+        match crate::widgets::focused_at_pass_start(ui.ctx()).filter(|field| *field != id) {
+            Some(field) => {
+                ui.memory_mut(|m| m.surrender_focus(field));
+                app.ui.search.held_pick = Some(r);
+                ui.ctx().request_repaint();
+            }
+            None => pick(app, r),
+        }
     }
 }
 
@@ -275,8 +286,13 @@ fn list_area(app: &mut RustGisApp, ui: &Ui, frame_r: Rect, list: &[Row], t: &Tok
                             picked = Some(k);
                         }
                     }
-                    if none {
-                        note(ui, tl!("Nothing found"), t.text_dim);
+                    // A grid reference that names no place says why (the band, the square letters, S
+                    // that may mean south), also while places can still be searched for it.
+                    let grid = st.results.grid_error.filter(|_| st.query == st.searched && st.results.hits.is_empty());
+                    if let Some(e) = grid {
+                        note(ui, &grid_error_text(e), t.text_dim);
+                    } else if none {
+                        note(ui, tl_raw!("Nothing found"), t.text_dim);
                     }
                 });
                 // Places stay in sight under the map's matches: the row that searches them, or
@@ -303,7 +319,7 @@ fn list_area(app: &mut RustGisApp, ui: &Ui, frame_r: Rect, list: &[Row], t: &Tok
                     note(ui, &e, t.red);
                 }
                 if matches!(&st.places, Places::Found(p) if p.is_empty()) {
-                    note(ui, tl!("No place found"), t.text_dim);
+                    note(ui, tl_raw!("No place found"), t.text_dim);
                 }
                 if matches!(st.places, Places::Found(_)) {
                     ui.horizontal(|ui| {
@@ -362,10 +378,32 @@ fn describe(st: &State, row: &Row) -> (String, &'static str, String, Option<Stri
     }
 }
 
+/// Why a query written as a UTM position or an MGRS reference names no place.
+fn grid_error_text(e: rustgis_engine::geom::GridError) -> String {
+    use rustgis_engine::geom::GridError as G;
+    // In logical order: the message is fitted to the list's rows, each put in display order.
+    let reason = match e {
+        G::Syntax => tl_raw!("not a UTM or MGRS grid reference"),
+        G::Zone => tl_raw!("the UTM zone must be 1 to 60"),
+        G::Band => tl_raw!("the latitude band must be a letter from C to X (not I or O)"),
+        G::Polar => tl_raw!("polar (UPS) grid references, north of 84° N or south of 80° S, aren't supported"),
+        G::Square => tl_raw!("the 100 km square letters aren't used in this zone"),
+        G::Digits => tl_raw!("the grid digits must be an even count of 0 to 10, half for the easting and half for the northing"),
+        G::BandMismatch => tl_raw!("the northing doesn't fall in the latitude band given"),
+        G::OutsideZone => tl_raw!("the place lies outside the zone given"),
+        G::Ambiguous => {
+            tl_raw!("S after the zone is latitude band S; for the southern hemisphere write the zone, then south (33 south 412345 3768000)")
+        }
+    };
+    crate::i18n::fmt_raw("No place at this grid reference: {reason}", &[("reason", reason)])
+}
+
+/// `text`, in logical order, wrapped at the list's width: a reason or an error can be longer
+/// than the list is wide, and a right-to-left one keeps its rows in reading order.
 fn note(ui: &mut Ui, text: &str, color: Color32) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        ui.label(egui::RichText::new(text).size(12.0).color(color));
+        crate::i18n::paragraph(ui, text, regular(12.0), color);
     });
 }
 
@@ -380,6 +418,10 @@ fn row_button(ui: &mut Ui, active: bool, icon: &str, label: &str, detail: Option
     let g = ui.painter().layout(label.to_string(), regular(12.5), t.text, w - 44.0);
     let h = g.size().y + if detail.is_some() { 20.0 } else { 8.0 };
     let (r, resp) = ui.allocate_exact_size(vec2(w, h.max(26.0)), Sense::click());
+    // Named for screen readers (and scripted clicks), as the box is: with the line under it, which
+    // tells apart rows of the same text.
+    let name = detail.map_or_else(|| label.to_string(), |d| format!("{label}, {d}"));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
     let p = ui.painter();
     if active || resp.hovered() {
         p.rect_filled(r.shrink2(vec2(4.0, 0.0)), CornerRadius::same(4), if active { t.selection } else { t.hover });
@@ -483,5 +525,169 @@ pub fn paint_marker(p: &egui::Painter, at: egui::Pos2, name: &str, t: &Tokens) {
         p.rect_filled(bg, CornerRadius::same(4), t.ribbon.gamma_multiply(0.92));
         p.rect_stroke(bg, CornerRadius::same(4), Stroke::new(1.0, t.border_strong), egui::StrokeKind::Inside);
         p.galley(bg.min + vec2(5.0, 3.0), g, t.text);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    use super::*;
+
+    /// A row's name carries the line under it, which tells apart rows of the same text.
+    #[test]
+    fn a_row_is_named_with_the_line_under_it() {
+        let h = egui_kittest::Harness::new_ui(|ui| {
+            let t = Tokens::get(ui.ctx());
+            row_button(ui, false, "table", "Bogota", Some("name"), &t);
+            row_button(ui, false, "contents", "Cities", None, &t);
+        });
+        assert!(h.query_by_role_and_label(Role::Button, "Bogota, name").is_some());
+        assert!(h.query_by_role_and_label(Role::Button, "Cities").is_some());
+    }
+
+    /// A grid reference that names no place says why under the box, before places are searched
+    /// and after none are found; a query that isn't one says nothing of grids.
+    #[test]
+    fn a_refused_grid_reference_says_why() {
+        for (query, places, want) in [
+            ("33S 412345 5523456", Places::Idle, Some("write the zone, then south")),
+            ("38TMJ", Places::Found(Vec::new()), Some("doesn't fall in the latitude band")),
+            ("Zzyzx Qq", Places::Found(Vec::new()), None),
+        ] {
+            let mut app = RustGisApp::with_sample();
+            let results = search::search(&app.session, query, search::LIMIT);
+            let st = &mut app.ui.search;
+            st.query = query.into();
+            st.searched = query.into();
+            st.results = results;
+            st.places = places;
+            st.open = true;
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 800.0)).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    show(app, ui, &Tokens::get(&ctx));
+                },
+                app,
+            );
+            h.run();
+            // The list stays up while the box has the focus (as when typing).
+            h.get_by_role(Role::TextInput).focus();
+            h.run();
+            // A label's text is its accessible value.
+            let grid = h
+                .query_all_by(|n| n.role() == Role::Label && n.value().is_some_and(|v| v.starts_with("No place at this grid reference")))
+                .next()
+                .and_then(|n| n.accesskit_node().value());
+            match want {
+                Some(w) => {
+                    let label: String = grid.unwrap_or_else(|| panic!("{query}: no reason shown"));
+                    assert!(label.contains(w), "{query}: {label}");
+                }
+                None => {
+                    assert!(grid.is_none(), "{query}");
+                    assert!(h.query_by_label("Nothing found").is_some(), "{query}");
+                }
+            }
+        }
+    }
+
+    /// A reason in right-to-left text, longer than the list is wide, is broken into rows ahead of
+    /// the toolkit's wrapping, which would put a back-to-front paragraph's rows out of order; the
+    /// first row holds the start of the sentence.
+    #[test]
+    fn a_right_to_left_note_keeps_its_rows_in_reading_order() {
+        use rustgis_engine::render::fonts::{ScriptFont, script_font};
+        let text = "هیچ مکانی در این مرجع شبکه نیست زیرا حرف پس از منطقه کمربند عرض جغرافیایی است";
+        // The Persian face, as the app installs it for Persian: the interface face alone has no
+        // Persian glyphs on macOS (San Francisco) or with the built-in fonts.
+        let Some((bytes, _)) = script_font(ScriptFont::Arabic) else {
+            // On CI a missing face fails, so the check is never skipped there unseen.
+            assert!(std::env::var_os("CI").is_none(), "no installed face draws Persian");
+            eprintln!("skipped: no installed face draws Persian");
+            return;
+        };
+        let extra =
+            vec![("script-arabic".to_string(), std::sync::Arc::new(egui::FontData::from_owned(bytes.clone())), Some(ScriptFont::Arabic))];
+        // The fonts are in from the next frame on.
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(220.0, 300.0)).build_ui(move |ui| {
+            if !fonts {
+                crate::theme::install_fonts(ui.ctx(), &extra, Some(ScriptFont::Arabic));
+                fonts = true;
+                return;
+            }
+            let t = Tokens::get(ui.ctx());
+            note(ui, text, t.text_dim);
+        });
+        h.run();
+        let shown: String = h.query_all_by_role(Role::Label).find_map(|n| n.value()).unwrap();
+        let rows: Vec<&str> = shown.split('\n').collect();
+        assert!(rows.len() > 1, "{shown:?}");
+        assert!(rows[0].contains("هیچ"), "{shown:?}");
+        assert!(!rows[0].contains("است"), "{shown:?}");
+    }
+
+    /// A number typed for one layer, then another layer picked in a list a places search left
+    /// open: the number is set on the layer it was typed for, even when the other had the same
+    /// value (#1194). The field is drawn after the box, as the right pane is.
+    #[test]
+    fn a_number_typed_is_set_on_its_own_layer_when_the_list_picks_another() {
+        let mut app = RustGisApp::with_sample();
+        let width = |app: &RustGisApp, name: &str| {
+            let l = app.session.map().layers.iter().find(|l| l.name == name).unwrap();
+            l.renderer.base_symbol().stroke_width
+        };
+        for name in ["Countries", "Cities"] {
+            app.session.run("layer.select", &json!({"layer": name})).unwrap();
+            app.session.run("layer.outline", &json!({"width": 1.0})).unwrap();
+        }
+        let results = search::search(&app.session, "Countries", search::LIMIT);
+        let st = &mut app.ui.search;
+        st.query = "Countries".into();
+        st.searched = "Countries".into();
+        st.results = results;
+        st.places = Places::Found(Vec::new());
+        st.open = true;
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 800.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                show(app, ui, &Tokens::get(&ctx));
+                if let Some(layer) = app.session.active_layer.and_then(|id| app.session.map().layer(id)).cloned() {
+                    let mut w = layer.renderer.base_symbol().stroke_width;
+                    let label = ui.label("Width");
+                    let r = ui.add(egui::DragValue::new(&mut w).update_while_editing(false)).labelled_by(label.id);
+                    if crate::widgets::changed(&r) {
+                        let _ = app.run("layer.outline", json!({"width": w}));
+                    }
+                }
+            },
+            app,
+        );
+        h.run();
+        h.get_by_role(Role::SpinButton).focus();
+        h.run();
+        h.event(egui::Event::Text("3".into()));
+        h.run();
+        let at = h.get_by_role_and_label(Role::Button, "Countries").rect().center();
+        h.hover_at(at);
+        h.drag_at(at);
+        h.step();
+        h.drop_at(at);
+        h.run();
+        let countries = h.state().session.map().layers.iter().find(|l| l.name == "Countries").map(|l| l.id);
+        assert_eq!(h.state().session.active_layer, countries, "the list picked Countries");
+        assert_eq!(width(h.state(), "Cities"), 3.0);
+        assert_eq!(width(h.state(), "Countries"), 1.0);
     }
 }

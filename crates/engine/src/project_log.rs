@@ -6,6 +6,29 @@ use serde_json::Value;
 
 use crate::{CmdResult, Session};
 
+/// A redacted output projection. Never use it as executable parameters or approval identity.
+pub struct LogCopy(Value);
+
+impl LogCopy {
+    /// Consumes the output-only wrapper for serialization.
+    pub fn into_log_value(self) -> Value {
+        self.0
+    }
+}
+
+/// The session log's bounded, document-aware parameter policy, shared with the agent audit.
+/// The source value is never mutated and remains the only input to execution and planning.
+pub fn log_params(params: &Value) -> LogCopy {
+    LogCopy(kept_params(params))
+}
+
+/// Cleans a structural command/tool identifier for display and audit output only.
+/// The original identifier remains the sole input to lookup, execution and approval.
+pub fn log_identifier(id: &str) -> String {
+    let public = crate::roles::identifier(id, &mut crate::durable::Report::default());
+    crate::durable::generated_text(public.as_deref().unwrap_or(id))
+}
+
 /// Now, in milliseconds since 1970 (UTC).
 pub(crate) fn now_ms() -> u64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -115,10 +138,104 @@ fn kept_error(e: &str) -> String {
 /// `v` without secrets: as History's Copy as code takes them out (`history::redacted`), and,
 /// first, inside the JSON a text holds (a script's command lines: `s3.connect {"secret": …}`),
 /// whose objects are redacted in place.
+/// A bounded review's display projection, without the log's clipping. Never used for
+/// execution, consent equality or provenance; the policy retains its private original.
+pub(crate) fn review_params(v: &Value) -> Result<Value, String> {
+    review_value(v, 0)
+}
+
+/// Projects bounded review data recursively, including JSON held inside nested script strings.
+/// A card that cannot show its structure safely is refused; log/diagnostic clipping is separate.
+fn review_value(v: &Value, depth: usize) -> Result<Value, String> {
+    if depth > 32 {
+        return Err("too deeply nested to show in full; ask for a smaller request".into());
+    }
+    Ok(match v {
+        Value::Object(o) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in o {
+                let sensitive =
+                    rustgis_data::address::normalized_name(key).as_deref() != Some("key") && rustgis_data::address::log_sensitive(key);
+                let Value::String(public_key) = review_value(&Value::String(key.clone()), depth + 1)? else {
+                    return Err("a review field name must be text".into());
+                };
+                let value = if sensitive { Value::String(String::new()) } else { review_value(value, depth + 1)? };
+                if out.insert(public_key, value).is_some() {
+                    return Err("redacted field names cannot be distinguished; simplify the request".into());
+                }
+            }
+            crate::cmd::history::redacted(&Value::Object(out))
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|v| review_value(v, depth + 1)).collect::<Result<_, _>>()?),
+        Value::String(text) => {
+            let mut out = String::new();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(['{', '[']) {
+                let (before, from) = rest.split_at(at);
+                out.push_str(before);
+                let mut values = serde_json::Deserializer::from_str(from).into_iter::<Value>();
+                match values.next() {
+                    Some(Ok(value @ (Value::Object(_) | Value::Array(_)))) => {
+                        let value = review_value(&value, depth + 1)?;
+                        out.push_str(&value.to_string());
+                        rest = from.get(values.byte_offset()..).unwrap_or("");
+                    }
+                    _ if from.get(1..).is_some_and(|r| r.trim_start().starts_with(['"', '\''])) || last_secret_name(from).is_some() => {
+                        return Err("structured text cannot be safely shown in full; simplify the request".into());
+                    }
+                    _ => {
+                        let first = from.chars().next().ok_or("empty structured text")?;
+                        out.push(first);
+                        rest = from.get(first.len_utf8()..).unwrap_or("");
+                    }
+                }
+            }
+            out.push_str(rest);
+            Value::String(crate::cmd::history::redacted_text(&sql_secrets_removed(&out)))
+        }
+        other => other.clone(),
+    })
+}
+
 fn redacted(v: &Value) -> Value {
     crate::cmd::history::redacted(&embedded_redacted(v, 0))
 }
 
+/// A bounded log-only context check for a short key beside nested connection settings.
+/// User data/documents do not make an ordinary join or lookup key a credential.
+pub(crate) fn address_context(key: &str, v: &Value, depth: usize) -> bool {
+    if depth >= 8 || matches!(key, "data" | "text" | "values" | "attributes" | "properties" | "features" | "geometry") {
+        return false;
+    }
+    match v {
+        Value::String(s) => {
+            let s = s.trim_start();
+            [
+                "http://",
+                "https://",
+                "s3://",
+                "rustgis-login:",
+                "rustgis-anonymous:",
+                "rustgis-s3:",
+                "postgres:",
+                "postgresql:",
+                "pg:",
+                "mysql:",
+                "mariadb:",
+                "mssql:",
+                "pmtiles:",
+                "cog:",
+            ]
+            .iter()
+            .any(|prefix| s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+        }
+        Value::Array(values) => values.iter().take(LOG_LIST_ITEMS).any(|v| address_context("", v, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, v)| address_context(key, v, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Scrubs bounded nested log parameters and JSON embedded in text before the log retains them.
 fn embedded_redacted(v: &Value, depth: usize) -> Value {
     match v {
         Value::String(t) => {
@@ -126,7 +243,17 @@ fn embedded_redacted(v: &Value, depth: usize) -> Value {
             Value::String(sql_secrets_removed(&t))
         }
         Value::Array(a) if depth < 8 => Value::Array(a.iter().map(|x| embedded_redacted(x, depth + 1)).collect()),
-        Value::Object(o) if depth < 8 => Value::Object(o.iter().map(|(k, x)| (k.clone(), embedded_redacted(x, depth + 1))).collect()),
+        Value::Object(o) if depth < 8 => Value::Object(
+            o.iter()
+                .map(|(k, x)| {
+                    // Preserve History's plain-key refinement; the log-only fields share diagnostics'
+                    // canonical list. Clipping already bounds recursion and text before this pass.
+                    let sensitive =
+                        rustgis_data::address::normalized_name(k).as_deref() != Some("key") && rustgis_data::address::log_sensitive(k);
+                    (k.clone(), if sensitive { Value::String(String::new()) } else { embedded_redacted(x, depth + 1) })
+                })
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -342,6 +469,14 @@ pub struct LogEntry {
     pub millis: u64,
 }
 
+impl LogEntry {
+    /// When it started, as `2026-10-30 14:05:09` (UTC).
+    pub fn time_utc(&self) -> String {
+        let (date, time) = rustgis_map::graphics::civil(self.at / 1000);
+        format!("{date} {time}:{:02}", (self.at / 1000) % 60)
+    }
+}
+
 /// The session's log (#797): one entry for each command run in the session, from any front end
 /// and in whatever project was open, oldest first. It sits outside the project and its undo
 /// history: undoing a command doesn't take its entry back, and saving, sharing or packaging a
@@ -355,6 +490,14 @@ pub struct SessionLog {
     /// How many of `entries` are plugins' commands', kept in step with them so a push doesn't
     /// count them.
     plugin_entries: usize,
+    /// Counts each change to `entries` (an entry added, the log cleared), so a view of it knows
+    /// when to read it again ([`SessionLog::changes`]).
+    changes: u64,
+    /// How many entries were dropped since the log was last cleared, so a view or a saved file
+    /// can say so ([`SessionLog::dropped_said`]): the oldest, past [`LOG_LIMIT`], and older plugin
+    /// commands' (newer than some of the user's still kept), past [`LOG_PLUGIN_LIMIT`].
+    dropped: u64,
+    dropped_plugin: u64,
 }
 
 impl SessionLog {
@@ -381,15 +524,18 @@ impl SessionLog {
         {
             self.entries.remove(oldest);
             self.plugin_entries = self.plugin_entries.saturating_sub(1);
+            self.dropped_plugin = self.dropped_plugin.saturating_add(1);
         }
         if plugin(&e) {
             self.plugin_entries += 1;
         }
+        self.changes = self.changes.wrapping_add(1);
         self.entries.push_back(e);
         while self.entries.len() > LOG_LIMIT {
             if self.entries.pop_front().is_some_and(|x| plugin(&x)) {
                 self.plugin_entries = self.plugin_entries.saturating_sub(1);
             }
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
@@ -401,6 +547,8 @@ impl SessionLog {
             e.at = last.at;
             e.millis = last.millis.saturating_add(e.millis);
             *last = e;
+            // The newest entry changed: a view of the log reads it again.
+            self.changes = self.changes.wrapping_add(1);
             return;
         }
         self.push(e);
@@ -423,13 +571,80 @@ impl SessionLog {
         self.entries.len()
     }
 
+    /// How many times the entries have changed (one added, the log cleared): the same number
+    /// means the same entries.
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    /// How many entries were dropped past the log's limits since it was last cleared.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.saturating_add(self.dropped_plugin)
+    }
+
+    /// What was dropped past the log's limits since it was last cleared, by kind, as the pane, an
+    /// export and a download say it; `None` when nothing was.
+    pub fn dropped_said(&self) -> Option<String> {
+        let mut said = Vec::new();
+        if self.dropped > 0 {
+            said.push(format!("{} oldest entries were dropped past the log's limit of {LOG_LIMIT}", self.dropped));
+        }
+        if self.dropped_plugin > 0 {
+            said.push(format!(
+                "{} older plugin command entries were dropped past the {LOG_PLUGIN_LIMIT} kept for plugins",
+                self.dropped_plugin
+            ));
+        }
+        (!said.is_empty()).then(|| said.join("; "))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Writes the log to `w`, oldest first: as CSV (`csv`: a header, then one row an entry, a
+    /// readable UTC time first and the parameters as a JSON column) or as JSON Lines (one entry a
+    /// line). Entry by entry, so a long log isn't held as text first.
+    pub fn write(&self, w: &mut dyn std::io::Write, csv: bool) -> std::io::Result<()> {
+        if csv {
+            w.write_all(b"time_utc,at,command,ok,millis,error,params\n")?;
+        }
+        self.entries.iter().try_for_each(|e| write_entry(w, e, csv))
     }
 
     /// Empties the log; how many entries it had.
     pub fn clear(&mut self) -> usize {
         self.plugin_entries = 0;
+        self.dropped = 0;
+        self.dropped_plugin = 0;
+        self.changes = self.changes.wrapping_add(1);
         std::mem::take(&mut self.entries).len()
+    }
+}
+
+/// A CSV cell: quoted, and kept from being read as a formula where it starts as one does (`=`,
+/// `+`, `-`, `@`, or a tab or carriage return before them), as spreadsheets would.
+fn csv_cell(t: &str) -> String {
+    let lead = if t.starts_with(['=', '+', '-', '@', '\t', '\r']) { "'" } else { "" };
+    format!("\"{lead}{}\"", t.replace('"', "\"\""))
+}
+
+/// Entry `e` as a CSV row (`csv`) or a JSON line, written to `w`.
+fn write_entry(w: &mut dyn std::io::Write, e: &LogEntry, csv: bool) -> std::io::Result<()> {
+    if csv {
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{}",
+            e.time_utc(),
+            e.at,
+            csv_cell(&e.command),
+            e.ok,
+            e.millis,
+            csv_cell(e.error.as_deref().unwrap_or("")),
+            csv_cell(&e.params.to_string())
+        )
+    } else {
+        serde_json::to_writer(&mut *w, e).map_err(std::io::Error::other)?;
+        w.write_all(b"\n")
     }
 }

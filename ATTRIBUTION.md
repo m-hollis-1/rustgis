@@ -15,6 +15,7 @@ of use.
 
 | File | Author / source | Licence |
 |---|---|---|
+| Interface themes (`crates/ui-egui/themes/light.json`, `dark.json`) | The RustGIS project | Apache-2.0 |
 | Sample data (`countries`, `countries_chn`, `cities`, `rivers`, `lakes` GeoJSON), embedded at build time from [rustgis-assets](https://github.com/opengeos/rustgis-assets/tree/main/data) | Natural Earth 1:110m, attributes trimmed; `countries_chn` is Natural Earth's China point of view (1:10m, simplified) | Public domain |
 | QGIS screenshot (`qgis-world-atlas.webp` in [rustgis-assets](https://github.com/opengeos/rustgis-assets/tree/main/images)), on the [RustGIS and QGIS](docs/comparison/qgis.md) page | Taken by the RustGIS project: [QGIS](https://qgis.org) 4.2 showing the Natural Earth sample data above | QGIS is GPL-2.0-or-later; the data is public domain |
 | QGIS test corpus (`crates/map/testdata/qgis/generated/`: styles, projects and their sample data) | Dominik Strebel ([@pick2510](https://github.com/pick2510)) for the RustGIS project: written by [QGIS](https://qgis.org) 4.2.3 through its API, from `generate.py` there; the data is made up | Apache-2.0 |
@@ -72,8 +73,11 @@ Copyright (c) 1996 The Regents of the University of California, under a BSD-styl
 cmocean's (MIT, as above) and rio-tiler's cfastie, rplumbo and schwarzwald. The full licence
 texts are in THIRD-PARTY-LICENSES.txt.
 
-Three small pieces of code follow other projects' code, and their licences are in
-THIRD-PARTY-LICENSES.txt too: where a label goes in an area (`pole_of_inaccessibility` in
+Four pieces of code follow other projects' code, and their licences are in
+THIRD-PARTY-LICENSES.txt too: the reader of ArcGIS feature-service answers as protocol buffers
+(`crates/data/src/esripbf.rs`) follows [Terrio](https://github.com/opengeos/terrio)'s ESRIPBF reader
+(Copyright (c) 2026 Qiusheng Wu and Terrio contributors, MIT), and both follow Esri's published
+[`FeatureCollection.proto`](https://github.com/Esri/arcgis-pbf) (Apache-2.0); where a label goes in an area (`pole_of_inaccessibility` in
 `crates/tiles/src/symbols.rs`) follows [polylabel](https://github.com/mapbox/polylabel)
 (Copyright (c) 2016 Mapbox, ISC); telling expression filters from legacy ones
 (`is_expression_filter` in `crates/tiles/src/style.rs`) follows the

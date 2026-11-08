@@ -41,6 +41,40 @@ pub const NEED: &str = "waiting for the file's bytes";
 /// covering, a server without ranges): it is downloaded whole instead.
 pub const READ_WHOLE: &str = "can't be read in place";
 
+/// An owned, principal-free predicate for a claimed deferred request.
+pub type Still = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+thread_local! { static STILL: std::cell::RefCell<Option<Still>> = const { std::cell::RefCell::new(None) }; }
+/// Clones synchronous request context before a worker or browser future is scheduled.
+pub fn current_still() -> Option<Still> {
+    STILL.with(|s| s.borrow().clone())
+}
+/// The guard is synchronous. Never hold it across an await.
+pub fn with_still<T>(still: Still, f: impl FnOnce() -> T) -> T {
+    with_optional_still(Some(still), f)
+}
+/// Re-enters captured context synchronously, including around follow-on callbacks.
+pub fn with_optional_still<T>(still: Option<Still>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Still>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STILL.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = current_still();
+    let combined = match (previous.clone(), still) {
+        (Some(a), Some(b)) => Some(std::sync::Arc::new(move || a() && b()) as Still),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+    STILL.with(|s| *s.borrow_mut() = combined);
+    let _restore = Restore(previous);
+    f()
+}
+/// Checked immediately before a request-producing stage, without suspension before sending.
+pub fn check_still(still: &Option<Still>) -> std::result::Result<(), String> {
+    if still.as_ref().is_some_and(|s| !s()) { Err("request cancelled before it was sent".into()) } else { Ok(()) }
+}
+
 /// A request for part of a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
@@ -86,6 +120,27 @@ pub fn can_fetch() -> bool {
 
 /// Fetches a whole file through the installed fetcher (a file that can't be read in place).
 pub fn fetch_whole(url: &str, done: Done) {
+    let still = current_still();
+    if let Err(e) = check_still(&still) {
+        done(Err(Failed::Other(e)));
+        return;
+    }
+    let context = still.clone();
+    let done: Done = Box::new(move |r| {
+        with_optional_still(context.clone(), || {
+            done(check_still(&context).map_err(Failed::Other).and(r));
+        })
+    });
+    if let Err(error) = crate::login_address::check(url) {
+        done(Err(Failed::Other(error.into())));
+        return;
+    }
+    let done: Done = if crate::login_address::is_wrapper(url) {
+        let address = url.to_string();
+        Box::new(move |r| done(crate::login_address::check(&address).map_err(|e| Failed::Other(e.into())).and(r)))
+    } else {
+        done
+    };
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
         Some(f) => f(url, Want::Whole, done),
@@ -148,7 +203,7 @@ pub struct Remote {
 
 impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Remote").field("url", &self.url).finish_non_exhaustive()
+        f.debug_struct("Remote").field("url", &crate::login_address::inner(&self.url)).finish_non_exhaustive()
     }
 }
 
@@ -185,6 +240,7 @@ impl Remote {
     }
 
     fn get(&self, at: u64, len: u64, exact: bool) -> Option<bytes::Bytes> {
+        crate::login_address::check(&self.url).ok()?;
         let mut s = self.lock();
         let len = match s.end {
             Some(end) if at >= end => return Some(bytes::Bytes::new()),
@@ -216,6 +272,7 @@ impl Remote {
     /// Bytes from `at` to the end of the held piece that holds `at` (a column chunk read in
     /// pages), or `None` (noted as missing, `want` bytes from there).
     pub fn from(&self, at: u64, want: u64) -> Option<bytes::Bytes> {
+        crate::login_address::check(&self.url).ok()?;
         let mut s = self.lock();
         s.tick += 1;
         let tick = s.tick;
@@ -244,6 +301,7 @@ impl Remote {
     /// The file's last `n` bytes (all of it when it's shorter), and whether that is the whole
     /// file; `None` when they aren't held (noted as missing).
     pub fn tail(&self, n: u64) -> Option<(Arc<Vec<u8>>, bool)> {
+        crate::login_address::check(&self.url).ok()?;
         let mut s = self.lock();
         match &s.tail {
             Some((t, whole)) if *whole || t.len() as u64 >= n => Some((t.clone(), *whole)),
@@ -308,6 +366,9 @@ impl Remote {
     /// Keeps fetched bytes `at..`: merged with the parts they meet. A piece shorter than asked
     /// for (`asked`) ends the file.
     fn insert(&self, at: u64, asked: u64, bytes: Vec<u8>) {
+        if crate::login_address::check(&self.url).is_err() {
+            return;
+        }
         let mut s = self.lock();
         if (bytes.len() as u64) < asked {
             let end = at.saturating_add(bytes.len() as u64);
@@ -359,6 +420,9 @@ impl Remote {
 
     /// Keeps a file's last `asked` bytes: fewer is the whole file.
     fn insert_tail(&self, asked: u64, bytes: Vec<u8>) {
+        if crate::login_address::check(&self.url).is_err() {
+            return;
+        }
         let whole = (bytes.len() as u64) < asked;
         let bytes = Arc::new(bytes);
         {
@@ -419,23 +483,49 @@ pub fn drive<T: Send + 'static>(
     done: Box<dyn FnOnce(Result<T>) + Send>,
 ) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    step(remote, work, done, NEXT.fetch_add(1, Ordering::Relaxed), 0);
+    step(remote, work, done, NEXT.fetch_add(1, Ordering::Relaxed), 0, current_still());
 }
 
+/// Re-enters the owned synchronous carrier for each read round, including callbacks on another thread.
 fn step<T: Send + 'static>(
     remote: Arc<Remote>,
     work: Arc<dyn Fn() -> Result<T> + Send + Sync>,
     done: Box<dyn FnOnce(Result<T>) + Send>,
     drive: u64,
     rounds: usize,
+    still: Option<Still>,
 ) {
+    with_optional_still(still.clone(), || step_in(remote, work, done, drive, rounds, still));
+}
+
+/// Checks before reading, sending each new range, accepting bytes and starting another round.
+fn step_in<T: Send + 'static>(
+    remote: Arc<Remote>,
+    work: Arc<dyn Fn() -> Result<T> + Send + Sync>,
+    done: Box<dyn FnOnce(Result<T>) + Send>,
+    drive: u64,
+    rounds: usize,
+    still: Option<Still>,
+) {
+    if let Err(e) = check_still(&still) {
+        done(Err(DataError::Format(e)));
+        return;
+    }
+    if let Err(error) = crate::login_address::check(remote.url()) {
+        done(Err(DataError::Format(error.into())));
+        return;
+    }
     let r = {
         let _running = Running::enter(drive);
         work()
     };
+    if let Err(error) = crate::login_address::check(remote.url()) {
+        done(Err(DataError::Format(error.into())));
+        return;
+    }
     let wants = remote.take_missing(drive);
     if wants.is_empty() {
-        done(r);
+        done(check_still(&still).map_err(DataError::Format).and(r));
         return;
     }
     // Readers plan within READ_BUDGET; a round asking for far more is a hostile file's offsets.
@@ -461,42 +551,49 @@ fn step<T: Send + 'static>(
     let round = Arc::new(Mutex::new(Round { left: wants.len(), failed: None, done: Some(done) }));
     for w in wants {
         let (remote2, work2, round2) = (remote.clone(), work.clone(), round.clone());
+        let context = still.clone();
         let landed: Done = Box::new(move |res| {
-            match (w, res) {
-                (Want::Range(a, b), Ok(bytes)) => remote2.insert(a, b - a, bytes),
-                (Want::Tail(n), Ok(bytes)) => remote2.insert_tail(n, bytes),
-                // (Reads ask for ranges and tails; a whole file is all of its bytes from the start.)
-                (Want::Whole, Ok(bytes)) => remote2.insert(0, bytes.len() as u64, bytes),
-                // A request dropped unfetched (the view moved on) is asked for again next round.
-                (_, Err(Failed::Dropped)) => {}
-                // A range past the end of the file.
-                (Want::Range(a, b), Err(Failed::PastEnd)) => remote2.insert(a, b - a, Vec::new()),
-                (_, Err(e)) => {
-                    let e = match e {
-                        Failed::NoRanges => format!("the server doesn't answer byte-range requests ({READ_WHOLE})"),
-                        Failed::PastEnd => "the last bytes asked for past the end of the file".into(),
-                        Failed::Dropped => "the request was dropped".into(),
-                        Failed::Other(e) => e,
-                    };
-                    let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
-                    r.failed.get_or_insert(e);
-                }
-            }
-            let next = {
-                let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
-                r.left = r.left.saturating_sub(1);
-                if r.left == 0 { Some((r.done.take(), r.failed.take())) } else { None }
-            };
-            if let Some((Some(done), failed)) = next {
-                match failed {
-                    Some(e) => {
-                        done(Err(DataError::Format(if e.starts_with(remote2.url()) { e } else { format!("{}: {e}", remote2.url()) })))
+            with_optional_still(context.clone(), || {
+                let res = check_still(&context).map_err(Failed::Other).and(res);
+                match (w, res) {
+                    (Want::Range(a, b), Ok(bytes)) => remote2.insert(a, b - a, bytes),
+                    (Want::Tail(n), Ok(bytes)) => remote2.insert_tail(n, bytes),
+                    // (Reads ask for ranges and tails; a whole file is all of its bytes from the start.)
+                    (Want::Whole, Ok(bytes)) => remote2.insert(0, bytes.len() as u64, bytes),
+                    // A request dropped unfetched (the view moved on) is asked for again next round.
+                    (_, Err(Failed::Dropped)) => {}
+                    // A range past the end of the file.
+                    (Want::Range(a, b), Err(Failed::PastEnd)) => remote2.insert(a, b - a, Vec::new()),
+                    (_, Err(e)) => {
+                        let e = match e {
+                            Failed::NoRanges => format!("the server doesn't answer byte-range requests ({READ_WHOLE})"),
+                            Failed::PastEnd => "the last bytes asked for past the end of the file".into(),
+                            Failed::Dropped => "the request was dropped".into(),
+                            Failed::Other(e) => e,
+                        };
+                        let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
+                        r.failed.get_or_insert(e);
                     }
-                    None => step(remote2, work2, done, drive, rounds + 1),
                 }
-            }
+                let next = {
+                    let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
+                    r.left = r.left.saturating_sub(1);
+                    if r.left == 0 { Some((r.done.take(), r.failed.take())) } else { None }
+                };
+                if let Some((Some(done), failed)) = next {
+                    match failed {
+                        Some(e) => {
+                            done(Err(DataError::Format(if e.starts_with(remote2.url()) { e } else { format!("{}: {e}", remote2.url()) })))
+                        }
+                        None => step(remote2, work2, done, drive, rounds + 1, context),
+                    }
+                }
+            })
         });
-        fetch(&remote.url, w, landed);
+        match check_still(&still) {
+            Ok(()) => fetch(&remote.url, w, landed),
+            Err(e) => landed(Err(Failed::Other(e))),
+        }
     }
 }
 
@@ -598,6 +695,17 @@ pub(crate) mod testing {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    pub(crate) static LOGIN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    pub(crate) fn validate_login(address: &str) -> std::result::Result<(), &'static str> {
+        let binding = crate::login_address::parse(address)?.map(|b| b.binding);
+        if binding == Some("ffffffffffffffff") && !LOGIN_ACTIVE.load(Ordering::Acquire) {
+            Err("The service login is no longer active.")
+        } else {
+            Ok(())
+        }
+    }
+
     fn served() -> &'static Mutex<HashMap<String, (Arc<Vec<u8>>, Arc<AtomicUsize>)>> {
         static S: OnceLock<Mutex<HashMap<String, (Arc<Vec<u8>>, Arc<AtomicUsize>)>>> = OnceLock::new();
         S.get_or_init(Mutex::default)
@@ -634,6 +742,28 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_ranges_and_late_publications_are_revoked() {
+        crate::login_address::set_validator(testing::validate_login);
+        let address = crate::login_address::bind("ffffffffffffffff", "https://revoked.test", "https://revoked.test/file.fgb").unwrap();
+        let remote = Remote::new(&address);
+        remote.insert(0, 4, b"body".to_vec());
+        remote.insert_tail(4, b"tail".to_vec());
+        assert_eq!(remote.bytes(0, 4).unwrap().as_ref(), b"body");
+        assert!(remote.tail(4).is_some());
+        testing::LOGIN_ACTIVE.store(false, Ordering::Release);
+        assert!(remote.bytes(0, 4).is_none());
+        assert!(remote.from(0, 4).is_none());
+        assert!(remote.tail(4).is_none());
+        remote.insert(4, 4, b"late".to_vec());
+        remote.insert_tail(4, b"late".to_vec());
+        assert_eq!(remote.lock().held, 4);
+        assert_eq!(remote.lock().tail.as_ref().unwrap().0.as_slice(), b"tail");
+        let replacement = crate::login_address::bind("eeeeeeeeeeeeeeee", "https://revoked.test", "https://revoked.test/file.fgb").unwrap();
+        assert!(file(&replacement).bytes(0, 4).is_none());
+        assert!(file("https://revoked.test/file.fgb").bytes(0, 4).is_none());
+    }
 
     #[test]
     fn holds_merges_and_notes_what_is_missing() {

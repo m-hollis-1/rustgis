@@ -8,7 +8,7 @@ use serde_json::Value;
 use serde_json::json;
 
 pub fn commands() -> Vec<C> {
-    vec![C::new("layer.repairGeodatabase", "Repair Geodatabase Layer", "Data › Data Source", repair_geodatabase).params(
+    vec![C::new("layer.repairGeodatabase", "Repair Geodatabase Layer", "Data › Data Source", repair_geodatabase).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
         r#"{"layer"?: name|id (default: the active layer) | "all"?: true (every broken layer read from the connection's geodatabase), "connection": "the saved SQL Server connection's id or name to read the layer's table through; sign in with connection.login first when it has a user and no saved password; a Windows sign-in connection (no user) connects as you"} → "repaired" (the names of the layers fixed, each reading the table of the same name through the connection, at the Default version, keeping its style) and "skipped" (each with its "layer" name and the "why" it wasn't fixed); a named layer that can't be repaired is an error, and so is "all" when none could be (the error says why for each)"#,
     )]
 }

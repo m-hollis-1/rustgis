@@ -123,8 +123,10 @@ _GeoLibre: docs/features.md › Layers, styling, and labels; docs/user-guide/sty
 - [ ] **More classification methods**: standard deviation, geometric interval, manual breaks.
   Partial: Jenks, equal interval, quantile (_Roadmap: fixes and quick wins_).
 - [ ] **Symbol library**: a marker library, custom SVG/PNG markers, fill patterns, pie/donut/bar
-  diagrams, arrow lines, inverted-polygon masks, geometry generators. Partial: 5 marker shapes
-  (_Roadmap: expressions and cartography_ for markers, patterns and a library).
+  diagrams, arrow lines, inverted-polygon masks, geometry generators. Partial: 5 marker shapes,
+  pie/bar diagrams on features from several fields (`layer.diagram`), each slice or bar labelled
+  with its value, percent or both, and the categories listed in layout legends (_Roadmap:
+  expressions and cartography_ for markers, patterns and a library).
 - [ ] **Style interchange**: import/export SLD, QGIS QML, Mapbox GL JSON. Partial: MapLibre style
   export and `.rgisstyle` (_Roadmap: expressions and cartography_ for QML and SLD import).
 - [ ] **Smart styling**: automatic palette on add, one-click style suggestions. Missing.
@@ -177,12 +179,13 @@ model-builder.md, segmentation.md, obia.md_
   spatial join, clip, erase, split, intersect, identity, union, symmetrical difference, update
   and near are built in.
 - [ ] **More built-in vector tools**: attribute join, extract vertices, points along lines,
-  fix/check geometry, random extract, buffer options. Partial: Merge (append layers) and extract vertices are built in,
-  as Merge and Feature Vertices To Points (_Roadmap: solid ground_).
+  fix/check geometry, random extract, buffer options. Partial: Merge (append layers), extract
+  vertices and points along lines are built in, as Merge, Feature Vertices To Points and Points
+  Along Lines (_Roadmap: solid ground_).
 - [ ] **Routing services**: isochrones, service areas, OD matrix, multi-stop routing,
   turn-by-turn (Valhalla/OSRM). Partial: shortest path over a line layer (_Roadmap: analysis_).
 - [ ] **Geocoding**: forward, batch and reverse, with multiple providers and a place search box.
-  Partial: place search and address tables (Nominatim, Photon or your own server), a local locator,
+  Partial: place search and address tables (Nominatim, Photon, PDOK's Locatieserver or your own server), a local locator,
   a search box. Missing: reverse geocoding (_Roadmap: analysis_).
 - [ ] **Spatial statistics**: Emerging Hot Spot (Getis-Ord Gi\*), composite score builder.
   Partial: Suitability Modeler (_Roadmap: analysis_ for hot spots).
@@ -193,8 +196,8 @@ model-builder.md, segmentation.md, obia.md_
   eCognition import. RustGIS has pixel classification.
 - [ ] **Visual Model Builder canvas**: a node graph with validation and export to code. Partial:
   ModelBuilder with a node canvas and models from history.
-- [ ] **Re-run or copy history as code; batch runs over a folder**. Partial: history copied as
-  code; batch runs are missing (_Roadmap: solid ground_).
+- [x] **Re-run or copy history as code; batch runs over a folder**: history copied as code, batch
+  runs over layers and folders (`gp.batch`).
 - [ ] **Viewshed from public terrain tiles (no DEM needed)**. Partial: needs a loaded elevation
   raster (_Roadmap: analysis_ for a DEM downloader).
 - [x] **Conversion**: vector to PMTiles/GeoParquet, raster to COG: GeoParquet, COG and vector and
@@ -208,12 +211,12 @@ model-builder.md, segmentation.md, obia.md_
 ## Layouts & printing
 _GeoLibre: docs/features.md › Map tools, printing, and media; docs/user-guide/print-layout.md_
 
-- [ ] **SVG layout export**. Partial: PDF and PNG (_Roadmap: any time_).
+- [x] **SVG layout export**: each element a named group, map frames and surrounds as vectors.
 - [ ] **Atlas along a line, page-filtered tables and charts, copy to clipboard**. Partial:
   per-feature map series (_Roadmap: any time_ for the clipboard).
 - [ ] **Map and video recording**: canvas recording, a marker along a line to MP4, camera tours.
   Partial: keyframe PNG frames, time slider GIFs.
-- [ ] **STL 3D export**. Partial: OBJ and glTF (_Roadmap: any time_).
+- [x] **STL 3D export**: binary STL beside OBJ and glTF.
 
 ## Sharing, collaboration & publishing
 _GeoLibre: docs/collaboration.md, docs/server-api.md, docs/user-guide/embedding.md, projects.md,
@@ -304,7 +307,7 @@ _GeoLibre: docs/user-guide/ai-assistant.md, docs/features.md › AI, Python, and
 _GeoLibre: docs/features.md › Platforms and interface; docs/i18n.md_
 
 - [ ] **More languages and right-to-left layout**: GeoLibre has 20 languages including Arabic,
-  Persian and Hebrew. Partial: 19 languages; Persian text is drawn right to left, while the panes
+  Persian and Hebrew. Partial: 20 languages; Persian text is drawn right to left, while the panes
   keep their left-to-right layout.
 - [ ] **Translated geoprocessing tool names**. Missing (possibly deliberate).
 - [ ] **Keyboard-shortcut cheat sheet**. Partial: Command Search; rebindable shortcuts are on the

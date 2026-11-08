@@ -303,16 +303,20 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 sep(ui, &t);
                 // Pointer coordinates.
-                let coord = app
-                    .map
-                    .pointer_lonlat
-                    .map(|c| if app.map.dms { rustgis_engine::geom::format_dms(c) } else { rustgis_engine::geom::format_lonlat(c) });
+                let format = app.map.coord_format;
+                let earth = app.session.map().body().is_earth();
+                // Kept after the pointer leaves the map, so a click here still shows the position;
+                // dimmed then, to tell it from a live one.
+                let kept = app.map.kept_pointer_lonlat(app.session.map().instance_id(), app.session.opened);
+                let live = app.map.pointer_lonlat.is_some();
                 let resp = ui.add(
-                    egui::Label::new(egui::RichText::new(coord.unwrap_or_else(|| "—".into())).monospace().size(11.5).color(t.text_dim))
-                        .sense(Sense::click()),
+                    egui::Label::new(
+                        egui::RichText::new(format.readout(kept, earth)).monospace().size(11.5).color(if live { t.text_dim } else { t.text_disabled }),
+                    )
+                    .sense(Sense::click()),
                 );
-                if resp.on_hover_text(tl!("Click to switch between decimal degrees and DMS")).clicked() {
-                    app.map.dms = !app.map.dms;
+                if resp.on_hover_text(format.hover()).clicked() {
+                    let _ = app.run("ui.coordinateFormat", Value::Null);
                 }
                 let projection = match &app.session.map().projection {
                     rustgis_engine::map::Projection::Globe => tl!("WGS 84 / Globe").to_string(),
@@ -338,6 +342,18 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                     if resp.on_hover_text(tl!("Clear selection")).clicked() {
                         let _ = app.run("select.clear", Value::Null);
                     }
+                }
+                // An export writing its file: its progress and Cancel.
+                #[cfg(not(target_arch = "wasm32"))]
+                if app.export_job.is_some() {
+                    sep(ui, &t);
+                    crate::exportjob::status(app, ui, &t);
+                }
+                // A file read for Add Data, or a layer's features for Load All.
+                #[cfg(not(target_arch = "wasm32"))]
+                if crate::readjob::showing(app) {
+                    sep(ui, &t);
+                    crate::readjob::status(app, ui, &t);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // The CPU/GPU backend toggle, then the frame rate (live while the map moves,
@@ -421,7 +437,9 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                     }
                     // Cut to the room left (the whole notice on hover), so it doesn't run
                     // over the selection count and coordinates. A click opens its history.
-                    if let Some(n) = app.session.notices.last()
+                    if let Some(running) = crate::pluginstart::running(app) {
+                        ui.add(egui::Label::new(egui::RichText::new(running).size(11.5).color(t.accent)).truncate());
+                    } else if let Some(n) = app.session.notices.last()
                         && ui.add(
                             egui::Button::new(egui::RichText::new(&n.text).size(11.5).color(if n.error { t.red } else { t.text_dim }))
                                 .frame(false)
@@ -664,7 +682,7 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
 
 /// Whether a UI command is available on the current platform.
 pub(crate) fn command_available(id: &str, web: bool) -> bool {
-    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay")
+    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay" | "ui.themeLoad" | "ui.themeReload")
 }
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
@@ -694,11 +712,17 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.pane.sql", "SQL Pane", "Analyze › Workflows"),
     ("ui.pane.directions", "Directions", "Home › Navigate"),
     ("ui.pane.bookmarks", "Bookmarks Pane", "Home › Navigate › Bookmarks"),
-    ("ui.theme", "Toggle Dark Mode", "View"),
+    ("ui.theme", "Toggle Dark Mode", "Settings › Theme"),
+    ("ui.themeFile", "Follow the System", "Settings › Theme"),
+    ("ui.themeLoad", "Load a Theme from File…", "Settings › Theme"),
+    ("ui.themeReload", "Reload Themes", "Settings › Theme"),
+    ("ui.scale", "Reset Interface Scale", "Settings › Theme"),
     ("ui.map.gpu", "Toggle GPU Rendering", "View"),
     ("ui.importShapefile", "Import Shapefile with Projection…", "Home › Add"),
     ("ui.measurementUnits", "Toggle Imperial Measurements", "Home › Inspect › Measure"),
+    ("ui.coordinateFormat", "Next Coordinate Format", "View"),
     ("ui.moveSharedVertices", "Shared Vertices", "Edit › Features"),
+    ("ui.traceEdges", "Trace", "Edit › Features"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
 ];
@@ -994,8 +1018,8 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         for &(id, label, loc) in UI_COMMANDS {
-            // The web app always serves the latest release (no Check for Updates button) and is
-            // one process a loopback relay could not reach (`ui.mcpRelay` is desktop only).
+            // Match the platform availability used by the shortcut editor, including desktop
+            // theme files and the loopback relay.
             if !command_available(id, cfg!(target_arch = "wasm32")) {
                 continue;
             }

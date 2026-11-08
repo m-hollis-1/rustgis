@@ -295,6 +295,7 @@ pub fn process_manifest(id: &str, permissions: &[&str], run: &[String]) -> Strin
     if let Some(c) = m["commands"].as_array_mut() {
         c.push(serde_json::json!({"id": "n", "label": "Noisy"}));
         c.push(serde_json::json!({"id": "c", "label": "Crash"}));
+        c.push(serde_json::json!({"id": "d", "label": "Say, then forward"}));
     }
     if let Some(t) = m["tools"].as_array_mut() {
         t.push(serde_json::json!({"id": "w", "name": "Work Forever", "params": []}));
@@ -306,7 +307,7 @@ pub fn process_manifest(id: &str, permissions: &[&str], run: &[String]) -> Strin
 /// test module does, then exits. Elsewhere it returns at once.
 ///
 /// - `h` logs "hi" and returns `{"hello": "world"}`; `f` sends its params as a host request
-///   and returns the reply; `e` fails with "nope"; `n` prints a line that isn't JSON and a JSON object that isn't a message first;
+///   and returns the reply; `d` says an error first, then does what `f` does; `e` fails with "nope"; `n` prints a line that isn't JSON and a JSON object that isn't a message first;
 ///   `c` writes "boom" to its error output and exits without answering; `s` never answers;
 ///   `g` starts another copy of itself that never answers, logs its process id and never
 ///   answers either.
@@ -339,6 +340,26 @@ pub fn serve_if_child() {
             let mut answer = String::new();
             let _ = input.read_line(&mut answer);
             serde_json::from_str(&answer).unwrap_or_else(|_| json!({"error": "no answer"}))
+        }
+        // An error notice first, then what `f` does.
+        Some('d') => {
+            let said = json!({"call": {"op": "host.notify", "params": {"text": "said before the call", "error": true}}});
+            let _ = writeln!(out, "{said}");
+            let _ = out.flush();
+            let mut answer = String::new();
+            let _ = input.read_line(&mut answer);
+            let _ = writeln!(out, "{}", json!({"call": {"op": params["op"], "params": params["params"]}}));
+            let _ = out.flush();
+            answer.clear();
+            let _ = input.read_line(&mut answer);
+            let reply: Value = serde_json::from_str(&answer).unwrap_or_else(|_| json!({"error": "no answer"}));
+            if params.get("fail").and_then(Value::as_bool) == Some(true)
+                && reply.get("ok").and_then(|v| v.get("pending")).and_then(Value::as_bool) == Some(true)
+            {
+                json!({"error":"nope"})
+            } else {
+                reply
+            }
         }
         Some('n') => {
             let _ = writeln!(out, "a library printing");
@@ -382,6 +403,16 @@ pub fn serve_if_child() {
             }
         }
         Some('m') => {
+            // Hold an actual tool request for cancellation tests; ordinary calls do not wait.
+            if let (Some(ready), Some(release)) =
+                (params.get("control_ready").and_then(Value::as_str), params.get("control_release").and_then(Value::as_str))
+            {
+                let _ = std::fs::write(ready, b"started");
+                let start = std::time::Instant::now();
+                while !std::path::Path::new(release).is_file() && start.elapsed() < std::time::Duration::from_secs(20) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
             let _ = writeln!(out, "{}", json!({"progress": "making"}));
             json!({"ok": {"layers": [{"name": "Made", "geojson": {"type": "FeatureCollection", "features": [
             {"type": "Feature", "properties": {"n": 1}, "geometry": {"type": "Point", "coordinates": [1, 2]}}]}}], "messages": ["made"]}})

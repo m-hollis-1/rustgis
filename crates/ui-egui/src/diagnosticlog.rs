@@ -77,10 +77,17 @@ fn entry(ui: &mut Ui, record: &Record, t: &Tokens) {
         Severity::Warning => (tl!("Warning"), t.amber),
         Severity::Info => (tl!("Info"), t.accent_text),
     };
+    // A source is a command id (kept as written) or one of the history's own words.
+    let source = match record.source.as_str() {
+        "Application" => tl!("Application"),
+        "Network" => tl!("Network"),
+        "Plugin" => tl!("Plugin"),
+        command => command,
+    };
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(time(record.timestamp_ms)).small().monospace().color(t.text_dim));
         ui.label(RichText::new(severity).small().strong().color(color));
-        ui.label(RichText::new(record.source.as_str()).small().color(t.text_dim));
+        ui.label(RichText::new(source).small().color(t.text_dim));
     });
     ui.add(egui::Label::new(&record.message).wrap().selectable(true));
     if !record.details.is_empty() || record.network.is_some() {
@@ -115,21 +122,8 @@ fn entry(ui: &mut Ui, record: &Record, t: &Tokens) {
 /// The entry's UTC date and time: with the date, a session past UTC midnight reads in order.
 fn time(timestamp_ms: u64) -> String {
     let seconds = timestamp_ms / 1000;
-    let (year, month, day) = civil_date(seconds / 86_400);
-    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC", seconds / 3600 % 24, seconds / 60 % 60, seconds % 60)
-}
-
-/// The proleptic Gregorian date `days` after 1970-01-01 (Howard Hinnant's `civil_from_days`).
-fn civil_date(days: u64) -> (u64, u64, u64) {
-    let z = days.saturating_add(719_468);
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + u64::from(month <= 2), month, day)
+    let (date, minute) = rustgis_engine::map::graphics::civil(seconds);
+    format!("{date} {minute}:{:02} UTC", seconds % 60)
 }
 
 #[cfg(test)]

@@ -1640,6 +1640,7 @@ fn scale_bars_read_units_divisions_subdivisions_labels_and_format() {
         decimals,
         label_size,
         fit,
+        ..
     } = frame_of(&imp, "SCALE BAR").1
     else {
         panic!("not a scale bar")

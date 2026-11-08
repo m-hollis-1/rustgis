@@ -55,17 +55,56 @@ const SNAP_COLOR: Color32 = Color32::from_rgb(0xE0, 0x3E, 0x8C);
 /// An element's box: x, y, width, height (mm).
 type Box4 = (f64, f64, f64, f64);
 
+/// Seconds at least between two drawings of the page while what its map frames show lands: each
+/// tile or read landing would draw the whole page again. Anything landing counts, the page's or
+/// another map's: telling them apart would mean working out what each frame asks for, and the
+/// wait ends once the page is whole.
+const FRAMES_REDRAW_S: f64 = 0.25;
+
+/// What has landed so far: the tile cache's generation (tiles, styles, legend pictures, a raster's
+/// parts read in place) and the background reads' (a streamed layer's features, a source or
+/// raster opened by its address). Each goes up as something lands.
+fn landings() -> (u64, u64) {
+    (rustgis_engine::render::rustgis_tiles::cache::generation(), rustgis_engine::map::source::generation())
+}
+
+/// A page drawn in the browser while something it shows was still on its way: a map frame's tiles
+/// or streamed reads, or a legend's pictures (WMS, WMTS).
+#[derive(Clone, Copy)]
+struct PageWait {
+    /// [`landings`] when it was drawn: anything landing since changes it.
+    landed: (u64, u64),
+    /// Whether a frame's tiles or reads were among what was missing: the page is drawn again as
+    /// they land, at most every [`FRAMES_REDRAW_S`]. Legend pictures alone draw it again only once
+    /// they all have, not on every fetch (the map's own tiles land too).
+    frames: bool,
+    /// When it was drawn (egui's time, seconds).
+    drawn: f64,
+}
+
+/// Whether a page drawn while `w` was missing is due to be drawn again: something has landed since
+/// (it is now at `landed`), and either a frame was drawn short and the last drawing is at least
+/// [`FRAMES_REDRAW_S`] old at `now`, or only legend pictures were missing and none is still on its
+/// way (`legends_pending`, asked only then).
+fn redraw_due(w: PageWait, landed: (u64, u64), now: f64, legends_pending: impl FnOnce() -> bool) -> bool {
+    w.landed != landed && if w.frames { now - w.drawn >= FRAMES_REDRAW_S } else { !legends_pending() }
+}
+
 #[derive(Default)]
 pub struct LayoutView {
     texture: Option<egui::TextureHandle>,
     key: Option<(u64, usize, [usize; 2], i64, i64, i64)>,
-    /// The tile cache's generation the page was drawn at while a legend picture it shows was
-    /// still on its way (in the browser, which doesn't wait for them): drawn again once a fetch
+    /// What the page was drawn without (in the browser, which doesn't wait): drawn again once it
     /// lands.
-    legends_wait: Option<u64>,
-    /// Page zoom (1 = fit) and pan, in screen points.
+    page_wait: Option<PageWait>,
+    /// Page zoom (0 or 1 = fit) and pan, in screen points, of the layout `viewed` names.
     zoom: f32,
     pan: egui::Vec2,
+    /// The layout `zoom` and `pan` are for, by name (unique, unlike an index, which shifts when
+    /// layouts are removed).
+    viewed: Option<String>,
+    /// The zoom and pan of the project's other layouts opened so far, by name.
+    views: std::collections::HashMap<String, (f32, egui::Vec2)>,
     pub selected: Option<u32>,
     /// Every element selected (Shift-click adds and takes away, a Shift-drag round elements
     /// selects them), `selected` the last picked; one element, or none, without Shift.
@@ -77,7 +116,7 @@ pub struct LayoutView {
     /// The element whose fields the Format pane drew this frame, by layout and element: text
     /// typed into any other is saved at the end of the frame (`save_drafts`).
     drawn: Option<(usize, u32)>,
-    /// The project (`Session::opened`) the selection and the text being typed are for.
+    /// The project (`Session::opened`) the selection, the text being typed and the page views are for.
     project: Option<u64>,
     drag: Option<Drag>,
     /// The page rectangle and points per millimetre the drag last saw.
@@ -135,9 +174,9 @@ impl LayoutView {
     }
 }
 
-/// Forgets the selection and the text typed into its fields once another project has replaced
-/// the one they were for: its elements may have the same ids. Run after every command, after
-/// what agents and scripts sent, and before drafts are saved.
+/// Forgets the selection, the text typed into its fields and the layouts' page views once another
+/// project has replaced the one they were for: its elements and layouts may have the same ids and
+/// names. Run after every command, after what agents and scripts sent, and before drafts are saved.
 pub(crate) fn follow_project(app: &mut RustGisApp) {
     let opened = app.session.opened;
     if app.layout.project.is_some_and(|p| p != opened) {
@@ -146,8 +185,18 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
         app.layout.formatted = None;
         app.layout.drawn = None;
         app.layout.typing.clear();
+        app.layout.viewed = None;
+        app.layout.views.clear();
     }
     app.layout.project = Some(opened);
+    // A page view stays with its layout: one removed or renamed leaves none for a new layout
+    // given that name, and comes back fitted to the page if that's undone.
+    let layouts = &app.session.project.layouts;
+    let named = |name: &str| layouts.iter().any(|l| l.name == name);
+    app.layout.views.retain(|name, _| named(name));
+    if app.layout.viewed.as_deref().is_some_and(|name| !named(name)) {
+        app.layout.viewed = None;
+    }
 }
 
 /// How much map a pan's preview draws past each side of the frame, in frame widths and heights.
@@ -190,6 +239,18 @@ impl LayoutView {
     /// fonts a text names have just been indexed).
     pub fn redraw(&mut self) {
         self.key = None;
+    }
+
+    /// Makes `zoom` and `pan` those of the layout named `name`: each layout keeps its own view of
+    /// the page, and one not opened yet fits the page.
+    fn view_layout(&mut self, name: &str) {
+        if self.viewed.as_deref() == Some(name) {
+            return;
+        }
+        if let Some(old) = self.viewed.replace(name.to_string()) {
+            self.views.insert(old, (self.zoom, self.pan));
+        }
+        (self.zoom, self.pan) = self.views.remove(name).unwrap_or_default();
     }
 
     /// Stops drawing a polygon or lasso frame, or navigating map frames (Esc).
@@ -563,6 +624,7 @@ fn shown_layout(app: &mut RustGisApp, li: usize) -> Option<std::rc::Rc<Layout>> 
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let Some(li) = app.session.active_layout else { return };
     let Some(layout) = shown_layout(app, li) else { return };
+    app.layout.view_layout(&layout.name);
     let t = Tokens::get(ui.ctx());
     if app.layout.selected.is_some_and(|id| layout.element(id).is_none()) {
         app.layout.selected = None;
@@ -607,14 +669,17 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let dpi = (px_per_mm as f64 * 25.4).min(max_side / layout.width.max(layout.height) * 25.4).clamp(20.0, 300.0);
     let size = [(page.width() * ppp) as usize, (page.height() * ppp) as usize];
     let key = (app.session.revision, li, size, (dpi * 10.0) as i64, layout.width as i64, layout.height as i64);
-    // Only once the pictures have: any other fetch landing (the map's tiles) bumps the generation.
-    let landed = app.layout.legends_wait.is_some_and(|g| g != rustgis_engine::render::rustgis_tiles::cache::generation())
-        && !rustgis_engine::render::layout::legends_pending(&layout, &app.session.project.maps);
-    if (app.layout.key != Some(key) || landed) && size[0] > 2 && size[1] > 2 {
+    // Read before drawing: something landing while it draws is a reason to draw again.
+    let landed = landings();
+    let now = ui.input(|i| i.time);
+    let due = app.layout.page_wait.is_some_and(|w| {
+        redraw_due(w, landed, now, || rustgis_engine::render::layout::legends_pending(&layout, &app.session.project.maps))
+    });
+    if (app.layout.key != Some(key) || due) && size[0] > 2 && size[1] > 2 {
         let info = page_info(app, li);
-        // Before drawing: a fetch landing while it draws is a reason to draw again.
-        let generation = rustgis_engine::render::rustgis_tiles::cache::generation();
-        if let Some(pm) = rustgis_engine::render::layout::render(&layout, &mut app.session.project.maps, dpi, &info) {
+        if let Some((pm, frames_pending)) =
+            rustgis_engine::render::layout::render_pending(&layout, &mut app.session.project.maps, dpi, &info)
+        {
             let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
             match &mut app.layout.texture {
                 Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
@@ -622,12 +687,15 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             }
             app.layout.key = Some(key);
             // Natively the page waited for them already: drawn again, it would wait again.
-            app.layout.legends_wait = (cfg!(target_arch = "wasm32")
-                && rustgis_engine::render::layout::legends_pending(&layout, &app.session.project.maps))
-            .then_some(generation);
+            let web = cfg!(target_arch = "wasm32");
+            let frames = web && frames_pending;
+            // Waiting for the frames draws it again anyway: the legends are asked about once
+            // they are whole.
+            let legends = web && !frames && rustgis_engine::render::layout::legends_pending(&layout, &app.session.project.maps);
+            app.layout.page_wait = (legends || frames).then_some(PageWait { landed, frames, drawn: now });
         }
     }
-    if app.layout.legends_wait.is_some() {
+    if app.layout.page_wait.is_some() {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }
     // A pan's preview is drawn as the pan starts, and let go when it ends.
@@ -1347,6 +1415,13 @@ pub(crate) fn save_drafts(app: &mut RustGisApp) {
     }
 }
 
+/// Saves all text being typed, the field the Format pane shows included: for a command that
+/// draws the page before the pane runs this frame (the ribbon is drawn first).
+pub(crate) fn commit_drafts(app: &mut RustGisApp) {
+    app.layout.drawn = None;
+    save_drafts(app);
+}
+
 /// A text field whose typing is kept in the view's state while it has focus. Returns the new text
 /// when the field loses focus with a change.
 fn text_field(
@@ -1410,16 +1485,23 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
             (rustgis_engine::map::layout::MAX_GRATICULE_STEP, 0.05)
         };
         let r = ui
-            .add(egui::DragValue::new(&mut step).range(0.0..=most).speed(speed).max_decimals(4).custom_formatter(|v, _| {
-                if v <= 0.0 {
-                    tl!("Auto").to_string()
-                } else if measured {
-                    // (The system's units: metres for UTM.)
-                    format!("{v}")
-                } else {
-                    format!("{v}°")
-                }
-            }))
+            .add(
+                egui::DragValue::new(&mut step)
+                    .update_while_editing(false)
+                    .range(0.0..=most)
+                    .speed(speed)
+                    .max_decimals(4)
+                    .custom_formatter(|v, _| {
+                        if v <= 0.0 {
+                            tl!("Auto").to_string()
+                        } else if measured {
+                            // (The system's units: metres for UTM.)
+                            format!("{v}")
+                        } else {
+                            format!("{v}°")
+                        }
+                    }),
+            )
             .on_hover_text(if measured { tl!("In the coordinate system's units: metres for UTM.") } else { tl!("In degrees.") })
             .labelled_by(input_label.id);
         if drag.settled(ui, &r, &mut step) && (step - g.step).abs() > 1e-9 {
@@ -1451,7 +1533,14 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
         let mut w = g.width;
         let drag = Dragged::lend(ui, key("width"), &mut w);
         let r = ui
-            .add(egui::DragValue::new(&mut w).range(0.0..=MAX_GRID_WIDTH).speed(0.05).max_decimals(2).suffix(" pt"))
+            .add(
+                egui::DragValue::new(&mut w)
+                    .update_while_editing(false)
+                    .range(0.0..=MAX_GRID_WIDTH)
+                    .speed(0.05)
+                    .max_decimals(2)
+                    .suffix(" pt"),
+            )
             .labelled_by(input_label.id);
         if drag.settled(ui, &r, &mut w) && (w - g.width).abs() > 1e-9 {
             set(app, json!({"width": w}));
@@ -1462,7 +1551,14 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
             let mut t = g.tick_length;
             let drag = Dragged::lend(ui, key("tickLength"), &mut t);
             let r = ui
-                .add(egui::DragValue::new(&mut t).range(0.0..=MAX_TICK_MM).speed(0.1).max_decimals(1).suffix(" mm"))
+                .add(
+                    egui::DragValue::new(&mut t)
+                        .update_while_editing(false)
+                        .range(0.0..=MAX_TICK_MM)
+                        .speed(0.1)
+                        .max_decimals(1)
+                        .suffix(" mm"),
+                )
                 .labelled_by(input_label.id);
             if drag.settled(ui, &r, &mut t) && (t - g.tick_length).abs() > 1e-9 {
                 set(app, json!({"tickLength": t}));
@@ -1631,7 +1727,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                     let input_label = ui.label(tl!(label));
                     let mut val = v;
                     let drag = Dragged::lend(ui, drag_key(key), &mut val);
-                    let r = ui.add(egui::DragValue::new(&mut val).speed(0.5).max_decimals(1)).labelled_by(input_label.id);
+                    let r = ui
+                        .add(egui::DragValue::new(&mut val).update_while_editing(false).speed(0.5).max_decimals(1))
+                        .labelled_by(input_label.id);
                     if drag.settled(ui, &r, &mut val) && (val - v).abs() > 1e-6 {
                         update(app, json!({key: val}));
                     }
@@ -1674,7 +1772,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let input_label = ui.label(tl!("Columns"));
                         let mut n = *columns as u64;
                         let drag = Dragged::lend(ui, drag_key("columns"), &mut n);
-                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=MAX_LEGEND_COLUMNS as u64)).labelled_by(input_label.id);
+                        let r = ui
+                            .add(egui::DragValue::new(&mut n).update_while_editing(false).range(1..=MAX_LEGEND_COLUMNS as u64))
+                            .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *columns {
                             update(app, json!({"columns": n}));
                         }
@@ -1753,7 +1853,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let input_label = ui.label(tl!("Ticks"));
                         let mut n = *ticks as u64;
                         let drag = Dragged::lend(ui, drag_key("ticks"), &mut n);
-                        let r = ui.add(egui::DragValue::new(&mut n).range(2..=MAX_COLORBAR_TICKS as u64)).labelled_by(input_label.id);
+                        let r = ui
+                            .add(egui::DragValue::new(&mut n).update_while_editing(false).range(2..=MAX_COLORBAR_TICKS as u64))
+                            .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *ticks {
                             update(app, json!({"ticks": n}));
                         }
@@ -1792,7 +1894,11 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let r = ui
                             .add_enabled(
                                 own_scale,
-                                egui::DragValue::new(&mut sc).range(MIN_FRAME_SCALE..=MAX_FRAME_SCALE).speed(speed).max_decimals(decimals),
+                                egui::DragValue::new(&mut sc)
+                                    .update_while_editing(false)
+                                    .range(MIN_FRAME_SCALE..=MAX_FRAME_SCALE)
+                                    .speed(speed)
+                                    .max_decimals(decimals),
                             )
                             .labelled_by(input_label.id);
                         let settled = drag.settled(ui, &r, &mut sc);
@@ -1810,7 +1916,15 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             // The bearing is the source's when the link takes its rotation too.
                             let own = key != "bearing" || !link.is_some_and(|l| l.rotation);
                             let r = ui
-                                .add_enabled(own, egui::DragValue::new(&mut v).range(range).speed(0.5).max_decimals(1).suffix("°"))
+                                .add_enabled(
+                                    own,
+                                    egui::DragValue::new(&mut v)
+                                        .update_while_editing(false)
+                                        .range(range)
+                                        .speed(0.5)
+                                        .max_decimals(1)
+                                        .suffix("°"),
+                                )
                                 .labelled_by(input_label.id);
                             if drag.settled(ui, &r, &mut v) && (v - current).abs() > 1e-6 {
                                 update(app, json!({key: v}));
@@ -1864,6 +1978,8 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         decimals,
                         label_size,
                         fit,
+                        color,
+                        fill,
                         ..
                     } => {
                         let input_label = ui.label(tl!("Style"));
@@ -1895,7 +2011,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let input_label = ui.label(tl!("Divisions"));
                         let mut n = *divisions as u64;
                         let drag = Dragged::lend(ui, drag_key("divisions"), &mut n);
-                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=MAX_SCALE_DIVISIONS as u64)).labelled_by(input_label.id);
+                        let r = ui
+                            .add(egui::DragValue::new(&mut n).update_while_editing(false).range(1..=MAX_SCALE_DIVISIONS as u64))
+                            .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *divisions {
                             update(app, json!({"divisions": n}));
                         }
@@ -1909,7 +2027,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             let input_label = ui.label(tl!(label));
                             let mut n = current as u64;
                             let drag = Dragged::lend(ui, drag_key(key), &mut n);
-                            let r = ui.add(egui::DragValue::new(&mut n).range(0..=most as u64)).labelled_by(input_label.id);
+                            let r = ui
+                                .add(egui::DragValue::new(&mut n).update_while_editing(false).range(0..=most as u64))
+                                .labelled_by(input_label.id);
                             if drag.settled(ui, &r, &mut n) && n as usize != current {
                                 update(app, json!({key: n}));
                             }
@@ -1919,7 +2039,14 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let mut size = *label_size;
                         let drag = Dragged::lend(ui, drag_key("labelSize"), &mut size);
                         let r = ui
-                            .add(egui::DragValue::new(&mut size).range(SCALE_LABEL_SIZE).speed(0.25).max_decimals(1).suffix(" pt"))
+                            .add(
+                                egui::DragValue::new(&mut size)
+                                    .update_while_editing(false)
+                                    .range(SCALE_LABEL_SIZE)
+                                    .speed(0.25)
+                                    .max_decimals(1)
+                                    .suffix(" pt"),
+                            )
                             .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut size) && (size - *label_size).abs() > 1e-6 {
                             update(app, json!({"labelSize": size}));
@@ -1974,12 +2101,25 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             .response
                             .labelled_by(input_label.id);
                         ui.end_row();
+                        // The fill is the alternating bar's light divisions: the other styles draw none.
+                        let colors = [("Color", "color", *color), ("Fill", "fill", *fill)];
+                        let shown = if *style == ScaleBarStyle::Alternating { 2 } else { 1 };
+                        for (label, key, current) in colors.into_iter().take(shown) {
+                            ui.label(tl!(label));
+                            let mut c = crate::theme::c32(current);
+                            let resp = crate::widgets::color_button(ui, &mut c);
+                            if resp.changed() {
+                                crate::widgets::one_step_per_press(app, &resp);
+                                update(app, json!({key: crate::theme::rgba(c).hex()}));
+                            }
+                            ui.end_row();
+                        }
                     }
                     ElementKind::Table { rows, .. } => {
                         let input_label = ui.label(tl!("Rows"));
                         let mut n = *rows as u64;
                         let drag = Dragged::lend(ui, drag_key("rows"), &mut n);
-                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=500)).labelled_by(input_label.id);
+                        let r = ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(1..=500)).labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *rows {
                             update(app, json!({"rows": n}));
                         }
@@ -2001,7 +2141,14 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let mut wd = *width;
                         let drag = Dragged::lend(ui, drag_key("width"), &mut wd);
                         let r = ui
-                            .add(egui::DragValue::new(&mut wd).range(0.0..=50.0).speed(0.1).max_decimals(1).suffix(" pt"))
+                            .add(
+                                egui::DragValue::new(&mut wd)
+                                    .update_while_editing(false)
+                                    .range(0.0..=50.0)
+                                    .speed(0.1)
+                                    .max_decimals(1)
+                                    .suffix(" pt"),
+                            )
                             .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut wd) && (wd - width).abs() > 1e-6 {
                             update(app, json!({"width": wd}));
@@ -2021,7 +2168,14 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let mut wd = *width;
                         let drag = Dragged::lend(ui, drag_key("width"), &mut wd);
                         let r = ui
-                            .add(egui::DragValue::new(&mut wd).range(0.1..=50.0).speed(0.1).max_decimals(1).suffix(" pt"))
+                            .add(
+                                egui::DragValue::new(&mut wd)
+                                    .update_while_editing(false)
+                                    .range(0.1..=50.0)
+                                    .speed(0.1)
+                                    .max_decimals(1)
+                                    .suffix(" pt"),
+                            )
                             .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut wd) && (wd - width).abs() > 1e-6 {
                             update(app, json!({"width": wd}));
@@ -2046,7 +2200,14 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let mut a = current;
                         let drag = Dragged::lend(ui, drag_key("angle"), &mut a);
                         let r = ui
-                            .add(egui::DragValue::new(&mut a).range(-180.0..=180.0).speed(1.0).max_decimals(1).suffix("°"))
+                            .add(
+                                egui::DragValue::new(&mut a)
+                                    .update_while_editing(false)
+                                    .range(-180.0..=180.0)
+                                    .speed(1.0)
+                                    .max_decimals(1)
+                                    .suffix("°"),
+                            )
                             .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut a) && (a - current).abs() > 1e-6 {
                             update(app, json!({"angle": a}));
@@ -2365,6 +2526,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                 let r = ui
                     .add(
                         egui::DragValue::new(&mut w)
+                            .update_while_editing(false)
                             .range(rustgis_engine::map::layout::MIN_INDICATOR_WIDTH..=rustgis_engine::map::layout::MAX_INDICATOR_WIDTH)
                             .speed(0.05)
                             .max_decimals(2)
@@ -2499,11 +2661,41 @@ pub(crate) fn locked_delete() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{RULER, landing, page_rect, resized, rotate_handle, snap_to, to_screen, turned};
+    use super::{FRAMES_REDRAW_S, PageWait, RULER, landing, page_rect, redraw_due, resized, rotate_handle, snap_to, to_screen, turned};
     use crate::RustGisApp;
     use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
     use serde_json::json;
     use std::{cell::Cell, rc::Rc};
+
+    /// In the browser, a page drawn while its frames' tiles were on their way is drawn again as
+    /// they land, at most every `FRAMES_REDRAW_S`, without asking about legends.
+    #[test]
+    fn a_page_missing_tiles_is_drawn_again_as_they_land() {
+        let w = PageWait { landed: (7, 3), frames: true, drawn: 10.0 };
+        let legends = || panic!("the frames' wait doesn't ask about legends");
+        assert!(redraw_due(w, (8, 3), 10.0 + FRAMES_REDRAW_S, legends), "a tile landed, long enough since the last drawing");
+        assert!(!redraw_due(w, (8, 3), 10.0 + FRAMES_REDRAW_S / 2.0, legends), "a tile landed, but too soon after the last drawing");
+        assert!(!redraw_due(w, (7, 3), 60.0, legends), "nothing landed");
+    }
+
+    /// A streamed layer's read, or a source opened by its address, lands outside the tile cache:
+    /// a frame drawn short of it is drawn again too (#1534).
+    #[test]
+    fn a_page_missing_a_streamed_read_is_drawn_again_as_it_lands() {
+        let w = PageWait { landed: (7, 3), frames: true, drawn: 10.0 };
+        assert!(redraw_due(w, (7, 4), 10.0 + FRAMES_REDRAW_S, || false), "a read landed");
+        assert!(!redraw_due(w, (7, 4), 10.0 + FRAMES_REDRAW_S / 2.0, || false), "a read landed, but too soon");
+    }
+
+    /// A page waiting only for legend pictures is drawn again once they have all landed, not on
+    /// every fetch: the map's own tiles land too (#1177).
+    #[test]
+    fn a_page_missing_legend_pictures_is_drawn_again_once_they_land() {
+        let w = PageWait { landed: (7, 3), frames: false, drawn: 10.0 };
+        assert!(redraw_due(w, (8, 3), 10.0, || false), "the pictures landed");
+        assert!(!redraw_due(w, (8, 3), 60.0, || true), "a fetch landed, but a picture is still on its way");
+        assert!(!redraw_due(w, (7, 3), 60.0, || false), "nothing landed");
+    }
 
     #[test]
     fn turns_snap_to_level_upright_and_diagonal() {
@@ -3548,6 +3740,59 @@ mod tests {
         assert_eq!(h.state().session.undo_depth(), undo + 1, "one undo step");
     }
 
+    /// A text size typed in the Format pane is set once, on Enter; Escape brings back the size
+    /// from before, without a step (#1194).
+    #[test]
+    fn a_size_typed_in_the_format_pane_is_one_undo_step_and_escape_brings_it_back() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Sizes"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.selected = Some(title);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                // As the app does each frame: Escape noted, then the shortcuts, which take it.
+                crate::widgets::note_escape(ui.ctx());
+                crate::chrome::shortcuts(app, &ui.ctx().clone());
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let size = |app: &RustGisApp| match &app.session.project.layouts[li].element(title).unwrap().kind {
+            ElementKind::Text { size, .. } => *size,
+            kind => panic!("{kind:?}"),
+        };
+        let before = size(h.state());
+        let undo = h.state().session.undo_depth();
+        let type_size = |h: &mut egui_kittest::Harness<'_, RustGisApp>, text: &str, key: egui::Key, steps: usize| {
+            h.get_by_role_and_label(Role::SpinButton, "Size").focus();
+            h.run();
+            h.event(egui::Event::Text(text.into()));
+            h.run();
+            assert_eq!(h.state().session.undo_depth(), steps, "nothing is set while typing");
+            h.key_press(key);
+            h.run();
+        };
+        type_size(&mut h, "23", egui::Key::Enter, undo);
+        assert_eq!(size(h.state()), 23.0);
+        assert_eq!(h.state().session.undo_depth(), undo + 1);
+        type_size(&mut h, "30", egui::Key::Escape, undo + 1);
+        assert_eq!(size(h.state()), 23.0, "Escape brings back the size from before");
+        assert_eq!(h.state().session.undo_depth(), undo + 1);
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+        assert_eq!(size(h.state()), before);
+    }
+
     /// A drag in the picker of a text's colour, in the shared text form, is one undo step (#1194).
     #[test]
     fn a_colour_drag_in_the_format_pane_is_one_undo_step() {
@@ -3975,6 +4220,24 @@ mod tests {
         assert_eq!(h.state().ui.right, Some(Format));
     }
 
+    /// Capture To Clipboard draws the text still being typed into the Format pane.
+    #[test]
+    fn a_capture_keeps_the_text_being_typed() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layout.new", json!({"name": "Typing"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.typing.insert((li, title, "text"), "Typed".into());
+        // The pane drew this field last frame and it still has focus.
+        app.layout.drawn = Some((li, title));
+        app.run("ui.captureLayout", json!(null)).unwrap();
+        let text = match &app.session.project.layouts[li].element(title).unwrap().kind {
+            super::ElementKind::Text { text, .. } => text.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(text, "Typed");
+    }
+
     /// Text being typed when another project opens is for the old one: it never reaches the
     /// element of the same id in the new one, whether the app opened it or an agent did through
     /// the session itself (the MCP relay, the file bridge).
@@ -4106,6 +4369,74 @@ mod tests {
         assert!((y[0] - 40.0).abs() < 0.5, "at about 40 mm: {y:?}");
         drag(&mut h, Pos2::new(page.center().x, to_screen(page, s, (0.0, y[0])).y), ruler);
         assert!(h.state().session.project.layouts[li].guides.y.is_empty(), "dropped on the ruler, it's gone");
+    }
+
+    /// Each layout keeps its own zoom and pan of the page. One not opened yet fits the page, and
+    /// so does a new layout given the name of one renamed, removed or of another project.
+    #[test]
+    fn each_layout_keeps_its_page_view() {
+        type H<'a> = egui_kittest::Harness<'a, RustGisApp>;
+        type View = (f32, egui::Vec2);
+        const FIT: View = (0.0, egui::Vec2::ZERO);
+        fn run(h: &mut H<'_>, id: &str, params: serde_json::Value) -> View {
+            h.state_mut().run(id, params).unwrap();
+            h.run_steps(2);
+            (h.state().layout.zoom, h.state().layout.pan)
+        }
+        fn set(h: &mut H<'_>, view: View) {
+            let layout = &mut h.state_mut().layout;
+            (layout.zoom, layout.pan) = view;
+            h.run_steps(2);
+        }
+        let (a, b): (View, View) = ((2.0, vec2(30.0, -20.0)), (3.0, vec2(-40.0, 10.0)));
+        let open = |name: &str| json!({"name": name});
+
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "A", "template": "blank"})).unwrap();
+        app.run("layout.new", json!({"name": "B", "template": "blank"})).unwrap();
+        let text = serde_json::to_string(&app.session.project).unwrap();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+
+        set(&mut h, b);
+        assert_eq!(run(&mut h, "layout.activate", open("A")), FIT, "not opened yet: fits the page");
+        set(&mut h, a);
+        assert_eq!(run(&mut h, "layout.activate", open("B")), b, "back as it was left");
+        assert_eq!(run(&mut h, "layout.activate", open("A")), a);
+
+        // Showing the map and coming back keeps it; a copy starts with its own.
+        run(&mut h, "layout.close", json!({}));
+        assert_eq!(run(&mut h, "layout.activate", open("A")), a, "closed and opened again");
+        assert_eq!(run(&mut h, "layout.duplicate", json!({"name": "A", "newName": "A2"})), FIT, "a copy fits the page");
+        assert_eq!(run(&mut h, "layout.activate", open("A")), a, "the copy didn't change it");
+
+        // B's name freed by renaming it: a new B doesn't get its view.
+        run(&mut h, "layout.activate", open("B"));
+        assert_eq!(run(&mut h, "layout.rename", json!({"name": "B", "newName": "C"})), FIT, "renamed: fits the page");
+        run(&mut h, "layout.activate", open("A"));
+        assert_eq!(run(&mut h, "layout.new", json!({"name": "B", "template": "blank"})), FIT, "a new layout with a used name");
+
+        // A's name freed by removing it while open.
+        run(&mut h, "layout.activate", open("A"));
+        set(&mut h, a);
+        run(&mut h, "layout.remove", open("A"));
+        assert_eq!(run(&mut h, "layout.new", json!({"name": "A", "template": "blank"})), FIT, "a new layout after the removal");
+
+        // Another project with a layout of the same name.
+        set(&mut h, a);
+        run(&mut h, "project.openText", json!({"text": text}));
+        assert_eq!(run(&mut h, "layout.activate", open("A")), FIT, "another project's layout");
     }
 
     #[test]

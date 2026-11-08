@@ -19,25 +19,25 @@ pub mod fetch;
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("plugin.list", "Plugins", "Plugins › Manage", list).view(),
-        C::new("plugin.install", "Install Plugin", "Plugins › Manage", install)
+        C::new("plugin.list", "Plugins", "Plugins › Manage", list).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view(),
+        C::new("plugin.install", "Install Plugin", "Plugins › Manage", install).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"path": "a .rgplugin package, or a plugin folder (for development)"}"#),
-        C::new("plugin.uninstall", "Uninstall Plugin", "Plugins › Manage", uninstall).view().params(r#"{"id": plugin id}"#),
-        C::new("plugin.enable", "Enable Plugin", "Plugins › Manage", enable).view().params(r#"{"id": plugin id, "enabled"?: bool}"#),
-        C::new("plugin.registry", "Browse Plugins", "Plugins › Manage", browse)
+        C::new("plugin.uninstall", "Uninstall Plugin", "Plugins › Manage", uninstall).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(r#"{"id": plugin id}"#),
+        C::new("plugin.enable", "Enable Plugin", "Plugins › Manage", enable).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(r#"{"id": plugin id, "enabled"?: bool}"#),
+        C::new("plugin.registry", "Browse Plugins", "Plugins › Manage", browse).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"url"?: "registry.json (default: https://plugins.rustgis.app/registry.json)"}"#),
-        C::new("plugin.installFromRegistry", "Install Plugin From Registry", "Plugins › Manage", install_from_registry)
+        C::new("plugin.installFromRegistry", "Install Plugin From Registry", "Plugins › Manage", install_from_registry).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"id": plugin id, "url"?: registry.json}"#),
-        C::new("plugin.panel", "Plugin Panel State", "Plugins", panel).view().params(
+        C::new("plugin.panel", "Plugin Panel State", "Plugins", panel).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
             r#"{"id": plugin id, "values"?: {widget id: true/false, a whole number, or a tree node's id (null for none)}, "refresh"?: bool (run the panel's state command)}"#,
         ),
-        C::new("plugin.browse", "Browse Plugin Content", "Plugins", super::plugin_browse::browse).view().params(
+        C::new("plugin.browse", "Browse Plugin Content", "Plugins", super::plugin_browse::browse).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(
             r#"{"id": plugin id, "node"?: "a node's id as a listing gave it (the roots when absent)", "query"?: "search text, when the plugin's browser declares search"} → {id, node, nodes: [{id, label, detail?, icon?, count?, expandable, children}], truncated, notes}"#,
         ),
-        C::new("plugin.prepare", "Prepare Plugin Environment", "Plugins › Manage", prepare)
+        C::new("plugin.prepare", "Prepare Plugin Environment", "Plugins › Manage", prepare).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved))
             .view()
             .params(r#"{"id": plugin id (a process plugin that declares "python": downloads its Python and packages)}"#),
     ]
@@ -59,7 +59,7 @@ fn panel(s: &mut Session, p: &Value) -> CmdResult {
     }
     if b(p, "refresh").unwrap_or(false) && !decl.state.is_empty() {
         // A failed refresh leaves the values as they were, as a failed command does.
-        if let Err(e) = s.run_plugin(&rustgis_plugins::command_id(id, &decl.state), &json!({})) {
+        if let Err(e) = s.run(&rustgis_plugins::command_id(id, &decl.state), &json!({})) {
             *s.panel_state(id, &decl) = before;
             return Err(e);
         }
@@ -253,191 +253,36 @@ pub(crate) fn leak(s: &str) -> &'static str {
     new
 }
 
-/// Commands reserved to the user (see [`user_only`]); plugin management is too.
-const NEVER: &[&str] = &[
-    "gp.installGeolibre",
-    "gp.uninstallGeolibre",
-    "gp.setGeolibre",
-    "script.run",
-    "task.run",
-    "model.run",
-    // A model saved by a plugin would be trusted to touch files when the user runs it.
-    "model.new",
-    "model.save",
-    "model.import",
-    "project.new",
-    "project.open",
-    "project.openText",
-    "project.sample",
-    "project.fromTemplate",
-    // A QGIS project names the files and web addresses its layers come from, and the import
-    // adds them without each one passing a plugin's permissions.
-    "project.importQgis",
-    // So does an ArcGIS Pro project, map or layer file.
-    "project.importArcgis",
-    "project.importGeolibre",
-    // Completion callbacks can finish project imports; plugins never supply their state.
-    "layer.addDownload",
-    "edit.undo",
-    "edit.redo",
-    // Credentials: a plugin never sets where the user's are sent.
-    "connection.new",
-    "connection.edit",
-    "connection.duplicate",
-    "connection.remove",
-    "connection.login",
-    "connection.forgetPassword",
-    "connection.forgetSavedKeys",
-    "connection.resolveS3",
-    "connection.test",
-    "connection.browse",
-    "s3.connect",
-    "s3.disconnect",
-    "earthdata.login",
-    "earthdata.logout",
-    // The session log records what was done (#797): a plugin never empties it or turns it off.
-    "project.clearLog",
-    "project.logCommands",
-    "pg.connect",
-    "pg.disconnect",
-    // Writes to a database: the user's to do, asked each time.
-    "pg.saveEdits",
-    "gpkg.saveEdits",
-];
-
-/// Commands that write files without naming one in their parameters, or read what the user's
-/// commands named (the session log's paths, addresses and SQL).
-const REACHES_FILES: &[&str] = &["project.save", "project.saveAs", "project.log"];
-
-/// Commands that read a file a layer names, not their parameters.
-const READS_FILES: &[&str] = &["gpkg.discardEdits"];
-
-/// Commands that open what a layer names, a file or a web service, not their parameters: Retry
-/// reopens a broken layer's file (or its web address) or adds its service again.
-const LAYER_SOURCES: &[&str] = &["layer.retry"];
-
-/// Parameter keys that name a file, folder or address. (`data` and `text` carry content, which
-/// plugins may pass: `layer.addDataBytes`, `map.import` from text.)
-pub(crate) const PLACE_KEYS: &[&str] = &["path", "folder", "dir", "file", "url", "uri", "source", "output", "connection", "database"];
-
-/// The command running an SQL query through DuckDB, which can read any file and web address.
+/// Parameter locations shared with the log's reach heuristic.
+pub(crate) const PLACE_KEYS: &[&str] = crate::policy::PLACE_KEYS;
 pub const SQL: &str = "layer.addSql";
-
-/// Commands that read a database, which can be a PostgreSQL server's as well as a file, and a
-/// Zarr store, a folder or a web address.
-const DATABASES: &[&str] = &[
-    SQL,
-    "layer.addDatabase",
-    "info.databaseTables",
-    "sql.query",
-    "sql.schema",
-    "raster.zarrInfo",
-    "layer.addZarr",
-    "pg.tables",
-    "pg.addLayer",
-    "pg.discardEdits",
-    "zarr.series",
-    "zarr.reduce",
-    "cube.trend",
-    "cube.reduce",
-];
-
-/// What a command reaches beyond the project when run with some parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach {
-    /// Reads or writes files, or runs a native program (the GeoLibre suite) that does.
     Files,
-    /// Fetches from an address (web tiles).
     Network,
+    Plugin(&'static str),
 }
-
-/// Whether `id` is reserved to the user: plugin management, the GeoLibre runner, the user's own
-/// automation (scripts, tasks, models run with the user's trust), and replacing the project or
-/// stepping through its undo history. Plugins never run these; the AI assistant asks first.
+/// Compatibility projection of the engine's additive declarations.
 pub fn user_only(id: &str) -> bool {
-    id.starts_with("plugin.") || NEVER.contains(&id)
+    use crate::policy::Effect;
+    id.starts_with("plugin.")
+        || crate::cmd::all().iter().find(|c| c.id == id).is_some_and(|c| {
+            [Effect::Automation, Effect::Reserved, Effect::Replaces, Effect::History].into_iter().any(|e| c.effects.contains(e))
+        })
 }
-
-/// What running `spec` with `params` reaches beyond the project, if anything: by what the
-/// parameters name, what the command's parameters can name, and what it is.
 pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
-    // External tools (the GeoLibre suite) run a native program that reads files a parameter
-    // names, including bare file names.
-    if spec.id == "gp.run" && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::is_geolibre_tool) {
-        return Some(Reach::Files);
+    use crate::policy::Effect;
+    let e = crate::policy::command_effects(spec, params);
+    if e.contains(Effect::Plugin) {
+        return ps(params, "tool").and_then(super::gp::resolve_tool).map(|t| Reach::Plugin(t.id));
     }
-    // So do tools with a file parameter (a plugin's `file`): they're handed the file.
-    if spec.id == "gp.run"
-        && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files)
-    {
-        return Some(Reach::Files);
-    }
-    if spec.id == "gp.run"
-        && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::writes_files)
-    {
-        return Some(Reach::Files);
-    }
-    // A catalog's Zarr entry is opened as `layer.addZarr` is, a database's way.
-    if spec.id == "cube.open" && super::cube_catalog::opens_zarr(params) {
-        return Some(Reach::Files);
-    }
-    // Commands that fetch from an address read and write no files, so `files` doesn't come into
-    // it (their addresses would look like paths to the check below).
-    if super::tiles::NETWORK.contains(&spec.id) {
-        return Some(Reach::Network);
-    }
-    if DATABASES.contains(&spec.id) || LAYER_SOURCES.contains(&spec.id) {
-        return Some(Reach::Files);
-    }
-    // Georeferencing and projecting write a file only when given a `path`; the rest of them stays
-    // in the project.
-    if spec.id == "raster.georeference" || spec.id == "raster.project" {
-        return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
-    }
-    // A built-in tool's output layer name stays in the session, as it does in a task.
-    let params = super::items::layer_name_left_out(spec.id, params);
-    let files = super::items::names_place(&params, PLACE_KEYS, 0)
-        || PLACE_KEYS.iter().any(|k| spec.params.contains(&format!("\"{k}\"")))
-        || REACHES_FILES.contains(&spec.id)
-        || READS_FILES.contains(&spec.id)
-        || ["share.", "offline.", "cache.", "notebook."].iter().any(|p| spec.id.starts_with(p));
-    files.then_some(Reach::Files)
-}
-
-/// Why a plugin may not run `id` with `params`, if it may not.
-fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
-    let m = &plugin.manifest;
-    if user_only(spec.id) {
-        return Some(format!("plugins can't run '{}'", spec.id));
-    }
-    // An SQL query reads files and web addresses alike, and a database is a file or a server.
-    let database = DATABASES.contains(&spec.id)
-        || LAYER_SOURCES.contains(&spec.id)
-        || (spec.id == "cube.open" && super::cube_catalog::opens_zarr(params));
-    if database && !(m.has(Permission::Files) && m.has(Permission::Network)) {
-        return Some(format!("{} needs the 'files' and 'network' permissions to run '{}'", m.name, spec.id));
-    }
-    match reaches(spec, params) {
+    if e.contains(Effect::Files) {
         Some(Reach::Files)
-            if spec.id == "gp.run"
-                && !m.has(Permission::Files)
-                && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::is_geolibre_tool) =>
-        {
-            return Some(format!("{} needs the 'files' permission to run GeoLibre tools", m.name));
-        }
-        // The address could carry what the plugin read out of the project.
-        Some(Reach::Network) if !m.has(Permission::Network) => {
-            return Some(format!("{} needs the 'network' permission to run '{}'", m.name, spec.id));
-        }
-        Some(Reach::Files) if !m.has(Permission::Files) => {
-            return Some(format!("{} needs the 'files' permission to run '{}'", m.name, spec.id));
-        }
-        _ => {}
+    } else if e.contains(Effect::Network) {
+        Some(Reach::Network)
+    } else {
+        None
     }
-    if spec.mutates && !m.has(Permission::Edit) {
-        return Some(format!("{} needs the 'edit' permission to run '{}'", m.name, spec.id));
-    }
-    None
 }
 
 /// Answers a running plugin's requests.
@@ -454,6 +299,12 @@ struct Bridge<'a> {
 
 impl Bridge<'_> {
     fn need(&self, p: Permission, what: &str) -> Result<(), String> {
+        if p == Permission::Edit {
+            return self.s.host_effect(crate::policy::Effects::NONE.with(crate::policy::Effect::Edits), "host.addLayer");
+        }
+        if p == Permission::Network {
+            return self.s.host_effect(crate::policy::Effects::NONE.with(crate::policy::Effect::Network), "host.fetch");
+        }
         if self.plugin.manifest.has(p) {
             Ok(())
         } else {
@@ -527,11 +378,21 @@ impl Bridge<'_> {
         if id.starts_with(rustgis_plugins::PREFIX) {
             return Err("plugins can't run other plugins' commands".into());
         }
-        let spec = self.s.registry.get(id).ok_or_else(|| format!("unknown command '{id}'"))?;
-        if let Some(why) = refused(&self.plugin, spec, params) {
-            return Err(why);
+        // Routing receipts belong to engine-issued downloads, never guest JSON.
+        let unnumbered;
+        let params = if matches!(id, "layer.addUrl" | "layer.addDownload") && params.get("request").is_some() {
+            unnumbered = fetch::without_request(params);
+            &unnumbered
+        } else {
+            params
+        };
+        if let Some(connection) = params.get("connection").and_then(Value::as_str).map(str::trim)
+            && self.s.connections.connections.iter().any(|c| c.id == connection && crate::service_logins::is_service(c))
+        {
+            return Err(format!("plugins can't use a saved web-service connection's login ('{id}')"));
         }
-        let (enabled, run, label, mutates) = (spec.enabled, spec.run, spec.label, spec.mutates);
+        let spec = self.s.registry.get(id).ok_or_else(|| format!("unknown command '{id}'"))?;
+        let (enabled, label, mutates) = (spec.enabled, spec.label, spec.mutates);
         let named = params.get("layer").and_then(|_| self.s.layer_id(params).ok());
         let active = self.s.active_layer;
         if named.is_some() {
@@ -555,8 +416,11 @@ impl Bridge<'_> {
         // command that only left a request for the front end ([`Session::request_url`]) changed
         // nothing; a later one must not erase the undo step for an earlier edit.
         self.s.request_only = false;
-        let mut res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self.s, params)))
-            .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
+        let mut res = crate::service_logins::anonymously(self.s, true, |s| {
+            let op = s.authorize(id, params)?;
+            super::workflows::steps_of(s, |s| s.invoke(op, crate::policy::Txn::Shared))
+        })
+        .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
         let requested = std::mem::take(&mut self.s.request_only);
         self.requested |= requested;
         self.changed |= mutates && !requested;
@@ -604,7 +468,9 @@ impl Host for Bridge<'_> {
             "host.fetch" => {
                 // The address, and what the plugin answers, can carry what it read from the project.
                 self.need(Permission::Network, "fetch from the web")?;
-                self.fetches.fetch(params)
+                let c = self.s.continuation()?;
+                let still = Arc::new(move || c.check().is_ok());
+                crate::render::rustgis_tiles::cache::with_still(still, || self.fetches.fetch(params))
             }
             _ if op.starts_with("host.") => Err(format!("unknown request '{op}'")),
             _ => self.command(op, params),
@@ -618,13 +484,16 @@ impl Host for Bridge<'_> {
 
 impl Session {
     /// Runs a plugin command (`plugin:<plugin>/<command>`) as one undoable step.
-    pub(crate) fn run_plugin(&mut self, id: &str, params: &Value) -> CmdResult {
-        let Some(cmd) = rustgis_plugins::command(id) else {
-            return Err(match rustgis_plugins::split_id(id).and_then(|(p, _)| rustgis_plugins::get(p)) {
-                Some(p) if !p.enabled => format!("the plugin {} is disabled", p.manifest.name),
-                _ => format!("unknown command '{id}'"),
-            });
-        };
+    pub(crate) fn run_plugin(&mut self, op: crate::policy::Authorized<crate::policy::CommandOp>) -> CmdResult {
+        let crate::policy::CommandOp::Plugin { cmd, pin, params } = op.op() else { return Err("not a plugin command".into()) };
+        let cmd = cmd.clone();
+        if !rustgis_plugins::is_current(pin.plugin()) {
+            return Err("the plugin was disabled, updated or removed".into());
+        }
+        let params = params.clone();
+        let params = &params;
+        let id = rustgis_plugins::command_id(&cmd.plugin.manifest.id, &cmd.decl.id);
+        let id = id.as_str();
         let label = leak(&cmd.decl.label);
         let mutates = cmd.mutates();
         let plugin = cmd.plugin.clone();
@@ -657,14 +526,26 @@ impl Session {
         // could change the project, it is no undo step. Other commands keep theirs.
         let state_command = panel.as_ref().is_some_and(|d| !d.state.is_empty() && d.state == cmd.decl.id);
         let mut pending = Vec::new();
+        let mut requested = Vec::new();
+        let mut suspended = Vec::new();
+        let queued_before = self.queued_authority();
+        // The downloads this call leaves to the app: its own, apart from a calling command's.
+        let outer = self.call_requests.replace(Vec::new());
+        let mark = self.notice_mark();
         let res = self.guarded(label, mutates, |s| {
             let fetches = fetch::Calls::for_plugin(&plugin.manifest.id);
             let mut bridge = Bridge { s, plugin, fetches, changed: false, requested: false };
             let res = rustgis_plugins::run_command_with_panel(&cmd, &mut bridge, params, request);
-            if !bridge.fetches.pending.is_empty() {
-                // Waiting for a fetch (the browser): whatever the call did is undone, quietly,
-                // and the command runs again from the start once the answers are in.
+            let asked = bridge.s.call_requests.as_mut().map(std::mem::take).unwrap_or_default();
+            if res.is_ok() && (!bridge.fetches.pending.is_empty() || !asked.is_empty()) {
+                // Waiting for a fetch (the browser) or a download left to the app: whatever the
+                // call did is undone, quietly, and the command runs again from the start once
+                // the answers are in and the downloads added (#1202).
                 pending = std::mem::take(&mut bridge.fetches.pending);
+                requested = asked;
+                // Retain the exact engine-issued requests only for successful suspension.
+                // A genuine guest error/panic keeps guarded's ordinary retirement behavior.
+                suspended = bridge.s.suspend_plugin_requests(&queued_before, &requested);
                 bridge.s.quiet_failure = true;
                 return Err(String::new());
             }
@@ -688,13 +569,35 @@ impl Session {
                 _ => {}
             }
         }
-        if pending.is_empty() {
+        self.call_requests = outer;
+        if pending.is_empty() && requested.is_empty() {
             return res;
         }
+        // Restore only the original opaque authorities removed by intentional suspension.
+        // No JSON request can create a fresh User admission after the rollback.
+        let suspended_keys: Vec<u64> = suspended.iter().map(|q| q.key).collect();
+        let giving_up = self.retry_tries >= fetch::MAX_RETRIES;
+        if !giving_up {
+            self.restore_plugin_requests(suspended)?;
+        }
+        // A service's document is read here, once the run is kept: the app adds nothing for it,
+        // and with no command waiting nothing would take it.
+        let documents: Vec<(u64, Value)> =
+            requested.iter().filter(|(n, asked)| !giving_up && fetch::is_document(asked) && !self.url_waits.has(*n)).cloned().collect();
+        // The errors this run said stay: the next run, doing the same again, doesn't repeat them.
+        let earlier = self.rerun_said.len();
+        let said: Vec<String> = self.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+        self.rerun_said.extend(said);
         // The panel's values went back with the failed call: the run again sets them again.
-        let res = self.retry_plugin(id, given, pending);
+        let res = self.retry_plugin(id, given, pending, requested);
+        self.rerun_said.truncate(earlier);
         if let Err(e) = &res {
+            self.discard_plugin_requests(&suspended_keys);
             self.notify(e.clone(), true);
+        } else {
+            for (n, asked) in &documents {
+                self.url_waits.read_document(*n, asked);
+            }
         }
         res
     }
@@ -744,5 +647,48 @@ mod tests {
         assert!(!bridge.s.request_only, "the bridge took the flag");
         assert_eq!(s.take_url_requests().len(), 2);
         rustgis_plugins::unload("eng-bridge");
+    }
+
+    /// A plugin can't choose a download's number: the app gives it, so one plugin can't land or
+    /// share another command's wait (#1202).
+    #[test]
+    fn a_plugin_cant_choose_a_downloads_number() {
+        let pkg = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::package("eng-number", &["edit", "network"])).unwrap();
+        rustgis_plugins::load(pkg, "test").unwrap();
+        let mut s = Session::new(crate::Project::default());
+        s.run_leaving_downloads(
+            "plugin:eng-number/f",
+            &json!({
+                "op":"layer.addUrl", "params":{"url":"https://x.org/a.geojson", "request":99}
+            }),
+        )
+        .unwrap();
+        let taken = s.take_url_requests();
+        assert_eq!(taken.len(), 1);
+        assert_ne!(taken[0].params()["request"], json!(99));
+        rustgis_plugins::unload("eng-number");
+    }
+
+    /// A command run again answers one landed download as often as it asks for it in that run:
+    /// the same address asked twice isn't downloaded again (#1202).
+    #[test]
+    fn a_rerun_answers_a_download_asked_twice() {
+        let mut s = Session::new(crate::sample::world_project());
+        let l7 = u64::from(s.map().layers[0].id);
+        s.leave_downloads = true;
+        let asked = json!({"url": "https://x.org/a.geojson"});
+        s.rerun_landed = vec![(asked.clone(), Ok(json!({"layer": l7})), Default::default())];
+        for _ in 0..2 {
+            assert_eq!(s.run("layer.addUrl", &asked).unwrap(), json!({"layer": l7}));
+        }
+        assert!(s.take_url_requests().is_empty(), "nothing asked again");
+        // Asked with spaces around the address (kept trimmed): the same answer.
+        let padded = json!({"url": "  https://x.org/a.geojson "});
+        assert_eq!(s.run("layer.addUrl", &padded).unwrap(), json!({"layer": l7}));
+        assert!(s.take_url_requests().is_empty(), "nothing asked again");
+        // A layer undone while the command waited: said, not named.
+        s.rerun_landed = vec![(asked.clone(), Ok(json!({"layer": 4_000_000})), Default::default())];
+        let e = s.run("layer.addUrl", &asked).unwrap_err();
+        assert!(e.contains("removed or undone"), "{e}");
     }
 }

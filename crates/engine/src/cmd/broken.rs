@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 pub fn commands() -> Vec<C> {
-    vec![C::new("layer.diagnose", "Diagnose Broken Layer", "Layers", diagnose).view().params(
+    vec![C::new("layer.diagnose", "Diagnose Broken Layer", "Layers", diagnose).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
         r#"{"layer": name|id} → the layer's id as "layer", its "kind" (signIn, certificate, unreachable, serviceMissing, fileMissing, geodatabase or other) and "reason"; for a service layer its "server" (https://host); for a file layer its "path", its "folder" and the "siblings" (ids of the map's other broken file layers read from that folder); for a layer ArcGIS Pro read from an enterprise geodatabase (always "geodatabase") its "server", "database", "table", "platform" and "version" (null for the Default version), the saved "connections" that fit it (each with its id, name and whether it is an exact match: exact matches first, then the same database on another host) and the "siblings" (ids of the map's other broken geodatabase layers in the same database on the same server)"#,
     )]
 }

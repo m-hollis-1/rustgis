@@ -7,11 +7,11 @@ use serde_json::json;
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("layer.repairSource", "Repair Data Source", "Data › Data Source", repair_source).params(
+        C::new("layer.repairSource", "Repair Data Source", "Data › Data Source", repair_source).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"layer"?: name|id (default: the active layer), "path": "the file or folder (a Zarr store, a File Geodatabase) the layer's data moved to", "table"?: "the dataset in a GeoPackage, GDAL or DuckDB file, or a raster's subdataset (default: the one the layer reads now)"}"#),
-        C::new("layer.repairFolder", "Repair Data Sources in a Folder", "Data › Data Source", repair_folder).params(
+        C::new("layer.repairFolder", "Repair Data Sources in a Folder", "Data › Data Source", repair_folder).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"from": "the folder the broken layers' data was in", "to": "the folder it moved to"} → "repaired" (the names of the layers fixed, each to the file of the same name in the new folder) and "skipped" (each with its "layer" name and the "why" it wasn't fixed); fails when no broken layer had its data in the old folder, or when none of them could be repaired (the error says why for each)"#),
-        C::new("map.repairTiles", "Repair Tile Archive", "Layers", repair_tiles).params(
+        C::new("map.repairTiles", "Repair Tile Archive", "Layers", repair_tiles).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id, "path": "the .pmtiles or .mbtiles file the archive moved to"}"#),
     ]
 }
@@ -79,6 +79,7 @@ pub(crate) fn fits(l: &rustgis_map::Layer, info: &rustgis_data::source::SourceIn
     Ok(())
 }
 
+/// Reopens linked data after compatibility checks; undo restores the source and any reset label moves.
 fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -112,11 +113,23 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
             // A broken layer's query was kept unchecked while it had no fields to check it against.
             let was_broken = src.is_broken();
             let l = s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?;
-            l.replace_source(new);
+            let moved = l.replace_source(new);
+            let name = l.name.clone();
             let dropped = l.definition_query.take_if(|q| was_broken && rustgis_data::query::parse(q, &l.dataset).is_err());
             if let Some(q) = dropped {
-                let name = l.name.clone();
                 s.notify(format!("{name}: its definition query ({q}) doesn't fit {full}'s fields, so it was cleared"), false);
+            }
+            // A lock's feature ids and callout offsets belong to the old source too. The whole
+            // lock goes, not just this layer's entries: while locked only the labels it names are
+            // drawn, so dropping this layer's alone would hide its labels until the lock is
+            // taken again. Cleared, every label is locked again where it is placed next.
+            s.map_mut().label_lock = None;
+            s.map_mut().label_lock_line_anchors.clear();
+            if moved > 0 {
+                s.notify(
+                    format!("{moved} saved label move(s) reset in {name}: replacement data may reuse feature ids; undo restores them"),
+                    false,
+                );
             }
         }
         Ok(json!({"layer": id, "path": full, "table": s.map().layer(id).and_then(|l| l.linked_table())}))

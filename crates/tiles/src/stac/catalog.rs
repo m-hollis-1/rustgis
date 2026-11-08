@@ -5,6 +5,7 @@
 //! cloud cover and phase. Like the rest of [`super`], this is sans I/O: [`Walk`] says what to
 //! read next and takes the answers. Documents are hostile input: the walk is bounded in documents
 //! read, depth, links followed and items kept.
+//! A fetched document's login binding follows only links on its canonical origin.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -17,7 +18,7 @@ pub const MAX_READS: usize = 400;
 /// How deep a walk goes below its start.
 pub const MAX_DEPTH: usize = 8;
 /// The most links read from one document.
-const MAX_LINKS: usize = 5000;
+pub(super) const MAX_LINKS: usize = 5000;
 /// The most documents waiting to be read.
 const MAX_QUEUE: usize = 20_000;
 /// The most documents read at once.
@@ -27,6 +28,7 @@ const MAX_CHILDREN: usize = 2000;
 
 /// Whether an address names a static catalog's document (a `.json` file) rather than a STAC API.
 pub fn is_static(url: &str) -> bool {
+    let url = crate::logins::inner(url);
     let path = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/').to_ascii_lowercase();
     path.ends_with(".json")
 }
@@ -41,6 +43,7 @@ pub struct Child {
 /// A label for a document without a title: its folder's name for a `catalog.json` or
 /// `collection.json`, else its file's name without `.json`.
 pub fn label_of(url: &str) -> String {
+    let url = crate::logins::inner(url);
     let path = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
     let mut parts = path.rsplit('/');
     let file = parts.next().unwrap_or("");
@@ -87,7 +90,7 @@ pub fn parse_item_links(bytes: &[u8], from: &str) -> Result<Vec<Child>, String> 
 
 /// The links of a relation, resolved against `from`: (address, title), the first
 /// [`MAX_LINKS`] of them (counted among that relation's alone).
-fn links(v: &Value, rel: &str, from: &str) -> Vec<(String, String)> {
+pub(super) fn links(v: &Value, rel: &str, from: &str) -> Vec<(String, String)> {
     of_rel(v, rel).take(MAX_LINKS).filter_map(|l| Some((resolve(from, l.get("href")?.as_str()?)?, text(l.get("title"))))).collect()
 }
 
@@ -97,7 +100,7 @@ fn of_rel<'a>(v: &'a Value, rel: &'a str) -> impl Iterator<Item = &'a Value> {
 }
 
 /// Whether a document has more links of a relation than a walk follows.
-fn too_many(v: &Value, rel: &str) -> bool {
+pub(super) fn too_many(v: &Value, rel: &str) -> bool {
     of_rel(v, rel).nth(MAX_LINKS).is_some()
 }
 
@@ -152,7 +155,7 @@ impl Filter {
     }
 
     /// Whether an item is kept (`phase` is its `phase` property, if it has one).
-    fn keeps(&self, item: &Item, phase: Option<&str>) -> bool {
+    pub(super) fn keeps(&self, item: &Item, phase: Option<&str>) -> bool {
         if let (Some([w, s, e, n]), Some([iw, is, ie, inn])) = (self.bbox, item.bbox) {
             // A box over the antimeridian (west east of east), the filter's or the item's, is two:
             // up to 180° and from -180°.
@@ -396,7 +399,7 @@ fn collection_item(v: &Value, from: &str) -> Option<Value> {
         let roles: Vec<&str> = a.get("roles").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let t = a.get("type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
         let href = a.get("href").and_then(Value::as_str).unwrap_or("");
-        let path = href.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+        let path = crate::logins::inner(href).split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
         // Data RustGIS can add (by its media type or extension), or an asset that says it is data.
         const TYPES: [&str; 9] = ["geotiff", "image/tiff", "parquet", "pmtiles", "flatgeobuf", "geo+json", "vnd.las", "laszip", "zarr"];
         const EXTENSIONS: [&str; 11] =

@@ -6,10 +6,10 @@ use serde_json::{Value, json};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("layer.retry", "Retry", "Layers", retry).params(
+        C::new("layer.retry", "Retry", "Layers", retry).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
             r#"{"layer"?: name|id | "all"?: true (every broken layer of the map)} → {"retried": n, "opened": m, "failed": [{"layer", "error"}]}"#,
         ),
-        C::new("layer.relinkService", "Use Another Address", "Layers", relink).params(
+        C::new("layer.relinkService", "Use Another Address", "Layers", relink).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"layer": name|id of a broken service layer, "url": "the service's new address"} → the layer's id and whether it opened; the layer stays broken, at its old address, when the new one fails (the error says why)"#,
         ),
     ]

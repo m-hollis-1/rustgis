@@ -166,7 +166,7 @@ mod tests {
                 size: 40.0,
                 marker,
             };
-            crate::draw_marker(&mut pm, 30.0, 30.0, &s, 1.0, None, 1.0);
+            crate::canvas::with_canvas(&mut pm, |c| crate::draw_marker(c, 30.0, 30.0, &s, 1.0, None, 1.0));
             pm
         };
         let drawn = draw(rustgis_map::Marker::Char(missing));

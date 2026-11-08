@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod render_lod;
 mod window;
+pub(crate) use window::Query;
 
 /// Retained streamed rows and geometry caches per map; excludes scratch and render/export copies.
 pub const VIEW_BYTES: usize = if cfg!(target_arch = "wasm32") { 48 * 1024 * 1024 } else { 128 * 1024 * 1024 };
@@ -32,6 +33,8 @@ pub const VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 100_000 } else {
 
 /// The most features a view reads from a file by its web address (each one is fetched).
 pub const REMOTE_VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 30_000 } else { 60_000 };
+
+const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
 
 /// A streamed layer's source.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -80,6 +83,9 @@ pub struct SourceLayer {
     pub(crate) saved_selection: Vec<u64>,
     #[serde(skip)]
     pub(crate) window_fields: Option<usize>,
+    /// The layer's definition query, applied while a view is read rather than to the rows read.
+    #[serde(skip)]
+    pub(crate) query: Option<Query>,
     /// A source by its web address being opened (its header or footer being fetched).
     #[serde(skip)]
     opening: Option<Opening>,
@@ -89,6 +95,9 @@ pub struct SourceLayer {
     /// The last open failed because the server refused the login (no password given this session, or a wrong one).
     #[serde(skip)]
     pub login: bool,
+    /// Runtime-only: imported source selection awaits an explicit reconnect or exact peer retention.
+    #[serde(skip)]
+    reconnect_required: bool,
     /// The most features a view reads (0 = [`VIEW_LIMIT`]).
     #[serde(skip)]
     pub limit: usize,
@@ -577,20 +586,37 @@ pub struct Window {
     pub matched: u64,
     /// How many were read.
     pub kept: usize,
+    /// The read kept the definition query's matches: `matched` counts them.
+    pub filtered: bool,
 }
 
 /// A read in flight.
 struct Pending {
     extent: Extent,
     result: Mutex<Option<Result<(Batch, window::Cache), String>>>,
+    still: Option<rustgis_data::source::remote::Still>,
 }
 
 /// A source being opened off the frame.
-type Opening = Arc<Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>>;
+type Opening = Arc<OpeningState>;
+struct OpeningState {
+    result: Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>,
+    still: Option<rustgis_data::source::remote::Still>,
+}
+impl OpeningState {
+    /// Owns the initiating carrier before an asynchronous source open can leave this thread.
+    fn new() -> Opening {
+        Arc::new(Self { result: Mutex::new(None), still: rustgis_data::source::remote::current_still() })
+    }
+    /// Retains the existing completion-slot locking behavior; authority stays outside its payload.
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<Result<Arc<dyn FeatureSource>, String>>>> {
+        self.result.lock()
+    }
+}
 
-/// Tells the app something landed (a read, or a source opened by its address).
-pub(crate) fn landed() {
-    GENERATION.fetch_add(1, Ordering::Relaxed);
+/// Asks the app for a frame (the waker) with nothing new to draw: what landed while the map drew
+/// is said a frame after (see [`wake`] for something new to draw).
+pub(crate) fn another_frame() {
     if let Some(w) = waker().lock().ok().and_then(|w| w.clone()) {
         w();
     }
@@ -784,6 +810,11 @@ impl SourceLayer {
     /// Opens the source again (after a project loads). A source by its web address is opened off
     /// the frame: `Ok` while it is (see [`SourceLayer::is_pending`]), open once it has landed.
     pub fn open(&mut self) -> Result<(), String> {
+        rustgis_data::source::remote::check_still(&rustgis_data::source::remote::current_still())?;
+        if self.reconnect_required {
+            self.error = Some(RECONNECT_REQUIRED.into());
+            return Err(RECONNECT_REQUIRED.into());
+        }
         if let Some(url) = self.path.clone().filter(|p| rustgis_data::source::is_remote_name(p)) {
             return self.open_remote(&url);
         }
@@ -866,6 +897,10 @@ impl SourceLayer {
     /// (or footer) off the frame, taken by a later call when it has landed.
     fn open_remote(&mut self, url: &str) -> Result<(), String> {
         if let Some(slot) = self.opening.clone() {
+            if let Err(e) = rustgis_data::source::remote::check_still(&slot.still) {
+                self.opening = None;
+                return self.opened(Err(e));
+            }
             // A file that can't be read in place is downloaded whole into the same slot, by the
             // first copy to see it; the others wait on that download rather than start their own.
             let claimed = slot.lock().ok().is_some_and(|mut s| {
@@ -890,9 +925,9 @@ impl SourceLayer {
         }
         match rustgis_data::source::open_url_now(url) {
             Ok(s) => self.opened(Ok(Arc::from(s))),
-            Err(e) if e.to_string().contains(rustgis_data::source::remote::READ_WHOLE) => self.open_whole(url, Arc::new(Mutex::new(None))),
+            Err(e) if e.to_string().contains(rustgis_data::source::remote::READ_WHOLE) => self.open_whole(url, OpeningState::new()),
             Err(e) if e.to_string().contains(rustgis_data::source::remote::NEED) => {
-                let slot: Opening = Arc::new(Mutex::new(None));
+                let slot = OpeningState::new();
                 let land = slot.clone();
                 self.opening = Some(slot);
                 rustgis_data::source::open_url(
@@ -901,7 +936,7 @@ impl SourceLayer {
                         if let Ok(mut s) = land.lock() {
                             *s = Some(r.map(Arc::from).map_err(|e| e.to_string()));
                         }
-                        landed();
+                        wake();
                     }),
                 );
                 Ok(())
@@ -921,22 +956,25 @@ impl SourceLayer {
         let name = url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or("layer").to_string();
         let table = self.table.clone();
         let url = url.to_string();
-        rustgis_data::source::remote::fetch_whole(
-            &url.clone(),
-            Box::new(move |r| {
-                let r = match r {
-                    Ok(bytes) => rustgis_data::source::open_shared(&name, Arc::new(bytes), table.as_deref())
-                        .map(Arc::from)
-                        .map_err(|e| format!("{url}: {e}")),
-                    Err(rustgis_data::source::remote::Failed::Other(e)) => Err(format!("{url}: {e}")),
-                    Err(e) => Err(format!("{url}: couldn't be downloaded ({e:?})")),
-                };
-                if let Ok(mut s) = land.lock() {
-                    *s = Some(r);
-                }
-                landed();
-            }),
-        );
+        let still = land.still.clone();
+        rustgis_data::source::remote::with_optional_still(still, || {
+            rustgis_data::source::remote::fetch_whole(
+                &url.clone(),
+                Box::new(move |r| {
+                    let r = match r {
+                        Ok(bytes) => rustgis_data::source::open_shared(&name, Arc::new(bytes), table.as_deref())
+                            .map(Arc::from)
+                            .map_err(|e| format!("{url}: {e}")),
+                        Err(rustgis_data::source::remote::Failed::Other(e)) => Err(format!("{url}: {e}")),
+                        Err(e) => Err(format!("{url}: couldn't be downloaded ({e:?})")),
+                    };
+                    if let Ok(mut s) = land.lock() {
+                        *s = Some(r);
+                    }
+                    wake();
+                }),
+            );
+        });
         Ok(())
     }
 
@@ -973,6 +1011,25 @@ impl SourceLayer {
         self.handle.is_some()
     }
 
+    /// When `query` (on a layer of `fields`) can filter only a sample of a view, the source's
+    /// feature count (`None` when it doesn't say) and the most a view reads. That is when the view
+    /// isn't walked with it (a database, GeoJSON or LiDAR read in place, a file by its web address,
+    /// or a query using a row number), and the source holds more features than a view reads,
+    /// doesn't say how many, or the view read now is already a sample (of more bytes than a view
+    /// holds). `None` until open.
+    pub fn query_sample(&self, query: &str, fields: &[rustgis_data::Field]) -> Option<(Option<u64>, usize)> {
+        let h = self.handle.as_ref()?;
+        let most = match self.limit {
+            0 if h.remote().is_some() => REMOTE_VIEW_LIMIT,
+            0 => VIEW_LIMIT,
+            n => n,
+        };
+        let count = h.info().count;
+        let query = Query { text: query.to_string(), fields: fields.to_vec() };
+        let crowded = count.is_none_or(|c| c > most as u64) || self.sampled().is_some();
+        (window::walked(h.as_ref(), &query).is_none() && crowded).then_some((count, most))
+    }
+
     pub fn info(&self) -> Option<&SourceInfo> {
         self.handle.as_deref().map(|h| h.info())
     }
@@ -1002,6 +1059,25 @@ impl SourceLayer {
         self.pending.is_some() || self.opening.is_some()
     }
 
+    /// Suspends automatic reads without changing the serialized source definition or any password.
+    pub fn require_reconnect(&mut self) {
+        self.reconnect_required = true;
+        self.handle = None;
+        self.opening = None;
+        self.pending = None;
+        self.error = Some(RECONNECT_REQUIRED.into());
+    }
+
+    /// Whether the source still needs its owner to authorize a reconnect.
+    pub fn reconnect_required(&self) -> bool {
+        self.reconnect_required
+    }
+
+    /// Releases a source after its owner explicitly reconnects or validates exact peer retention.
+    pub fn allow_reconnect(&mut self) {
+        self.reconnect_required = false;
+    }
+
     /// Opens the source afresh, forgetting a failed or never-started open (and the window read
     /// from the old one): a source by its web address read again once what signs it has changed
     /// (its address, or the login behind it). Its symbology and place in the project stay.
@@ -1015,10 +1091,58 @@ impl SourceLayer {
         self.open()
     }
 
+    /// Leaves a read under way to the layer this one was copied from, which takes it when it
+    /// lands: a copy drawn elsewhere (an export on a thread of its own) reads what it needs for
+    /// itself. The two would otherwise share the read, and the one that didn't take it would wait
+    /// for it forever. The copy decides its thinning by itself too, so the map's redraws never
+    /// wait for the export's.
+    pub fn detach_read(&mut self) {
+        self.pending = None;
+        self.render_lod = Default::default();
+    }
+
+    /// Whether `other` (a copy of this one) reads the same source the same way: the same file and
+    /// table, opened by the same open. One opened afresh since (`reopen`, a table replaced) is
+    /// another, whatever its path.
+    pub fn same_opening(&self, other: &SourceLayer) -> bool {
+        let handles = match (&self.handle, &other.handle) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        // A source by its web address still opening: the same open shares its slot.
+        let openings = match (&self.opening, &other.opening) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        handles && openings && self.path == other.path && self.table == other.table
+    }
+
     /// Forgets the window, so the next view reads again (after the source changes).
     pub fn reset(&mut self) {
         self.render_lod = Default::default();
         self.reset_window();
+    }
+
+    /// Reads the view again, keeping the selection parked for the next read.
+    pub(crate) fn reread(&mut self) {
+        let selected = std::mem::take(&mut self.saved_selection);
+        self.reset_window();
+        self.saved_selection = selected;
+    }
+
+    /// Applies the layer's definition query (`fields` are the layer's) as views are read; a
+    /// different one reads the view again.
+    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field]) {
+        let text = text.map(str::trim).filter(|t| !t.is_empty());
+        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice())) != text.map(|t| (t, fields)) {
+            self.query = text.map(|t| Query { text: t.to_string(), fields: fields.to_vec() });
+            // A source that can't be walked reads the same rows whatever the query.
+            if self.handle.as_ref().is_some_and(|h| h.visits_chunks()) {
+                self.reread();
+            }
+        }
     }
 
     /// Drops disposable view rows while retaining decisions about the unchanged full source.
@@ -1068,7 +1192,9 @@ impl SourceLayer {
         let estimate = self.estimated_row_bytes;
         let full_read = self.full_read;
         let fields = self.window_fields;
-        let pending = Arc::new(Pending { extent, result: Mutex::new(None) });
+        let query = self.query.clone();
+        let still = rustgis_data::source::remote::current_still();
+        let pending = Arc::new(Pending { extent, result: Mutex::new(None), still: still.clone() });
         let p = pending.clone();
         // A source by its web address: the read runs as its bytes land (on the desktop and in
         // the browser alike), fetching what it needs in rounds.
@@ -1076,7 +1202,7 @@ impl SourceLayer {
             let (h2, p2) = (h.clone(), p.clone());
             let work = Arc::new(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields)
+                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                 }))
                 .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
             });
@@ -1087,7 +1213,7 @@ impl SourceLayer {
                     if let Ok(mut slot) = p2.result.lock() {
                         *slot = Some(r.map_err(|e| e.to_string()));
                     }
-                    landed();
+                    wake();
                 }),
             );
             self.pending = Some(pending);
@@ -1095,14 +1221,20 @@ impl SourceLayer {
             return;
         }
         let job = move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields)
-            }))
-            .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
-            .map_err(|e| e.to_string());
-            if let Ok(mut slot) = p.result.lock() {
-                *slot = Some(r);
-            }
+            rustgis_data::source::remote::with_optional_still(still.clone(), || {
+                let r = rustgis_data::source::remote::check_still(&still)
+                    .and_then(|()| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
+                        }))
+                        .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
+                        .map_err(|e| e.to_string())
+                    })
+                    .and_then(|r| rustgis_data::source::remote::check_still(&still).map(|()| r));
+                if let Ok(mut slot) = p.result.lock() {
+                    *slot = Some(r);
+                }
+            })
         };
         #[cfg(not(target_arch = "wasm32"))]
         if !block {
@@ -1123,7 +1255,7 @@ impl SourceLayer {
                 Err(e) => {
                     self.saved_selection.clear();
                     self.error = Some(format!("couldn't start reading the layer: {e}"));
-                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0, filtered: false });
                 }
             }
             return;
@@ -1138,13 +1270,14 @@ impl SourceLayer {
         let Some(p) = self.pending.clone() else { return Polled::Idle };
         let start = web_time::Instant::now();
         loop {
-            let done = p.result.lock().ok().and_then(|mut r| r.take());
+            let done = p.result.lock().ok().and_then(|mut r| r.take()).map(|r| rustgis_data::source::remote::check_still(&p.still).and(r));
             match done {
                 Some(Ok((b, cache))) => {
                     self.pending = None;
                     self.estimated_row_bytes = cache.mean_bytes;
+                    let filtered = cache.filtered;
                     self.ready_cache = Some(cache);
-                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len() };
+                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len(), filtered };
                     self.window = Some(w);
                     self.error = None;
                     return Polled::Done(w, b);
@@ -1155,7 +1288,7 @@ impl SourceLayer {
                     self.saved_selection.clear();
                     self.error = Some(e.clone());
                     // Not read again until the view moves past it.
-                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0, filtered: false });
                     return Polled::Failed(e);
                 }
                 None if block && cfg!(not(target_arch = "wasm32")) && start.elapsed() < web_time::Duration::from_secs(60) => {
@@ -1177,6 +1310,12 @@ impl SourceLayer {
     /// (features read, features matching) when the window is a sample of the view.
     pub fn sampled(&self) -> Option<(usize, u64)> {
         self.window.as_ref().filter(|w| !w.complete).map(|w| (w.kept, w.matched))
+    }
+
+    /// Whether the view read kept the definition query's matches, so [`SourceLayer::sampled`]
+    /// counts matches rather than every feature in view.
+    pub fn sampled_matches(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.filtered)
     }
 }
 
@@ -1208,6 +1347,16 @@ fn waker() -> &'static Mutex<Option<Arc<dyn Fn() + Send + Sync>>> {
     W.get_or_init(|| Mutex::new(None))
 }
 
+/// Something read in the background (a feature read, a source opened by its address, a raster's
+/// pixels read in place; outside this module, a Zarr step) has landed: the map redraws
+/// ([`generation`]) and the UI is woken.
+pub fn wake() {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    if let Some(w) = waker().lock().ok().and_then(|w| w.clone()) {
+        w();
+    }
+}
+
 /// Called whenever a background read finishes (the UI asks for a repaint).
 pub fn set_waker(f: impl Fn() + Send + Sync + 'static) {
     if let Ok(mut w) = waker().lock() {
@@ -1220,8 +1369,157 @@ pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+impl SourceLayer {
+    /// Persisted source address and local driver paths; handles and embedded data are opaque.
+    pub(crate) fn output_slots(&self) -> Vec<(crate::LayerRole, &str, bool, bool)> {
+        let SourceLayer {
+            path,
+            file_name: _,
+            table: _,
+            shapefile_crs: _,
+            embedded,
+            handle: _,
+            window: _,
+            render_lod: _,
+            pending: _,
+            projection: _,
+            ready_cache: _,
+            byte_budget: _,
+            estimated_row_bytes: _,
+            full_read: _,
+            saved_selection: _,
+            window_fields: _,
+            query: _,
+            opening: _,
+            error: _,
+            login: _,
+            reconnect_required: _,
+            limit: _,
+            reads: _,
+            gdal,
+            duckdb,
+            postgis,
+            mysql,
+            sqlserver,
+            // A broken layer's origin is for people, its geodatabase is opened only by Retry (a
+            // command of its own, with its own permissions), and its reason is text: none is a
+            // place the project writes. Its service address is saved, so its token is taken out.
+            origin: _,
+            service,
+            geodatabase: _,
+            reason: _,
+        } = self;
+        use crate::{LayerRole as R, paths};
+        let mut out = Vec::new();
+        if let Some(p) = path {
+            out.push((
+                R::Streamed,
+                p.as_str(),
+                true,
+                embedded.is_none()
+                    && gdal.is_none()
+                    && duckdb.is_none()
+                    && postgis.is_none()
+                    && mysql.is_none()
+                    && sqlserver.is_none()
+                    && paths::is_local(p),
+            ));
+        }
+        if let Some(g) = gdal {
+            out.push((R::GdalPath, g.path.as_str(), false, paths::is_local(&g.path)));
+        }
+        if let Some(d) = duckdb
+            && let Some(p) = &d.database
+        {
+            out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
+        }
+        if let Some(pg) = postgis {
+            out.push((R::PostgisDatabase, pg.database.as_str(), true, false));
+        }
+        if let Some(my) = mysql {
+            out.push((R::MysqlDatabase, my.database.as_str(), true, false));
+        }
+        if let Some(ms) = sqlserver {
+            out.push((R::SqlServerDatabase, ms.database.as_str(), true, false));
+        }
+        if let Some(s) = service {
+            out.push((R::Service, s.url.as_str(), true, false));
+        }
+        out
+    }
+
+    /// Resolves a prepared field without examining its written contents.
+    pub(crate) fn output_slot_mut(&mut self, role: crate::LayerRole) -> Option<&mut String> {
+        match role {
+            crate::LayerRole::Streamed => self.path.as_mut(),
+            crate::LayerRole::GdalPath => Some(&mut self.gdal.as_mut()?.path),
+            crate::LayerRole::DuckDbDatabase => self.duckdb.as_mut()?.database.as_mut(),
+            crate::LayerRole::PostgisDatabase => Some(&mut self.postgis.as_mut()?.database),
+            crate::LayerRole::MysqlDatabase => Some(&mut self.mysql.as_mut()?.database),
+            crate::LayerRole::SqlServerDatabase => Some(&mut self.sqlserver.as_mut()?.database),
+            crate::LayerRole::Service => Some(&mut self.service.as_mut()?.url),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A later frame's whole-file fallback owns the opening's carrier through send and landing.
+    #[test]
+    fn permission_policy_opening_fallback_retains_owner_outside_ambient_context() {
+        use rustgis_data::source::remote;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        for (owned, revoke) in [(true, false), (true, true), (false, false)] {
+            let live = Arc::new(AtomicBool::new(true));
+            let check = live.clone();
+            let still = owned.then(|| Arc::new(move || check.load(Ordering::SeqCst)) as remote::Still);
+            let held = Arc::new(Mutex::new(None));
+            let hold = held.clone();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let count = sends.clone();
+            let ranges = Arc::new(AtomicUsize::new(0));
+            let range_count = ranges.clone();
+            let url = format!("https://opening-fallback.invalid/{owned}-{revoke}.fgb");
+            remote::forget_file(&url);
+            remote::set_fetcher(move |_, want, done| match want {
+                remote::Want::Whole => {
+                    let context = remote::current_still();
+                    assert_eq!(context.is_some(), owned, "the actual later-frame fallback must re-enter its saved carrier");
+                    *hold.lock().unwrap() = Some((context, done));
+                }
+                _ => {
+                    range_count.fetch_add(1, Ordering::SeqCst);
+                    done(Err(remote::Failed::NoRanges));
+                }
+            });
+            let mut source = super::SourceLayer { path: Some(url.clone()), ..Default::default() };
+            remote::with_optional_still(still, || source.open()).unwrap();
+            assert_eq!(ranges.load(Ordering::SeqCst), 1, "actual opening tried a range");
+            assert!(source.opening.is_some());
+            assert!(remote::current_still().is_none());
+            // The next frame starts outside the original synchronous scope.
+            source.open().unwrap();
+            let (context, done) = held.lock().unwrap().take().unwrap();
+            live.store(!revoke, Ordering::SeqCst);
+            let mut ds = rustgis_data::Dataset::new("fallback", rustgis_data::GeometryType::Point, vec![]);
+            ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0., 0.))), vec![]);
+            let result = remote::check_still(&context).map_err(remote::Failed::Other).map(|()| {
+                count.fetch_add(1, Ordering::SeqCst);
+                rustgis_data::source::fgb::write(&ds).unwrap()
+            });
+            done(result);
+            assert_eq!(source.open().is_err(), revoke);
+            assert_eq!(source.is_open(), !revoke, "a revoked landing must never install the source");
+            assert_eq!(sends.load(Ordering::SeqCst), usize::from(!revoke));
+            assert!(remote::current_still().is_none());
+            remote::forget_file(&url);
+        }
+    }
+
     /// Reopening this same layer must invalidate populated decisions even without `reset`.
     #[test]
     fn reopening_a_populated_thinning_cache_uses_the_new_handle() {

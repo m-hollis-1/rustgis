@@ -9,7 +9,7 @@ use crate::{DataError, Feature, Field, FieldType, Geometry, GeometryType, Result
 use rustgis_geom::Extent;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tiberius::{ColumnData, Row};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -22,6 +22,14 @@ const EXACT_COUNT_BELOW: u64 = 2_000_000;
 const EXTENT_SAMPLE: usize = 20_000;
 const LIST_LIMIT: usize = 10_000;
 const DEFAULT_PORT: u16 = 1433;
+
+// The enterprise geodatabase catalog, read with this module's private connection helpers.
+#[path = "sqlserver_gdb.rs"]
+mod gdb;
+pub use gdb::{GdbListing, geodatabase_tables, read_table};
+
+/// The most rows of a registered table [`read_table`] is asked for when the table is added whole.
+pub const MAX_EDITABLE: usize = 100_000;
 
 // ---------------------------------------------------------------------------------------------
 // Connection addresses
@@ -146,14 +154,29 @@ pub struct Conn {
     compatibility: u32,
     rt: tokio::runtime::Runtime,
     client: Mutex<Option<Client>>,
+    /// The database's geodatabase catalog, read on first use.
+    geodatabase: OnceLock<Option<Arc<super::geodatabase::Catalog>>>,
+    /// Why the geodatabase's catalog couldn't be read, last time it was tried.
+    geodatabase_problem: Mutex<Option<String>>,
 }
 
 fn err(e: tiberius::error::Error) -> DataError {
     match e {
         tiberius::error::Error::Server(t) if t.code() == 18456 => DataError::Login(t.message().to_string()),
         tiberius::error::Error::Server(t) => DataError::Format(t.message().to_string()),
+        tiberius::error::Error::Tls(m) if untrusted_certificate(&m) => DataError::Format(UNTRUSTED_CERTIFICATE.into()),
         e => DataError::Format(e.to_string()),
     }
+}
+
+/// Why a server whose certificate this computer doesn't trust can't be reached, and what to do.
+pub const UNTRUSTED_CERTIFICATE: &str = "the server's certificate isn't from an authority this computer trusts      (SQL Server's own self-signed certificate is the usual reason). If this is your organisation's server, tick      Trust the server's certificate in the connection (or add trust-server-certificate=true to its address) and      connect again";
+
+/// Whether a TLS error says the server's certificate wasn't trusted (rather than, say, a protocol
+/// mismatch): tiberius words it "the server's certificate was rejected", rustls "UnknownIssuer".
+fn untrusted_certificate(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("unknownissuer") || m.contains("certificate was rejected") || m.contains("invalid peer certificate")
 }
 
 fn dropped(e: &tiberius::error::Error) -> bool {
@@ -350,9 +373,65 @@ pub fn connect(address: &str, ask: bool) -> Result<Arc<Conn>> {
     if let Some(c) = find(&mut live) {
         return Ok(c);
     }
-    let conn = Arc::new(Conn { config, password: password.clone(), major, schema, compatibility, rt, client: Mutex::new(Some(client)) });
+    let conn = Arc::new(Conn {
+        config,
+        password: password.clone(),
+        major,
+        schema,
+        compatibility,
+        rt,
+        client: Mutex::new(Some(client)),
+        geodatabase: OnceLock::new(),
+        geodatabase_problem: Mutex::new(None),
+    });
     live.push((address.to_string(), password, Arc::downgrade(&conn)));
     Ok(conn)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The geodatabase
+
+/// The geodatabase the connection's database holds, read once per connection; None when it holds
+/// none or the catalog isn't readable (the reason is kept for [`geodatabase_problem`], not
+/// returned: the database then browses as plain SQL Server). A failure to tell whether there is
+/// one at all is kept as the problem but not cached, so the next call asks again.
+pub fn geodatabase(conn: &Conn) -> Option<Arc<super::geodatabase::Catalog>> {
+    if let Some(cached) = conn.geodatabase.get() {
+        return cached.clone();
+    }
+    // The error texts come from `Conn::query`, which redacts the password.
+    let (catalog, problem) = match gdb::detect_owner(conn) {
+        Err(e) => {
+            set_problem(conn, Some(e.to_string()));
+            return None;
+        }
+        Ok(None) => (None, None),
+        Ok(Some(owner)) => match gdb::read_catalog(conn, &owner) {
+            Ok(c) => (Some(Arc::new(c)), None),
+            Err(e) => (None, Some(e.to_string())),
+        },
+    };
+    // The problem is set first, so whoever sees the catalog cached also sees why it is missing.
+    set_problem(conn, problem);
+    conn.geodatabase.get_or_init(|| catalog).clone()
+}
+
+fn set_problem(conn: &Conn, problem: Option<String>) {
+    *conn.geodatabase_problem.lock().unwrap_or_else(|e| e.into_inner()) = problem;
+}
+
+/// Why the catalog couldn't be read, when `geodatabase` is None for a database that has
+/// GDB_ITEMS (permissions), or whether it has one couldn't be told: for the browse notice.
+pub fn geodatabase_problem(conn: &Conn) -> Option<String> {
+    if geodatabase(conn).is_some() {
+        return None;
+    }
+    current_problem(conn)
+}
+
+/// The kept problem, without asking the server again.
+fn current_problem(conn: &Conn) -> Option<String> {
+    conn.geodatabase_problem.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -368,6 +447,13 @@ pub struct Table {
     pub kind: String,
     pub current: bool,
     pub several: bool,
+    /// The geodatabase class alias, when the catalog gives one (`None` from [`tables`]).
+    pub alias: Option<String>,
+    /// The geodatabase feature dataset the class is in (`None` from [`tables`]).
+    pub dataset: Option<String>,
+    /// The geodatabase class's name without its owner and database (`Mains` for
+    /// `utility.sde.Mains`), when the catalog registers it (`None` from [`tables`]).
+    pub short: Option<String>,
 }
 
 impl Table {
@@ -458,6 +544,18 @@ fn to_micros(s: &str) -> std::borrow::Cow<'_, str> {
         _ => s.into(),
     }
 }
+/// A column's value as the field at `k` holds it; null when it doesn't convert. A value of a date
+/// field that isn't a date RustGIS holds is null too, counted in `unread` ([`Batch::unread_dates`]).
+fn attr_of(ty: FieldType, v: &ColumnData<'static>, unread: &mut Vec<usize>, k: usize) -> Value {
+    match ty {
+        FieldType::Integer => int_of(v).map(Value::Int),
+        FieldType::Double => float_of(v).map(Value::Float),
+        FieldType::Boolean => bool_of(v).map(Value::Bool),
+        FieldType::Text => text_of(v).map(Value::Text),
+        FieldType::Date | FieldType::DateTime => Some(super::server_date(text_of(v).as_deref().map(to_micros).as_deref(), ty, unread, k)),
+    }
+    .unwrap_or(Value::Null)
+}
 fn bytes_of<'a>(v: &'a ColumnData<'static>) -> Option<&'a [u8]> {
     if let ColumnData::Binary(Some(v)) = v { Some(v) } else { None }
 }
@@ -478,6 +576,9 @@ pub fn tables(conn: &Conn) -> Result<Vec<Table>> {
                 kind: text_of(at(r, 3))?,
                 current: text_of(at(r, 0)).is_some_and(|s| s == conn.schema),
                 several: false,
+                alias: None,
+                dataset: None,
+                short: None,
             })
         })
         .collect();
@@ -501,9 +602,17 @@ pub fn find_table(conn: &Conn, name: &str) -> Result<Table> {
         .ok_or_else(|| DataError::Format(format!("no table '{name}' with a geometry column")))
 }
 
+/// The kinds of geometry a spatial column holds. A registered geodatabase class is the kind its
+/// definition's shape type names, else is probed through how it is read (its versioned view or
+/// Default rows), so a class whose rows are all still in its delta tables isn't taken for empty.
 pub fn families(conn: &Conn, table: &Table) -> Result<Vec<Family>> {
+    let from = match gdb::probe(conn, table)? {
+        Some(gdb::Probe::Known(family)) => return Ok(vec![family]),
+        Some(gdb::Probe::From(from)) => from,
+        None => table.sql_from(),
+    };
     let g = ident(&table.column);
-    let sql = format!("SELECT DISTINCT {g}.STDimension() FROM {} WHERE {g} IS NOT NULL", table.sql_from());
+    let sql = format!("SELECT DISTINCT {g}.STDimension() FROM {from} t WHERE {g} IS NOT NULL");
     let Some(rows) = conn.query_within(&sql, &[], PROBE_TIMEOUT)? else {
         return Ok(Family::ALL.to_vec());
     };
@@ -528,6 +637,9 @@ pub struct SqlServerSource {
     info: SourceInfo,
     conn: Arc<Conn>,
     table: Table,
+    /// The FROM target of reads and counts, without an alias: the base table, a geodatabase
+    /// class's versioned view, or the derived table of a branch-versioned class's Default rows.
+    from: String,
     family: Option<Family>,
     raw_srid: u32,
     geography: bool,
@@ -663,15 +775,32 @@ impl SqlServerSource {
         }
         let mut notes = Vec::new();
         let g = ident(&table.column);
-        let from = table.sql_from();
         let geography = table.geography();
-        let rows = conn.query(&format!("SELECT TOP (1) {g}.STSrid FROM {from} WHERE {g} IS NOT NULL"), &[])?;
+        let columns = gdb::columns_of(&conn, &table.schema, &table.name)?;
+        let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
+        let reading = gdb::reading(&conn, &table, &names)?;
+        let from = reading.as_ref().map_or_else(|| table.sql_from(), |r| r.from.clone());
+        // `reading` already asked for the catalog, so the kept problem is current; it only counts
+        // while there is still no catalog.
+        if reading.is_none()
+            && !matches!(conn.geodatabase.get(), Some(Some(_)))
+            && let Some(note) = gdb::catalog_note(current_problem(&conn).as_deref())
+        {
+            notes.push(note);
+        }
+        let rows = conn.query(&format!("SELECT TOP (1) {g}.STSrid FROM {from} t WHERE {g} IS NOT NULL"), &[])?;
         let raw_srid =
             rows.first().and_then(|r| int_of(at(r, 0))).and_then(|n| u32::try_from(n).ok()).unwrap_or(if geography { 4326 } else { 0 });
         if raw_srid != 0 {
             notes.push(format!("the column doesn't fix a coordinate system: rows in one other than EPSG:{raw_srid} are left out"));
         }
         let mut srid = raw_srid;
+        if srid == 0
+            && let Some(n) = reading.as_ref().and_then(|r| r.srid_fallback)
+        {
+            srid = n;
+            notes.push(format!("the column doesn't fix a coordinate system; EPSG:{n} taken from the geodatabase's spatial reference"));
+        }
         if srid == 0 {
             match crs.map(str::trim).filter(|c| !c.is_empty()) {
                 Some(given) => {
@@ -700,9 +829,27 @@ impl SqlServerSource {
             .collect();
         notes.extend(fine_times_note(&conn, &from, &fine));
         let keys = conn.query("SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS c JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON k.CONSTRAINT_SCHEMA = c.CONSTRAINT_SCHEMA AND k.CONSTRAINT_NAME = c.CONSTRAINT_NAME WHERE c.CONSTRAINT_TYPE = 'PRIMARY KEY' AND c.TABLE_SCHEMA = @P1 AND c.TABLE_NAME = @P2", &[&table.schema, &table.name])?;
-        let key = if keys.len() == 1 { keys.first().and_then(|r| text_of(at(r, 0))) } else { None };
-        let columns = cols.iter().filter_map(|r| Some((text_of(at(r, 0))?, text_of(at(r, 1))?)));
-        let (fields, projection) = projection(&table.column, columns, key.as_deref());
+        let mut key = if keys.len() == 1 { keys.first().and_then(|r| text_of(at(r, 0))) } else { None };
+        // The registered ObjectID column is the feature id when the table has it.
+        if let Some(rowid) = reading.as_ref().and_then(|r| r.rowid.as_deref()) {
+            match names.iter().find(|n| n.eq_ignore_ascii_case(rowid)) {
+                Some(n) => key = Some(n.clone()),
+                None => notes.push(format!("the registered ObjectID column {rowid} isn't in the table")),
+            }
+        }
+        let (mut fields, projection) = projection(&table.column, columns, key.as_deref());
+        let mut name = table.label();
+        if let Some(r) = reading {
+            for f in &mut fields {
+                if let Some((_, alias)) = r.field_aliases.iter().find(|(n, _)| n.eq_ignore_ascii_case(&f.name)) {
+                    f.alias = Some(alias.clone());
+                }
+            }
+            if let Some(alias) = r.alias {
+                name = alias;
+            }
+            notes.extend(r.notes);
+        }
         if projection.numbered {
             notes.push(
                 "no single-column integer key: features are numbered as read, so their ids can change from one read to the next".into(),
@@ -710,7 +857,7 @@ impl SqlServerSource {
         }
         let mut src = SqlServerSource {
             info: SourceInfo {
-                name: table.label(),
+                name,
                 format: "SQL Server",
                 geometry_type: geometry_type(family),
                 fields,
@@ -723,6 +870,7 @@ impl SqlServerSource {
             },
             conn,
             table,
+            from,
             family,
             raw_srid,
             geography,
@@ -766,11 +914,7 @@ impl SqlServerSource {
             Some(n) if n >= EXACT_COUNT_BELOW => Some(n),
             _ => self
                 .conn
-                .query_within(
-                    &format!("SELECT COUNT_BIG(*) FROM {} WHERE {}", self.table.sql_from(), self.filter(None)),
-                    &[],
-                    PROBE_TIMEOUT,
-                )
+                .query_within(&format!("SELECT COUNT_BIG(*) FROM {} t WHERE {}", self.from, self.filter(None)), &[], PROBE_TIMEOUT)
                 .ok()
                 .flatten()
                 .and_then(|r| first_count(&r)),
@@ -808,25 +952,7 @@ impl SqlServerSource {
     fn row_feature(&self, r: &Row, unread: &mut Vec<usize>) -> Option<Feature> {
         let id = id_of(at(r, 0))?;
         let geometry: Geometry = self.reproject.geometry(wkb::decode(bytes_of(at(r, 1))?)?)?;
-        let attrs = self
-            .info
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(k, f)| {
-                let v = at(r, k + 2);
-                match f.ty {
-                    FieldType::Integer => int_of(v).map(Value::Int),
-                    FieldType::Double => float_of(v).map(Value::Float),
-                    FieldType::Boolean => bool_of(v).map(Value::Bool),
-                    FieldType::Text => text_of(v).map(Value::Text),
-                    FieldType::Date | FieldType::DateTime => {
-                        Some(super::server_date(text_of(v).as_deref().map(to_micros).as_deref(), f.ty, unread, k))
-                    }
-                }
-                .unwrap_or(Value::Null)
-            })
-            .collect();
+        let attrs = self.info.fields.iter().enumerate().map(|(k, f)| attr_of(f.ty, at(r, k + 2), unread, k)).collect();
         Some(Feature { id, geometry: Some(geometry), attrs })
     }
 
@@ -849,7 +975,7 @@ impl SqlServerSource {
             return Ok(out);
         }
         let filter = self.filter(window.as_deref());
-        let from = self.table.sql_from();
+        let from = &self.from;
         let cols = self.projection.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect::<Vec<_>>().join(", ");
         let numbered = |every: &str| {
             format!(
@@ -866,7 +992,7 @@ impl SqlServerSource {
             (matched, rows)
         } else {
             // Concurrent edits may change the rows between this count and the read.
-            let matched = first_count(&query(&format!("SELECT COUNT_BIG(*) FROM {from} WHERE {filter}"))?).unwrap_or(0);
+            let matched = first_count(&query(&format!("SELECT COUNT_BIG(*) FROM {from} t WHERE {filter}"))?).unwrap_or(0);
             let step = stride(matched, limit);
             let sql = if step <= 1 && !self.projection.numbered {
                 format!("SELECT TOP ({limit}) {cols} FROM (SELECT {} FROM {from} t WHERE {filter}) s", self.projection.raw)
@@ -1203,11 +1329,13 @@ mod tests {
         assert!(auth_method(&Login::Integrated, None).is_err());
     }
 
-    /// `RUSTGIS_TEST_MSSQL=mssql://user:password@host/database?... cargo test -- --ignored sqlserver_live --nocapture`.
+    /// `RUSTGIS_TEST_MSSQL=mssql://user:password@host/database?... cargo test -- --ignored sqlserver_live --nocapture`;
+    /// `RUSTGIS_TEST_SDE=<address>` instead names a database holding an enterprise geodatabase.
     #[test]
     #[ignore]
     fn sqlserver_live() {
-        let Ok(address) = std::env::var("RUSTGIS_TEST_MSSQL") else { return };
+        let sde = std::env::var("RUSTGIS_TEST_SDE").ok();
+        let Some(address) = sde.clone().or_else(|| std::env::var("RUSTGIS_TEST_MSSQL").ok()) else { return };
         let super::super::duckdb::Database::Sqlserver(address) = super::super::duckdb::Database::parse(&address) else {
             panic!("not a connection")
         };
@@ -1215,10 +1343,61 @@ mod tests {
         *conn.client.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let all = tables(&conn).unwrap_or_else(|e| panic!("after a dropped connection: {e}"));
         assert!(!all.is_empty());
+        if sde.is_some() {
+            let catalog = geodatabase(&conn).unwrap_or_else(|| panic!("no geodatabase: {:?}", geodatabase_problem(&conn)));
+            let (item, table) = catalog
+                .items
+                .iter()
+                .filter(|i| i.kind == super::super::geodatabase::ItemKind::FeatureClass)
+                .find_map(|i| find_table(&conn, &format!("{}.{}", i.schema, i.table)).ok().map(|t| (i, t)))
+                .unwrap_or_else(|| panic!("no feature class with a native spatial column"));
+            let src = SqlServerSource::open(conn.clone(), table.clone(), None, None).unwrap_or_else(|e| panic!("{}: {e}", item.name));
+            assert_eq!(src.info().name, item.alias.clone().unwrap_or_else(|| table.label()));
+            println!(
+                "geodatabase {:?} owner={} items={}: {} notes={:?}",
+                catalog.release,
+                catalog.owner,
+                catalog.items.len(),
+                src.info().name,
+                src.info().notes
+            );
+            let listing =
+                geodatabase_tables(&conn).unwrap_or_else(|e| panic!("{e}")).unwrap_or_else(|| panic!("a geodatabase lists nothing"));
+            println!(
+                "listing: datasets={:?} classes={} tables={} other={}",
+                listing.datasets,
+                listing.classes.len(),
+                listing.tables.len(),
+                listing.other.len()
+            );
+            if let Some(item) = listing.tables.first() {
+                let (data, report) = read_table(&conn, item, 100).unwrap_or_else(|e| panic!("{}: {e}", item.name));
+                assert_eq!(data.geometry_type, GeometryType::None);
+                assert!(data.features.len() <= 100);
+                assert!(data.features.iter().all(|f| f.geometry.is_none() && f.attrs.len() == data.fields.len()));
+                println!("{}: {} fields, {} rows, messages={:?}", data.name, data.fields.len(), data.features.len(), report.messages);
+            }
+        }
         for t in &all {
-            let fams = families(&conn, t).unwrap_or_else(|e| panic!("{}: {e}", t.label()));
+            let fams = match families(&conn, t) {
+                Ok(fams) => fams,
+                // A geodatabase class RustGIS refuses to read is refused by its probe too.
+                Err(DataError::Unsupported(why)) if sde.is_some() => {
+                    println!("{}: {why}", t.label());
+                    continue;
+                }
+                Err(e) => panic!("{}: {e}", t.label()),
+            };
             for f in fams {
-                let src = SqlServerSource::open(conn.clone(), t.clone(), Some(f), None).unwrap_or_else(|e| panic!("{}: {e}", t.label()));
+                let src = match SqlServerSource::open(conn.clone(), t.clone(), Some(f), None) {
+                    Ok(src) => src,
+                    // A geodatabase class RustGIS refuses to read (a versioned class without its view).
+                    Err(DataError::Unsupported(why)) if sde.is_some() => {
+                        println!("{}: {why}", t.label());
+                        continue;
+                    }
+                    Err(e) => panic!("{}: {e}", t.label()),
+                };
                 let i = src.info();
                 let whole = src.read(&Request { extent: None, limit: 250_000 }).unwrap_or_else(|e| panic!("{}: {e}", t.label()));
                 let e = i.extent;
@@ -1253,6 +1432,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_untrusted_certificate_says_how_to_connect_anyway() {
+        let tls = |m: &str| err(tiberius::error::Error::Tls(m.into())).to_string();
+        let raw = "Error forming TLS connection: the server's certificate was rejected during the TLS handshake: UnknownIssuer. To connect anyway you can: (1) trust a specific CA";
+        let said = tls(raw);
+        assert!(said.contains("Trust the server's certificate"), "{said}");
+        assert!(said.contains("trust-server-certificate=true"), "{said}");
+        assert!(!said.contains("Config::"), "{said}");
+        // Other TLS failures keep their own words.
+        assert!(tls("protocol version not supported").contains("protocol version"));
     }
 
     /// `RUSTGIS_TEST_MSSQL=… cargo test -- --ignored sqlserver_live_zm`: creates and drops two

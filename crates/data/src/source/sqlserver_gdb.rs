@@ -122,7 +122,7 @@ pub(super) struct Reading {
 /// database without a geodatabase). `columns` are the base table's column names.
 pub(super) fn reading(conn: &Conn, table: &Table, columns: &[String]) -> Result<Option<Reading>> {
     let Some(catalog) = super::geodatabase(conn) else { return Ok(None) };
-    let Some(item) = catalog.find(&format!("{}.{}", table.schema, table.name)) else { return Ok(None) };
+    let Some(item) = registered(&catalog, table)? else { return Ok(None) };
     let native_spatial = native_spatial(table);
     let views = views_of(conn, item, &table.schema)?;
     let plan = geodatabase::read_plan(item, native_spatial, &views, columns);
@@ -155,14 +155,35 @@ pub(super) enum Probe {
 /// base table, whose rows may still be in the delta tables.
 pub(super) fn probe(conn: &Conn, table: &Table) -> Result<Option<Probe>> {
     let Some(catalog) = super::geodatabase(conn) else { return Ok(None) };
-    let Some(item) = catalog.find(&format!("{}.{}", table.schema, table.name)) else { return Ok(None) };
-    if let Some(family) = item.family {
+    let Some(item) = registered(&catalog, table)? else { return Ok(None) };
+    if let Some(family) = known_family(item, &table.column) {
         return Ok(Some(Probe::Known(family)));
     }
     let names: Vec<String> = columns_of(conn, &table.schema, &table.name)?.into_iter().map(|(n, _)| n).collect();
     let views = views_of(conn, item, &table.schema)?;
     let plan = geodatabase::read_plan(item, native_spatial(table), &views, &names);
     Ok(Some(Probe::From(reading_of(plan, table, item, None)?.from)))
+}
+
+/// The catalog's item for `table`; an error when a cut catalog can't say it has none.
+fn registered<'a>(catalog: &'a geodatabase::Catalog, table: &Table) -> Result<Option<&'a Item>> {
+    catalog.registered(&format!("{}.{}", table.schema, table.name)).map_err(DataError::Unsupported)
+}
+
+/// The kind of geometry the definition gives `column`: it speaks for the class's shape column
+/// only, so another spatial column of the same table is probed.
+fn known_family(item: &Item, column: &str) -> Option<Family> {
+    item.family.filter(|_| item.shape_column.as_deref().is_some_and(|shape| shape.eq_ignore_ascii_case(column)))
+}
+
+/// What to say about the rows of a table read up to `limit`: how many there are when the count
+/// came back, and that there may be more when it didn't and the read filled the limit.
+fn rows_note(count: Option<u64>, read: usize, limit: usize) -> Option<String> {
+    match count {
+        Some(count) if count > limit as u64 => Some(format!("the first {limit} rows of {count}")),
+        None if read >= limit => Some(format!("the first {limit} rows: the table may hold more, as its rows couldn't be counted in time")),
+        _ => None,
+    }
 }
 
 /// The derived table of a branch-versioned class's Default rows: the latest row per ObjectID on
@@ -352,9 +373,7 @@ pub fn read_table(conn: &Conn, item: &Item, limit: usize) -> Result<(Dataset, Re
     report.messages.extend(unread_dates);
     let count_sql = format!("SELECT COUNT_BIG(*) FROM {} t", reading.from);
     let count = conn.query_within(&count_sql, &[], PROBE_TIMEOUT).ok().flatten().and_then(|r| first_count(&r));
-    if let Some(count) = count.filter(|c| *c > limit as u64) {
-        report.messages.push(format!("the first {limit} rows of {count}"));
-    }
+    report.messages.extend(rows_note(count, features.len(), limit));
     let mut dataset = Dataset::new(reading.alias.clone().unwrap_or_else(|| item.short_name().to_string()), GeometryType::None, fields);
     dataset.features = features;
     dataset.source = Some(format!("{}.{}", item.schema, item.table));
@@ -444,6 +463,33 @@ mod tests {
         let unversioned = Item { versioning: Versioning::Unversioned, ..item() };
         assert_eq!(geodatabase::read_plan(&unversioned, native_spatial(&second), &[], &[]), ReadPlan::Base);
         assert_eq!(geodatabase::read_plan(&item(), native_spatial(&second), &views, &[]), ReadPlan::VersionedView("MAINS_evw".into()));
+    }
+
+    #[test]
+    fn the_definition_speaks_for_the_shape_column_only() {
+        assert_eq!(known_family(&item(), "shape"), Some(Family::Lines));
+        assert_eq!(known_family(&item(), "LABEL_POINT"), None);
+        assert_eq!(known_family(&Item { shape_column: None, ..item() }, "SHAPE"), None);
+    }
+
+    #[test]
+    fn a_table_read_to_its_limit_says_there_may_be_more() {
+        assert_eq!(rows_note(Some(1931), 100, 100).as_deref(), Some("the first 100 rows of 1931"));
+        assert_eq!(rows_note(Some(100), 100, 100), None);
+        assert_eq!(rows_note(None, 40, 100), None);
+        let unknown = rows_note(None, 100, 100).unwrap_or_default();
+        assert!(unknown.contains("the first 100 rows") && unknown.contains("may hold more"), "{unknown}");
+    }
+
+    #[test]
+    fn a_cut_catalog_refuses_a_table_it_does_not_list() {
+        let mut catalog = geodatabase::Catalog { owner: "sde".into(), release: None, items: vec![item()], srs: vec![], cut: false };
+        let other = Table { name: "OTHER".into(), ..table() };
+        assert!(registered(&catalog, &table()).unwrap().is_some());
+        assert!(registered(&catalog, &other).unwrap().is_none());
+        catalog.cut = true;
+        assert!(registered(&catalog, &table()).unwrap().is_some());
+        assert!(matches!(registered(&catalog, &other), Err(DataError::Unsupported(why)) if why.contains("SDE.OTHER")));
     }
 
     #[test]

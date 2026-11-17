@@ -216,6 +216,17 @@ impl Catalog {
     /// `SDE.MAINS`, in any case (a three-part name loses its first part, the database). A bare
     /// name matches the short name of an item. Feature datasets are not picked, as a dataset and
     /// a class can share a name; see [`Catalog::feature_datasets`].
+    /// As [`Catalog::find`], for a decision that rests on a name being absent: a catalog cut at
+    /// [`MAX_ITEMS`] can't say a name it doesn't list is unregistered, and says why instead.
+    pub fn registered(&self, name: &str) -> std::result::Result<Option<&Item>, String> {
+        match self.find(name) {
+            None if self.cut => Err(format!(
+                "the geodatabase lists {MAX_ITEMS} items or more, so whether {name} is registered in it isn't known: it isn't read, as a versioned class's own table doesn't show its Default version"
+            )),
+            found => Ok(found),
+        }
+    }
+
     pub fn find(&self, name: &str) -> Option<&Item> {
         let name = name.trim();
         let query = without_database(name).unwrap_or_else(|| name.to_string());
@@ -321,6 +332,13 @@ pub fn read_plan(item: &Item, native_spatial: bool, views: &[String], columns: &
         (_, Some(view)) => ReadPlan::VersionedView(view.clone()),
         (Versioning::Traditional, None) => ReadPlan::Refused(format!(
             "{} is versioned but its versioned view is missing; ask the geodatabase administrator to enable SQL access for it",
+            item.name
+        )),
+        // A class archived without versioning keeps every past row in its base table (the
+        // current ones are those its view shows), so the base table isn't the class. (Not yet
+        // run against a real archived class.)
+        _ if item.archived || has("GDB_TO_DATE").is_some() => ReadPlan::Refused(format!(
+            "{} is archived but its view is missing, and its table holds past rows too; ask the geodatabase administrator to enable SQL access for it",
             item.name
         )),
         _ => ReadPlan::Base,
@@ -658,6 +676,37 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(read_plan(&base, true, &[], &[]), ReadPlan::Base);
+    }
+
+    #[test]
+    fn an_archived_class_without_its_view_is_refused() {
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let base = plain("sde.Mains", "MAINS", Versioning::Unversioned);
+        let archived = Item { archived: true, ..base.clone() };
+        // Its base table keeps every past row, so it isn't read as the class.
+        match read_plan(&archived, true, &[], &[]) {
+            ReadPlan::Refused(why) => assert!(why.contains("archiv") && why.contains("sde.Mains"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // The table's own columns say so whatever the definition does.
+        match read_plan(&base, true, &[], &strings(&["OBJECTID", "gdb_from_date", "GDB_TO_DATE"])) {
+            ReadPlan::Refused(why) => assert!(why.contains("archiv"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Its view shows the current rows.
+        assert_eq!(read_plan(&archived, true, &strings(&["MAINS_EVW"]), &[]), ReadPlan::VersionedView("MAINS_EVW".into()));
+        assert_eq!(read_plan(&base, true, &[], &strings(&["OBJECTID", "NAME"])), ReadPlan::Base);
+    }
+
+    #[test]
+    fn a_cut_catalog_does_not_vouch_for_a_missing_name() {
+        let mut c = catalog();
+        assert_eq!(c.registered("sde.Other"), Ok(None));
+        assert_eq!(c.registered("Mains").map(|i| i.map(|i| i.table.as_str())), Ok(Some("MAINS")));
+        c.cut = true;
+        assert_eq!(c.registered("Mains").map(|i| i.map(|i| i.table.as_str())), Ok(Some("MAINS")));
+        let why = c.registered("sde.Other").unwrap_err();
+        assert!(why.contains("sde.Other") && why.contains("isn't known"), "{why}");
     }
 
     #[test]

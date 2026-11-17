@@ -244,6 +244,9 @@ fn property_value(text: &[char], key: &str) -> Option<String> {
             return None;
         }
         let start = at + key.len();
+        if let Some(value) = counted(text, start) {
+            return property_text(value);
+        }
         let (mut i, mut short) = (start, None);
         while i < start + GAP {
             let rest = text.get(i..)?;
@@ -258,13 +261,31 @@ fn property_value(text: &[char], key: &str) -> Option<String> {
             }
             let found = rest.get(..run)?;
             if run >= 2 {
-                return property_text(found);
+                // The next key's name ends this one's value: a one-character run before it is the value.
+                return property_text(found).or_else(|| short.and_then(property_text));
             }
             short.get_or_insert(found);
             i += run;
         }
         short.and_then(property_text)
     })
+}
+
+/// The value ArcGIS Pro writes after a key: the key's NUL, a string VARIANT's type (8), the
+/// value's length in bytes (its NUL included) and the text, which keeps its spaces and any
+/// letters. None for any other layout, which is scanned for a printable run instead.
+fn counted(text: &[char], start: usize) -> Option<&[char]> {
+    let head = text.get(start..start + 4)?;
+    if (head[0], head[1], head[3]) != ('\0', '\u{8}', '\0') {
+        return None;
+    }
+    let bytes = head[2] as usize;
+    if bytes < 2 || !bytes.is_multiple_of(2) || bytes / 2 - 1 > MAX_VALUE {
+        return None;
+    }
+    let end = start + 4 + bytes / 2 - 1;
+    let value = text.get(start + 4..end)?;
+    (text.get(end) == Some(&'\0') && !value.iter().any(|c| c.is_control())).then_some(value)
 }
 
 /// A property-set value as kept: not another key's or a secret's name, cut before a secret's name.
@@ -281,12 +302,27 @@ fn property_text(run: &[char]) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Whether `at` lies in a secret's value: the pair it is in (back to the last `;` or control
+/// character) starts with a secret's name. A pair too long to find the start of counts as one.
+fn in_secret(text: &[char], at: usize) -> bool {
+    let back = MAX_VALUE + 32;
+    let from = at.saturating_sub(back);
+    let before = text.get(from..at).unwrap_or_default();
+    let start = match before.iter().rposition(|&c| c == ';' || c.is_control()) {
+        Some(i) => i + 1,
+        None if from == 0 => 0,
+        None => return true,
+    };
+    let pair: String = before.get(start..).unwrap_or_default().iter().collect::<String>().trim_start().to_ascii_uppercase();
+    SECRETS.iter().any(|k| pair.strip_prefix(k).is_some_and(|rest| rest.starts_with('=')))
+}
+
 fn text_value(text: &[char], key: &str) -> Option<String> {
     let key: Vec<char> = key.chars().collect();
     (0..text.len()).find_map(|at| {
         let starts_pair = at == 0 || text.get(at - 1).is_some_and(|c| !(c.is_ascii_alphanumeric() || *c == '_'));
         let named = text.get(at..at + key.len()).is_some_and(|w| w.iter().zip(&key).all(|(a, b)| a.eq_ignore_ascii_case(b)));
-        if !starts_pair || !named || text.get(at + key.len()) != Some(&'=') {
+        if !starts_pair || !named || text.get(at + key.len()) != Some(&'=') || in_secret(text, at) {
             return None;
         }
         let rest = text.get(at + key.len() + 1..)?;
@@ -449,6 +485,59 @@ mod tests {
         let mut bytes = property_set(&[("SERVER", "set-host")], 0);
         bytes.extend(b"\x00DATABASE=d;");
         assert_eq!(parse(&bytes).unwrap_err(), SdeError::NoServer);
+    }
+
+    /// A property set as ArcGIS Pro writes it: each key and value a counted UTF-16 string.
+    fn counted_set(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (key, value) in pairs {
+            let (k, v) = (utf16(key), utf16(value));
+            bytes.extend((k.len() as u32 + 2).to_le_bytes());
+            bytes.extend(k);
+            bytes.extend([0, 0, 0x08, 0x00]);
+            bytes.extend((v.len() as u32 + 2).to_le_bytes());
+            bytes.extend(v);
+            bytes.extend([0, 0]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_counted_value_keeps_its_spaces_and_letters() {
+        let pairs = [
+            ("SERVER", "gis-db"),
+            ("DBCLIENT", "sqlserver"),
+            ("DATABASE", "City GIS"),
+            ("USER", "Jos\u{e9} M"),
+            ("VERSION", "editor.Design 2"),
+            ("ENCRYPTED_PASSWORD", "00ff"),
+        ];
+        let c = parse(&counted_set(&pairs)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((c.server.as_str(), c.database.as_str()), ("gis-db", "City GIS"));
+        assert_eq!(c.user.as_deref(), Some("Jos\u{e9} M"));
+        assert_eq!(c.version.as_deref(), Some("editor.Design 2"));
+        assert!(!format!("{c:?}").contains("00ff"));
+        // an empty counted value is no value, not the next key's
+        let c = parse(&counted_set(&[("USER", ""), ("SERVER", "gis-db")])).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((c.user, c.server.as_str()), (None, "gis-db"));
+    }
+
+    #[test]
+    fn a_one_character_value_survives_the_next_key() {
+        let c = parse(&property_set(&[("SERVER", "h"), ("DATABASE", "utility")], 0)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((c.server.as_str(), c.database.as_str()), ("h", "utility"));
+    }
+
+    #[test]
+    fn a_key_inside_a_password_is_not_a_key() {
+        let c = parse(b"SERVER=gis-db;DBCLIENT=sqlserver;PASSWORD=USER=hunter2;").unwrap();
+        assert_eq!(c.user, None);
+        assert!(!format!("{c:?}").contains("hunter2"));
+        let c = parse(b"SERVER=gis-db;ENCRYPTED_PASSWORD=ab DATABASE=cd;").unwrap();
+        assert_eq!(c.database, "");
+        // a pair of its own after the password still reads
+        let c = parse(b"SERVER=gis-db;PASSWORD=a=b;USER=editor;").unwrap();
+        assert_eq!(c.user.as_deref(), Some("editor"));
     }
 
     #[test]

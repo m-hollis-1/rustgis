@@ -399,10 +399,16 @@ pub fn geodatabase(conn: &Conn) -> Option<Arc<super::geodatabase::Catalog>> {
     if let Some(cached) = conn.geodatabase.get() {
         return cached.clone();
     }
+    // One reader at a time, holding the problem: the catalog and why it is missing are then one
+    // reader's answer, never one's catalog beside another's problem.
+    let mut held = conn.geodatabase_problem.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = conn.geodatabase.get() {
+        return cached.clone();
+    }
     // The error texts come from `Conn::query`, which redacts the password.
     let (catalog, problem) = match gdb::detect_owner(conn) {
         Err(e) => {
-            set_problem(conn, Some(e.to_string()));
+            *held = Some(e.to_string());
             return None;
         }
         Ok(None) => (None, None),
@@ -412,12 +418,8 @@ pub fn geodatabase(conn: &Conn) -> Option<Arc<super::geodatabase::Catalog>> {
         },
     };
     // The problem is set first, so whoever sees the catalog cached also sees why it is missing.
-    set_problem(conn, problem);
+    *held = problem;
     conn.geodatabase.get_or_init(|| catalog).clone()
-}
-
-fn set_problem(conn: &Conn, problem: Option<String>) {
-    *conn.geodatabase_problem.lock().unwrap_or_else(|e| e.into_inner()) = problem;
 }
 
 /// Why the catalog couldn't be read, when `geodatabase` is None for a database that has
@@ -892,7 +894,8 @@ impl SqlServerSource {
     /// Notes the Z and M values reading drops: `STAsBinary` writes x and y only. Counts the rows
     /// with them within the probe timeout, and says so when that count fails or runs out of time.
     fn check_zm(&mut self) {
-        let sql = zm_probe(&self.table.sql_from(), &ident(&self.table.column), &self.filter(None));
+        // Through what the rows are read from: a versioned class's edits aren't in its own table.
+        let sql = zm_probe(&self.from, &ident(&self.table.column), &self.filter(None));
         let probe = self.conn.query_within(&sql, &[], PROBE_TIMEOUT).map(|rows| rows.map(|r| first_count(&r)));
         note_zm(&mut self.info, probe);
     }
@@ -902,14 +905,20 @@ impl SqlServerSource {
     }
 
     fn count_rows(&self) -> Option<u64> {
-        let estimate = self
-            .conn
-            .query(
-                "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID(@P1) AND p.index_id IN (0, 1)",
-                &[&self.table.sql_from()],
-            )
-            .ok()
-            .and_then(|r| first_count(&r));
+        // The table's own row count stands for the rows read only when they are read from it: a
+        // versioned class's table holds other versions' rows, or lacks the Default's edits.
+        let own = self.from == self.table.sql_from();
+        let estimate = own
+            .then(|| {
+                self.conn
+                    .query(
+                        "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID(@P1) AND p.index_id IN (0, 1)",
+                        &[&self.table.sql_from()],
+                    )
+                    .ok()
+                    .and_then(|r| first_count(&r))
+            })
+            .flatten();
         match estimate {
             Some(n) if n >= EXACT_COUNT_BELOW => Some(n),
             _ => self
@@ -1022,7 +1031,7 @@ impl SqlServerSource {
 /// The query that counts the rows of `from` matching `filter` whose geometry column `g` has Z or M
 /// values.
 fn zm_probe(from: &str, g: &str, filter: &str) -> String {
-    format!("SELECT COUNT_BIG(*) FROM {from} WHERE {filter} AND ({g}.HasZ = 1 OR {g}.HasM = 1)")
+    format!("SELECT COUNT_BIG(*) FROM {from} t WHERE {filter} AND ({g}.HasZ = 1 OR {g}.HasM = 1)")
 }
 
 /// Records what the Z/M count found: rows with Z or M values mark the source (with the count when
@@ -1288,7 +1297,7 @@ mod tests {
     fn zm_probe_counts_heights_and_measures() {
         assert_eq!(
             zm_probe("[dbo].[t]", "[g]", "[g] IS NOT NULL AND [g].STSrid = 4326"),
-            "SELECT COUNT_BIG(*) FROM [dbo].[t] WHERE [g] IS NOT NULL AND [g].STSrid = 4326 AND ([g].HasZ = 1 OR [g].HasM = 1)"
+            "SELECT COUNT_BIG(*) FROM [dbo].[t] t WHERE [g] IS NOT NULL AND [g].STSrid = 4326 AND ([g].HasZ = 1 OR [g].HasM = 1)"
         );
     }
 

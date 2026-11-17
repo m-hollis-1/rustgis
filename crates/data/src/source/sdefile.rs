@@ -296,9 +296,15 @@ fn counted(text: &[char], start: usize) -> Option<&[char]> {
     if bytes < 2 || !bytes.is_multiple_of(2) || bytes / 2 - 1 > MAX_VALUE {
         return None;
     }
-    let end = start + 4 + bytes / 2 - 1;
-    let value = text.get(start + 4..end)?;
-    (text.get(end) == Some(&'\0') && !value.iter().any(|c| c.is_control())).then_some(value)
+    // The length counts UTF-16 units, and a character outside the basic plane is two of them.
+    let rest = text.get(start + 4..)?;
+    let (mut units, mut chars) = (0, 0);
+    while units < bytes / 2 - 1 {
+        units += rest.get(chars)?.len_utf16();
+        chars += 1;
+    }
+    let value = rest.get(..chars)?;
+    (units == bytes / 2 - 1 && rest.get(chars) == Some(&'\0') && !value.iter().any(|c| c.is_control())).then_some(value)
 }
 
 /// A property-set value as kept: not another key's or a secret's name, cut before a secret's name.
@@ -540,6 +546,14 @@ mod tests {
         let pairs = [("SERVER", "gis-db"), ("DBCLIENT", "sqlserver"), ("DATABASE", "City USER=editor")];
         let c = parse(&counted_set(&pairs)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((c.server.as_str(), c.database.as_str(), c.user), ("gis-db", "City USER=editor", None));
+    }
+
+    #[test]
+    fn a_counted_value_keeps_letters_outside_the_basic_plane() {
+        // One character, two UTF-16 units: the stored length counts units.
+        let pairs = [("SERVER", "gis-db"), ("DBCLIENT", "sqlserver"), ("DATABASE", "City \u{20000} USER=editor")];
+        let c = parse(&counted_set(&pairs)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((c.server.as_str(), c.database.as_str(), c.user), ("gis-db", "City \u{20000} USER=editor", None));
     }
 
     #[test]

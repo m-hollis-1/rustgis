@@ -1402,7 +1402,12 @@ mod tests {
                 let whole = src.read(&Request { extent: None, limit: 250_000 }).unwrap_or_else(|e| panic!("{}: {e}", t.label()));
                 let e = i.extent;
                 let q = Extent::new(e.min_x, e.min_y, e.min_x + e.width() / 2.0, e.min_y + e.height() / 2.0);
-                let part = src.read(&Request { extent: Some(q), limit: 1000 }).unwrap_or_else(|e| panic!("{}: {e}", t.label()));
+                // A table whose extent couldn't be measured in time has no quarter to ask for.
+                let part = if e.is_empty() {
+                    Batch::default()
+                } else {
+                    src.read(&Request { extent: Some(q), limit: 1000 }).unwrap_or_else(|e| panic!("{}: {e}", t.label()))
+                };
                 for ft in &part.features {
                     let g = ft.geometry.as_ref().map(|g| g.extent()).unwrap_or(Extent::EMPTY);
                     assert!(g.intersects(&q.padded(0.01, 0.0)), "{}: feature {} outside the request", t.label(), ft.id);

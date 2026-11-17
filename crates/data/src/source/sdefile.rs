@@ -84,9 +84,13 @@ pub fn parse(bytes: &[u8]) -> Result<SdeConnection, SdeError> {
         return Err(SdeError::TooLarge);
     }
     let texts = Texts::new(bytes);
-    let mut values: Vec<Option<String>> = KEYS.iter().map(|k| texts.value(k)).collect();
+    // A file with a counted value is a property set, whatever `KEY=` text its values hold.
+    // Otherwise pairs win, and a file without any is scanned as a property set.
+    let properties = || KEYS.iter().map(|k| texts.property(k)).collect();
+    let mut values: Vec<Option<String>> =
+        if KEYS.iter().any(|k| texts.counted(k)) { properties() } else { KEYS.iter().map(|k| texts.value(k)).collect() };
     if values.iter().all(Option::is_none) {
-        values = KEYS.iter().map(|k| texts.property(k)).collect();
+        values = properties();
     }
     let value = |key: &str| KEYS.iter().position(|k| *k == key).and_then(|i| values.get(i)).cloned().flatten();
     let instance = value("INSTANCE");
@@ -221,7 +225,12 @@ impl Texts {
     /// first printable run within [`GAP`] characters after it (a one-character run, which may be
     /// a VARIANT's length, only when no longer one follows). Never asked for a secret.
     fn property(&self, key: &str) -> Option<String> {
-        self.0.get(1..)?.iter().find_map(|text| property_value(text, key))
+        self.0.get(1..)?.iter().find_map(|text| property_value(text, key, false))
+    }
+
+    /// Whether `key` has a value in the counted layout ArcGIS Pro writes ([`counted`]).
+    fn counted(&self, key: &str) -> bool {
+        self.0.get(1..).is_some_and(|texts| texts.iter().any(|text| property_value(text, key, true).is_some()))
     }
 }
 
@@ -233,7 +242,8 @@ fn printable(c: char) -> bool {
     c.is_ascii_alphanumeric() || c.is_ascii_punctuation()
 }
 
-fn property_value(text: &[char], key: &str) -> Option<String> {
+/// The value of `key` in a property set; with `counted_only`, only one in the counted layout.
+fn property_value(text: &[char], key: &str, counted_only: bool) -> Option<String> {
     let key: Vec<char> = key.chars().collect();
     (0..text.len()).find_map(|at| {
         let alone_before = at == 0 || text.get(at - 1).is_some_and(|c| !(c.is_ascii_alphanumeric() || *c == '_'));
@@ -246,6 +256,9 @@ fn property_value(text: &[char], key: &str) -> Option<String> {
         let start = at + key.len();
         if let Some(value) = counted(text, start) {
             return property_text(value);
+        }
+        if counted_only {
+            return None;
         }
         let (mut i, mut short) = (start, None);
         while i < start + GAP {
@@ -520,6 +533,13 @@ mod tests {
         // an empty counted value is no value, not the next key's
         let c = parse(&counted_set(&[("USER", ""), ("SERVER", "gis-db")])).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((c.user, c.server.as_str()), (None, "gis-db"));
+    }
+
+    #[test]
+    fn text_inside_a_counted_value_does_not_pick_the_layout() {
+        let pairs = [("SERVER", "gis-db"), ("DBCLIENT", "sqlserver"), ("DATABASE", "City USER=editor")];
+        let c = parse(&counted_set(&pairs)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((c.server.as_str(), c.database.as_str(), c.user), ("gis-db", "City USER=editor", None));
     }
 
     #[test]

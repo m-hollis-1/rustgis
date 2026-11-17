@@ -126,7 +126,7 @@ pub(super) fn reading(conn: &Conn, table: &Table, columns: &[String]) -> Result<
     let native_spatial = native_spatial(table);
     let views = views_of(conn, item, &table.schema)?;
     let plan = geodatabase::read_plan(item, native_spatial, &views, columns);
-    let srs = item.srid.and_then(|s| catalog.srs(s));
+    let srs = shape_srid(item, &table.column).and_then(|s| catalog.srs(s));
     reading_of(plan, table, item, srs).map(Some)
 }
 
@@ -173,7 +173,17 @@ fn registered<'a>(catalog: &'a geodatabase::Catalog, table: &Table) -> Result<Op
 /// The kind of geometry the definition gives `column`: it speaks for the class's shape column
 /// only, so another spatial column of the same table is probed.
 fn known_family(item: &Item, column: &str) -> Option<Family> {
-    item.family.filter(|_| item.shape_column.as_deref().is_some_and(|shape| shape.eq_ignore_ascii_case(column)))
+    item.family.filter(|_| is_shape(item, column))
+}
+
+/// The class's registered spatial reference, which is its shape column's: another spatial column
+/// of the same table keeps what its own rows say.
+fn shape_srid(item: &Item, column: &str) -> Option<i64> {
+    item.srid.filter(|_| is_shape(item, column))
+}
+
+fn is_shape(item: &Item, column: &str) -> bool {
+    item.shape_column.as_deref().is_some_and(|shape| shape.eq_ignore_ascii_case(column))
 }
 
 /// What to say about the rows of a table read up to `limit`: how many there are when the count
@@ -470,6 +480,8 @@ mod tests {
         assert_eq!(known_family(&item(), "shape"), Some(Family::Lines));
         assert_eq!(known_family(&item(), "LABEL_POINT"), None);
         assert_eq!(known_family(&Item { shape_column: None, ..item() }, "SHAPE"), None);
+        assert_eq!(shape_srid(&item(), "Shape"), Some(3));
+        assert_eq!(shape_srid(&item(), "LABEL_POINT"), None);
     }
 
     #[test]

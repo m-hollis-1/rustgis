@@ -45,7 +45,7 @@ pub(super) fn queries(owner: &str) -> Option<Queries> {
         ),
         registry: format!("SELECT TOP ({MAX_ITEMS}) owner, table_name, rowid_column FROM {o}.SDE_table_registry"),
         layers: format!("SELECT TOP ({MAX_ITEMS}) owner, table_name, spatial_column, srid FROM {o}.SDE_layers"),
-        srs: format!("SELECT TOP ({MAX_ITEMS}) srid, auth_srid, srtext FROM {o}.SDE_spatial_references"),
+        srs: format!("SELECT TOP ({MAX_ITEMS}) srid, auth_srid, srtext, auth_name FROM {o}.SDE_spatial_references"),
         release: format!("SELECT TOP (1) major, minor, bugfix FROM {o}.SDE_version"),
     })
 }
@@ -84,7 +84,9 @@ pub(super) fn read_catalog(conn: &Conn, owner: &str) -> Result<Catalog> {
     let srs = conn
         .query(&q.srs, &[])?
         .iter()
-        .filter_map(|r| Some(Srs { srid: int_of(at(r, 0))?, auth_srid: int_of(at(r, 1)), srtext: text_of(at(r, 2)) }))
+        .filter_map(|r| {
+            Some(Srs { srid: int_of(at(r, 0))?, auth_name: text_of(at(r, 3)), auth_srid: int_of(at(r, 1)), srtext: text_of(at(r, 2)) })
+        })
         .collect();
     let release = conn.query(&q.release, &[]).ok().and_then(|rows| {
         let r = rows.first()?;
@@ -260,10 +262,11 @@ pub(super) fn reading_of(plan: ReadPlan, table: &Table, item: &Item, srs: Option
         ReadPlan::Refused(why) => return Err(DataError::Unsupported(why)),
     };
     let srid_fallback = srs.and_then(|s| {
-        s.auth_srid
-            .filter(|a| *a > 0)
-            .and_then(|a| u32::try_from(a).ok())
-            .or_else(|| s.srtext.as_deref().and_then(|t| Crs::parse(t).ok()).map(|c| c.epsg()).filter(|e| *e > 0).map(u32::from))
+        let epsg = |c: Crs| Some(c.epsg()).filter(|e| *e > 0).map(u32::from);
+        authority_code(s)
+            .and_then(Crs::from_epsg)
+            .and_then(epsg)
+            .or_else(|| s.srtext.as_deref().and_then(|t| Crs::parse(t).ok()).and_then(epsg))
     });
     Ok(Reading {
         from,
@@ -273,6 +276,17 @@ pub(super) fn reading_of(plan: ReadPlan, table: &Table, item: &Item, srs: Option
         srid_fallback,
         notes,
     })
+}
+
+/// The code a spatial reference gives that may be looked up as an EPSG code: `auth_srid` when its
+/// authority is EPSG, Esri (whose codes share the lookup: 102100 is EPSG:3857) or not named.
+/// Another authority's number isn't one, and the reference then goes by its text.
+fn authority_code(srs: &Srs) -> Option<u32> {
+    let name = srs.auth_name.as_deref().map(str::trim).unwrap_or_default();
+    if !(name.is_empty() || name.eq_ignore_ascii_case("EPSG") || name.eq_ignore_ascii_case("ESRI")) {
+        return None;
+    }
+    srs.auth_srid.filter(|a| *a > 0).and_then(|a| u32::try_from(a).ok())
 }
 
 /// What a geodatabase lists: its feature datasets, its registered feature classes and tables, and
@@ -591,20 +605,46 @@ mod tests {
         let refused = reading_of(ReadPlan::Refused("not readable".into()), &t, &i, None);
         assert!(matches!(refused, Err(DataError::Unsupported(ref why)) if why == "not readable"), "{refused:?}");
 
-        let srs = Srs { srid: 3, auth_srid: Some(2263), srtext: Some(WGS84.into()) };
+        let srs = Srs { srid: 3, auth_name: None, auth_srid: Some(2263), srtext: Some(WGS84.into()) };
         let r = reading_of(ReadPlan::Base, &t, &i, Some(&srs)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(r.srid_fallback, Some(2263));
 
         let expected = Crs::parse(WGS84).map(|c| c.epsg()).unwrap_or(0);
         assert!(expected > 0);
         for auth_srid in [None, Some(0)] {
-            let srs = Srs { srid: 3, auth_srid, srtext: Some(WGS84.into()) };
+            let srs = Srs { srid: 3, auth_name: None, auth_srid, srtext: Some(WGS84.into()) };
             let r = reading_of(ReadPlan::Base, &t, &i, Some(&srs)).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(r.srid_fallback, Some(u32::from(expected)));
         }
-        let srs = Srs { srid: 3, auth_srid: None, srtext: Some("not a coordinate system".into()) };
+        let srs = Srs { srid: 3, auth_name: None, auth_srid: None, srtext: Some("not a coordinate system".into()) };
         let r = reading_of(ReadPlan::Base, &t, &i, Some(&srs)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(r.srid_fallback, None);
+    }
+
+    #[test]
+    fn a_spatial_reference_code_is_epsg_only_when_its_authority_allows() {
+        let (t, i) = (table(), item());
+        let fallback = |auth_name: Option<&str>, auth_srid: i64, srtext: Option<&str>| {
+            let srs = Srs { srid: 3, auth_name: auth_name.map(Into::into), auth_srid: Some(auth_srid), srtext: srtext.map(Into::into) };
+            reading_of(ReadPlan::Base, &t, &i, Some(&srs)).unwrap_or_else(|e| panic!("{e}")).srid_fallback
+        };
+        let wgs84 = Crs::parse(WGS84).map(|c| u32::from(c.epsg())).unwrap_or(0);
+        assert!(wgs84 > 0);
+        // An EPSG code, named so or not named at all.
+        assert_eq!(fallback(Some("EPSG"), 2263, None), Some(2263));
+        assert_eq!(fallback(Some(" epsg "), 2263, None), Some(2263));
+        assert_eq!(fallback(None, 2263, None), Some(2263));
+        assert_eq!(fallback(Some(""), 2263, None), Some(2263));
+        // Esri's Web Mercator is EPSG:3857.
+        assert_eq!(fallback(Some("ESRI"), 102_100, None), Some(3857));
+        assert_eq!(fallback(None, 102_100, None), Some(3857));
+        // An Esri code with no EPSG code goes by its text, or is left unset.
+        assert_eq!(fallback(Some("ESRI"), 102_719, Some(WGS84)), Some(wgs84));
+        assert_eq!(fallback(Some("ESRI"), 102_719, None), None);
+        assert_eq!(fallback(None, 102_719, None), None);
+        // Another authority's number isn't an EPSG code, whatever it is.
+        assert_eq!(fallback(Some("LOCAL"), 2263, None), None);
+        assert_eq!(fallback(Some("LOCAL"), 2263, Some(WGS84)), Some(wgs84));
     }
 
     fn spatial(schema: &str, name: &str, column: &str) -> Table {

@@ -97,6 +97,8 @@ impl Item {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Srs {
     pub srid: i64,
+    /// The authority `auth_srid` is a code of (`EPSG`, `ESRI`), when the row names one.
+    pub auth_name: Option<String>,
     pub auth_srid: Option<i64>,
     pub srtext: Option<String>,
 }
@@ -479,7 +481,7 @@ mod tests {
             ],
             vec![RegistryRow { owner: "SDE".into(), table: "MAINS".into(), rowid_column: Some("OBJECTID".into()) }],
             vec![LayerRow { owner: "SDE".into(), table: "MAINS".into(), column: "SHAPE".into(), srid: Some(2) }],
-            vec![Srs { srid: 2, auth_srid: Some(4326), srtext: None }],
+            vec![Srs { srid: 2, auth_name: None, auth_srid: Some(4326), srtext: None }],
         )
     }
 

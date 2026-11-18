@@ -212,10 +212,6 @@ impl Catalog {
         Catalog { owner: owner.to_string(), release, items, srs: srs.into_iter().take(MAX_ITEMS).collect(), cut }
     }
 
-    /// The feature class or table a name picks: `Mains`, `sde.Mains`, `utility.sde.Mains` or
-    /// `SDE.MAINS`, in any case (a three-part name loses its first part, the database). A bare
-    /// name matches the short name of an item. Feature datasets are not picked, as a dataset and
-    /// a class can share a name; see [`Catalog::feature_datasets`].
     /// As [`Catalog::find`], for a decision that rests on a name being absent: a catalog cut at
     /// [`MAX_ITEMS`] can't say a name it doesn't list is unregistered, and says why instead.
     pub fn registered(&self, name: &str) -> std::result::Result<Option<&Item>, String> {
@@ -227,6 +223,10 @@ impl Catalog {
         }
     }
 
+    /// The feature class or table a name picks: `Mains`, `sde.Mains`, `utility.sde.Mains` or
+    /// `SDE.MAINS`, in any case (a three-part name loses its first part, the database). A bare
+    /// name matches the short name of an item. Feature datasets are not picked, as a dataset and
+    /// a class can share a name; see [`Catalog::feature_datasets`].
     pub fn find(&self, name: &str) -> Option<&Item> {
         let name = name.trim();
         let query = without_database(name).unwrap_or_else(|| name.to_string());
@@ -268,12 +268,22 @@ impl Catalog {
 }
 
 /// The geodatabase's own tables, never listed as data: `GDB_*`, `SDE_*`, `A<n>`, `D<n>` and `i<n>`
-/// (a registered table's add and delete tables and its index), `*_evw`, `*_vw` and `*_H`, in any
-/// case.
+/// (a registered table's add and delete tables and its index), in any case. A registered
+/// table's views and archive are told by [`derived_from`].
 pub fn is_machinery(table: &str) -> bool {
     let t = table.to_ascii_lowercase();
     let numbered = t.strip_prefix(['a', 'd', 'i']).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    numbered || t.starts_with("gdb_") || t.starts_with("sde_") || t.ends_with("_evw") || t.ends_with("_vw") || t.ends_with("_h")
+    numbered || t.starts_with("gdb_") || t.starts_with("sde_")
+}
+
+/// The table a name would be a versioned view (`*_evw`, `*_vw`) or the archive (`*_H`) of, in
+/// any case: the name without that ending. It is the geodatabase's own only when that table is
+/// registered; a table of the user's own can end the same way.
+pub fn derived_from(table: &str) -> Option<&str> {
+    ["_evw", "_vw", "_h"].iter().find_map(|end| {
+        let cut = table.len().checked_sub(end.len()).filter(|cut| *cut > 0)?;
+        table.get(cut..).filter(|tail| tail.eq_ignore_ascii_case(end)).and_then(|_| table.get(..cut))
+    })
 }
 
 /// How a registered class is read.
@@ -638,11 +648,17 @@ mod tests {
 
     #[test]
     fn machinery_is_hidden() {
-        for t in ["GDB_ITEMS", "SDE_layers", "A12", "D12", "i12", "MAINS_evw", "MAINS_vw", "MAINS_H"] {
+        for t in ["GDB_ITEMS", "SDE_layers", "A12", "D12", "i12"] {
             assert!(is_machinery(t), "{t}");
         }
-        for t in ["Mains", "A_Roads", "Dams", "History", "A", "i"] {
+        for t in ["Mains", "A_Roads", "Dams", "History", "A", "i", "MAINS_evw", "Sites_H"] {
             assert!(!is_machinery(t), "{t}");
+        }
+        for (t, of) in [("MAINS_evw", "MAINS"), ("mains_VW", "mains"), ("MAINS_H", "MAINS")] {
+            assert_eq!(derived_from(t), Some(of), "{t}");
+        }
+        for t in ["Mains", "_H", "_evw", "Hevw", "\u{e9}_"] {
+            assert_eq!(derived_from(t), None, "{t}");
         }
     }
 

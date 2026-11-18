@@ -302,7 +302,12 @@ pub(super) fn listing_of(catalog: &Catalog, spatial: Vec<Table>) -> GdbListing {
         })
         .collect();
     let tables = data().filter(|i| i.kind == ItemKind::Table).cloned().collect();
-    let other = spatial.iter().filter(|t| !is_machinery(&t.name) && !data().any(|i| same(t, i))).cloned().collect();
+    // A view or archive is the geodatabase's own when its table is registered in the same schema.
+    let derived = |t: &Table| {
+        geodatabase::derived_from(&t.name)
+            .is_some_and(|of| data().any(|i| t.schema.eq_ignore_ascii_case(&i.schema) && of.eq_ignore_ascii_case(&i.table)))
+    };
+    let other = spatial.iter().filter(|t| !is_machinery(&t.name) && !derived(t) && !data().any(|i| same(t, i))).cloned().collect();
     let datasets = catalog.feature_datasets().iter().map(|d| d.short_name().to_string()).collect();
     GdbListing { datasets, classes, tables, other }
 }
@@ -317,21 +322,24 @@ pub fn geodatabase_tables(conn: &Conn) -> Result<Option<GdbListing>> {
 /// The statement that reads a registered table's rows, and the fields it yields. The first
 /// column is the feature id: the registered ObjectID column when the table has it as an integer
 /// (the rows are then read in its order), else the row number. The rest follow the fields, each
-/// cast as [`field_cast`] does; geometry and binary columns are left out.
-fn table_select(reading: &Reading, columns: &[(String, String)], limit: usize) -> (Vec<Field>, String) {
+/// cast as [`field_cast`] does; geometry and binary columns are left out, and named third.
+fn table_select(reading: &Reading, columns: &[(String, String)], limit: usize) -> (Vec<Field>, String, Vec<String>) {
     let rowid = reading.rowid.as_deref().and_then(|want| {
         columns
             .iter()
             .find(|(name, ty)| name.eq_ignore_ascii_case(want) && matches!(ty.as_str(), "tinyint" | "smallint" | "int" | "bigint"))
             .map(|(name, _)| ident(name))
     });
-    let mut fields = Vec::new();
+    let (mut fields, mut left_out) = (Vec::new(), Vec::new());
     let mut select = vec![match &rowid {
         Some(id) => format!("CAST({id} AS BIGINT)"),
         None => "ROW_NUMBER() OVER (ORDER BY (SELECT NULL))".to_string(),
     }];
     for (name, ty) in columns {
-        let Some((field_type, cast)) = field_cast(ty, &ident(name)) else { continue };
+        let Some((field_type, cast)) = field_cast(ty, &ident(name)) else {
+            left_out.push(name.clone());
+            continue;
+        };
         let mut field = Field::new(name.clone(), field_type);
         field.alias = reading.field_aliases.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, alias)| alias.clone());
         fields.push(field);
@@ -341,7 +349,20 @@ fn table_select(reading: &Reading, columns: &[(String, String)], limit: usize) -
     if let Some(id) = rowid {
         sql.push_str(&format!(" ORDER BY {id}"));
     }
-    (fields, sql)
+    (fields, sql, left_out)
+}
+
+/// What to say about the columns a table read leaves out, naming the first few.
+fn left_out_note(columns: &[String]) -> Option<String> {
+    const NAMED: usize = 8;
+    let names = columns.iter().take(NAMED).map(String::as_str).collect::<Vec<_>>().join(", ");
+    let more = columns.len().saturating_sub(NAMED);
+    let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+    match columns.len() {
+        0 => None,
+        1 => Some(format!("1 column of a type that isn't read (binary, row version or spatial) is left out: {names}")),
+        n => Some(format!("{n} columns of a type that isn't read (binary, row version or spatial) are left out: {names}{more}")),
+    }
 }
 
 /// A registered non-spatial table loaded whole (through its versioned view when versioned), at
@@ -366,7 +387,7 @@ pub fn read_table(conn: &Conn, item: &Item, limit: usize) -> Result<(Dataset, Re
         short: None,
     };
     let reading = reading_of(plan, &base, item, None)?;
-    let (fields, sql) = table_select(&reading, &columns, limit);
+    let (fields, sql, left_out) = table_select(&reading, &columns, limit);
     let rows = conn.query(&sql, &[])?;
     let mut unread = Vec::new();
     let features: Features = rows
@@ -381,6 +402,7 @@ pub fn read_table(conn: &Conn, item: &Item, limit: usize) -> Result<(Dataset, Re
     let unread_dates = crate::source::unread_dates_note(&fields, &unread);
     let mut report = ReadReport { messages: reading.notes.clone(), unread_dates: unread_dates.clone(), ..Default::default() };
     report.messages.extend(unread_dates);
+    report.messages.extend(left_out_note(&left_out));
     let count_sql = format!("SELECT COUNT_BIG(*) FROM {} t", reading.from);
     let count = conn.query_within(&count_sql, &[], PROBE_TIMEOUT).ok().flatten().and_then(|r| first_count(&r));
     report.messages.extend(rows_note(count, features.len(), limit));
@@ -590,7 +612,12 @@ mod tests {
                 spatial("SDE", "MAINS", "SHAPE"),
                 spatial("SDE", "MAINS_evw", "SHAPE"),
                 spatial("SDE", "A12", "SHAPE"),
+                spatial("SDE", "mains_H", "SHAPE"),
                 spatial("dbo", "Parcels", "geom"),
+                // A table of the user's own that only ends like a view or an archive is listed.
+                spatial("dbo", "Sites_H", "geom"),
+                spatial("dbo", "Zoning_vw", "geom"),
+                spatial("dbo", "MAINS_evw", "geom"),
             ],
         );
         assert_eq!(listing.datasets, ["Water"]);
@@ -599,7 +626,15 @@ mod tests {
         assert_eq!(listing.classes, vec![(mains.clone(), Some(expected))]);
         let readings = catalog.find("Readings").unwrap_or_else(|| panic!("Readings is registered"));
         assert_eq!(listing.tables, vec![readings.clone()]);
-        assert_eq!(listing.other, vec![spatial("dbo", "Parcels", "geom")]);
+        assert_eq!(
+            listing.other,
+            vec![
+                spatial("dbo", "Parcels", "geom"),
+                spatial("dbo", "Sites_H", "geom"),
+                spatial("dbo", "Zoning_vw", "geom"),
+                spatial("dbo", "MAINS_evw", "geom")
+            ]
+        );
     }
 
     #[test]
@@ -637,7 +672,16 @@ mod tests {
                 .collect();
         let (t, i) = (table(), item());
         let reading = reading_of(ReadPlan::VersionedView("MAINS_evw".into()), &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
-        let (fields, sql) = table_select(&reading, &columns, 50);
+        let (fields, sql, left_out) = table_select(&reading, &columns, 50);
+        assert_eq!(left_out, ["SHAPE", "RAW"]);
+        assert_eq!(
+            left_out_note(&left_out).as_deref(),
+            Some("2 columns of a type that isn't read (binary, row version or spatial) are left out: SHAPE, RAW")
+        );
+        assert_eq!(left_out_note(&[]), None, "a table read whole says nothing");
+        let many: Vec<String> = (0..10).map(|n| format!("B{n}")).collect();
+        assert!(left_out_note(&many).is_some_and(|note| note.starts_with("10 columns") && note.ends_with("B7 and 2 more")));
+        assert!(table_select(&reading, &columns[..2], 50).2.is_empty());
         assert_eq!(
             sql,
             "SELECT TOP (50) CAST([OBJECTID] AS BIGINT), CAST([OBJECTID] AS BIGINT), CAST([DIAMETER] AS FLOAT), CAST([NOTE] AS NVARCHAR(MAX)) FROM [SDE].[MAINS_evw] t ORDER BY [OBJECTID]"
@@ -647,12 +691,12 @@ mod tests {
 
         // A branch table reads from its Default rows' derived table, aliased.
         let branch = reading_of(ReadPlan::Branch("OBJECTID".into()), &t, &i, None).unwrap_or_else(|e| panic!("{e}"));
-        let (_, sql) = table_select(&branch, &columns, 5);
+        let (_, sql, _) = table_select(&branch, &columns, 5);
         assert!(sql.ends_with(&format!("FROM {} t ORDER BY [OBJECTID]", branch.from)), "{sql}");
 
         // Without a registered row id the rows are numbered.
         let unnumbered = Reading { rowid: None, ..reading_of(ReadPlan::Base, &t, &i, None).unwrap_or_else(|e| panic!("{e}")) };
-        let (_, sql) = table_select(&unnumbered, &columns, 5);
+        let (_, sql, _) = table_select(&unnumbered, &columns, 5);
         assert!(sql.starts_with("SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), "), "{sql}");
 
         // A row id column the table lacks, or that isn't an integer, is no ordering.

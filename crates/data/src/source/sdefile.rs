@@ -86,11 +86,23 @@ pub fn parse(bytes: &[u8]) -> Result<SdeConnection, SdeError> {
     let texts = Texts::new(bytes);
     // A file with a counted value is a property set, whatever `KEY=` text its values hold.
     // Otherwise pairs win, and a file without any is scanned as a property set.
-    let properties = || KEYS.iter().map(|k| texts.property(k)).collect();
-    let mut values: Vec<Option<String>> =
-        if KEYS.iter().any(|k| texts.counted(k)) { properties() } else { KEYS.iter().map(|k| texts.value(k)).collect() };
-    if values.iter().all(Option::is_none) {
-        values = properties();
+    // `lost` marks a key whose value was there and couldn't be kept ([`kept`]).
+    let mut lost = [false; KEYS.len()];
+    let mut read = |properties: bool| -> Vec<Option<String>> {
+        let one = |(key, lost): (&&str, &mut bool)| if properties { texts.property(key, lost) } else { texts.value(key, lost) };
+        KEYS.iter().zip(lost.iter_mut()).map(one).collect()
+    };
+    let counted = KEYS.iter().any(|k| texts.counted(k));
+    let mut values = read(counted);
+    if !counted && values.iter().all(Option::is_none) {
+        values = read(true);
+    }
+    // Reading on without it would be silent: no database opens the login's default one, and no
+    // version shows Default.
+    if let Some(key) = KEYS.iter().zip(&values).zip(lost).find_map(|((key, value), lost)| (lost && value.is_none()).then_some(key)) {
+        return Err(SdeError::Other(format!(
+            "that connection file's {key} is too long to read, or holds the word PASSWORD, which is never read; enter the connection by hand"
+        )));
     }
     let value = |key: &str| KEYS.iter().position(|k| *k == key).and_then(|i| values.get(i)).cloned().flatten();
     let instance = value("INSTANCE");
@@ -179,9 +191,10 @@ fn platform_phrase(platform: &str) -> String {
 fn split_instance(instance: &str) -> (Option<String>, Option<String>) {
     let mut parts = instance.splitn(3, ':');
     match (parts.next(), parts.next(), parts.next()) {
-        (Some(sde), Some(platform), Some(server)) if sde.eq_ignore_ascii_case("sde") => {
+        // `sde:sqlserver` alone names the platform and no server.
+        (Some(sde), Some(platform), server) if sde.eq_ignore_ascii_case("sde") => {
             let some = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
-            (some(platform), some(server))
+            (some(platform), server.and_then(some))
         }
         _ => (None, Some(instance.to_string())),
     }
@@ -217,20 +230,20 @@ impl Texts {
     /// The first non-empty value of `key` (in any case) after `KEY=` and before the next `;`,
     /// control character or secret's name. The key starts a pair: at the start of the text or
     /// after a character that can't be part of another key.
-    fn value(&self, key: &str) -> Option<String> {
-        self.0.iter().find_map(|text| text_value(text, key))
+    fn value(&self, key: &str, lost: &mut bool) -> Option<String> {
+        self.0.iter().find_map(|text| text_value(text, key, lost))
     }
 
     /// The value of `key` in a property set: the key as a UTF-16LE string of its own, then the
     /// first printable run within [`GAP`] characters after it (a one-character run, which may be
     /// a VARIANT's length, only when no longer one follows). Never asked for a secret.
-    fn property(&self, key: &str) -> Option<String> {
-        self.0.get(1..)?.iter().find_map(|text| property_value(text, key, false))
+    fn property(&self, key: &str, lost: &mut bool) -> Option<String> {
+        self.0.get(1..)?.iter().find_map(|text| property_value(text, key, false, lost))
     }
 
     /// Whether `key` has a value in the counted layout ArcGIS Pro writes ([`counted`]).
     fn counted(&self, key: &str) -> bool {
-        self.0.get(1..).is_some_and(|texts| texts.iter().any(|text| property_value(text, key, true).is_some()))
+        self.0.get(1..).is_some_and(|texts| texts.iter().any(|text| property_value(text, key, true, &mut false).is_some()))
     }
 }
 
@@ -243,7 +256,8 @@ fn printable(c: char) -> bool {
 }
 
 /// The value of `key` in a property set; with `counted_only`, only one in the counted layout.
-fn property_value(text: &[char], key: &str, counted_only: bool) -> Option<String> {
+/// `lost` is set when a value is there and can't be kept.
+fn property_value(text: &[char], key: &str, counted_only: bool, lost: &mut bool) -> Option<String> {
     let key: Vec<char> = key.chars().collect();
     (0..text.len()).find_map(|at| {
         let alone_before = at == 0 || text.get(at - 1).is_some_and(|c| !(c.is_ascii_alphanumeric() || *c == '_'));
@@ -255,7 +269,7 @@ fn property_value(text: &[char], key: &str, counted_only: bool) -> Option<String
         }
         let start = at + key.len();
         if let Some(value) = counted(text, start) {
-            return property_text(value);
+            return property_text(value, lost);
         }
         if counted_only {
             return None;
@@ -270,17 +284,18 @@ fn property_value(text: &[char], key: &str, counted_only: bool) -> Option<String
             // Look no further than a value can be long, so a key costs O(MAX_VALUE), not O(file).
             let run = rest.iter().take(MAX_VALUE + 1).take_while(|c| printable(**c)).count();
             if run > MAX_VALUE {
+                *lost = true;
                 return None;
             }
             let found = rest.get(..run)?;
             if run >= 2 {
                 // The next key's name ends this one's value: a one-character run before it is the value.
-                return property_text(found).or_else(|| short.and_then(property_text));
+                return property_text(found, lost).or_else(|| short.and_then(|run| property_text(run, lost)));
             }
             short.get_or_insert(found);
             i += run;
         }
-        short.and_then(property_text)
+        short.and_then(|run| property_text(run, lost))
     })
 }
 
@@ -307,15 +322,28 @@ fn counted(text: &[char], start: usize) -> Option<&[char]> {
     (units == bytes / 2 - 1 && rest.get(chars) == Some(&'\0') && !value.iter().any(|c| c.is_control())).then_some(value)
 }
 
-/// A property-set value as kept: not another key's or a secret's name, cut before a secret's name.
-fn property_text(run: &[char]) -> Option<String> {
-    let mut value: String = run.iter().collect();
+/// A property-set value as kept: not another key's or a secret's name, and as [`kept`] has it.
+fn property_text(run: &[char], lost: &mut bool) -> Option<String> {
+    let value: String = run.iter().collect();
     let upper = value.to_ascii_uppercase();
     if KEYS.iter().chain(SECRETS.iter()).any(|k| *k == upper) {
         return None;
     }
-    if let Some(secret) = SECRETS.iter().filter_map(|k| upper.find(k)).min() {
-        value.truncate(secret);
+    kept(value, lost)
+}
+
+/// A value as kept: trimmed, not blank, and cut before a secret's pair it runs into
+/// (`editor PASSWORD=…`, a missing `;`). A value that holds a secret's name any other way can't
+/// be told from the secret: it isn't kept, and `lost` says so.
+fn kept(mut value: String, lost: &mut bool) -> Option<String> {
+    let upper = value.to_ascii_uppercase();
+    if let Some(at) = SECRETS.iter().filter_map(|k| upper.find(k)).min() {
+        let rest = upper.get(at..).unwrap_or_default();
+        if !SECRETS.iter().any(|k| rest.strip_prefix(k).is_some_and(|after| after.trim_start().starts_with('='))) {
+            *lost = true;
+            return None;
+        }
+        value.truncate(at);
     }
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -336,7 +364,7 @@ fn in_secret(text: &[char], at: usize) -> bool {
     SECRETS.iter().any(|k| pair.strip_prefix(k).is_some_and(|rest| rest.starts_with('=')))
 }
 
-fn text_value(text: &[char], key: &str) -> Option<String> {
+fn text_value(text: &[char], key: &str, lost: &mut bool) -> Option<String> {
     let key: Vec<char> = key.chars().collect();
     (0..text.len()).find_map(|at| {
         let starts_pair = at == 0 || text.get(at - 1).is_some_and(|c| !(c.is_ascii_alphanumeric() || *c == '_'));
@@ -349,15 +377,12 @@ fn text_value(text: &[char], key: &str) -> Option<String> {
         let end = match rest.iter().take(MAX_VALUE + 1).position(|&c| c == ';' || c.is_control()) {
             Some(end) => end,
             None if rest.len() <= MAX_VALUE => rest.len(),
-            None => return None,
+            None => {
+                *lost = true;
+                return None;
+            }
         };
-        let mut value: String = rest.get(..end)?.iter().collect();
-        let upper = value.to_ascii_uppercase();
-        if let Some(secret) = SECRETS.iter().filter_map(|k| upper.find(k)).min() {
-            value.truncate(secret);
-        }
-        let value = value.trim();
-        (!value.is_empty() && value.chars().count() <= MAX_VALUE).then(|| value.to_string())
+        kept(rest.get(..end)?.iter().collect(), lost)
     })
 }
 
@@ -442,6 +467,29 @@ mod tests {
         assert_eq!(pick_server(Some("gis-db"), None, Some("5151")).as_deref(), Some("gis-db"), "a bare instance is the last resort");
         assert_eq!(pick_server(None, None, Some("5151")).as_deref(), Some("5151"));
         assert_eq!(pick_server(Some(""), None, None), None);
+        // A prefix without a server part names the platform and no server.
+        let c = parse(b"SERVER=gis-db;INSTANCE=sde:sqlserver;DATABASE=d").unwrap();
+        assert_eq!((c.server.as_str(), c.platform.as_str()), ("gis-db", "sqlserver"));
+        assert_eq!(pick_server(Some("gis-db"), None, Some("sde:sqlserver:")).as_deref(), Some("gis-db"));
+        assert_eq!(parse(b"INSTANCE=sde:sqlserver;DATABASE=d").unwrap_err(), SdeError::NoServer);
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_kept_is_an_error_not_a_blank() {
+        let refused = |bytes: &[u8], key: &str| {
+            let err = parse(bytes).err().unwrap_or_else(|| panic!("{key} was dropped without a word"));
+            assert!(err.to_string().contains(key), "{err}");
+            assert!(!err.to_string().to_uppercase().contains("VAULT"), "{err}");
+        };
+        // Too long to be a name: without it the connection would open the login's default database.
+        refused(format!("SERVER=gis-db;DATABASE={};USER=u;", "d".repeat(MAX_VALUE + 1)).as_bytes(), "DATABASE");
+        // A name holding a secret's name can't be told from a value that ran into the secret.
+        refused(b"SERVER=gis-db;DATABASE=PasswordVault;USER=u;", "DATABASE");
+        refused(b"SERVER=gis-db;DATABASE=d;VERSION=sde.password_vault;", "VERSION");
+        refused(&property_set(&[("SERVER", "gis-db"), ("DATABASE", "PasswordVault")], 0), "DATABASE");
+        // A blank value is a blank, and a value that runs into a secret's pair is cut before it.
+        assert_eq!(parse(b"SERVER=gis-db;DATABASE=;USER=u;").unwrap().database, "");
+        assert_eq!(parse(b"SERVER=gis-db;DATABASE=d PASSWORD=hunter2;").unwrap().database, "d");
     }
 
     /// A property-set-like buffer: each key a UTF-16LE string ended by NUL, binary, then its value.
@@ -497,9 +545,10 @@ mod tests {
         assert_eq!(parse(&property_set(&[("DATABASE", "utility"), ("ENCRYPTED_PASSWORD", "00ff")], 0)).unwrap_err(), SdeError::NoServer);
         // a key inside a longer word isn't the key
         assert_eq!(parse(&property_set(&[("MYSERVER", "gis-db")], 0)).unwrap_err(), SdeError::NoServer);
-        // a value longer than a value can be is junk
+        // a value longer than a value can be is junk, and said to be
         let long = "x".repeat(MAX_VALUE + 1);
-        assert_eq!(parse(&property_set(&[("SERVER", &long)], 0)).unwrap_err(), SdeError::NoServer);
+        let err = parse(&property_set(&[("SERVER", &long)], 0)).unwrap_err();
+        assert!(matches!(&err, SdeError::Other(why) if why.contains("SERVER is too long")), "{err}");
         // pairs win: a file with `KEY=` text isn't read as a property set
         let mut bytes = property_set(&[("SERVER", "set-host")], 0);
         bytes.extend(b"\x00DATABASE=d;");

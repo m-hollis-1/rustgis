@@ -170,7 +170,7 @@ fn err(e: tiberius::error::Error) -> DataError {
 }
 
 /// Why a server whose certificate this computer doesn't trust can't be reached, and what to do.
-pub const UNTRUSTED_CERTIFICATE: &str = "the server's certificate isn't from an authority this computer trusts      (SQL Server's own self-signed certificate is the usual reason). If this is your organisation's server, tick      Trust the server's certificate in the connection (or add trust-server-certificate=true to its address) and      connect again";
+pub const UNTRUSTED_CERTIFICATE: &str = "the server's certificate isn't from an authority this computer trusts (SQL Server's own self-signed certificate is the usual reason). If this is your organisation's server, add trust-server-certificate=true to the connection's address and connect again";
 
 /// Whether a TLS error says the server's certificate wasn't trusted (rather than, say, a protocol
 /// mismatch): tiberius words it "the server's certificate was rejected", rustls "UnknownIssuer".
@@ -1113,6 +1113,14 @@ mod tests {
     use crate::raster::Crs;
 
     #[test]
+    fn the_untrusted_certificate_message_is_single_spaced_and_names_the_address() {
+        assert!(!UNTRUSTED_CERTIFICATE.contains("  "), "{UNTRUSTED_CERTIFICATE}");
+        assert!(UNTRUSTED_CERTIFICATE.contains("trust-server-certificate=true"));
+        // The address is the one way to trust a certificate until a form offers a box for it.
+        assert!(!UNTRUSTED_CERTIFICATE.contains("tick"), "{UNTRUSTED_CERTIFICATE}");
+    }
+
+    #[test]
     fn source_columns_cannot_shadow_numbering_or_count() {
         // The projection and window syntax is shared with SQLite; exercise real name resolution
         // locally without needing a SQL Server or evaluating its spatial methods.
@@ -1453,7 +1461,6 @@ mod tests {
         let tls = |m: &str| err(tiberius::error::Error::Tls(m.into())).to_string();
         let raw = "Error forming TLS connection: the server's certificate was rejected during the TLS handshake: UnknownIssuer. To connect anyway you can: (1) trust a specific CA";
         let said = tls(raw);
-        assert!(said.contains("Trust the server's certificate"), "{said}");
         assert!(said.contains("trust-server-certificate=true"), "{said}");
         assert!(!said.contains("Config::"), "{said}");
         // Other TLS failures keep their own words.

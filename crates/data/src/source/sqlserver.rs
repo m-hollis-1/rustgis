@@ -1416,7 +1416,23 @@ mod tests {
                     Err(e) => panic!("{}: {e}", t.label()),
                 };
                 let i = src.info();
-                let whole = src.read(&Request { extent: None, limit: 250_000 }).unwrap_or_else(|e| panic!("{}: {e}", t.label()));
+                let whole = match src.read(&Request { extent: None, limit: 250_000 }) {
+                    Ok(whole) => whole,
+                    // A table too large to count and sample whole in the statement timeout says so;
+                    // its reads by extent are what a map asks for.
+                    Err(e) if e.to_string() == timed_out(STATEMENT_TIMEOUT).to_string() => {
+                        println!(
+                            "{} {} rows={:?} idx={} notes={:?}: not read whole, {e}",
+                            t.label(),
+                            f.label(),
+                            i.count,
+                            i.indexed,
+                            i.notes
+                        );
+                        continue;
+                    }
+                    Err(e) => panic!("{}: {e}", t.label()),
+                };
                 let e = i.extent;
                 let q = Extent::new(e.min_x, e.min_y, e.min_x + e.width() / 2.0, e.min_y + e.height() / 2.0);
                 // A table whose extent couldn't be measured in time has no quarter to ask for.

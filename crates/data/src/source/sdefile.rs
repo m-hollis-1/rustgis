@@ -268,8 +268,15 @@ fn property_value(text: &[char], key: &str, counted_only: bool, lost: &mut bool)
             return None;
         }
         let start = at + key.len();
+        // A counted value is the value, even when it is another key's name.
         if let Some(value) = counted(text, start) {
-            return property_text(value, lost);
+            return kept(value.iter().collect(), lost);
+        }
+        // A counted value too long to keep isn't scanned for a printable run: that would read
+        // its first word as the value.
+        if counted_too_long(text, start) {
+            *lost = true;
+            return None;
         }
         if counted_only {
             return None;
@@ -320,6 +327,14 @@ fn counted(text: &[char], start: usize) -> Option<&[char]> {
     }
     let value = rest.get(..chars)?;
     (units == bytes / 2 - 1 && rest.get(chars) == Some(&'\0') && !value.iter().any(|c| c.is_control())).then_some(value)
+}
+
+/// Whether the counted layout's header at `start` gives a length over [`MAX_VALUE`].
+fn counted_too_long(text: &[char], start: usize) -> bool {
+    text.get(start..start + 4).is_some_and(|head| {
+        let bytes = head[2] as usize;
+        (head[0], head[1], head[3]) == ('\0', '\u{8}', '\0') && bytes >= 2 && bytes.is_multiple_of(2) && bytes / 2 - 1 > MAX_VALUE
+    })
 }
 
 /// A property-set value as kept: not another key's or a secret's name, and as [`kept`] has it.
@@ -603,6 +618,19 @@ mod tests {
         let pairs = [("SERVER", "gis-db"), ("DBCLIENT", "sqlserver"), ("DATABASE", "City \u{20000} USER=editor")];
         let c = parse(&counted_set(&pairs)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((c.server.as_str(), c.database.as_str(), c.user), ("gis-db", "City \u{20000} USER=editor", None));
+    }
+
+    #[test]
+    fn a_counted_value_is_kept_whole_or_not_at_all() {
+        // A counted value that is another key's name is still the value.
+        let c = parse(&counted_set(&[("SERVER", "gis-db"), ("DBCLIENT", "sqlserver"), ("DATABASE", "VERSION")]))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.database, "VERSION");
+        // One too long to keep is an error, not its first word.
+        let long = format!("City {}", "x".repeat(MAX_VALUE));
+        let err =
+            parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", &long)])).err().unwrap_or_else(|| panic!("read as another database"));
+        assert!(matches!(&err, SdeError::Other(why) if why.contains("DATABASE is too long")), "{err}");
     }
 
     #[test]

@@ -215,14 +215,32 @@ fn percent_encode(s: &str) -> String {
 
 /// The file's bytes read as text every way it may hold the properties: ASCII, and UTF-16LE at
 /// both byte alignments. Anything that isn't text becomes NUL, which ends a value.
-struct Texts(Vec<Vec<char>>);
+struct Texts(Vec<Text>);
+
+/// One reading of the file's bytes.
+struct Text {
+    chars: Vec<char>,
+    /// Where a UTF-16 unit was half a surrogate pair and became NUL, in order. A counted length
+    /// is a number, not text, so [`counted`] has to tell such a half from a zero.
+    unpaired: Vec<usize>,
+}
 
 impl Texts {
     fn new(bytes: &[u8]) -> Self {
-        let ascii = bytes.iter().map(|&b| if b.is_ascii() { b as char } else { '\0' }).collect();
+        let ascii = Text { chars: bytes.iter().map(|&b| if b.is_ascii() { b as char } else { '\0' }).collect(), unpaired: Vec::new() };
         let utf16 = |skip: usize| {
             let units = bytes.get(skip..).unwrap_or_default().as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c));
-            char::decode_utf16(units).map(|r| r.unwrap_or('\0')).collect()
+            let mut unpaired = Vec::new();
+            let chars = char::decode_utf16(units)
+                .enumerate()
+                .map(|(i, r)| {
+                    r.unwrap_or_else(|_| {
+                        unpaired.push(i);
+                        '\0'
+                    })
+                })
+                .collect();
+            Text { chars, unpaired }
         };
         Self(vec![ascii, utf16(0), utf16(1)])
     }
@@ -231,7 +249,7 @@ impl Texts {
     /// control character or secret's name. The key starts a pair: at the start of the text or
     /// after a character that can't be part of another key.
     fn value(&self, key: &str, lost: &mut bool) -> Option<String> {
-        self.0.iter().find_map(|text| text_value(text, key, lost))
+        self.0.iter().find_map(|text| text_value(&text.chars, key, lost))
     }
 
     /// The value of `key` in a property set: the key as a UTF-16LE string of its own, then the
@@ -257,7 +275,8 @@ fn printable(c: char) -> bool {
 
 /// The value of `key` in a property set; with `counted_only`, only one in the counted layout.
 /// `lost` is set when a value is there and can't be kept.
-fn property_value(text: &[char], key: &str, counted_only: bool, lost: &mut bool) -> Option<String> {
+fn property_value(text: &Text, key: &str, counted_only: bool, lost: &mut bool) -> Option<String> {
+    let (whole, text) = (text, text.chars.as_slice());
     let key: Vec<char> = key.chars().collect();
     (0..text.len()).find_map(|at| {
         let alone_before = at == 0 || text.get(at - 1).is_some_and(|c| !(c.is_ascii_alphanumeric() || *c == '_'));
@@ -269,7 +288,7 @@ fn property_value(text: &[char], key: &str, counted_only: bool, lost: &mut bool)
         }
         let start = at + key.len();
         // A counted value is the value, even when it is another key's name.
-        match counted(text, start) {
+        match counted(whole, start) {
             Counted::Value(value) => return kept(value.iter().collect(), lost),
             // Not scanned for a printable run: that would read its first word as the value.
             Counted::Lost => {
@@ -320,16 +339,19 @@ enum Counted<'a> {
 /// The value ArcGIS Pro writes after a key: the key's NUL, a string VARIANT's type (8), the
 /// value's length in bytes as 32 bits (its NUL included) and the text, which keeps its spaces
 /// and any letters.
-fn counted(text: &[char], start: usize) -> Counted<'_> {
+fn counted(text: &Text, start: usize) -> Counted<'_> {
+    let (unpaired, text) = (&text.unpaired, text.chars.as_slice());
     let Some(head) = text.get(start..start + 4) else { return Counted::No };
     if (head[0], head[1]) != ('\0', '\u{8}') {
         return Counted::No;
     }
-    // The length's two halves were read as UTF-16 units. A half that came out as a character
-    // outside the basic plane was a surrogate pair, so the length is far over the limit.
+    // The length's two halves were read as UTF-16 units. A half that was a surrogate, alone
+    // (read as NUL) or paired (read as one character outside the basic plane), is 0xD800 or
+    // more, so the length is far over the limit.
+    let surrogate = |at: usize| unpaired.binary_search(&at).is_ok();
     let (low, high) = (head[2] as u64, head[3] as u64);
     let bytes = low | high << 16;
-    if low > 0xFFFF || high > 0xFFFF || bytes / 2 > MAX_VALUE as u64 + 1 {
+    if surrogate(start + 2) || surrogate(start + 3) || low > 0xFFFF || high > 0xFFFF || bytes / 2 > MAX_VALUE as u64 + 1 {
         return Counted::Lost;
     }
     if bytes < 2 || !bytes.is_multiple_of(2) {
@@ -647,6 +669,17 @@ mod tests {
         let long = format!("City {}", "x".repeat(32_762));
         let err =
             parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", &long)])).err().unwrap_or_else(|| panic!("read as another database"));
+        assert!(matches!(&err, SdeError::Other(why) if why.contains("DATABASE is too long")), "{err}");
+        // And one whose length isn't text at all: 55,296 bytes is 0xD800, half a surrogate pair,
+        // in the low half and then in the high half.
+        let long = format!("City {}", "x".repeat(27_642));
+        let err =
+            parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", &long)])).err().unwrap_or_else(|| panic!("read as another database"));
+        assert!(matches!(&err, SdeError::Other(why) if why.contains("DATABASE is too long")), "{err}");
+        let mut high = counted_set(&[("SERVER", "gis-db"), ("DATABASE", "City GIS")]);
+        let at = high.len() - utf16("City GIS").len() - 2 - 2;
+        high[at..at + 2].copy_from_slice(&[0x00, 0xD8]);
+        let err = parse(&high).err().unwrap_or_else(|| panic!("read with half its length"));
         assert!(matches!(&err, SdeError::Other(why) if why.contains("DATABASE is too long")), "{err}");
         // And one holding a control character: its first word isn't the value either.
         let err = parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", "City\tGIS")]))

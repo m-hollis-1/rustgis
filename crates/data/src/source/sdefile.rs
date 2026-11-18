@@ -101,7 +101,7 @@ pub fn parse(bytes: &[u8]) -> Result<SdeConnection, SdeError> {
     // version shows Default.
     if let Some(key) = KEYS.iter().zip(&values).zip(lost).find_map(|((key, value), lost)| (lost && value.is_none()).then_some(key)) {
         return Err(SdeError::Other(format!(
-            "that connection file's {key} is too long to read, or holds the word PASSWORD, which is never read; enter the connection by hand"
+            "that connection file's {key} is too long to read, holds a character a value can't have, or holds the word PASSWORD, which is never read; enter the connection by hand"
         )));
     }
     let value = |key: &str| KEYS.iter().position(|k| *k == key).and_then(|i| values.get(i)).cloned().flatten();
@@ -269,14 +269,14 @@ fn property_value(text: &[char], key: &str, counted_only: bool, lost: &mut bool)
         }
         let start = at + key.len();
         // A counted value is the value, even when it is another key's name.
-        if let Some(value) = counted(text, start) {
-            return kept(value.iter().collect(), lost);
-        }
-        // A counted value too long to keep isn't scanned for a printable run: that would read
-        // its first word as the value.
-        if counted_too_long(text, start) {
-            *lost = true;
-            return None;
+        match counted(text, start) {
+            Counted::Value(value) => return kept(value.iter().collect(), lost),
+            // Not scanned for a printable run: that would read its first word as the value.
+            Counted::Lost => {
+                *lost = true;
+                return None;
+            }
+            Counted::No => {}
         }
         if counted_only {
             return None;
@@ -306,35 +306,47 @@ fn property_value(text: &[char], key: &str, counted_only: bool, lost: &mut bool)
     })
 }
 
-/// The value ArcGIS Pro writes after a key: the key's NUL, a string VARIANT's type (8), the
-/// value's length in bytes (its NUL included) and the text, which keeps its spaces and any
-/// letters. None for any other layout, which is scanned for a printable run instead.
-fn counted(text: &[char], start: usize) -> Option<&[char]> {
-    let head = text.get(start..start + 4)?;
-    if (head[0], head[1], head[3]) != ('\0', '\u{8}', '\0') {
-        return None;
-    }
-    let bytes = head[2] as usize;
-    if bytes < 2 || !bytes.is_multiple_of(2) || bytes / 2 - 1 > MAX_VALUE {
-        return None;
-    }
-    // The length counts UTF-16 units, and a character outside the basic plane is two of them.
-    let rest = text.get(start + 4..)?;
-    let (mut units, mut chars) = (0, 0);
-    while units < bytes / 2 - 1 {
-        units += rest.get(chars)?.len_utf16();
-        chars += 1;
-    }
-    let value = rest.get(..chars)?;
-    (units == bytes / 2 - 1 && rest.get(chars) == Some(&'\0') && !value.iter().any(|c| c.is_control())).then_some(value)
+/// What follows a key, read as the counted layout ([`counted`]).
+enum Counted<'a> {
+    /// The value, whole.
+    Value(&'a [char]),
+    /// A counted value that can't be kept: longer than [`MAX_VALUE`], or holding a control
+    /// character.
+    Lost,
+    /// Another layout, which is scanned for a printable run instead.
+    No,
 }
 
-/// Whether the counted layout's header at `start` gives a length over [`MAX_VALUE`].
-fn counted_too_long(text: &[char], start: usize) -> bool {
-    text.get(start..start + 4).is_some_and(|head| {
-        let bytes = head[2] as usize;
-        (head[0], head[1], head[3]) == ('\0', '\u{8}', '\0') && bytes >= 2 && bytes.is_multiple_of(2) && bytes / 2 - 1 > MAX_VALUE
-    })
+/// The value ArcGIS Pro writes after a key: the key's NUL, a string VARIANT's type (8), the
+/// value's length in bytes as 32 bits (its NUL included) and the text, which keeps its spaces
+/// and any letters.
+fn counted(text: &[char], start: usize) -> Counted<'_> {
+    let Some(head) = text.get(start..start + 4) else { return Counted::No };
+    if (head[0], head[1]) != ('\0', '\u{8}') {
+        return Counted::No;
+    }
+    // The length's two halves were read as UTF-16 units. A half that came out as a character
+    // outside the basic plane was a surrogate pair, so the length is far over the limit.
+    let (low, high) = (head[2] as u64, head[3] as u64);
+    let bytes = low | high << 16;
+    if low > 0xFFFF || high > 0xFFFF || bytes / 2 > MAX_VALUE as u64 + 1 {
+        return Counted::Lost;
+    }
+    if bytes < 2 || !bytes.is_multiple_of(2) {
+        return Counted::No;
+    }
+    let want = (bytes / 2 - 1) as usize;
+    // The length counts UTF-16 units, and a character outside the basic plane is two of them.
+    let Some(rest) = text.get(start + 4..) else { return Counted::No };
+    let (mut units, mut chars) = (0, 0);
+    while units < want {
+        let Some(c) = rest.get(chars) else { return Counted::No };
+        units += c.len_utf16();
+        chars += 1;
+    }
+    // A length that doesn't end at the value's NUL isn't this layout's.
+    let Some(value) = rest.get(..chars).filter(|_| units == want && rest.get(chars) == Some(&'\0')) else { return Counted::No };
+    if value.iter().any(|c| c.is_control()) { Counted::Lost } else { Counted::Value(value) }
 }
 
 /// A property-set value as kept: not another key's or a secret's name, and as [`kept`] has it.
@@ -631,6 +643,19 @@ mod tests {
         let err =
             parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", &long)])).err().unwrap_or_else(|| panic!("read as another database"));
         assert!(matches!(&err, SdeError::Other(why) if why.contains("DATABASE is too long")), "{err}");
+        // So is one whose length needs the count's high half: 65,536 bytes with its NUL.
+        let long = format!("City {}", "x".repeat(32_762));
+        let err =
+            parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", &long)])).err().unwrap_or_else(|| panic!("read as another database"));
+        assert!(matches!(&err, SdeError::Other(why) if why.contains("DATABASE is too long")), "{err}");
+        // And one holding a control character: its first word isn't the value either.
+        let err = parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", "City\tGIS")]))
+            .err()
+            .unwrap_or_else(|| panic!("read as another database"));
+        assert!(matches!(&err, SdeError::Other(why) if why.contains("DATABASE is too long")), "{err}");
+        // A good counted value beside them still reads whole.
+        let c = parse(&counted_set(&[("SERVER", "gis-db"), ("DATABASE", "City GIS")])).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.database, "City GIS");
     }
 
     #[test]

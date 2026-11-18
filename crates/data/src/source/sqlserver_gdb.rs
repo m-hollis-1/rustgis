@@ -67,15 +67,7 @@ pub(super) fn read_catalog(conn: &Conn, owner: &str) -> Result<Catalog> {
     let items = conn
         .query(&q.items, &[])?
         .iter()
-        .filter_map(|r| {
-            Some(ItemRow {
-                name: text_of(at(r, 0))?,
-                physical: text_of(at(r, 1)).unwrap_or_default(),
-                path: text_of(at(r, 2)).unwrap_or_default(),
-                type_name: text_of(at(r, 3))?,
-                definition: text_of(at(r, 4)),
-            })
-        })
+        .map(|r| item_row(text_of(at(r, 0)), text_of(at(r, 1)), text_of(at(r, 2)), text_of(at(r, 3)), text_of(at(r, 4))))
         .collect();
     let registry = conn
         .query(&q.registry, &[])?
@@ -99,6 +91,25 @@ pub(super) fn read_catalog(conn: &Conn, owner: &str) -> Result<Catalog> {
         Some(format!("{}.{}.{}", int_of(at(r, 0))?, int_of(at(r, 1))?, int_of(at(r, 2))?))
     });
     Ok(Catalog::from_rows(owner, release, items, registry, layers, srs))
+}
+
+/// An item row as it was read. A value that can't be read is left blank and the row kept, so
+/// every row the statement answered with counts toward [`MAX_ITEMS`]: a dropped row would let a
+/// full answer pass for a whole catalog.
+fn item_row(
+    name: Option<String>,
+    physical: Option<String>,
+    path: Option<String>,
+    type_name: Option<String>,
+    definition: Option<String>,
+) -> ItemRow {
+    ItemRow {
+        name: name.unwrap_or_default(),
+        physical: physical.unwrap_or_default(),
+        path: path.unwrap_or_default(),
+        type_name: type_name.unwrap_or_default(),
+        definition,
+    }
 }
 
 /// How a registered class is read.
@@ -524,6 +535,26 @@ mod tests {
         catalog.cut = true;
         assert!(registered(&catalog, &table()).unwrap().is_some());
         assert!(matches!(registered(&catalog, &other), Err(DataError::Unsupported(why)) if why.contains("SDE.OTHER")));
+    }
+
+    #[test]
+    fn a_row_without_a_name_counts_toward_the_limit_and_is_listed_by_its_table() {
+        let table_row = |i: usize| item_row(Some(format!("sde.T{i}")), Some(format!("SDE.T{i}")), None, Some("Table".into()), None);
+        let mut rows: Vec<ItemRow> = (1..MAX_ITEMS).map(table_row).collect();
+        rows.push(item_row(None, Some("SDE.NAMELESS".into()), None, Some("Table".into()), None));
+        rows.push(item_row(None, None, None, Some("Table".into()), None));
+        rows.truncate(MAX_ITEMS);
+        let catalog = geodatabase::Catalog::from_rows("sde", None, rows, vec![], vec![], vec![]);
+        // A full answer is a cut one, whatever its rows hold.
+        assert!(catalog.cut);
+        let other = Table { name: "OTHER".into(), ..table() };
+        assert!(matches!(registered(&catalog, &other), Err(DataError::Unsupported(_))));
+        // The row without a name goes by its table, so the table is still read as registered.
+        assert_eq!(catalog.find("sde.nameless").map(|i| i.name.as_str()), Some("SDE.NAMELESS"));
+        assert!(catalog.items.iter().all(|i| !i.name.is_empty()));
+        // A row with neither is left out, after it has been counted.
+        let rows = vec![table_row(1), item_row(None, None, None, Some("Table".into()), None)];
+        assert_eq!(geodatabase::Catalog::from_rows("sde", None, rows, vec![], vec![], vec![]).items.len(), 1);
     }
 
     #[test]

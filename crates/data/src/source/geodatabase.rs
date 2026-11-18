@@ -181,6 +181,11 @@ impl Catalog {
             .take(MAX_ITEMS)
             .filter_map(|row| {
                 let kind = kind_of(&row.type_name)?;
+                // A row whose name couldn't be read goes by its table; one with neither is left out.
+                let name = if row.name.trim().is_empty() { row.physical.trim().to_string() } else { row.name };
+                if name.is_empty() {
+                    return None;
+                }
                 let (schema, table) = split_physical(&row.physical);
                 let read = row.definition.as_deref().and_then(read_definition);
                 let definition_ok = read.is_some();
@@ -196,7 +201,7 @@ impl Catalog {
                     table: table.to_string(),
                     kind,
                     dataset,
-                    alias: def.alias.filter(|a| a != short(&row.name)),
+                    alias: def.alias.filter(|a| a != short(&name)),
                     shape_column: def.shape_column.or_else(|| layer.map(|l| l.0.clone()).filter(|c| !c.is_empty())),
                     field_aliases: def.field_aliases,
                     versioning: def.versioning.unwrap_or(Versioning::Unversioned),
@@ -205,7 +210,7 @@ impl Catalog {
                     archived: def.archived,
                     rowid_column: registry.get(&key(schema, table)).cloned().flatten(),
                     srid: layer.and_then(|l| l.1),
-                    name: row.name,
+                    name,
                 })
             })
             .collect();

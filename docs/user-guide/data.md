@@ -784,8 +784,10 @@ rustgis-cli run --cmd 'layer.addDatabase={"database":"mssql://gis@gis-db/utility
 
 Without `layer`, every feature class and other spatial table is added, and a notice counts the
 registered tables left for you to add by name. A class stored in a format RustGIS doesn't read
-(SDEBINARY) is left out and named in a notice, and so is a class read from a spatial column
-other than the shape column it registers. A table with several spatial columns is named with its
+(SDEBINARY: its table has no geometry or geography column) is left out. A class whose registered
+shape column isn't such a column, but whose table has another, is added and read from that
+column. One notice for each kind counts the classes and names the first few; when nothing can
+be added, the error says the same. A table with several spatial columns is named with its
 column (`Mains:SHAPE`).
 
 `info.databaseTables` lists a geodatabase's tables as `items`: each has `item` (`featureClass`,
@@ -805,7 +807,7 @@ when it has one. A class whose geodatabase definition can't be read is refused (
 versioned is unknown") rather than guessed at.
 
 **Tables** without geometry add as standalone tables: the whole table is loaded, up to 100,000
-rows, with a notice when there may be more. A versioned table is read through its versioned
+rows (fewer when memory is short), with a notice when there may be more. A versioned table is read through its versioned
 view. A standalone table doesn't keep its source, so it doesn't reopen with the project: add it
 again.
 

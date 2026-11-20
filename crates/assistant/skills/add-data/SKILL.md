@@ -30,7 +30,7 @@ and its limits are listed in `user-guide/data-formats.md`.
   `{"database": D, "layer": L}`, where L is its name, its schema-qualified name or Pro's
   database-qualified name; a registered
   non-spatial table added the same way becomes a standalone table (loaded whole, up to 100,000
-  rows). A versioned class is read at the Default version.
+  rows, fewer when memory is short). A versioned class is read at the Default version.
 - **Catalogs:** STAC, Overture Maps, Source Cooperative, OpenStreetMap and open-data portals are
   described in `user-guide/data.md`; find their commands with `search_commands` ("stac", "overture",
   "openstreetmap").

@@ -3626,30 +3626,52 @@ fn find_sqlserver(
     name: &str,
 ) -> rustgis_data::Result<rustgis_data::source::sqlserver::Table> {
     use rustgis_data::source::{geodatabase::ItemKind, sqlserver};
-    if let Some(catalog) = sqlserver::geodatabase(conn)
-        && let Some(item) = catalog.find(name).filter(|i| i.kind == ItemKind::FeatureClass)
-    {
-        return class_table(item, &sqlserver::tables(conn)?);
+    if let Some(catalog) = sqlserver::geodatabase(conn) {
+        let class = |n: &str| catalog.find(n).filter(|i| i.kind == ItemKind::FeatureClass);
+        // The name as given first; then as a table of several spatial columns is labelled,
+        // `table:column`.
+        let (base, column) = split_column(name);
+        let found = class(name).map(|i| (i, None)).or_else(|| column.and_then(|c| class(base).map(|i| (i, Some(c)))));
+        if let Some((item, column)) = found {
+            return class_table(item, &sqlserver::tables(conn)?, column);
+        }
     }
     sqlserver::find_table(conn, name)
 }
 
-/// The spatial column of the database's `tables` a registered feature class reads: its shape
-/// column, else its table's first, carrying the class alias, feature dataset and short name. A
-/// class with none is stored in a format RustGIS doesn't read (SDEBINARY or other storage).
+/// A table's name and the column it names after `:`, as [`rustgis_data::source::sqlserver::Table::label`]
+/// writes a table of several spatial columns.
+#[cfg(not(target_arch = "wasm32"))]
+fn split_column(name: &str) -> (&str, Option<&str>) {
+    match name.rsplit_once(':') {
+        Some((table, column)) if !column.trim().is_empty() => (table, Some(column.trim())),
+        _ => (name, None),
+    }
+}
+
+/// The spatial column of the database's `tables` a registered feature class reads, carrying the
+/// class alias, feature dataset and short name. A `column` asked for by name is the one read,
+/// whichever of the table's it is (the definition speaks for the shape column only), and an
+/// error when the table has no such spatial column. Without one it is the class's shape column,
+/// else its table's first ([`fallback_note`] says so). A class with none is stored in a format
+/// RustGIS doesn't read (SDEBINARY or other storage).
 #[cfg(not(target_arch = "wasm32"))]
 fn class_table(
     item: &rustgis_data::source::geodatabase::Item,
     tables: &[rustgis_data::source::sqlserver::Table],
+    column: Option<&str>,
 ) -> rustgis_data::Result<rustgis_data::source::sqlserver::Table> {
     let full = format!("{}.{}", item.schema, item.table);
     let named = |n: &str| tables.iter().find(|t| t.is_named(n));
-    let shape = item.shape_column.as_deref().and_then(|column| named(&format!("{full}:{column}")));
-    let Some(t) = shape.or_else(|| named(&full)) else {
-        return Err(rustgis_data::DataError::Unsupported(format!(
-            "{} is stored in a format RustGIS doesn't read (SDEBINARY or another non-native storage)",
-            item.name
-        )));
+    let found = match column {
+        Some(column) => Some(
+            named(&format!("{full}:{column}"))
+                .ok_or_else(|| rustgis_data::DataError::Format(format!("{} has no geometry or geography column '{column}'", item.name)))?,
+        ),
+        None => item.shape_column.as_deref().and_then(|shape| named(&format!("{full}:{shape}"))).or_else(|| named(&full)),
+    };
+    let Some(t) = found else {
+        return Err(rustgis_data::DataError::Unsupported(format!("{} is {UNREAD_STORAGE}", item.name)));
     };
     Ok(rustgis_data::source::sqlserver::Table {
         alias: item.alias.clone(),
@@ -3657,6 +3679,67 @@ fn class_table(
         short: Some(item.short_name().to_string()),
         ..t.clone()
     })
+}
+
+/// Why a class whose table holds no native spatial column isn't read.
+#[cfg(not(target_arch = "wasm32"))]
+const UNREAD_STORAGE: &str = "stored in a format RustGIS doesn't read (SDEBINARY or another non-native storage)";
+
+/// What to say when a class is read from a column other than the shape column it registers,
+/// which isn't among its table's spatial columns; `None` when it is read from its shape column
+/// or registers none.
+#[cfg(not(target_arch = "wasm32"))]
+fn fallback_note(item: &rustgis_data::source::geodatabase::Item, table: &rustgis_data::source::sqlserver::Table) -> Option<String> {
+    let shape = item.shape_column.as_deref().filter(|shape| !shape.eq_ignore_ascii_case(&table.column))?;
+    Some(format!(
+        "{} is read from its column {}: its registered shape column {shape} isn't a geometry or geography column",
+        item.name, table.column
+    ))
+}
+
+/// What adding a whole geodatabase leaves out or reads another way.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct GdbLeft {
+    /// The registered tables, which are added by name.
+    tables: usize,
+    /// The classes whose tables hold no native spatial column, by name.
+    unread: Vec<String>,
+    /// The classes read from another column than their shape column ([`fallback_note`]).
+    fallbacks: Vec<String>,
+}
+
+/// The layers adding a whole geodatabase adds (its classes with a spatial column and its other
+/// spatial tables), and what it leaves.
+#[cfg(not(target_arch = "wasm32"))]
+fn geodatabase_layers(listing: rustgis_data::source::sqlserver::GdbListing) -> (Vec<rustgis_data::source::sqlserver::Table>, GdbLeft) {
+    let mut left = GdbLeft { tables: listing.tables.len(), ..Default::default() };
+    let mut tables = Vec::new();
+    for (item, table) in listing.classes {
+        match table {
+            Some(table) => {
+                left.fallbacks.extend(fallback_note(&item, &table));
+                tables.push(table);
+            }
+            None => left.unread.push(item.name),
+        }
+    }
+    tables.extend(listing.other);
+    (tables, left)
+}
+
+/// The notice for the classes a whole-geodatabase add can't read, naming the first few.
+#[cfg(not(target_arch = "wasm32"))]
+fn unread_note(unread: &[String]) -> Option<String> {
+    const NAMED: usize = 5;
+    let names = unread.iter().take(NAMED).map(String::as_str).collect::<Vec<_>>().join(", ");
+    let more = unread.len().saturating_sub(NAMED);
+    let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+    match unread.len() {
+        0 => None,
+        1 => Some(format!("1 feature class was left out: {UNREAD_STORAGE}: {names}")),
+        n => Some(format!("{n} feature classes were left out: {UNREAD_STORAGE}: {names}{more}")),
+    }
 }
 
 /// Adds a registered non-spatial table of an enterprise geodatabase as a standalone table,
@@ -3689,7 +3772,9 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
     let wanted = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty());
     // An enterprise geodatabase: a registered table is added whole, as a standalone table; all
     // its classes are added without a name, and the tables it registers are left to be named.
+    // A class that can't be read, or is read from another column than its shape column, is said.
     let mut unadded = 0;
+    let mut said: Vec<String> = Vec::new();
     let mut tables = match (&live, wanted) {
         (LiveDb::Sqlserver(conn), Some(l)) => {
             let table = rustgis_data::source::sqlserver::geodatabase(conn)
@@ -3697,18 +3782,32 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
             if let Some(item) = table {
                 return add_geodatabase_table(s, p, conn, &item, &label);
             }
-            vec![live.find(l).map_err(err)?]
+            let found = live.find(l).map_err(err)?;
+            // A column asked for by name is the one wanted, so only the class's own choice is said.
+            if let LiveTable::Sqlserver(t) = &found
+                && let Some(catalog) = rustgis_data::source::sqlserver::geodatabase(conn)
+                && let Some(item) = catalog.find(l).filter(|i| i.kind == rustgis_data::source::geodatabase::ItemKind::FeatureClass)
+            {
+                said.extend(fallback_note(item, t));
+            }
+            vec![found]
         }
         (LiveDb::Sqlserver(conn), None) => match rustgis_data::source::sqlserver::geodatabase_tables(conn).map_err(err)? {
             Some(listing) => {
-                unadded = listing.tables.len();
-                listing.classes.into_iter().filter_map(|(_, t)| t).chain(listing.other).map(LiveTable::Sqlserver).collect()
+                let (tables, left) = geodatabase_layers(listing);
+                unadded = left.tables;
+                said.extend(unread_note(&left.unread));
+                said.extend(left.fallbacks);
+                tables.into_iter().map(LiveTable::Sqlserver).collect()
             }
             None => live.tables().map_err(err)?,
         },
         (_, Some(l)) => vec![live.find(l).map_err(err)?],
         (_, None) => live.tables().map_err(err)?,
     };
+    for note in said {
+        s.notify(format!("{label}: {note}"), true);
+    }
     if tables.is_empty() {
         return Err(format!("{label}: no tables with a geometry column"));
     }
@@ -7204,7 +7303,114 @@ mod tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod geodatabase_tests {
     use super::LiveTable;
-    use rustgis_data::source::sqlserver::Table;
+    use rustgis_data::source::geodatabase::{Item, ItemKind, Versioning};
+    use rustgis_data::source::sqlserver::{GdbListing, Table};
+
+    fn class(name: &str, shape: Option<&str>) -> Item {
+        Item {
+            name: format!("utility.gis.{name}"),
+            schema: "gis".into(),
+            table: name.to_uppercase(),
+            kind: ItemKind::FeatureClass,
+            dataset: None,
+            alias: Some(format!("{name} (alias)")),
+            shape_column: shape.map(str::to_string),
+            field_aliases: Vec::new(),
+            versioning: Versioning::Unversioned,
+            definition_ok: true,
+            family: None,
+            archived: false,
+            rowid_column: None,
+            srid: None,
+        }
+    }
+
+    fn spatial(table: &str, column: &str, several: bool) -> Table {
+        Table {
+            schema: "gis".into(),
+            name: table.into(),
+            column: column.into(),
+            kind: "geometry".into(),
+            current: false,
+            several,
+            alias: None,
+            dataset: None,
+            short: None,
+        }
+    }
+
+    /// A class named with its column, as a table of several is labelled, is still the class.
+    #[test]
+    fn a_class_named_with_its_column_keeps_its_alias() {
+        assert_eq!(super::split_column("gis.MAINS:SHAPE"), ("gis.MAINS", Some("SHAPE")));
+        assert_eq!(super::split_column("gis.MAINS"), ("gis.MAINS", None));
+        assert_eq!(super::split_column("gis.MAINS:"), ("gis.MAINS:", None));
+        let item = class("Mains", Some("SHAPE"));
+        let tables = [spatial("MAINS", "EXTRA", true), spatial("MAINS", "SHAPE", true)];
+        for (column, expected) in [("shape", "SHAPE"), ("EXTRA", "EXTRA")] {
+            let t = super::class_table(&item, &tables, Some(column)).unwrap();
+            assert_eq!((t.column.as_str(), t.alias.as_deref(), t.short.as_deref()), (expected, Some("Mains (alias)"), Some("Mains")));
+        }
+        let e = super::class_table(&item, &tables, Some("NOPE")).unwrap_err().to_string();
+        assert!(e.contains("utility.gis.Mains has no geometry or geography column 'NOPE'"), "{e}");
+    }
+
+    /// A class read from a column other than its registered shape column says so; one read from
+    /// its shape column, or that registers none, says nothing.
+    #[test]
+    fn a_class_read_from_another_column_says_so() {
+        let item = class("Mains", Some("SHAPE"));
+        let t = super::class_table(&item, &[spatial("MAINS", "EXTRA", false)], None).unwrap();
+        assert_eq!(t.column, "EXTRA");
+        assert_eq!(
+            super::fallback_note(&item, &t).as_deref(),
+            Some("utility.gis.Mains is read from its column EXTRA: its registered shape column SHAPE isn't a geometry or geography column")
+        );
+        assert_eq!(super::fallback_note(&item, &spatial("MAINS", "shape", false)), None);
+        assert_eq!(super::fallback_note(&class("Mains", None), &spatial("MAINS", "EXTRA", false)), None);
+    }
+
+    /// Adding a whole geodatabase adds its readable classes and other spatial tables, counts its
+    /// registered tables and names the classes it can't read; a clean one names none.
+    #[test]
+    fn a_whole_geodatabase_names_the_classes_it_leaves_out() {
+        let table = Item { kind: ItemKind::Table, ..class("Readings", None) };
+        let listing = GdbListing {
+            datasets: Vec::new(),
+            classes: vec![
+                (class("Mains", Some("SHAPE")), Some(spatial("MAINS", "SHAPE", false))),
+                (class("Orphans", Some("SHAPE")), None),
+                (class("Valves", Some("SHAPE")), Some(spatial("VALVES", "EXTRA", false))),
+            ],
+            tables: vec![table],
+            other: vec![spatial("PARCELS", "geom", false)],
+        };
+        let (tables, left) = super::geodatabase_layers(listing);
+        assert_eq!(tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["MAINS", "VALVES", "PARCELS"]);
+        assert_eq!(left.tables, 1);
+        assert_eq!(left.unread, ["utility.gis.Orphans"]);
+        assert_eq!(left.fallbacks.len(), 1);
+        assert_eq!(
+            super::unread_note(&left.unread).as_deref(),
+            Some(
+                "1 feature class was left out: stored in a format RustGIS doesn't read (SDEBINARY or another non-native storage): utility.gis.Orphans"
+            )
+        );
+        let many: Vec<String> = (0..7).map(|n| format!("C{n}")).collect();
+        let note = super::unread_note(&many).unwrap();
+        assert!(note.starts_with("7 feature classes were left out") && note.ends_with(": C0, C1, C2, C3, C4 and 2 more"), "{note}");
+
+        let clean = GdbListing {
+            datasets: Vec::new(),
+            classes: vec![(class("Mains", Some("SHAPE")), Some(spatial("MAINS", "SHAPE", false)))],
+            tables: Vec::new(),
+            other: Vec::new(),
+        };
+        let (tables, left) = super::geodatabase_layers(clean);
+        assert_eq!(tables.len(), 1);
+        assert!(left.unread.is_empty() && left.fallbacks.is_empty() && left.tables == 0);
+        assert_eq!(super::unread_note(&left.unread), None);
+    }
 
     /// A geodatabase class names its layer by its alias, else by its short name; a table the
     /// catalog doesn't register, by its label.
@@ -7258,10 +7464,10 @@ mod geodatabase_tests {
             dataset: None,
             short: None,
         };
-        let t = super::class_table(&item, &[column("EXTRA"), column("SHAPE")]).unwrap();
+        let t = super::class_table(&item, &[column("EXTRA"), column("SHAPE")], None).unwrap();
         assert_eq!((t.column.as_str(), t.short.as_deref(), t.dataset.as_deref()), ("SHAPE", Some("Mains"), Some("Water")));
         assert_eq!(LiveTable::Sqlserver(t).display(), "Mains");
-        let e = super::class_table(&item, &[]).unwrap_err().to_string();
+        let e = super::class_table(&item, &[], None).unwrap_err().to_string();
         assert!(e.contains("utility.gis.Mains is stored in a format RustGIS doesn't read (SDEBINARY"), "{e}");
     }
 }

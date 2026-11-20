@@ -175,7 +175,9 @@ pub(in crate::cmd) fn sqlserver_listing(connection: &rustgis_data::source::sqlse
 }
 
 /// A geodatabase listing's rows. A class without a spatial column (its table holds no native one)
-/// is listed with `column` and `kind` null: it isn't a layer, and refuses at open.
+/// is listed with `column` and `kind` null: it isn't a layer, and refuses at open. A spatial
+/// table the catalog doesn't register has no dataset, alias or versioning (null), and is shown
+/// by its table name.
 #[cfg(not(target_arch = "wasm32"))]
 pub(in crate::cmd) fn geodatabase_rows(listing: rustgis_data::source::sqlserver::GdbListing) -> Vec<Value> {
     let mut rows = Vec::new();
@@ -200,6 +202,7 @@ pub(in crate::cmd) fn geodatabase_rows(listing: rustgis_data::source::sqlserver:
     for t in listing.other {
         rows.push(json!({
             "label": t.label(), "schema": t.schema, "name": t.name, "column": t.column, "kind": t.kind, "item": "other",
+            "dataset": null, "alias": null, "versioning": null, "display": t.name,
         }));
     }
     rows

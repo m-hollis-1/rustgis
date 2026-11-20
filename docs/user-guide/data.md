@@ -783,11 +783,15 @@ rustgis-cli run --cmd 'layer.addDatabase={"database":"mssql://gis@gis-db/utility
 ```
 
 Without `layer`, every feature class and other spatial table is added, and a notice counts the
-registered tables left for you to add by name.
+registered tables left for you to add by name. A class stored in a format RustGIS doesn't read
+(SDEBINARY) is left out and named in a notice, and so is a class read from a spatial column
+other than the shape column it registers. A table with several spatial columns is named with its
+column (`Mains:SHAPE`).
 
 `info.databaseTables` lists a geodatabase's tables as `items`: each has `item` (`featureClass`,
 `table` or `other`), `dataset`, `alias`, `versioning` (`none`, `traditional` or `branch`) and
-`display`, the name the tree shows. `connection.browse` lists the tree level by level.
+`display`, the name the tree shows; an `other` table, which the geodatabase doesn't register, has
+`dataset`, `alias` and `versioning` as `null`. `connection.browse` lists the tree level by level.
 
 **Versions.** A feature class shows the current rows of the **Default** version. When a `.sde`
 file names any other version, `connection.readSde` says so in a notice naming it: the layers

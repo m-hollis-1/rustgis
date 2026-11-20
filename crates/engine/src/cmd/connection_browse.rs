@@ -1347,6 +1347,7 @@ mod tests {
         assert_eq!(names(&super::geodatabase_tree(&rows, "mssql://gis-db/utility", None)), ["Valves"]);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_geodatabase_lists_layers_without_its_registered_tables() {
         let mut rows = geodatabase_rows();
@@ -1363,6 +1364,34 @@ mod tests {
         assert_eq!(plain["geodatabaseProblem"], "no permission");
     }
 
+    /// A spatial table the catalog doesn't register carries every field the others do.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_unregistered_spatial_table_has_every_item_field() {
+        use rustgis_data::source::sqlserver::{GdbListing, Table};
+        let parcels = Table {
+            schema: "dbo".into(),
+            name: "Parcels".into(),
+            column: "geom".into(),
+            kind: "geometry".into(),
+            current: false,
+            several: false,
+            alias: None,
+            dataset: None,
+            short: None,
+        };
+        let listing = GdbListing { datasets: Vec::new(), classes: Vec::new(), tables: Vec::new(), other: vec![parcels] };
+        let rows = super::super::connection_use::geodatabase_rows(listing);
+        let row = rows.first().and_then(Value::as_object).unwrap();
+        assert_eq!(row["item"], "other");
+        for field in ["dataset", "alias", "versioning"] {
+            assert!(row.get(field).is_some_and(Value::is_null), "{field}: {row:?}");
+        }
+        assert_eq!(row["display"], "Parcels");
+        assert_eq!(row["label"], "dbo.Parcels");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_class_without_a_spatial_table_is_listed_but_is_not_a_layer() {
         use rustgis_data::source::geodatabase::{Item, ItemKind, Versioning};

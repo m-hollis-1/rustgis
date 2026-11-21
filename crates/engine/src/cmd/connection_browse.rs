@@ -1380,15 +1380,19 @@ mod tests {
             dataset: None,
             short: None,
         };
-        let listing = GdbListing { datasets: Vec::new(), classes: Vec::new(), tables: Vec::new(), other: vec![parcels] };
+        let listing = GdbListing { datasets: Vec::new(), classes: Vec::new(), tables: Vec::new(), other: vec![parcels], cut: false };
         let rows = super::super::connection_use::geodatabase_rows(listing);
         let row = rows.first().and_then(Value::as_object).unwrap();
         assert_eq!(row["item"], "other");
         for field in ["dataset", "alias", "versioning"] {
             assert!(row.get(field).is_some_and(Value::is_null), "{field}: {row:?}");
         }
-        assert_eq!(row["display"], "Parcels");
+        // Its display is what the tree shows: the name with its schema, as two schemas may hold
+        // a table of one name.
+        assert_eq!(row["display"], "dbo.Parcels");
         assert_eq!(row["label"], "dbo.Parcels");
+        let tree = super::geodatabase_tree(&rows, "mssql://gis-db/utility", None);
+        assert_eq!(tree.children[0]["children"][0]["name"], row["display"]);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1428,6 +1432,7 @@ mod tests {
             classes: vec![(item("Valves", ItemKind::FeatureClass), Some(valves)), (item("Orphans", ItemKind::FeatureClass), None)],
             tables: vec![item("Readings", ItemKind::Table)],
             other: Vec::new(),
+            cut: false,
         };
         let rows = super::super::connection_use::geodatabase_rows(listing);
         let orphans = rows.iter().find(|r| r["name"] == "ORPHANS").unwrap();

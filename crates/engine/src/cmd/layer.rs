@@ -3671,7 +3671,13 @@ fn class_table(
         None => item.shape_column.as_deref().and_then(|shape| named(&format!("{full}:{shape}"))).or_else(|| named(&full)),
     };
     let Some(t) = found else {
-        return Err(rustgis_data::DataError::Unsupported(format!("{} is {UNREAD_STORAGE}", item.name)));
+        // A cut list can't say the table has no spatial column.
+        let why = if rustgis_data::source::sqlserver::tables_cut(tables) {
+            format!("{}: its spatial column wasn't found: {}", item.name, rustgis_data::source::sqlserver::tables_cut_note())
+        } else {
+            format!("{} is {UNREAD_STORAGE}", item.name)
+        };
+        return Err(rustgis_data::DataError::Unsupported(why));
     };
     Ok(rustgis_data::source::sqlserver::Table {
         alias: item.alias.clone(),
@@ -3731,13 +3737,15 @@ struct GdbLeft {
     unread: Vec<String>,
     /// The classes read from another column than their shape column ([`fallback`]).
     fallbacks: Vec<String>,
+    /// That the database's list of spatial columns was cut, when it was.
+    cut: Option<String>,
 }
 
 /// The layers adding a whole geodatabase adds (its classes with a spatial column and its other
 /// spatial tables), and what it leaves.
 #[cfg(not(target_arch = "wasm32"))]
 fn geodatabase_layers(listing: rustgis_data::source::sqlserver::GdbListing) -> (Vec<rustgis_data::source::sqlserver::Table>, GdbLeft) {
-    let mut left = GdbLeft { tables: listing.tables.len(), ..Default::default() };
+    let mut left = GdbLeft { tables: listing.tables.len(), cut: listing.cut_note(), ..Default::default() };
     let mut tables = Vec::new();
     for (item, table) in listing.classes {
         match table {
@@ -3752,14 +3760,18 @@ fn geodatabase_layers(listing: rustgis_data::source::sqlserver::GdbListing) -> (
     (tables, left)
 }
 
-/// The notice for the classes a whole-geodatabase add can't read, naming the first few.
+/// The notice for the classes a whole-geodatabase add leaves out for want of a spatial column,
+/// naming the first few. With the list of spatial columns `cut`, that isn't put down to their
+/// storage: their columns may be past the cut.
 #[cfg(not(target_arch = "wasm32"))]
-fn unread_note(unread: &[String]) -> Option<String> {
+fn unread_note(unread: &[String], cut: bool) -> Option<String> {
     let names = first_names(unread);
-    match unread.len() {
-        0 => None,
-        1 => Some(format!("1 feature class was left out: {UNREAD_STORAGE}: {names}")),
-        n => Some(format!("{n} feature classes were left out: {UNREAD_STORAGE}: {names}")),
+    match (unread.len(), cut) {
+        (0, _) => None,
+        (1, false) => Some(format!("1 feature class was left out: {UNREAD_STORAGE}: {names}")),
+        (n, false) => Some(format!("{n} feature classes were left out: {UNREAD_STORAGE}: {names}")),
+        (1, true) => Some(format!("1 feature class was left out: no spatial column was found for it among those read: {names}")),
+        (n, true) => Some(format!("{n} feature classes were left out: no spatial column was found for them among those read: {names}")),
     }
 }
 
@@ -3848,7 +3860,8 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
             Some(listing) => {
                 let (tables, left) = geodatabase_layers(listing);
                 unadded = left.tables;
-                said.extend(unread_note(&left.unread));
+                said.extend(left.cut.clone());
+                said.extend(unread_note(&left.unread, left.cut.is_some()));
                 said.extend(fallbacks_note(&left.fallbacks));
                 tables.into_iter().map(LiveTable::Sqlserver).collect()
             }
@@ -3875,7 +3888,8 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
         // A table that fails doesn't stop the others.
         let fail = |s: &mut Session, e: String| -> Result<(), String> {
             if single {
-                return Err(e);
+                // The only one: its failure is the command's, carrying what the add left.
+                return Err(with_left(e, &said));
             }
             s.notify(format!("{label}: {}: {e}", t.label()), true);
             Ok(())
@@ -7468,6 +7482,7 @@ mod geodatabase_tests {
             ],
             tables: vec![table],
             other: vec![spatial("PARCELS", "geom", false)],
+            cut: false,
         };
         let (tables, left) = super::geodatabase_layers(listing);
         assert_eq!(tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["MAINS", "VALVES", "PARCELS"]);
@@ -7475,13 +7490,13 @@ mod geodatabase_tests {
         assert_eq!(left.unread, ["utility.gis.Orphans"]);
         assert_eq!(left.fallbacks.len(), 1);
         assert_eq!(
-            super::unread_note(&left.unread).as_deref(),
+            super::unread_note(&left.unread, false).as_deref(),
             Some(
                 "1 feature class was left out: stored in a format RustGIS doesn't read (SDEBINARY or another non-native storage): utility.gis.Orphans"
             )
         );
         let many: Vec<String> = (0..7).map(|n| format!("C{n}")).collect();
-        let note = super::unread_note(&many).unwrap();
+        let note = super::unread_note(&many, false).unwrap();
         assert!(note.starts_with("7 feature classes were left out") && note.ends_with(": C0, C1, C2, C3, C4 and 2 more"), "{note}");
 
         let clean = GdbListing {
@@ -7489,11 +7504,34 @@ mod geodatabase_tests {
             classes: vec![(class("Mains", Some("SHAPE")), Some(spatial("MAINS", "SHAPE", false)))],
             tables: Vec::new(),
             other: Vec::new(),
+            cut: false,
         };
         let (tables, left) = super::geodatabase_layers(clean);
         assert_eq!(tables.len(), 1);
-        assert!(left.unread.is_empty() && left.fallbacks.is_empty() && left.tables == 0);
-        assert_eq!(super::unread_note(&left.unread), None);
+        assert!(left.unread.is_empty() && left.fallbacks.is_empty() && left.tables == 0 && left.cut.is_none());
+        assert_eq!(super::unread_note(&left.unread, false), None);
+    }
+
+    /// When the database's list of spatial columns was cut, a class without one isn't called
+    /// unreadable storage: the cut is said, by a whole add and by an add by name.
+    #[test]
+    fn a_cut_list_of_spatial_columns_is_said_not_taken_for_storage() {
+        let listing = GdbListing {
+            datasets: Vec::new(),
+            classes: vec![(class("Orphans", Some("SHAPE")), None)],
+            tables: Vec::new(),
+            other: Vec::new(),
+            cut: true,
+        };
+        let (_, left) = super::geodatabase_layers(listing);
+        let cut = left.cut.clone().unwrap_or_default();
+        assert!(cut.contains("only the first 10000 were read"), "{cut}");
+        let note = super::unread_note(&left.unread, left.cut.is_some()).unwrap();
+        assert!(!note.contains("SDEBINARY") && note.contains("no spatial column was found for it among those read"), "{note}");
+
+        let full: Vec<Table> = (0..10_000).map(|n| spatial(&format!("T{n}"), "geom", false)).collect();
+        let e = super::class_table(&class("Mains", Some("SHAPE")), &full, None).unwrap_err().to_string();
+        assert!(!e.contains("SDEBINARY") && e.contains("only the first 10000 were read"), "{e}");
     }
 
     /// A geodatabase class names its layer by its alias, else by its short name; a table the

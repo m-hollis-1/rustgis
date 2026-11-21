@@ -162,12 +162,15 @@ pub(in crate::cmd) fn sqlserver_listing(connection: &rustgis_data::source::sqlse
         let rows = sqlserver::tables(connection)?.into_iter().map(plain).collect();
         return Ok((rows, None, sqlserver::geodatabase_problem(connection)));
     };
+    let columns_cut = listing.cut_note();
     let rows = geodatabase_rows(listing);
-    // A catalog cut at its limit says so wherever the listing is shown.
+    // A catalog, or a list of spatial columns, cut at its limit says so wherever the listing is
+    // shown.
     let geodatabase = sqlserver::geodatabase(connection).map(|g| {
         let mut out = json!({"owner": g.owner, "release": g.release});
-        if let Some(note) = g.cut_note() {
-            out["note"] = json!(note);
+        let notes: Vec<String> = g.cut_note().into_iter().chain(columns_cut.clone()).collect();
+        if !notes.is_empty() {
+            out["note"] = json!(notes.join("; "));
         }
         out
     });
@@ -177,7 +180,7 @@ pub(in crate::cmd) fn sqlserver_listing(connection: &rustgis_data::source::sqlse
 /// A geodatabase listing's rows. A class without a spatial column (its table holds no native one)
 /// is listed with `column` and `kind` null: it isn't a layer, and refuses at open. A spatial
 /// table the catalog doesn't register has no dataset, alias or versioning (null), and is shown
-/// by its table name.
+/// by its label: its name with its schema, as two schemas may hold a table of one name.
 #[cfg(not(target_arch = "wasm32"))]
 pub(in crate::cmd) fn geodatabase_rows(listing: rustgis_data::source::sqlserver::GdbListing) -> Vec<Value> {
     let mut rows = Vec::new();
@@ -202,7 +205,7 @@ pub(in crate::cmd) fn geodatabase_rows(listing: rustgis_data::source::sqlserver:
     for t in listing.other {
         rows.push(json!({
             "label": t.label(), "schema": t.schema, "name": t.name, "column": t.column, "kind": t.kind, "item": "other",
-            "dataset": null, "alias": null, "versioning": null, "display": t.name,
+            "dataset": null, "alias": null, "versioning": null, "display": t.label(),
         }));
     }
     rows

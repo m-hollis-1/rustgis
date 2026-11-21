@@ -303,10 +303,21 @@ pub struct GdbListing {
     pub tables: Vec<Item>,
     /// The spatial tables the catalog doesn't register, without the geodatabase's machinery.
     pub other: Vec<Table>,
+    /// Whether the database's list of spatial columns was cut at its limit: a class past it is
+    /// listed without its column, and another spatial table past it isn't listed.
+    pub cut: bool,
+}
+
+impl GdbListing {
+    /// What to say when the list of spatial columns was cut.
+    pub fn cut_note(&self) -> Option<String> {
+        self.cut.then(super::tables_cut_note)
+    }
 }
 
 /// Groups the catalog's items with the database's spatial columns, worked out without a server.
 pub(super) fn listing_of(catalog: &Catalog, spatial: Vec<Table>) -> GdbListing {
+    let cut = super::tables_cut(&spatial);
     let same = |t: &Table, i: &Item| t.schema.eq_ignore_ascii_case(&i.schema) && t.name.eq_ignore_ascii_case(&i.table);
     let data = || catalog.items.iter().filter(|i| i.kind != ItemKind::FeatureDataset);
     let classes = data()
@@ -334,7 +345,7 @@ pub(super) fn listing_of(catalog: &Catalog, spatial: Vec<Table>) -> GdbListing {
     };
     let other = spatial.iter().filter(|t| !is_machinery(&t.name) && !derived(t) && !data().any(|i| same(t, i))).cloned().collect();
     let datasets = catalog.feature_datasets().iter().map(|d| d.short_name().to_string()).collect();
-    GdbListing { datasets, classes, tables, other }
+    GdbListing { datasets, classes, tables, other, cut }
 }
 
 /// The geodatabase's listing; `None` when the database holds none (or its catalog can't be read:
@@ -706,6 +717,22 @@ mod tests {
                 spatial("dbo", "MAINS_evw", "geom")
             ]
         );
+    }
+
+    #[test]
+    fn a_full_list_of_spatial_columns_is_a_cut_listing() {
+        let catalog = catalog();
+        let few = listing_of(&catalog, vec![spatial("SDE", "MAINS", "SHAPE")]);
+        assert!(!few.cut);
+        assert_eq!(few.cut_note(), None);
+        let full: Vec<Table> = (0..super::super::LIST_LIMIT).map(|n| spatial("dbo", &format!("T{n}"), "geom")).collect();
+        assert!(super::super::tables_cut(&full));
+        let listing = listing_of(&catalog, full);
+        assert!(listing.cut);
+        // Mains is past the cut here: listed without a column, and the note says why that may be.
+        assert!(listing.classes.iter().all(|(_, t)| t.is_none()));
+        let note = listing.cut_note().unwrap_or_default();
+        assert!(note.contains("10000 spatial columns or more") && note.contains("only the first 10000 were read"), "{note}");
     }
 
     #[test]

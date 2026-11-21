@@ -793,7 +793,8 @@ column (`Mains:SHAPE`).
 `info.databaseTables` lists a geodatabase's tables as `items`: each has `item` (`featureClass`,
 `table` or `other`), `dataset`, `alias`, `versioning` (`none`, `traditional` or `branch`) and
 `display`, the name the tree shows; an `other` table, which the geodatabase doesn't register, has
-`dataset`, `alias` and `versioning` as `null`. `connection.browse` lists the tree level by level.
+`dataset`, `alias` and `versioning` as `null` and its name with its schema as `display`. A database
+with 10,000 spatial columns or more has only the first 10,000 read, and the listing says so. `connection.browse` lists the tree level by level.
 
 **Versions.** A feature class shows the current rows of the **Default** version. When a `.sde`
 file names any other version, `connection.readSde` says so in a notice naming it: the layers

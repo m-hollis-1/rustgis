@@ -143,24 +143,30 @@ fn read_tables(database: &rustgis_data::source::duckdb::Database) -> rustgis_dat
     }
 }
 
+/// A geodatabase's listing as it was read, and why it wasn't when it failed. Only a login refusal
+/// ends the listing; any other trouble is kept as the problem, and the database then browses as
+/// plain SQL Server, saying why (the catalog may have been read, and only its tables' listing
+/// failed: [`rustgis_data::source::sqlserver::geodatabase_problem`] then has nothing to say).
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::cmd) fn listing_or_problem<T>(read: rustgis_data::Result<Option<T>>) -> rustgis_data::Result<(Option<T>, Option<String>)> {
+    match read {
+        Err(error @ rustgis_data::DataError::Login(_)) => Err(error),
+        Ok(listing) => Ok((listing, None)),
+        Err(error) => Ok((None, Some(error.to_string()))),
+    }
+}
+
 /// A SQL Server database's rows: a geodatabase's classes, tables and other spatial tables, or
 /// the plain spatial tables (with why the catalog was left unread, when it was).
 #[cfg(not(target_arch = "wasm32"))]
 pub(in crate::cmd) fn sqlserver_listing(connection: &rustgis_data::source::sqlserver::Conn) -> rustgis_data::Result<Listing> {
-    use rustgis_data::DataError;
     use rustgis_data::source::sqlserver;
 
     let plain = |t: sqlserver::Table| json!({"label": t.label(), "schema": t.schema, "name": t.name, "column": t.column, "kind": t.kind});
-    // Only a login refusal ends the listing; any other trouble with the catalog browses the
-    // database as plain SQL Server.
-    let listing = match sqlserver::geodatabase_tables(connection) {
-        Err(error @ DataError::Login(_)) => return Err(error),
-        Ok(listing) => listing,
-        Err(_) => None,
-    };
+    let (listing, problem) = listing_or_problem(sqlserver::geodatabase_tables(connection))?;
     let Some(listing) = listing else {
         let rows = sqlserver::tables(connection)?.into_iter().map(plain).collect();
-        return Ok((rows, None, sqlserver::geodatabase_problem(connection)));
+        return Ok((rows, None, problem.or_else(|| sqlserver::geodatabase_problem(connection))));
     };
     let columns_cut = listing.cut_note();
     let rows = geodatabase_rows(listing);

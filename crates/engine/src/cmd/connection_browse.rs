@@ -1364,6 +1364,21 @@ mod tests {
         assert_eq!(plain["geodatabaseProblem"], "no permission");
     }
 
+    /// A listing that fails for any reason but a refused login is kept as the problem, so the
+    /// database browses as plain SQL Server and says why.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_listing_that_fails_is_kept_as_the_problem_and_a_refused_login_ends_it() {
+        use super::super::connection_use::listing_or_problem;
+        use rustgis_data::DataError;
+        assert_eq!(listing_or_problem(Ok(Some(1))).unwrap(), (Some(1), None));
+        assert_eq!(listing_or_problem::<u8>(Ok(None)).unwrap(), (None, None));
+        let (listing, problem) = listing_or_problem::<u8>(Err(DataError::Format("the server took longer than 120 s".into()))).unwrap();
+        assert!(listing.is_none());
+        assert!(problem.is_some_and(|why| why.contains("took longer than 120 s")));
+        assert!(matches!(listing_or_problem::<u8>(Err(DataError::Login("refused".into()))), Err(DataError::Login(_))));
+    }
+
     /// A spatial table the catalog doesn't register carries every field the others do.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

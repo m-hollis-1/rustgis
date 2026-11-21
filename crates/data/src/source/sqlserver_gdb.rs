@@ -327,7 +327,8 @@ pub(super) fn listing_of(catalog: &Catalog, spatial: Vec<Table>) -> GdbListing {
             let table = spatial
                 .iter()
                 .find(|t| same(t, item) && shape.is_some_and(|s| t.column.eq_ignore_ascii_case(s)))
-                .or_else(|| spatial.iter().find(|t| same(t, item)))
+                // A cut list may hold another column of the table and not its shape column.
+                .or_else(|| spatial.iter().find(|t| same(t, item)).filter(|_| !(cut && shape.is_some())))
                 .map(|t| Table {
                     alias: item.alias.clone(),
                     dataset: item.dataset.clone(),
@@ -733,6 +734,13 @@ mod tests {
         assert!(listing.classes.iter().all(|(_, t)| t.is_none()));
         let note = listing.cut_note().unwrap_or_default();
         assert!(note.contains("10000 spatial columns or more") && note.contains("only the first 10000 were read"), "{note}");
+        // A cut may fall between a table's columns: another column of Mains isn't taken for its
+        // shape column, which may be past the cut.
+        let mut split: Vec<Table> = (1..super::super::LIST_LIMIT).map(|n| spatial("dbo", &format!("T{n}"), "geom")).collect();
+        split.push(spatial("SDE", "MAINS", "EXTRA"));
+        let listing = listing_of(&catalog, split);
+        assert!(listing.cut);
+        assert!(listing.classes.iter().all(|(_, t)| t.is_none()), "{:?}", listing.classes);
     }
 
     #[test]

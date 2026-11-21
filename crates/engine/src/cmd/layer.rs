@@ -3668,7 +3668,13 @@ fn class_table(
             named(&format!("{full}:{column}"))
                 .ok_or_else(|| rustgis_data::DataError::Format(format!("{} has no geometry or geography column '{column}'", item.name)))?,
         ),
-        None => item.shape_column.as_deref().and_then(|shape| named(&format!("{full}:{shape}"))).or_else(|| named(&full)),
+        None => {
+            let shape = item.shape_column.as_deref();
+            // A cut list may hold another column of the table and not its shape column: that one
+            // isn't read in its place.
+            let cut = shape.is_some() && rustgis_data::source::sqlserver::tables_cut(tables);
+            shape.and_then(|shape| named(&format!("{full}:{shape}"))).or_else(|| named(&full).filter(|_| !cut))
+        }
     };
     let Some(t) = found else {
         // A cut list can't say the table has no spatial column.
@@ -7529,9 +7535,17 @@ mod geodatabase_tests {
         let note = super::unread_note(&left.unread, left.cut.is_some()).unwrap();
         assert!(!note.contains("SDEBINARY") && note.contains("no spatial column was found for it among those read"), "{note}");
 
-        let full: Vec<Table> = (0..10_000).map(|n| spatial(&format!("T{n}"), "geom", false)).collect();
+        let mut full: Vec<Table> = (0..10_000).map(|n| spatial(&format!("T{n}"), "geom", false)).collect();
         let e = super::class_table(&class("Mains", Some("SHAPE")), &full, None).unwrap_err().to_string();
         assert!(!e.contains("SDEBINARY") && e.contains("only the first 10000 were read"), "{e}");
+        // The cut may fall between the table's columns: another column isn't read in place of a
+        // shape column that may be past the cut. One asked for by name still is, and a class
+        // that registers no shape column still reads its table's first.
+        full.push(spatial("MAINS", "EXTRA", false));
+        let e = super::class_table(&class("Mains", Some("SHAPE")), &full, None).unwrap_err().to_string();
+        assert!(e.contains("only the first 10000 were read"), "{e}");
+        assert_eq!(super::class_table(&class("Mains", Some("SHAPE")), &full, Some("EXTRA")).unwrap().column, "EXTRA");
+        assert_eq!(super::class_table(&class("Mains", None), &full, None).unwrap().column, "EXTRA");
     }
 
     /// A geodatabase class names its layer by its alias, else by its short name; a table the

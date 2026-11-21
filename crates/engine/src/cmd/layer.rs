@@ -3824,8 +3824,28 @@ fn add_geodatabase_table(
     label: &str,
 ) -> CmdResult {
     let read = rustgis_data::source::sqlserver::read_table(conn, item, table_rows()).map_err(|e| format!("{label}: {e}"))?;
+    let rows = read.0.features.len();
     let added = add_read(s, p, read, None)?;
-    Ok(json!({"layer": null, "layers": [], "tables": [added["id"]], "features": 0}))
+    Ok(table_result(&added["id"], rows))
+}
+
+/// What adding a registered table answers with: no layer, the table's id, and the rows read as
+/// its `features`.
+#[cfg(not(target_arch = "wasm32"))]
+fn table_result(id: &Value, rows: usize) -> Value {
+    json!({"layer": null, "layers": [], "tables": [id], "features": rows})
+}
+
+/// What to say of a class added by the name `wanted` when it is read from another column than
+/// its shape column ([`fallback`]); nothing when `wanted` names the column, which is then the
+/// one asked for.
+#[cfg(not(target_arch = "wasm32"))]
+fn named_fallback(
+    wanted: &str,
+    item: &rustgis_data::source::geodatabase::Item,
+    table: &rustgis_data::source::sqlserver::Table,
+) -> Option<String> {
+    if split_column(wanted).1.is_some() { None } else { fallback(item, table) }
 }
 
 /// Adds the tables of a PostGIS, MySQL, MariaDB or SQL Server database that have a geometry
@@ -3858,7 +3878,7 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
                 && let Some(catalog) = rustgis_data::source::sqlserver::geodatabase(conn)
                 && let Some(item) = catalog.find(l).filter(|i| i.kind == rustgis_data::source::geodatabase::ItemKind::FeatureClass)
             {
-                said.extend(fallbacks_note(&fallback(item, t).into_iter().collect::<Vec<_>>()));
+                said.extend(fallbacks_note(&named_fallback(l, item, t).into_iter().collect::<Vec<_>>()));
             }
             vec![found]
         }
@@ -7465,6 +7485,26 @@ mod geodatabase_tests {
             super::with_left("db: no tables with a geometry column".into(), &left),
             "db: no tables with a geometry column; 3 tables not added; add one by name with \"layer\"; 1 feature class was left out: SDEBINARY: Orphans"
         );
+    }
+
+    /// A column asked for by name is the one wanted: only the class's own choice of another
+    /// column than its shape column is said.
+    #[test]
+    fn a_column_asked_for_by_name_is_not_called_a_fallback() {
+        let item = class("Mains", Some("SHAPE"));
+        let extra = spatial("MAINS", "EXTRA", true);
+        assert_eq!(super::named_fallback("gis.MAINS:EXTRA", &item, &extra), None);
+        assert_eq!(super::named_fallback("Mains", &item, &extra).as_deref(), Some("utility.gis.Mains (EXTRA, not SHAPE)"));
+        assert_eq!(super::named_fallback("Mains", &item, &spatial("MAINS", "SHAPE", true)), None);
+    }
+
+    /// A registered table added says how many rows it read, not none.
+    #[test]
+    fn a_registered_table_added_says_its_rows() {
+        let result = super::table_result(&serde_json::json!(7), 50_000);
+        assert_eq!(result["features"], 50_000);
+        assert_eq!(result["tables"], serde_json::json!([7]));
+        assert!(result["layer"].is_null() && result["layers"].as_array().is_some_and(Vec::is_empty));
     }
 
     /// A registered table's row limit is sized for the memory there is, within its bounds.

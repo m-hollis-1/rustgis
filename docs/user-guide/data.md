@@ -809,8 +809,8 @@ versioned is unknown") rather than guessed at.
 
 **Tables** without geometry add as standalone tables: the whole table is loaded, up to 100,000
 rows (fewer when memory is short), with a notice when there may be more. A versioned table is read through its versioned
-view. A standalone table doesn't keep its source, so it doesn't reopen with the project: add it
-again.
+view. A standalone table's rows are saved with the project, so it reopens as it was added; it
+isn't read from the database again, so add it again for the rows as they are now.
 
 **What isn't read.** Named versions other than Default; feature classes in Esri's older SDEBINARY
 storage (refused, naming the storage); subtype and domain descriptions (the codes are read as

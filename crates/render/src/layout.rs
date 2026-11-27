@@ -1061,6 +1061,95 @@ pub(crate) fn legend_pin_pages() -> Vec<(Layout, Vec<Map>)> {
     pages
 }
 
+/// A `w` x `h` PNG, each pixel the opaque colour `colours` gives it, as base64.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn png_b64(w: u32, h: u32, colours: impl Fn(u32, u32) -> [u8; 3]) -> String {
+    use base64::Engine as _;
+    let Some(mut pm) = Pixmap::new(w, h) else { return String::new() };
+    for (i, px) in pm.pixels_mut().iter_mut().enumerate() {
+        let i = i as u32;
+        let [r, g, b] = colours(i % w, i / w);
+        *px = tiny_skia::ColorU8::from_rgba(r, g, b, 255).premultiply();
+    }
+    pm.encode_png().map(|png| base64::engine::general_purpose::STANDARD.encode(png)).unwrap_or_default()
+}
+
+/// A 32 x 32 RGB JPEG of a diagonal gradient at quality 80, as base64.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn jpeg_b64() -> String {
+    use base64::Engine as _;
+    let rgb: Vec<u8> = (0..32u32 * 32).flat_map(|i| [((i % 32 + i / 32) * 4) as u8, 120, (255 - (i % 32 + i / 32) * 4) as u8]).collect();
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80);
+    match encoder.encode(&rgb, 32, 32, image::ExtendedColorType::Rgb8) {
+        Ok(()) => base64::engine::general_purpose::STANDARD.encode(jpeg),
+        Err(_) => String::new(),
+    }
+}
+
+/// The 40 x 20 PNG the picture pins draw: its left half `#1F5C84`, its right half `#E8B04A`, a
+/// white line one pixel high across the middle (row 10).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn pin_png() -> String {
+    png_b64(40, 20, |x, y| match (x, y) {
+        (_, 10) => [0xFF, 0xFF, 0xFF],
+        (0..20, _) => [0x1F, 0x5C, 0x84],
+        _ => [0xE8, 0xB0, 0x4A],
+    })
+}
+
+/// Pages of 100 x 80 mm, no maps, one picture each (no file to it, as main has none) unless
+/// said: 1, the PNG of [`pin_png`] in (10, 10, 60, 30), a wider box (bars left and right); 2, the
+/// PNG in (10, 10, 20, 60), a taller box (bars above and below); 3, the JPEG of [`jpeg_b64`] in
+/// (10, 10, 40, 40); 4, an empty image in (10, 10, 40, 20), a grey box with "Picture"; 5, base64
+/// that isn't an image in (10, 10, 40, 20); 6, a 30000 x 1 PNG (it declares more than 20000 pixels
+/// a side) in (10, 10, 40, 20), a grey box; 7, an empty image in a box smaller than its word, (10,
+/// 10, 6, 4); 8, the PNG in (10, 10, 60, 30) on a background (fill `#FFF3D6`, outline `#222222`
+/// 1 pt wide, padding 2 mm); 9, a hidden picture with an empty image at (10, 10, 40, 20) and the
+/// PNG visible at (55, 10, 40, 20); 10, the PNG in a box across the page's right edge, (80, 10,
+/// 40, 20). Pictures have no turn of their own.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn picture_pin_pages() -> Vec<(Layout, Vec<Map>)> {
+    let (png, jpeg) = (pin_png(), jpeg_b64());
+    let huge = png_b64(30_000, 1, |_, _| [0x1F, 0x5C, 0x84]);
+    let page = |pictures: &[(&str, (f64, f64, f64, f64))]| {
+        let mut l = Layout::new("Pictures", 100.0, 80.0);
+        for (image, at) in pictures {
+            l.add("Picture", *at, ElementKind::Picture { image: (*image).to_string() });
+        }
+        l
+    };
+    let (wide, small) = ((10.0, 10.0, 60.0, 30.0), (10.0, 10.0, 40.0, 20.0));
+    let mut backed = page(&[(&png, wide)]);
+    if let Some(e) = backed.elements.first_mut() {
+        e.background = Some(rustgis_map::layout::Background {
+            outline: Rgba::rgb(0x22, 0x22, 0x22),
+            width: 1.0,
+            padding: 2.0,
+            ..rustgis_map::layout::Background::filled(Rgba::rgb(0xFF, 0xF3, 0xD6))
+        });
+    }
+    let mut hidden = page(&[("", small), (&png, (55.0, 10.0, 40.0, 20.0))]);
+    if let Some(e) = hidden.elements.first_mut() {
+        e.visible = false;
+    }
+    [
+        page(&[(&png, wide)]),
+        page(&[(&png, (10.0, 10.0, 20.0, 60.0))]),
+        page(&[(&jpeg, (10.0, 10.0, 40.0, 40.0))]),
+        page(&[("", small)]),
+        page(&[("bm90IGFuIGltYWdl", small)]),
+        page(&[(&huge, small)]),
+        page(&[("", (10.0, 10.0, 6.0, 4.0))]),
+        backed,
+        hidden,
+        page(&[(&png, (80.0, 10.0, 40.0, 20.0))]),
+    ]
+    .into_iter()
+    .map(|l| (l, Vec::new()))
+    .collect()
+}
+
 /// Each of `got`'s hashes that isn't its `pinned` one, named for its page (and resolution), with
 /// both values, and the whole of `got` to pin when the change is meant; one more line when the
 /// counts differ. `what` names the output compared.

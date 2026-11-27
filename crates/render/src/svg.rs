@@ -938,4 +938,66 @@ mod tests {
         wrong.extend(crate::layout::pin_mismatches("PDF", &pdf, &PINNED_LEGEND_PDF));
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
+
+    /// How [`pictures_export_as_before`]'s pages were written as SVG and as a vector PDF before
+    /// pictures remembered their file, in the built-in face: each page of
+    /// [`crate::layout::picture_pin_pages`] in turn.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_PICTURE_SVG: [u64; 10] = [
+        0x4942_1842_02a6_e13c, // 1: the PNG in a wider box
+        0xa7c0_17e7_a596_aa3d, // 2: the PNG in a taller box
+        0x485b_5dbb_83f7_a658, // 3: the JPEG
+        0xfc56_9f71_2ee2_878b, // 4: an empty image, a grey box with its word
+        0xfc56_9f71_2ee2_878b, // 5: not an image (page 4's: the same grey box in the same box)
+        0xfc56_9f71_2ee2_878b, // 6: declared too large (page 4's, as page 5)
+        0x472a_6b1c_6e32_0e7e, // 7: an empty image in a box smaller than its word
+        0xc1f2_7486_0200_c97e, // 8: the PNG on a background
+        0x067f_181a_d41a_c8ad, // 9: a hidden empty picture beside the PNG
+        0xf235_0cfd_309c_1f51, // 10: the PNG across the page's right edge
+    ];
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_PICTURE_PDF: [u64; 10] = [
+        0x200d_c9c7_cd54_9cbd, // 1: the PNG in a wider box
+        0xe045_9691_934f_1fe9, // 2: the PNG in a taller box
+        0xeed1_410f_5a3c_0369, // 3: the JPEG
+        0x0eb3_c651_f3e1_54ba, // 4: an empty image, a grey box with its word
+        0x0eb3_c651_f3e1_54ba, // 5: not an image (page 4's: the same grey box in the same box)
+        0x0eb3_c651_f3e1_54ba, // 6: declared too large (page 4's, as page 5)
+        0xea75_a4d8_57fc_3e36, // 7: an empty image in a box smaller than its word
+        0x1879_7c0e_152d_9db0, // 8: the PNG on a background
+        0x043b_262a_8f1a_11a8, // 9: a hidden empty picture beside the PNG
+        0xf03a_ae65_baa2_25d1, // 10: the PNG across the page's right edge
+    ];
+
+    /// A picture's SVG (at 72 dpi, its pictures drawn at that resolution) and vector PDF (at 150
+    /// dpi) are byte for byte main's, page by page: ten pages each. In a process of its own, told
+    /// to use the built-in face before any text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pictures_export_as_before() {
+        if std::env::var_os("RUSTGIS_PICTURE_EXPORT_PIN_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "svg::tests::pictures_export_as_before", "--nocapture"])
+                .env("RUSTGIS_PICTURE_EXPORT_PIN_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        let info = PageInfo::default();
+        let (mut svg, mut pdf) = (Vec::new(), Vec::new());
+        for (i, (l, mut maps)) in crate::layout::picture_pin_pages().into_iter().enumerate() {
+            let page = format!("page {}", i + 1);
+            let written = layout_svg(&l, &mut maps, 72.0, &info).unwrap().0.into_bytes();
+            svg.push((page.clone(), fnv(&written)));
+            let (drawing, _) = crate::layout::render_drawing(&l, &mut maps, 150.0, &info).unwrap();
+            let bytes = crate::pdf::write(&[crate::pdf::Page::drawing(drawing, l.width, l.height)], "Pictures");
+            pdf.push((page, fnv(&bytes)));
+        }
+        let mut wrong = crate::layout::pin_mismatches("SVG", &svg, &PINNED_PICTURE_SVG);
+        wrong.extend(crate::layout::pin_mismatches("PDF", &pdf, &PINNED_PICTURE_PDF));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }

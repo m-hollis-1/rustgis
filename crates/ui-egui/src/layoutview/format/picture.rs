@@ -5,9 +5,10 @@ use egui::Ui;
 use rustgis_engine::map::layout::{Element, ElementKind, picture_file_name};
 use serde_json::Value;
 
-/// A picture's rows in the grid: File, the name of the file it remembers (its whole path on
-/// hover) or "No file"; and, on the desktop, Choose File…, which reads the file picked into the
-/// picture through `update`. Nothing is sent until a file is picked.
+/// A picture's rows in the grid: File, the name of the file it remembers or "No file", its
+/// folders never in the label's text, only on hover and as its description for screen readers;
+/// and, on the desktop, Choose File…, which reads the file picked into the picture through
+/// `update`. Nothing is sent until a file is picked.
 #[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "the browser has no file paths to read a picture from"))]
 pub(super) fn picture_rows(app: &mut RustGisApp, ui: &mut Ui, e: &Element, update: &dyn Fn(&mut RustGisApp, Value)) {
     if !matches!(e.kind, ElementKind::Picture { .. }) {
@@ -16,7 +17,7 @@ pub(super) fn picture_rows(app: &mut RustGisApp, ui: &mut Ui, e: &Element, updat
     let source = e.kind.picture_source();
     ui.label(tl!("File"));
     match source.and_then(|s| Some((s, picture_file_name(s)?))) {
-        Some((path, name)) => ui.add(egui::Label::new(name).truncate()).on_hover_text(path),
+        Some((path, name)) => ui.add(egui::Label::new(name).truncate().show_tooltip_when_elided(false)).on_hover_text(path),
         None => ui.label(tl!("No file")),
     };
     ui.end_row();

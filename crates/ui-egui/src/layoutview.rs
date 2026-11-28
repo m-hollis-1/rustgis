@@ -135,6 +135,10 @@ pub struct LayoutView {
     section_warning: Option<String>,
     /// The last notice of the pictures the page draws as a grey box.
     picture_warning: Option<String>,
+    /// The layout (by its index) and the project revision its pictures were last checked at
+    /// ([`say_pictures_not_drawn`]): the check can decode pictures, so it runs once per layout and
+    /// revision, not on every redraw of the page for a zoom or a resize.
+    pictures_checked: Option<(usize, u64)>,
     /// The texts of the layout drawn (by its index) cut off on its page, with their lines left
     /// out of their box, as the Format pane tells them (#2346).
     text_losses: Option<(usize, Vec<rustgis_engine::render::layout::TextLoss>)>,
@@ -229,6 +233,7 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
         app.layout.text_warning = None;
         app.layout.section_warning = None;
         app.layout.picture_warning = None;
+        app.layout.pictures_checked = None;
         app.layout.text_losses = None;
         app.layout.views.clear();
     }
@@ -307,6 +312,7 @@ impl LayoutView {
         self.text_warning = None;
         self.section_warning = None;
         self.picture_warning = None;
+        self.pictures_checked = None;
         self.text_losses = None;
         if let Some(old) = self.viewed.replace(name.to_string()) {
             self.views.insert(old, (self.zoom, self.pan));
@@ -448,7 +454,10 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 app.layout.section_warning = note;
             }
-            say_pictures_not_drawn(app, &layout);
+            if app.layout.pictures_checked != Some((li, key.0)) {
+                say_pictures_not_drawn(app, &layout);
+                app.layout.pictures_checked = Some((li, key.0));
+            }
             // The Format pane is drawn before the page: a count that changed shows on the next
             // frame, without waiting for an input event.
             let losses = Some((li, losses));

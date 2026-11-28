@@ -2553,9 +2553,10 @@ fn format_harness(app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp>
     )
 }
 
-/// A picture's file in the Format pane: its name shown (the folders only on hover), opening sends
-/// nothing, Choose File… cancelled sends nothing, a file picked is read and remembered in one undo
-/// step, and a file that isn't a picture changes nothing.
+/// A picture's file in the Format pane: its name shown (the folders never in the label's text, only
+/// on hover and as its description for screen readers), opening sends nothing, Choose File…
+/// cancelled sends nothing, a file picked is read and remembered in one undo step, and a file
+/// that isn't a picture changes nothing.
 #[test]
 fn a_pictures_file_is_shown_and_chosen_again_in_one_undo_step() {
     use egui_kittest::kittest::Queryable;
@@ -2585,7 +2586,7 @@ fn a_pictures_file_is_shown_and_chosen_again_in_one_undo_step() {
     let (source, first_image) = picture(h.state());
     assert_eq!(source.as_deref(), Some(first.as_str()));
     h.get_by_label("first.png");
-    assert!(h.query_by_label(&first).is_none(), "the folders show only on hover");
+    assert!(h.query_by_label(&first).is_none(), "the folders are never the label's text");
     // Choose File… once the dialog has answered `picked` (cancelled when `None`).
     let choose = |h: &mut egui_kittest::Harness<'_, RustGisApp>, picked: Option<&str>| {
         crate::dialogs::PICKED.with(|p| *p.borrow_mut() = picked.map(String::from));
@@ -2680,4 +2681,38 @@ fn the_layout_view_says_a_picture_drawn_as_a_grey_box_once() {
     }
     assert_eq!(said(&mut app), Vec::<String>::new());
     assert_eq!(app.layout.picture_warning, None);
+}
+
+/// The layout view checks its pictures once a layout and revision: a zoom draws the page again
+/// without checking them again, and a change to the layout checks them again.
+#[test]
+fn the_layout_view_checks_its_pictures_once_a_change() {
+    let mut app = RustGisApp::with_sample();
+    let mut grey = Layout::new("Grey", 297.0, 210.0);
+    let source = Some("/data/logos/north.png".to_string());
+    grey.add("North", (10.0, 10.0, 30.0, 15.0), ElementKind::Picture { image: String::new(), source });
+    app.run("layout.import", json!({"text": serde_json::to_string(&grey).unwrap()})).unwrap();
+    let li = app.session.project.layouts.iter().position(|l| l.name == "Grey").unwrap();
+    let id = app.session.project.layouts[li].elements.iter().find(|e| e.name == "North").unwrap().id;
+    app.session.active_layout = Some(li);
+    let mark = app.session.notice_mark();
+    // How often the view has said the layout's grey pictures.
+    let said = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+        h.state().session.notices_since(mark).iter().filter(|n| n.text.contains("layout picture(s)")).count()
+    };
+    let mut h = format_harness(app);
+    h.run_steps(3);
+    assert_eq!(said(&h), 1, "the page drawn says its grey picture");
+    assert_eq!(h.state().layout.pictures_checked, Some((li, h.state().session.revision)));
+    let drawn = h.state().layout.key;
+    // Forgotten by hand: only a check would say it again.
+    h.state_mut().layout.picture_warning = None;
+    h.state_mut().layout.zoom = 2.0;
+    h.run_steps(3);
+    assert_ne!(h.state().layout.key, drawn, "the zoomed page was drawn again");
+    assert_eq!(said(&h), 1, "a zoom at the same revision doesn't check the pictures again");
+    h.state_mut().run("layout.update", json!({"layout": li, "element": id, "name": "Arrow"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(said(&h), 2, "a change checks them again");
+    assert_eq!(h.state().layout.pictures_checked, Some((li, h.state().session.revision)));
 }

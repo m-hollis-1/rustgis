@@ -50,12 +50,12 @@ pub(crate) struct GivenPicture {
 }
 
 /// A command's `path`: none when absent or null, as given when it is text that isn't blank and
-/// isn't an address; refused otherwise.
+/// isn't an address ([`rustgis_map::layout::picture_path_is_address`]); refused otherwise.
 pub(crate) fn picture_path_param(p: &Value) -> Result<Option<&str>, String> {
     match p.get("path") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(path)) if path.trim().is_empty() => Err(PICTURE_PATH.into()),
-        Some(Value::String(path)) if path.contains("://") => Err(PICTURE_ADDRESS.into()),
+        Some(Value::String(path)) if rustgis_map::layout::picture_path_is_address(path) => Err(PICTURE_ADDRESS.into()),
         Some(Value::String(path)) => Ok(Some(path)),
         Some(_) => Err(PICTURE_PATH.into()),
     }

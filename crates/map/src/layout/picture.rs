@@ -6,21 +6,44 @@ use super::*;
 /// names another file).
 pub const MAX_PICTURE_SOURCE: usize = 4096;
 
-/// Whether a picture keeps `path` as its file: when it isn't blank, holds no `://` (an address,
-/// which could carry a login), no control character and none of U+202A–U+202E or U+2066–U+2069
-/// (which turn the direction of text), and is at most [`MAX_PICTURE_SOURCE`] bytes. A kept path is
-/// kept exactly as given, neither trimmed nor resolved. A name holding a colon (`a:b.png`) is kept.
+/// Whether a picture keeps `path` as its file: when it names a file ([`picture_file_name`]; a path
+/// ending in a folder doesn't), isn't an address ([`picture_path_is_address`]; one could carry a
+/// login), holds no character [`rustgis_data::io::dbf_notice_char`] flattens in a notice (a control
+/// character, U+2028 or U+2029, which break a line, or U+061C, U+200E, U+200F, U+202A–U+202E or
+/// U+2066–U+2069, which turn the direction of text), and is at most [`MAX_PICTURE_SOURCE`] bytes.
+/// Zero-width characters (U+200B–U+200D) and U+FEFF are kept: they are part of real file names,
+/// and none of them breaks a line or reorders text. A kept path is kept exactly as given, neither
+/// trimmed nor resolved. A name holding a colon (`a:b.png`) is kept.
 pub fn picture_source_kept(path: &str) -> bool {
-    !path.trim().is_empty()
-        && path.len() <= MAX_PICTURE_SOURCE
-        && !path.contains("://")
-        && !path.chars().any(|c| c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+    path.len() <= MAX_PICTURE_SOURCE
+        && picture_file_name(path).is_some()
+        && !picture_path_is_address(path)
+        && path.chars().all(|c| rustgis_data::io::dbf_notice_char(c) == c)
 }
 
-/// The name a picture shows of its file `source`: its last part after `/` or `\` that isn't blank,
-/// trimmed; none when every part is blank. The folders are never shown.
+/// Whether `path` reads as an address, not a file: it holds `://` anywhere, or begins (after
+/// leading blanks) with a scheme of two or more characters (a letter, then letters, digits, `+`,
+/// `-` or `.`), a colon and a `/` or `\`. One letter is a drive (`C:\a.png`), and a name with a
+/// colon and no separator after it (`a:b.png`) is a file. A relative path whose first folder
+/// ends in a colon reads as an address: give it as `./folder:/a.png`. `mailto:a@b`,
+/// `data:image/png;base64,…` and `user:pw@host:/a.png` are left as paths: no rule tells them from
+/// a file name holding a colon, and none opens as a file unless it is one.
+pub fn picture_path_is_address(path: &str) -> bool {
+    if path.contains("://") {
+        return true;
+    }
+    let Some((scheme, rest)) = path.trim_start().split_once(':') else { return false };
+    let mut chars = scheme.chars();
+    scheme.len() >= 2
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && rest.starts_with(['/', '\\'])
+}
+
+/// The name a picture shows of its file `source`: its last part after `/` or `\`, trimmed; none
+/// when that is blank, `.` or `..` (the path ends in a folder). The folders are never shown.
 pub fn picture_file_name(source: &str) -> Option<&str> {
-    source.rsplit(['/', '\\']).map(str::trim).find(|part| !part.is_empty())
+    source.rsplit(['/', '\\']).next().map(str::trim).filter(|n| !matches!(*n, "" | "." | ".."))
 }
 
 /// A picture's file as a file holds it: text as it is (whether it is kept is for `Layout::clamp`),
@@ -70,43 +93,115 @@ mod tests {
         assert_eq!(serde_json::to_string(&k).unwrap(), with);
     }
 
-    /// What of a path is kept: not blank, not an address, no control or direction-override
-    /// characters, at most MAX_PICTURE_SOURCE bytes; a POSIX name with a colon is kept.
+    /// The paths a picture keeps as its file: each with a file name; a POSIX name with a colon and
+    /// a zero-width character or byte-order mark are kept; a blank, an address, a folder, a control
+    /// or direction character, or more than MAX_PICTURE_SOURCE bytes isn't.
     #[test]
     fn a_pictures_file_is_kept_only_when_it_is_a_plain_path() {
-        for kept in ["/data/logos/north.png", r"\\server\share\logo.jpg", "logo.png", "a:b.png", " spaced .png", "logo@2x.png"] {
-            assert!(picture_source_kept(kept), "{kept}");
+        let kept = [
+            "/data/logos/north.png",
+            r"\\server\share\logo.jpg",
+            "logo.png",
+            "a:b.png",
+            " spaced .png",
+            "logo@2x.png",
+            "\u{fc}.png",
+            "a\u{200D}b.png",
+            "a\u{200C}b.png",
+            "a\u{200B}b.png",
+            "\u{FEFF}logo.png",
+        ];
+        for path in kept.into_iter().chain(NAMED.iter().map(|(path, _)| *path)) {
+            assert!(picture_source_kept(path), "{path:?}");
         }
         let long = format!("/{}", "d".repeat(MAX_PICTURE_SOURCE));
-        for not in [
-            "",
-            "   ",
+        let not = [
             "https://user:secret@example.invalid/logo.png",
             "file:///data/x.png",
             "a\u{7}b.png",
             "a\nb.png",
             "x\u{202E}gnp.png",
+            "a\u{061C}b.png",
+            "a\u{200E}b.png",
+            "a\u{200F}b.png",
+            "logo\u{2028}b.png",
+            "logo\u{2029}b.png",
+            "a\u{2066}b.png",
             long.as_str(),
-        ] {
-            assert!(!picture_source_kept(not), "{not:?}");
+        ];
+        for path in not.into_iter().chain(UNNAMED).chain(ADDRESSES) {
+            assert!(!picture_source_kept(path), "{path:?}");
         }
         assert!(picture_source_kept(&format!("/{}", "d".repeat(MAX_PICTURE_SOURCE - 1))));
     }
 
-    /// The name a picture shows of its file: the last part, never the folders.
+    /// Paths, and the name a picture shows of each.
+    const NAMED: [(&str, &str); 9] = [
+        ("/data/logos/north.png", "north.png"),
+        (r"C:\maps\inset.png", "inset.png"),
+        (r"\\server\share\logo.jpg", "logo.jpg"),
+        ("logo.png", "logo.png"),
+        ("  /x/ name.png ", "name.png"),
+        ("a:b.png", "a:b.png"),
+        ("C:inset.png", "C:inset.png"),
+        ("a.png:stream", "a.png:stream"),
+        ("...", "..."),
+    ];
+    /// Paths that end in a folder or in nothing: no name is shown, and none is kept.
+    const UNNAMED: [&str; 10] = ["/home/someone/", r"C:\maps\", "dir/", "///", "", "   ", "/data/logos/..", "x/.", "/x/ ", ".."];
+
+    /// The name a picture shows of its file: the last part, never the folders, and none when the
+    /// last part is blank, `.` or `..`.
     #[test]
     fn picture_file_names_hide_their_folders() {
-        for (source, name) in [
-            ("/data/logos/north.png", Some("north.png")),
-            (r"\\server\share\logo.jpg", Some("logo.jpg")),
-            (r"C:\maps\inset.png", Some("inset.png")),
-            ("logo.png", Some("logo.png")),
-            ("dir/", Some("dir")),
-            ("  /x/ name.png ", Some("name.png")),
-            ("///", None),
-            ("", None),
+        for (source, name) in NAMED {
+            assert_eq!(picture_file_name(source), Some(name), "{source:?}");
+        }
+        for source in UNNAMED {
+            assert_eq!(picture_file_name(source), None, "{source:?}");
+        }
+    }
+
+    /// Paths that read as an address.
+    const ADDRESSES: [&str; 9] = [
+        "https://user:pw@host/a.png",
+        "file:///data/x.png",
+        "/vsicurl/https://host/a.png",
+        r"https:\\user:pw@host\x.png",
+        r"https:\user:pw@host\x",
+        "https:/user:pw@host/x.png",
+        "file:/data/x.png",
+        " s3:/bucket/a.png",
+        "ab:/c.png",
+    ];
+
+    /// An address is `://` anywhere, or a scheme of two or more characters, a colon and a
+    /// separator; a drive, a share, a name with a colon, and the forms no rule can tell from a
+    /// file name, are paths.
+    #[test]
+    fn an_address_is_told_from_a_path() {
+        for path in ADDRESSES {
+            assert!(picture_path_is_address(path), "{path:?}");
+        }
+        for path in [
+            r"C:\a.png",
+            "C:/a.png",
+            r"c:\\maps\\a.png",
+            r"\\server\share\a.png",
+            "//server/share/a.png",
+            r"\\?\C:\a.png",
+            "/data/a:b/c.png",
+            "logos/x:y/a.png",
+            "a:b.png",
+            "ab:c.png",
+            "logo@2x.png",
+            "./folder:/a.png",
+            "mailto:a@b",
+            "data:image/png;base64,AAAA",
+            "user:pw@host:/a.png",
+            "",
         ] {
-            assert_eq!(picture_file_name(source), name, "{source}");
+            assert!(!picture_path_is_address(path), "{path:?}");
         }
     }
 

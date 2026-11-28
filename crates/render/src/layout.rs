@@ -1061,7 +1061,8 @@ pub(crate) fn legend_pin_pages() -> Vec<(Layout, Vec<Map>)> {
     pages
 }
 
-/// A `w` x `h` PNG, each pixel the opaque colour `colours` gives it, as base64.
+/// A `w` x `h` PNG, each pixel the opaque colour `colours` gives it, as base64: made when the pins
+/// run, for a picture whose declared size alone decides what is drawn.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 fn png_b64(w: u32, h: u32, colours: impl Fn(u32, u32) -> [u8; 3]) -> String {
     use base64::Engine as _;
@@ -1074,43 +1075,52 @@ fn png_b64(w: u32, h: u32, colours: impl Fn(u32, u32) -> [u8; 3]) -> String {
     pm.encode_png().map(|png| base64::engine::general_purpose::STANDARD.encode(png)).unwrap_or_default()
 }
 
-/// A 32 x 32 RGB JPEG of a diagonal gradient at quality 80, as base64.
+/// The PNG the picture pins draw, frozen so an encoder's new output can't move a pin: 40 x 20,
+/// its left half (columns 0 to 19) `#1F5C84`, its right half `#E8B04A`, row 10 white; written by
+/// `tiny_skia::Pixmap::encode_png` (8-bit RGBA, opaque) and base64 (standard) once.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-fn jpeg_b64() -> String {
-    use base64::Engine as _;
-    let rgb: Vec<u8> = (0..32u32 * 32).flat_map(|i| [((i % 32 + i / 32) * 4) as u8, 120, (255 - (i % 32 + i / 32) * 4) as u8]).collect();
-    let mut jpeg = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80);
-    match encoder.encode(&rgb, 32, 32, image::ExtendedColorType::Rgb8) {
-        Ok(()) => base64::engine::general_purpose::STANDARD.encode(jpeg),
-        Err(_) => String::new(),
-    }
-}
+pub(crate) const PIN_PNG: &str = concat!(
+    "iVBORw0KGgoAAAANSUhEUgAAACgAAAAUCAYAAAD/Rn+7AAAAWElEQVR4nO3VMQ2AUBAE0WHzfYAoSnAD1khQdUig",
+    "uYQpeAIm2+2Yt6NodK9XZ44gF+SCXJALckEuyAW5IDdVVeuTdBvLfrYG7//qZIJckAtyQS7I5esBbx4rIwruG4R9",
+    "JwAAAABJRU5ErkJggg==",
+);
 
-/// The 40 x 20 PNG the picture pins draw: its left half `#1F5C84`, its right half `#E8B04A`, a
-/// white line one pixel high across the middle (row 10).
+/// The JPEG the picture pins draw, frozen as the PNG is: 32 x 32, sixteen 8 x 8 blocks each of one
+/// colour, block (bx, by) RGB (40 + 60 bx, 40 + 60 by, 200 - 20 (bx + by)); written once by the
+/// `image` crate's `JpegEncoder` at quality 80, which writes it 4:4:4 (every component sampled
+/// 1 x 1). Each block is flat, so it holds only its DC coefficient, and every decoder path (wide
+/// registers or none) decodes it with the same one-coefficient transform and the same colour
+/// conversion: the pinned pixels are the same on every machine, while the page still tests a JPEG
+/// decoded, placed and scaled.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-fn pin_png() -> String {
-    png_b64(40, 20, |x, y| match (x, y) {
-        (_, 10) => [0xFF, 0xFF, 0xFF],
-        (0..20, _) => [0x1F, 0x5C, 0x84],
-        _ => [0xE8, 0xB0, 0x4A],
-    })
-}
+pub(crate) const PIN_JPEG: &str = concat!(
+    "/9j/4AAQSkZJRgABAgAAAQABAAD/wAARCAAgACADAREAAhEBAxEB/9sAQwAGBAUGBQQGBgUGBwcGCAoQCgoJCQoU",
+    "Dg8MEBcUGBgXFBYWGh0lHxobIxwWFiAsICMmJykqKRkfLTAtKDAlKCko/9sAQwEHBwcKCAoTCgoTKBoWGigoKCgo",
+    "KCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo/8QAHwAAAQUBAQEBAQEAAAAAAAAA",
+    "AAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAk",
+    "M2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKT",
+    "lJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QA",
+    "HwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdh",
+    "cRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hp",
+    "anN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk",
+    "5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDyKv1s4DVryT6U1a8g+jNSvIPpTNr6I/nc1a8g+kNSvIPpTVry",
+    "T6Mza+iP54NWvIPpTUryD6M1a8g+lM2voz+eDVryD6Q1K8g+kNWvIPpD/9k=",
+);
 
 /// Pages of 100 x 80 mm, no maps, one picture each (no file to it, as main has none) unless
-/// said: 1, the PNG of [`pin_png`] in (10, 10, 60, 30), a wider box (bars left and right); 2, the
-/// PNG in (10, 10, 20, 60), a taller box (bars above and below); 3, the JPEG of [`jpeg_b64`] in
-/// (10, 10, 40, 40); 4, an empty image in (10, 10, 40, 20), a grey box with "Picture"; 5, base64
-/// that isn't an image in (10, 10, 40, 20); 6, a 30000 x 1 PNG (it declares more than 20000 pixels
-/// a side) in (10, 10, 40, 20), a grey box; 7, an empty image in a box smaller than its word, (10,
-/// 10, 6, 4); 8, the PNG in (10, 10, 60, 30) on a background (fill `#FFF3D6`, outline `#222222`
-/// 1 pt wide, padding 2 mm); 9, a hidden picture with an empty image at (10, 10, 40, 20) and the
-/// PNG visible at (55, 10, 40, 20); 10, the PNG in a box across the page's right edge, (80, 10,
-/// 40, 20). Pictures have no turn of their own.
+/// said: 1, [`PIN_PNG`] in (10, 10, 60, 30), a wider box (bars left and right); 2, the PNG in (10,
+/// 10, 20, 60), a taller box (bars above and below); 3, [`PIN_JPEG`] in (10, 10, 40, 40); 4, an
+/// empty image in (10, 10, 40, 20), a grey box with "Picture"; 5, base64 that isn't an image in
+/// (10, 10, 40, 20); 6, a 30000 x 1 PNG (it declares more than 20000 pixels a side) in (10, 10,
+/// 40, 20), a grey box; 7, an empty image in a box smaller than its word, (10, 10, 6, 4); 8, the
+/// PNG in (10, 10, 60, 30) on a background (fill `#FFF3D6`, outline `#222222` 1 pt wide, padding
+/// 2 mm); 9, a hidden picture with an empty image at (10, 10, 40, 20) and the PNG visible at (55,
+/// 10, 40, 20); 10, the PNG in a box across the page's right edge, (80, 10, 40, 20); 11, the PNG
+/// in a box about two pixels by one at 96 dpi, (10, 10, 0.6, 0.3). Pictures have no turn of their
+/// own.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn picture_pin_pages() -> Vec<(Layout, Vec<Map>)> {
-    let (png, jpeg) = (pin_png(), jpeg_b64());
+    let (png, jpeg) = (PIN_PNG, PIN_JPEG);
     let huge = png_b64(30_000, 1, |_, _| [0x1F, 0x5C, 0x84]);
     let page = |pictures: &[(&str, (f64, f64, f64, f64))]| {
         let mut l = Layout::new("Pictures", 100.0, 80.0);
@@ -1120,7 +1130,7 @@ pub(crate) fn picture_pin_pages() -> Vec<(Layout, Vec<Map>)> {
         l
     };
     let (wide, small) = ((10.0, 10.0, 60.0, 30.0), (10.0, 10.0, 40.0, 20.0));
-    let mut backed = page(&[(&png, wide)]);
+    let mut backed = page(&[(png, wide)]);
     if let Some(e) = backed.elements.first_mut() {
         e.background = Some(rustgis_map::layout::Background {
             outline: Rgba::rgb(0x22, 0x22, 0x22),
@@ -1129,21 +1139,22 @@ pub(crate) fn picture_pin_pages() -> Vec<(Layout, Vec<Map>)> {
             ..rustgis_map::layout::Background::filled(Rgba::rgb(0xFF, 0xF3, 0xD6))
         });
     }
-    let mut hidden = page(&[("", small), (&png, (55.0, 10.0, 40.0, 20.0))]);
+    let mut hidden = page(&[("", small), (png, (55.0, 10.0, 40.0, 20.0))]);
     if let Some(e) = hidden.elements.first_mut() {
         e.visible = false;
     }
     [
-        page(&[(&png, wide)]),
-        page(&[(&png, (10.0, 10.0, 20.0, 60.0))]),
-        page(&[(&jpeg, (10.0, 10.0, 40.0, 40.0))]),
+        page(&[(png, wide)]),
+        page(&[(png, (10.0, 10.0, 20.0, 60.0))]),
+        page(&[(jpeg, (10.0, 10.0, 40.0, 40.0))]),
         page(&[("", small)]),
         page(&[("bm90IGFuIGltYWdl", small)]),
         page(&[(&huge, small)]),
         page(&[("", (10.0, 10.0, 6.0, 4.0))]),
         backed,
         hidden,
-        page(&[(&png, (80.0, 10.0, 40.0, 20.0))]),
+        page(&[(png, (80.0, 10.0, 40.0, 20.0))]),
+        page(&[(png, (10.0, 10.0, 0.6, 0.3))]),
     ]
     .into_iter()
     .map(|l| (l, Vec::new()))

@@ -5847,13 +5847,13 @@ fn legends_draw_as_before() {
 
 /// How [`pictures_draw_as_before`]'s pages drew before pictures remembered their file, in the
 /// built-in face, page by page: each page of [`crate::layout::picture_pin_pages`] at 96 dpi, pages
-/// 1 and 4 at 300 dpi after it.
+/// 1 and 4 at 300 dpi after it; then a map graphic's picture twice.
 #[cfg(not(target_arch = "wasm32"))]
-const PINNED_PICTURE_PIXELS: [u64; 12] = [
+const PINNED_PICTURE_PIXELS: [u64; 15] = [
     0x9fa9_ca57_1c69_af27, // 1: the PNG in a wider box, 96 dpi
     0x5752_b48f_072b_54d4, // 1: 300 dpi
     0x7b3e_df0e_9fd1_f709, // 2: the PNG in a taller box
-    0x49d8_734d_a88a_2ae0, // 3: the JPEG
+    0x2def_df1a_abf3_c4ac, // 3: the JPEG
     0x3440_95a3_d3dc_fb42, // 4: an empty image, a grey box with its word, 96 dpi
     0xb771_eb09_bba9_f366, // 4: 300 dpi
     0x3440_95a3_d3dc_fb42, // 5: not an image (page 4's: the same grey box in the same box)
@@ -5862,13 +5862,18 @@ const PINNED_PICTURE_PIXELS: [u64; 12] = [
     0xe553_615c_19b6_2150, // 8: the PNG on a background
     0xfa6f_1910_01a5_a96b, // 9: a hidden empty picture beside the PNG
     0x6af5_c5c4_f5ee_41fa, // 10: the PNG across the page's right edge
+    0x418c_7184_49ad_1074, // 11: the PNG in a box about two pixels by one
+    0xebae_b1dc_c19e_9c2a, // a map graphic's PNG
+    0x6275_1960_a4b9_de0d, // a map graphic's JPEG at half opacity
 ];
 
 /// A picture draws exactly as main drew it, page by page ([`crate::layout::picture_pin_pages`]):
 /// every page at 96 dpi, and pages 1 (a PNG in a wider box) and 4 (an empty image's grey box and
 /// its word) at 300 dpi too, which holds the scaling of the image and of the grey box's outline and
-/// word with the resolution: twelve drawings. In a process of its own, told to use the built-in
-/// face before any text.
+/// word with the resolution: thirteen drawings. Then a map graphic's picture as a map draws it
+/// (`picture::draw`, which keeps decoded pictures as the layout's will): the PNG stretched over 60
+/// x 30 pixels, and the JPEG at half opacity over 20 x 40. In a process of its own, told to use the
+/// built-in face before any text.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn pictures_draw_as_before() {
@@ -5897,6 +5902,18 @@ fn pictures_draw_as_before() {
             let pm = render(&l, &mut maps, *dpi, &info).unwrap();
             drawn.push((format!("page {page} at {dpi} dpi"), fnv(std::slice::from_ref(&pm))));
         }
+    }
+    for (name, image, (w, h), opacity) in [
+        ("a map graphic's PNG", crate::layout::PIN_PNG, (60.0, 30.0), 1.0),
+        ("a map graphic's JPEG at half opacity", crate::layout::PIN_JPEG, (20.0, 40.0), 0.5),
+    ] {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let mut ds = Dataset::new("Graphics", GeometryType::Point, vec![Field::new("image", FieldType::Text)]);
+        ds.push(None, vec![Value::Text(image.into())]);
+        let mut pm = Pixmap::new(80, 50).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        crate::canvas::with_canvas(&mut pm, |c| crate::picture::draw(c, &ds, 0, (10.0, 5.0, 10.0 + w, 5.0 + h), opacity));
+        drawn.push((name.to_string(), fnv(std::slice::from_ref(&pm))));
     }
     let wrong = crate::layout::pin_mismatches("drawing", &drawn, &PINNED_PICTURE_PIXELS);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

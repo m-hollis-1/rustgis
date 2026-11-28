@@ -943,10 +943,10 @@ mod tests {
     /// pictures remembered their file, in the built-in face: each page of
     /// [`crate::layout::picture_pin_pages`] in turn.
     #[cfg(not(target_arch = "wasm32"))]
-    const PINNED_PICTURE_SVG: [u64; 10] = [
+    const PINNED_PICTURE_SVG: [u64; 11] = [
         0x4942_1842_02a6_e13c, // 1: the PNG in a wider box
         0xa7c0_17e7_a596_aa3d, // 2: the PNG in a taller box
-        0x485b_5dbb_83f7_a658, // 3: the JPEG
+        0x41f7_fd60_cf87_2ee9, // 3: the JPEG
         0xfc56_9f71_2ee2_878b, // 4: an empty image, a grey box with its word
         0xfc56_9f71_2ee2_878b, // 5: not an image (page 4's: the same grey box in the same box)
         0xfc56_9f71_2ee2_878b, // 6: declared too large (page 4's, as page 5)
@@ -954,12 +954,13 @@ mod tests {
         0xc1f2_7486_0200_c97e, // 8: the PNG on a background
         0x067f_181a_d41a_c8ad, // 9: a hidden empty picture beside the PNG
         0xf235_0cfd_309c_1f51, // 10: the PNG across the page's right edge
+        0x104a_db18_31a6_159a, // 11: the PNG in a box about two pixels by one
     ];
     #[cfg(not(target_arch = "wasm32"))]
-    const PINNED_PICTURE_PDF: [u64; 10] = [
+    const PINNED_PICTURE_PDF: [u64; 11] = [
         0x200d_c9c7_cd54_9cbd, // 1: the PNG in a wider box
         0xe045_9691_934f_1fe9, // 2: the PNG in a taller box
-        0xeed1_410f_5a3c_0369, // 3: the JPEG
+        0xdcea_057d_62df_50cf, // 3: the JPEG
         0x0eb3_c651_f3e1_54ba, // 4: an empty image, a grey box with its word
         0x0eb3_c651_f3e1_54ba, // 5: not an image (page 4's: the same grey box in the same box)
         0x0eb3_c651_f3e1_54ba, // 6: declared too large (page 4's, as page 5)
@@ -967,11 +968,12 @@ mod tests {
         0x1879_7c0e_152d_9db0, // 8: the PNG on a background
         0x043b_262a_8f1a_11a8, // 9: a hidden empty picture beside the PNG
         0xf03a_ae65_baa2_25d1, // 10: the PNG across the page's right edge
+        0x31f9_97d3_9884_916c, // 11: the PNG in a box about two pixels by one
     ];
 
     /// A picture's SVG (at 72 dpi, its pictures drawn at that resolution) and vector PDF (at 150
-    /// dpi) are byte for byte main's, page by page: ten pages each. In a process of its own, told
-    /// to use the built-in face before any text.
+    /// dpi) are byte for byte main's, page by page: eleven pages each. In a process of its own,
+    /// told to use the built-in face before any text.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn pictures_export_as_before() {

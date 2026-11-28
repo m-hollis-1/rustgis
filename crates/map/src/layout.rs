@@ -664,7 +664,8 @@ impl Layout {
                     *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
                 }
                 ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
-                // A picture's file `picture_source_kept` doesn't keep (only a hand-edited one) is dropped.
+                // A picture's file `picture_source_kept` doesn't keep (only a hand-edited one) is
+                // dropped.
                 ElementKind::Picture { source, .. } if source.as_deref().is_some_and(|s| !picture_source_kept(s)) => *source = None,
                 _ => {}
             }

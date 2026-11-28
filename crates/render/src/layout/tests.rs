@@ -5871,7 +5871,7 @@ const PINNED_PICTURE_PIXELS: [u64; 15] = [
 /// every page at 96 dpi, and pages 1 (a PNG in a wider box) and 4 (an empty image's grey box and
 /// its word) at 300 dpi too, which holds the scaling of the image and of the grey box's outline and
 /// word with the resolution: thirteen drawings. Then a map graphic's picture as a map draws it
-/// (`picture::draw`, which keeps decoded pictures as the layout's will): the PNG stretched over 60
+/// (`picture::draw`, which keeps decoded pictures as a layout's are): the PNG stretched over 60
 /// x 30 pixels, and the JPEG at half opacity over 20 x 40. In a process of its own, told to use the
 /// built-in face before any text.
 #[cfg(not(target_arch = "wasm32"))]

@@ -44,7 +44,8 @@ pub fn layout_bytes_with(
 /// Layout `li`'s current page as a PNG at `dpi`, or only its part in `region` (`[x, y, w, h]` in
 /// millimetres from the page's top left), drawn at that `dpi` rather than cut out of the whole
 /// page: what the assistant's `view_map` shows of a layout. It says what exporting the page says
-/// of it: texts cut off, named fonts still being read, frames drawn without their cast shadows.
+/// of it: texts cut off, named fonts still being read, frames drawn without their cast shadows,
+/// pictures drawn as a grey box.
 pub fn layout_png(s: &mut Session, li: usize, dpi: f64, region: Option<[f64; 4]>) -> Result<Vec<u8>, String> {
     let layout = s.project.layouts.get(li).ok_or("no layout")?.clone();
     if let Some(note) = named_fonts_unread(&layout) {

@@ -227,6 +227,11 @@ pub enum ElementKind {
     Picture {
         /// Base64 PNG or JPEG.
         image: String,
+        /// The file it was read from, as the command was given it, when [`picture_source_kept`]
+        /// keeps it: a picture whose image is missing names it, and can be read from it again.
+        /// Left out when none, so layouts saved before keep their bytes.
+        #[serde(default, deserialize_with = "de_picture_source", skip_serializing_if = "picture_source_unkept")]
+        source: Option<String>,
     },
     /// The attribute table of a layer in a frame's map.
     Table {

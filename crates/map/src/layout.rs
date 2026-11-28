@@ -22,6 +22,7 @@ mod grid;
 mod legend;
 mod lines;
 mod north;
+mod picture;
 mod scale_bar;
 mod section;
 mod stats;
@@ -35,6 +36,7 @@ pub use grid::*;
 pub use legend::*;
 pub use lines::*;
 pub use north::*;
+pub use picture::*;
 pub use scale_bar::*;
 pub use section::*;
 pub use stats::*;
@@ -494,7 +496,7 @@ impl Layout {
             let mut before = Element {
                 name: e.name.clone(),
                 kind: match &e.kind {
-                    ElementKind::Picture { .. } => ElementKind::Picture { image: String::new() },
+                    ElementKind::Picture { source, .. } => ElementKind::Picture { image: String::new(), source: source.clone() },
                     kind => kind.clone(),
                 },
                 ..*e
@@ -662,12 +664,17 @@ impl Layout {
                     *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
                 }
                 ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
+                // A picture's file `picture_source_kept` doesn't keep (only a hand-edited one) is dropped.
+                ElementKind::Picture { source, .. } if source.as_deref().is_some_and(|s| !picture_source_kept(s)) => *source = None,
                 _ => {}
             }
             // A map frame draws its map and its paper itself: a background on one (a hand-edited
             // file) is dropped.
             e.background = e.background.filter(|_| e.kind.takes_background()).map(Background::clamped);
-            let kind_changed = !matches!(e.kind, ElementKind::Picture { .. }) && e.kind != before.kind;
+            let kind_changed = match (&e.kind, &before.kind) {
+                (ElementKind::Picture { source, .. }, ElementKind::Picture { source: was, .. }) => source != was,
+                (kind, was) => kind != was,
+            };
             changed.push((
                 kind_changed
                     || e.background != before.background

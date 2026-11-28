@@ -268,7 +268,7 @@ fn pictures_save_and_say_as_before() {
         ("a path on a rectangle", rectangle("path", json!(at("missing.png"))), "added a rectangle"),
     ];
     let which = |s: &Session, id: &Value| match s.project.layouts[li].element(id.as_u64().unwrap() as u32).map(|e| &e.kind) {
-        Some(rustgis_map::layout::ElementKind::Picture { image }) => {
+        Some(rustgis_map::layout::ElementKind::Picture { image, .. }) => {
             format!("a picture of {}", images.iter().find(|(i, _)| *i == image.as_str()).map_or("another image", |(_, n)| n))
         }
         Some(k) => format!("a {}", k.code()),

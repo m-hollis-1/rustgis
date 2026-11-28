@@ -5896,7 +5896,7 @@ fn pictures_draw_as_before() {
         let draws = l
             .elements
             .iter()
-            .any(|e| e.visible && matches!(&e.kind, ElementKind::Picture { image } if crate::picture::decode(image).is_some()));
+            .any(|e| e.visible && matches!(&e.kind, ElementKind::Picture { image, .. } if crate::picture::decode(image).is_some()));
         assert_eq!(draws, !(4..=7).contains(&page), "page {page}");
         for dpi in if page == 1 || page == 4 { &[96.0, 300.0][..] } else { &[96.0][..] } {
             let pm = render(&l, &mut maps, *dpi, &info).unwrap();

@@ -592,7 +592,7 @@ mod tests {
     #[test]
     fn cropped_images_use_their_actual_pixel_bounds() {
         let (mut layout, mut maps, _) = page();
-        let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new() });
+        let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new(), source: None });
         let info = PageInfo::default();
         let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, (&info, &Default::default()), &mut None).unwrap().unwrap();
         let [x, y, w, h] = bounds;

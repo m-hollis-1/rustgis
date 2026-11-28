@@ -629,7 +629,7 @@ fn draw_page(
                     });
                 }
             }
-            ElementKind::Picture { image } => {
+            ElementKind::Picture { image, .. } => {
                 if let Some(img) = crate::picture::decode(image) {
                     let (iw, ih) = (img.width() as f32, img.height() as f32);
                     let s = (ew / iw).min(eh / ih);
@@ -1125,7 +1125,7 @@ pub(crate) fn picture_pin_pages() -> Vec<(Layout, Vec<Map>)> {
     let page = |pictures: &[(&str, (f64, f64, f64, f64))]| {
         let mut l = Layout::new("Pictures", 100.0, 80.0);
         for (image, at) in pictures {
-            l.add("Picture", *at, ElementKind::Picture { image: (*image).to_string() });
+            l.add("Picture", *at, ElementKind::Picture { image: (*image).to_string(), source: None });
         }
         l
     };

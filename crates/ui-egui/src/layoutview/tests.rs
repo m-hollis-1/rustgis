@@ -136,7 +136,7 @@ fn ink_reads_each_shape_as_drawn() {
 #[test]
 fn ink_reads_no_map_or_picture() {
     let picture = |l: &mut Layout| {
-        l.add("Picture", (0.0, 0.0, 100.0, 100.0), ElementKind::Picture { image: String::new() });
+        l.add("Picture", (0.0, 0.0, 100.0, 100.0), ElementKind::Picture { image: String::new(), source: None });
     };
     assert_eq!(inked(PAGE, None, picture, nothing), INK);
     assert_eq!(inked(NAVY, None, picture, nothing), PAGE);

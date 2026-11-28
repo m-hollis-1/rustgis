@@ -441,9 +441,11 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
             };
             (if kind == "text" { "Text" } else { "Dynamic Text" }, place(p, l, (15.0, 12.0, 120.0, (size * 0.5).max(8.0)))?, k)
         }
-        "picture" => {
-            ("Picture", place(p, l, (pw - 60.0, ph - 50.0, 45.0, 35.0))?, ElementKind::Picture { image: image.unwrap_or_default() })
-        }
+        "picture" => (
+            "Picture",
+            place(p, l, (pw - 60.0, ph - 50.0, 45.0, 35.0))?,
+            ElementKind::Picture { image: image.unwrap_or_default(), source: None },
+        ),
         "table" => {
             let frame = frame_of(l, p)?;
             let layer = frame_layer_name(s, l, frame, p)?;

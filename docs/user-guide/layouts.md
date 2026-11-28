@@ -649,7 +649,22 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   a setting put back to its default is no longer saved. A project that uses them can't be opened
   by an older RustGIS, and a layout file (`.rgislayout`) with such a text lists them in its
   header, so an older RustGIS refuses it as well.
-  **Picture** places a PNG or JPEG.
+  **Picture** places a PNG or JPEG. A picture added from a file remembers the file. Its image is
+  kept in the project, so the page doesn't need the file; but a picture that has no image (a
+  layout another program wrote without one, say) is drawn as a grey box with its file's name in
+  it, and its file can be read again: select it and use **Choose File…** in the **Format** pane,
+  which shows the file's name under **File** (the whole path when you hold the pointer over it).
+  Choosing a file again also brings a picture up to date when its file has changed. Only the
+  file's name is ever drawn or said, never its folders. A picture that has no image or one that
+  can't be drawn is drawn as a grey box, and the layout view and every export (PNG, PDF, SVG,
+  reports, and the Assistant's view of the layout) say so, naming it. A picture is never read from
+  its file by itself: not when a project or layout opens, nor when it is exported. Scripts give
+  `layout.update` a picture's `"path"` to read it again (a missing file, one over 16 MB, not a PNG
+  or JPEG, or one that can't be drawn is refused and the picture left as it was) or its `"image"`
+  (its file is then no longer remembered); `null` leaves each as it is. Each change is one undo
+  step. A project with a picture that remembers its file can't be opened by an older RustGIS, and
+  a layout file with one lists it in its header. In the browser, which has no file paths, a
+  picture is added from the file's contents and doesn't remember the file.
 - **Map Series**: one page per feature of an index layer; see [Map series](#map-series) for setup,
   page names, scales and a locator.
 - Click an element to select it, drag to move, drag its handles to resize, and edit it in the

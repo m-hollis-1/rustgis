@@ -19,10 +19,11 @@ use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 /// Pictures are drawn from at most this many pixels per side (bigger ones are scaled down).
 const MAX_SIDE: u32 = 4096;
 /// Pictures declaring more pixels per side than this aren't decoded at all.
-const MAX_DECLARED: u32 = 20_000;
+pub(crate) const MAX_DECLARED: u32 = 20_000;
 /// Most memory a picture's decoder may allocate.
 const MAX_ALLOC: u64 = 512 << 20;
-/// Decoded pictures kept between frames, and the most pixel memory they may hold together.
+/// Decoded pictures kept between frames, and the most memory they may hold together (their pixels
+/// and the base64 each keeps).
 const CACHE: usize = 32;
 const CACHE_BYTES: usize = 256 << 20;
 /// Picture markers are drawn from at most this many pixels per side: an 80 pt marker printed at
@@ -160,6 +161,9 @@ struct Cache {
 
 thread_local! {
     static DECODED: RefCell<Cache> = RefCell::new(Cache::default());
+    /// The pictures [`decoded`] has decoded on this thread ([`decodes`]).
+    #[cfg(test)]
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The picture markers this thread has met, each with its image in the [`Store`] or why it is
     /// drawn as a circle, so a frame finds it with no lock. Never emptied: only pictures a run keeps
     /// ([`rustgis_map::symbology::MAX_PICTURES`]) are met, and each entry shares the store's image.
@@ -483,25 +487,47 @@ pub fn draw(pm: &mut Canvas, ds: &Dataset, row: usize, (x0, y0, x1, y1): (f32, f
     if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 || w > 1e5 || h > 1e5 {
         return;
     }
+    let Some(img) = decoded(b64) else { return };
+    let t = Transform::from_row(w / img.width() as f32, 0.0, 0.0, h / img.height() as f32, x0.min(x1), y0.min(y1));
+    let paint = PixmapPaint { opacity, quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
+    pm.draw_shared(&img, None, &paint, t);
+}
+
+/// Base64 PNG or JPEG bytes decoded ([`decode`]), from this thread's cache of decoded pictures:
+/// decoded on the first look, and again only after the cache let it go. The cache keeps each
+/// picture's base64 with its pixels, or with none for one that doesn't decode (so that one isn't
+/// tried again either), at most [`CACHE`] of them and, oldest let go first, at most about
+/// [`CACHE_BYTES`] held ([`held`]: the base64 kept counts with the pixels). Graphics pictures
+/// and layout pictures share it.
+pub(crate) fn decoded(b64: &str) -> Option<Arc<Pixmap>> {
     let key = key(b64);
     DECODED.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.images.get(&key).is_none_or(|(src, _)| src.as_str() != b64.as_str()) {
+        if cache.images.get(&key).is_none_or(|(src, _)| src.as_str() != b64) {
             // Evict the oldest pictures (not all of them) to stay within the count and memory budget.
-            let held = |c: &Cache| c.images.values().filter_map(|(_, p)| p.as_ref()).map(|p| p.data().len()).sum::<usize>();
             while cache.images.len() >= CACHE || (!cache.images.is_empty() && held(&cache) > CACHE_BYTES) {
                 let Some(old) = cache.order.pop_front() else { break };
                 cache.images.remove(&old);
             }
-            if cache.images.insert(key, (b64.clone(), decode(b64).map(Arc::new))).is_none() {
+            #[cfg(test)]
+            DECODES.with(|n| n.set(n.get() + 1));
+            if cache.images.insert(key, (b64.to_string(), decode(b64).map(Arc::new))).is_none() {
                 cache.order.push_back(key);
             }
         }
-        let Some((_, Some(img))) = cache.images.get(&key) else { return };
-        let t = Transform::from_row(w / img.width() as f32, 0.0, 0.0, h / img.height() as f32, x0.min(x1), y0.min(y1));
-        let paint = PixmapPaint { opacity, quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
-        pm.draw_shared(img, None, &paint, t);
-    });
+        cache.images.get(&key).and_then(|(_, img)| img.clone())
+    })
+}
+
+/// The bytes `cache` holds: each picture's pixels and the base64 it keeps.
+fn held(cache: &Cache) -> usize {
+    cache.images.values().map(|(b64, img)| b64.len() + img.as_ref().map_or(0, |p| p.data().len())).sum()
+}
+
+/// How many pictures [`decoded`] has decoded on this thread.
+#[cfg(test)]
+pub(crate) fn decodes() -> usize {
+    DECODES.with(std::cell::Cell::get)
 }
 
 /// Runs `f` on picture marker `p`'s decoded image, its height for its width and, with `pack`, the

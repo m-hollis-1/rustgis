@@ -28,6 +28,7 @@ mod grid;
 mod legend;
 mod losses;
 mod north;
+mod picture;
 mod scale_bar;
 mod section;
 mod swatch;
@@ -43,6 +44,7 @@ pub use grid::*;
 pub use legend::*;
 pub use losses::*;
 use north::*;
+pub use picture::*;
 pub use scale_bar::*;
 pub use section::*;
 use swatch::*;
@@ -629,8 +631,8 @@ fn draw_page(
                     });
                 }
             }
-            ElementKind::Picture { image, .. } => {
-                if let Some(img) = crate::picture::decode(image) {
+            ElementKind::Picture { image, source } => match crate::picture::decoded(image) {
+                Some(img) => {
                     let (iw, ih) = (img.width() as f32, img.height() as f32);
                     let s = (ew / iw).min(eh / ih);
                     let (dw, dh) = (iw * s, ih * s);
@@ -638,15 +640,14 @@ fn draw_page(
                     pm.draw_pixmap(
                         0,
                         0,
-                        img.as_ref(),
+                        img.as_ref().as_ref(),
                         &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() },
                         t,
                         None,
                     );
-                } else {
-                    placeholder(&mut pm, r, "Picture", ppp);
                 }
-            }
+                None => draw_picture_box(&mut pm, r, source.as_deref(), ppp),
+            },
             ElementKind::Table { frame: f, layer, rows, color } => {
                 let ds = frame(*f).and_then(|fr| maps.get(fr.1)).and_then(|m| m.layer_by_name(layer)).map(|l| &l.dataset);
                 match ds {

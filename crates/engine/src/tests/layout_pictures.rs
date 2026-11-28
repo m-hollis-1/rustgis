@@ -393,7 +393,8 @@ fn a_picture_is_read_again_from_a_file_and_relinked() {
     assert_eq!(picture_in(&s, "L", &id), (third_b64.clone(), None));
     let (before, depth) = (serde_json::to_value(&s.project).unwrap(), s.undo_depth());
     s.run("layout.update", &json!({"element": id, "path": null, "image": null})).unwrap();
-    assert_eq!((serde_json::to_value(&s.project).unwrap(), s.undo_depth()), (before, depth), "null changes nothing");
+    // Null changes nothing, and leaves its Undo step as every update does.
+    assert_eq!((serde_json::to_value(&s.project).unwrap(), s.undo_depth()), (before, depth + 1), "null changes nothing");
     assert_eq!(picture_in(&s, "L", &id), (third_b64, None));
     // Any other update keeps its Undo step, as it always has, even one that changes nothing.
     let x = |s: &Session| s.project.layouts.iter().find(|l| l.name == "L").unwrap().element(id.as_u64().unwrap() as u32).unwrap().x;
@@ -486,8 +487,11 @@ fn a_bad_file_is_refused_and_the_picture_left_as_it_was() {
         assert_eq!(e, "only pictures take an image or a path");
         assert!(state(&s) == before, "{key} on a text changed it");
     }
+    let depth = s.undo_depth();
     s.run("layout.update", &json!({"element": text, "path": null, "image": null})).unwrap();
-    assert!(state(&s) == before, "null picture keys on a text changed it");
+    let after = state(&s);
+    assert!((&after.0, after.1, &after.2) == (&before.0, before.1, &before.2), "null picture keys on a text changed it");
+    assert_eq!(s.undo_depth(), depth + 1);
     // Locked, it is refused before its file is read.
     s.run("layout.update", &json!({"element": id, "locked": true})).unwrap();
     let before = state(&s);

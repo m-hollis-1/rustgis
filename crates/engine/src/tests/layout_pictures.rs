@@ -231,7 +231,8 @@ fn pictures_save_and_say_as_before() {
     };
     let images =
         [(PIN_PNG, "the PNG"), (PIN_JPEG, "the JPEG"), (huge.as_str(), "the 30000 x 1 PNG"), (damaged.as_str(), "the damaged PNG")];
-    const UNDRAWN: &str = "the picture can't be drawn: its image is damaged or larger than 20000 pixels a side";
+    const UNDRAWN: &str =
+        "the picture can't be drawn: its image is damaged, or too large (over 20000 pixels a side, or over 512 MB once decoded)";
     let rectangle = |key: &str, v: Value| {
         let mut p = json!({"kind": "rectangle", "x": 10, "y": 10, "w": 20, "h": 20});
         p[key] = v;
@@ -436,7 +437,7 @@ fn a_bad_file_is_refused_and_the_picture_left_as_it_was() {
         (picture_in(s, "L", &id), x, serde_json::to_value(&s.project).unwrap(), s.undo_depth(), s.dirty())
     };
     let before = state(&s);
-    let undrawn = "the picture can't be drawn: its image is damaged or larger than 20000 pixels a side";
+    let undrawn = "the picture can't be drawn: its image is damaged, or too large (over 20000 pixels a side, or over 512 MB once decoded)";
     let not_a_path = "path is the path of a PNG or JPEG file";
     for (path, said) in [
         // `read_picture_file`'s own "{path}: …".

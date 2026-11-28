@@ -21,7 +21,7 @@ const MAX_SIDE: u32 = 4096;
 /// Pictures declaring more pixels per side than this aren't decoded at all.
 pub(crate) const MAX_DECLARED: u32 = 20_000;
 /// Most memory a picture's decoder may allocate.
-const MAX_ALLOC: u64 = 512 << 20;
+pub(crate) const MAX_ALLOC: u64 = 512 << 20;
 /// Decoded pictures kept between frames, and the most memory they may hold together (their pixels
 /// and the base64 each keeps).
 const CACHE: usize = 32;

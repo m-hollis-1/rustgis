@@ -417,7 +417,7 @@ pub(crate) fn picture_file(path: &str) -> Result<String, String> {
 }
 
 /// `b64` when it is at most 16 MiB of a PNG or JPEG image.
-fn checked_picture(b64: String) -> Result<String, String> {
+pub(crate) fn checked_picture(b64: String) -> Result<String, String> {
     if b64.len() > MAX_PICTURE / 3 * 4 + 4 {
         return Err("the picture is too large".into());
     }

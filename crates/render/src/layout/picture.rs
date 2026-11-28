@@ -6,6 +6,8 @@ use rustgis_map::layout::{picture_file_name, picture_source_kept};
 
 /// The most pixels a side a layout picture's image may declare and still be drawn.
 pub const PICTURE_MAX_DECLARED: u32 = crate::picture::MAX_DECLARED;
+/// The most memory, in MiB, a layout picture's image may take once decoded and still be drawn.
+pub const PICTURE_MAX_DECODED_MB: u64 = crate::picture::MAX_ALLOC >> 20;
 
 /// Layout pictures named in a notice, before "and N more"; and the characters of a picture's
 /// name or file name a notice shows before cutting it with "…".
@@ -62,7 +64,8 @@ pub(super) fn draw_picture_box(pm: &mut Canvas, r: Rect, source: Option<&str>, p
 pub enum PictureLoss {
     /// Its image is empty.
     NoImage,
-    /// Its image doesn't draw: damaged, or larger than [`PICTURE_MAX_DECLARED`] pixels a side.
+    /// Its image doesn't draw: damaged, or too large (over [`PICTURE_MAX_DECLARED`] pixels a side,
+    /// or over [`PICTURE_MAX_DECODED_MB`] MiB once decoded).
     Undrawable,
 }
 
@@ -100,6 +103,14 @@ fn notice_cut(s: &str) -> String {
     }
 }
 
+/// How a notice says to give a picture its image again: in the browser, which has no file paths,
+/// by its image; elsewhere, from its file.
+const WAY_BACK: &str = if cfg!(target_arch = "wasm32") {
+    "give one its image again with layout.update and \"image\""
+} else {
+    "read one from its file again with layout.update and \"path\" (Choose File… in the Format pane)"
+};
+
 /// What is said of `gaps`: one notice for each [`PictureLoss`] among them, in its order, with the
 /// pictures counted and the first ten named, each with its file's name when it has one.
 pub fn pictures_notices(gaps: &[PictureGap]) -> Vec<String> {
@@ -122,13 +133,13 @@ pub fn pictures_notices(gaps: &[PictureGap]) -> Vec<String> {
             let what = match why {
                 PictureLoss::NoImage => "have no image".to_string(),
                 PictureLoss::Undrawable => {
-                    format!("have an image that can't be drawn (damaged, or larger than {PICTURE_MAX_DECLARED} pixels a side)")
+                    format!(
+                        "have an image that can't be drawn (damaged, or too large: over {PICTURE_MAX_DECLARED} pixels a side \
+                         or over {PICTURE_MAX_DECODED_MB} MB once decoded)"
+                    )
                 }
             };
-            Some(format!(
-                "{n} layout picture(s) {what} and are drawn as a grey box: {named}; read one from its file again with \
-                 layout.update and \"path\" (Choose File… in the Format pane)"
-            ))
+            Some(format!("{n} layout picture(s) {what} and are drawn as a grey box: {named}; {WAY_BACK}"))
         })
         .collect()
 }
@@ -245,7 +256,7 @@ mod tests {
         assert!(said[0].contains("Logo 10 (10, north.png); and 2 more; read one"), "{}", said[0]);
         assert!(!said[0].contains("Logo 11"), "{}", said[0]);
         assert!(said[0].contains("; and 2 more; read one from its file again with layout.update and \"path\""), "{}", said[0]);
-        let undrawable = "1 layout picture(s) have an image that can't be drawn (damaged, or larger than 20000 pixels a side)";
+        let undrawable = "1 layout picture(s) have an image that can't be drawn (damaged, or too large: over 20000 pixels a side or over 512 MB once decoded)";
         assert!(said[1].starts_with(undrawable), "{}", said[1]);
         assert!(said[1].contains("drawn as a grey box: Inset (13); read one"), "{}", said[1]);
         assert!(pictures_notices(&[]).is_empty());

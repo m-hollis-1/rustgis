@@ -15,18 +15,21 @@ pub(in crate::cmd::layout) const PICTURE_ADDRESS: &str = "a picture is read from
 /// Both `image` and `path` given.
 pub(in crate::cmd::layout) const PICTURE_BOTH: &str = "give a picture an image or a path, not both";
 
-/// A picture whose header reads but whose image can't be drawn.
+/// A picture whose header reads but whose image can't be drawn: damaged, declaring too many
+/// pixels a side, or needing more memory once decoded than the decoder may take.
 pub(in crate::cmd::layout) fn picture_undrawn() -> String {
     format!(
-        "the picture can't be drawn: its image is damaged or larger than {} pixels a side",
-        rustgis_render::layout::PICTURE_MAX_DECLARED
+        "the picture can't be drawn: its image is damaged, or too large (over {} pixels a side, or over {} MB once decoded)",
+        rustgis_render::layout::PICTURE_MAX_DECLARED,
+        rustgis_render::layout::PICTURE_MAX_DECODED_MB
     )
 }
 
 /// A picture read from a file whose path isn't kept as its file.
 pub(in crate::cmd::layout) fn picture_unremembered() -> String {
     format!(
-        "the picture is read, but its file isn't remembered: a path with control characters or over {} bytes isn't kept",
+        "the picture is read, but its file isn't remembered: a path with control or direction characters, over {} bytes or \
+         without a file name isn't kept",
         rustgis_map::layout::MAX_PICTURE_SOURCE
     )
 }
@@ -78,7 +81,7 @@ pub(in crate::cmd::layout) fn picture_given(p: &Value) -> Result<Option<GivenPic
     }
     let picture = match (given("image"), picture_path_param(p)?) {
         (Some(Value::String(image)), _) => {
-            GivenPicture { image: crate::cmd::graphics::picture(&json!({"image": image}))?, source: None, unremembered: false }
+            GivenPicture { image: crate::cmd::graphics::checked_picture(image.trim().to_string())?, source: None, unremembered: false }
         }
         (Some(_), _) => return Err(PICTURE_IMAGE.into()),
         (None, Some(path)) => {

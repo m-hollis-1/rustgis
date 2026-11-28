@@ -519,22 +519,42 @@ fn a_bad_file_is_refused_and_the_picture_left_as_it_was() {
 }
 
 /// A path the rule doesn't keep: the picture is read, its file not remembered, and that is said.
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_path_that_is_not_kept_is_read_and_said() {
     let (dir, mut s) = picture_world("a-path-that-is-not-kept-is-read-and-said");
-    let (first, _) = png_file(&dir, "first.png", (40, 20), [0x1F, 0x5C, 0x84]);
-    let (odd, odd_b64) = png_file(&dir, "logo\u{7}.png", (20, 20), [0x22, 0x88, 0x22]);
+    // A direction override is a file name every system allows; a bell, only some.
+    let names: &[&str] = if cfg!(unix) { &["logo\u{202E}.png", "logo\u{7}.png"] } else { &["logo\u{202E}.png"] };
     let unremembered = |s: &Session, mark| s.notices_since(mark).iter().filter(|n| n.text.contains("isn't remembered")).count();
-    let mark = s.notice_mark();
-    let id = s.run("layout.addElement", &json!({"kind": "picture", "path": odd})).unwrap()["element"].clone();
-    assert_eq!(picture_in(&s, "L", &id), (odd_b64.clone(), None));
-    assert_eq!(unremembered(&s, mark), 1);
-    let kept = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].clone();
-    let mark = s.notice_mark();
-    s.run("layout.update", &json!({"element": kept, "path": odd})).unwrap();
-    assert_eq!(picture_in(&s, "L", &kept), (odd_b64, None));
-    assert_eq!(unremembered(&s, mark), 1);
+    for (i, name) in names.iter().enumerate() {
+        let (first, _) = png_file(&dir, &format!("first{i}.png"), (40, 20), [0x1F, 0x5C, 0x84]);
+        let (odd, odd_b64) = png_file(&dir, name, (20, 20), [0x22, 0x88, 0x22]);
+        let mark = s.notice_mark();
+        let id = s.run("layout.addElement", &json!({"kind": "picture", "path": odd})).unwrap()["element"].clone();
+        assert_eq!(picture_in(&s, "L", &id), (odd_b64.clone(), None), "{name:?}");
+        assert_eq!(unremembered(&s, mark), 1, "{name:?}");
+        let kept = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].clone();
+        let mark = s.notice_mark();
+        s.run("layout.update", &json!({"element": kept, "path": odd})).unwrap();
+        assert_eq!(picture_in(&s, "L", &kept), (odd_b64, None), "{name:?}");
+        assert_eq!(unremembered(&s, mark), 1, "{name:?}");
+    }
+}
+
+/// A duplicated picture keeps its file, and a project holding only the copy still requires the
+/// capability.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_duplicated_picture_keeps_its_file() {
+    let (dir, mut s) = picture_world("a-duplicated-picture-keeps-its-file");
+    let (first, first_b64) = png_file(&dir, "first.png", (40, 20), [0x1F, 0x5C, 0x84]);
+    let id = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].clone();
+    let copy = s.run("layout.duplicateElement", &json!({"element": id})).unwrap()["element"].clone();
+    assert_ne!(copy, id);
+    assert_eq!(picture_in(&s, "L", &copy), (first_b64, Some(first)));
+    s.run("layout.removeElement", &json!({"element": id})).unwrap();
+    let requires = serde_json::to_value(&s.project).unwrap()["requires"].clone();
+    assert!(requires.as_array().is_some_and(|r| r.contains(&json!("layout-picture-source"))), "{requires}");
 }
 
 /// A project whose pictures' files are of the wrong kind, blank, an address, too long or with
@@ -660,6 +680,11 @@ fn a_picture_drawn_as_a_grey_box_is_said_by_every_export() {
         );
         assert!(said.iter().all(|n| n.starts_with("The report: ") == *in_report), "{route}: {said:?}");
     }
+    // The Assistant's view of a region holding only "Logo" says it, and only it.
+    let logo = said(&mut s, &|s| drop(crate::cmd::layout::layout_png(s, 0, 36.0, Some([5.0, 5.0, 40.0, 25.0])).unwrap()));
+    assert_eq!(logo.len(), 1, "{logo:?}");
+    assert!(logo[0].starts_with("1 layout picture(s) have no image") && logo[0].contains("Logo ("), "{logo:?}");
+    assert!(!logo[0].contains("Blank") && !logo[0].contains("Broken"), "{logo:?}");
     // The Assistant's view of a region holding only "Fine" says nothing of pictures.
     let fine = said(&mut s, &|s| drop(crate::cmd::layout::layout_png(s, 0, 36.0, Some([145.0, 245.0, 40.0, 25.0])).unwrap()));
     assert!(fine.is_empty(), "{fine:?}");

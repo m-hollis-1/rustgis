@@ -114,8 +114,8 @@ const WAY_BACK: &str = if cfg!(target_arch = "wasm32") {
 };
 
 /// What is said of `gaps`: one notice for each [`PictureLoss`] among them, in its order, with the
-/// pictures counted and the first ten named, each with its layout's name and its file's name when it
-/// has them.
+/// pictures counted and the first ten named, each with its layout's name and its file's name
+/// when it has them.
 pub fn pictures_notices(gaps: &[PictureGap]) -> Vec<String> {
     [PictureLoss::NoImage, PictureLoss::Undrawable]
         .into_iter()

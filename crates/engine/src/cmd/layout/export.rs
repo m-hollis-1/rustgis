@@ -66,6 +66,10 @@ pub fn layout_png(s: &mut Session, li: usize, dpi: f64, region: Option<[f64; 4]>
     if let Some(r) = region {
         gaps.retain(|g, _| layout.element(g.frame).is_some_and(|e| rustgis_render::layout::meets(e, r, 0.0)));
     }
+    let mut grey = rustgis_render::layout::pictures_not_drawn(&layout);
+    if let Some(r) = region {
+        grey.retain(|g| layout.element(g.id).is_some_and(|e| rustgis_render::layout::meets(e, r, 0.0)));
+    }
     let (img, mut unfitted) = rustgis_render::layout::unfitted_legends(|| {
         crate::cmd::share::saying_shadows(s, "The layout", |s| match region {
             Some(r) => rustgis_render::layout::render_region(&layout, &mut s.project.maps, dpi, &info, r),
@@ -83,6 +87,7 @@ pub fn layout_png(s: &mut Session, li: usize, dpi: f64, region: Option<[f64; 4]>
     if let Some(note) = rustgis_render::layout::sections_notice(&gaps, 1) {
         s.warn(note);
     }
+    say_pictures_not_drawn(s, &grey, "");
     img.encode_png().map_err(|e| e.to_string())
 }
 
@@ -231,6 +236,8 @@ pub(in crate::cmd::layout) fn layout_bytes_inner(
     if let Some(note) = rustgis_render::layout::sections_notice(&gaps, pages.len()) {
         s.warn(note);
     }
+    // A series' pages move its frame only: its pictures are the same on every page.
+    say_pictures_not_drawn(s, &rustgis_render::layout::pictures_not_drawn(&saved), "");
     say_unfitted_legends(s, &unfitted);
     pictured_notices(s, &frames_pictured, &pages_pictured);
     georeference_notices(s, &left_out, &by_corners, pages.len());
@@ -455,12 +462,14 @@ pub(in crate::cmd::layout) fn layout_svg(s: &mut Session, li: usize, dpi: f64) -
     let clipped = rustgis_render::layout::clipped_text(layout, &s.project.maps, dpi, &info);
     let note = rustgis_render::layout::clipped_text_notice(layout, &clipped);
     let gaps = rustgis_render::layout::sections_not_drawn(layout, &s.project.maps).into_iter().map(|g| (g, 1)).collect();
+    let grey = rustgis_render::layout::pictures_not_drawn(layout);
     let (drawn, unfitted) =
         rustgis_render::layout::unfitted_legends(|| rustgis_render::svg::layout_svg(layout, &mut s.project.maps, dpi, &info));
     let (text, pictured) = drawn?;
     for note in [note, rustgis_render::layout::sections_notice(&gaps, 1)].into_iter().flatten() {
         s.warn(note);
     }
+    say_pictures_not_drawn(s, &grey, "");
     say_unfitted_legends(s, &unfitted);
     pictured_notices(s, &pictured, &[]);
     Ok(text)

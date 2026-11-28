@@ -43,6 +43,7 @@ use legend::*;
 pub(crate) use legend::{legend_columns_param, legend_fit_param, legend_names_param};
 mod picture;
 pub(crate) use picture::gives_picture;
+pub(in crate::cmd) use picture::say_pictures_not_drawn;
 use picture::*;
 mod page;
 use page::*;

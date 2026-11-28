@@ -31,6 +31,14 @@ pub(in crate::cmd::layout) fn picture_unremembered() -> String {
     )
 }
 
+/// Says each of [`rustgis_render::layout::pictures_notices`] of `gaps`, the pictures an export
+/// draws as a grey box, with `prefix` before it.
+pub(in crate::cmd) fn say_pictures_not_drawn(s: &mut Session, gaps: &[rustgis_render::layout::PictureGap], prefix: &str) {
+    for note in rustgis_render::layout::pictures_notices(gaps) {
+        s.warn(format!("{prefix}{note}"));
+    }
+}
+
 /// A picture's image as a command gives it, and the file it was read from.
 pub(crate) struct GivenPicture {
     /// The image, base64, checked to draw.

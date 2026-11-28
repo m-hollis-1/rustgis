@@ -557,3 +557,123 @@ fn a_project_with_a_damaged_picture_file_opens_and_says_so() {
         assert!(!saved.contains(absent), "{absent} in {saved}");
     }
 }
+
+/// A session holding layout "L": the sample's map in a frame, and the pictures "Logo" (no image,
+/// from `/home/someone/logos/north.png`), "Blank" (no image, no file), "Broken" (an image that
+/// isn't one), "Hidden" (no image, not visible) and "Fine" (a PNG), as an older file holds them.
+#[cfg(not(target_arch = "wasm32"))]
+fn grey_pictures() -> Session {
+    let mut s = super::world();
+    s.run("layout.new", &json!({"name": "L", "page": "a4", "orientation": "portrait", "template": "map"})).unwrap();
+    let mut layout = serde_json::to_value(&s.project.layouts[0]).unwrap();
+    s.project.layouts.clear();
+    let picture = |id: u32, name: &str, x: f64, y: f64, kind: Value, visible: bool| json!({"id": id, "name": name, "x": x, "y": y, "w": 30.0, "h": 15.0, "visible": visible, "kind": {"Picture": kind}});
+    let fine = png_b64(20, 10, |_, _| [0x1F, 0x5C, 0x84]);
+    let elements = layout["elements"].as_array_mut().unwrap();
+    elements.extend([
+        picture(101, "Logo", 10.0, 10.0, json!({"image": "", "source": "/home/someone/logos/north.png"}), true),
+        picture(102, "Blank", 50.0, 10.0, json!({"image": ""}), true),
+        picture(103, "Broken", 90.0, 10.0, json!({"image": "bm90IGFuIGltYWdl"}), true),
+        picture(104, "Hidden", 130.0, 10.0, json!({"image": ""}), false),
+        picture(105, "Fine", 150.0, 250.0, json!({"image": fine}), true),
+    ]);
+    s.run("layout.import", &json!({"text": layout.to_string()})).unwrap();
+    assert_eq!((s.project.layouts.len(), s.project.layouts[0].name.as_str()), (1, "L"));
+    s
+}
+
+/// Pictures drawn as a grey box are said by every export, once a kind, named by their file's name,
+/// never its folders; a hidden one or one that draws isn't; a map series says them once; after a
+/// relink, nothing is said. (A layout whose pictures all draw says nothing new at any export:
+/// `pictures_save_and_say_as_before` pins that.)
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_picture_drawn_as_a_grey_box_is_said_by_every_export() {
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-a-picture-drawn-as-a-grey-box-{}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let at = |file: &str| dir.0.join(file).display().to_string();
+    let mut s = grey_pictures();
+    // The report places the layout on two pages: it is said once all the same.
+    s.run("report.new", &json!({"layer": "Countries", "name": "R", "fields": ["name"], "where": "name LIKE 'F%'"})).unwrap();
+    s.run("report.existingTemplate", &json!({"report": "R", "layout": "L"})).unwrap();
+    s.run("report.existingTemplate", &json!({"report": "R", "layout": "L", "end": true})).unwrap();
+    // What a route says of layout pictures.
+    let said = |s: &mut Session, run: &dyn Fn(&mut Session)| -> Vec<String> {
+        let mark = s.notice_mark();
+        run(s);
+        s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("layout picture(s)")).collect()
+    };
+    let export = |file: &'static str| {
+        let path = at(file);
+        Box::new(move |s: &mut Session| drop(s.run("layout.export", &json!({"path": path, "dpi": 36})).unwrap()))
+            as Box<dyn Fn(&mut Session)>
+    };
+    let report = |file: &'static str| {
+        let path = at(file);
+        Box::new(move |s: &mut Session| drop(s.run("report.export", &json!({"report": "R", "path": path, "dpi": 36})).unwrap()))
+            as Box<dyn Fn(&mut Session)>
+    };
+    let view: Box<dyn Fn(&mut Session)> = Box::new(|s| drop(crate::cmd::layout::layout_png(s, 0, 36.0, None).unwrap()));
+    let routes: Vec<(&str, bool, Box<dyn Fn(&mut Session)>)> = vec![
+        ("layout.export png", false, export("p.png")),
+        ("layout.export pdf", false, export("p.pdf")),
+        ("layout.export svg", false, export("p.svg")),
+        ("the Assistant's view", false, view),
+        ("report.export png", true, report("r.png")),
+        ("report.export pdf", true, report("r.pdf")),
+    ];
+    for (route, in_report, run) in &routes {
+        let said = said(&mut s, run.as_ref());
+        assert_eq!(said.len(), 2, "{route}: {said:?}");
+        let (logo, blank, broken) = if *in_report {
+            ("Logo in layout 'L' (", "Blank in layout 'L' (", "Broken in layout 'L' (")
+        } else {
+            ("Logo (", "Blank (", "Broken (")
+        };
+        assert!(
+            said[0].contains("2 layout picture(s) have no image")
+                && said[0].contains(logo)
+                && said[0].contains("north.png")
+                && said[0].contains(blank),
+            "{route}: {said:?}"
+        );
+        assert!(said[1].contains("1 layout picture(s) have an image that can't be drawn") && said[1].contains(broken), "{route}: {said:?}");
+        assert!(
+            said.iter().all(|n| !n.contains("someone") && !n.contains("logos") && !n.contains("Hidden") && !n.contains("Fine")),
+            "{route}: {said:?}"
+        );
+        assert!(said.iter().all(|n| n.starts_with("The report: ") == *in_report), "{route}: {said:?}");
+    }
+    // The Assistant's view of a region holding only "Fine" says nothing of pictures.
+    let fine = said(&mut s, &|s| drop(crate::cmd::layout::layout_png(s, 0, 36.0, Some([145.0, 245.0, 40.0, 25.0])).unwrap()));
+    assert!(fine.is_empty(), "{fine:?}");
+    // A map series over three countries: the PDF of all its pages says each kind once.
+    let mut series = grey_pictures();
+    for layer in &mut series.map_mut().layers {
+        if layer.name == "Countries" {
+            layer.dataset.features.truncate(3);
+        }
+    }
+    series.run("layout.series", &json!({"layout": "L", "layer": "Countries"})).unwrap();
+    assert_eq!(crate::cmd::layout::series_pages(&series, 0).map(|p| p.len()), Some(3));
+    let pages = said(&mut series, export("series.pdf").as_ref());
+    assert_eq!(pages.len(), 2, "{pages:?}");
+    assert!(pages[0].contains("2 layout picture(s) have no image"), "{pages:?}");
+    assert!(pages[1].contains("1 layout picture(s) have an image that can't be drawn"), "{pages:?}");
+    // Relinked, or removed: no route says anything of pictures.
+    let png = dir.0.join("north.png");
+    std::fs::write(&png, {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(png_b64(20, 10, |_, _| [0xE8, 0xB0, 0x4A])).unwrap()
+    })
+    .unwrap();
+    for id in [101, 103] {
+        s.run("layout.update", &json!({"layout": "L", "element": id, "path": png.display().to_string()})).unwrap();
+    }
+    s.run("layout.removeElement", &json!({"layout": "L", "element": 102})).unwrap();
+    assert!(rustgis_render::layout::pictures_not_drawn(&s.project.layouts[0]).is_empty());
+    for (route, _, run) in &routes {
+        let said = said(&mut s, run.as_ref());
+        assert!(said.is_empty(), "{route}: {said:?}");
+    }
+}

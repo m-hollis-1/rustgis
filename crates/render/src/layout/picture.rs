@@ -74,6 +74,8 @@ pub enum PictureLoss {
 pub struct PictureGap {
     pub id: u32,
     pub name: String,
+    /// The name of the layout it is in, when a notice names it (a report's, which draws several).
+    pub layout: Option<String>,
     /// The name of the file it was read from, when it keeps one; never its folders.
     pub file: Option<String>,
     pub why: PictureLoss,
@@ -89,7 +91,7 @@ pub fn pictures_not_drawn(layout: &Layout) -> Vec<PictureGap> {
         }
         let why = if image.trim().is_empty() { PictureLoss::NoImage } else { PictureLoss::Undrawable };
         let file = e.kind.picture_source().and_then(picture_file_name).map(String::from);
-        Some(PictureGap { id: e.id, name: e.name.clone(), file, why })
+        Some(PictureGap { id: e.id, name: e.name.clone(), layout: None, file, why })
     });
     gaps.collect()
 }
@@ -112,7 +114,8 @@ const WAY_BACK: &str = if cfg!(target_arch = "wasm32") {
 };
 
 /// What is said of `gaps`: one notice for each [`PictureLoss`] among them, in its order, with the
-/// pictures counted and the first ten named, each with its file's name when it has one.
+/// pictures counted and the first ten named, each with its layout's name and its file's name when it
+/// has them.
 pub fn pictures_notices(gaps: &[PictureGap]) -> Vec<String> {
     [PictureLoss::NoImage, PictureLoss::Undrawable]
         .into_iter()
@@ -121,9 +124,15 @@ pub fn pictures_notices(gaps: &[PictureGap]) -> Vec<String> {
             if these.is_empty() {
                 return None;
             }
-            let named = these.iter().take(NAMED).map(|g| match &g.file {
-                Some(file) => format!("{} ({}, {})", notice_cut(&g.name), g.id, notice_cut(file)),
-                None => format!("{} ({})", notice_cut(&g.name), g.id),
+            let named = these.iter().take(NAMED).map(|g| {
+                let name = match &g.layout {
+                    Some(layout) => format!("{} in layout '{}'", notice_cut(&g.name), notice_cut(layout)),
+                    None => notice_cut(&g.name),
+                };
+                match &g.file {
+                    Some(file) => format!("{name} ({}, {})", g.id, notice_cut(file)),
+                    None => format!("{name} ({})", g.id),
+                }
             });
             let mut named = named.collect::<Vec<_>>().join("; ");
             if these.len() > NAMED {
@@ -246,9 +255,15 @@ mod tests {
     #[test]
     fn the_picture_notices_count_and_name_each_kind() {
         let mut gaps: Vec<PictureGap> = (1..=12)
-            .map(|id| PictureGap { id, name: format!("Logo {id}"), file: Some("north.png".to_string()), why: PictureLoss::NoImage })
+            .map(|id| PictureGap {
+                id,
+                name: format!("Logo {id}"),
+                layout: None,
+                file: Some("north.png".to_string()),
+                why: PictureLoss::NoImage,
+            })
             .collect();
-        gaps.push(PictureGap { id: 13, name: "Inset".to_string(), file: None, why: PictureLoss::Undrawable });
+        gaps.push(PictureGap { id: 13, name: "Inset".to_string(), layout: None, file: None, why: PictureLoss::Undrawable });
         let said = pictures_notices(&gaps);
         assert_eq!(said.len(), 2, "{said:?}");
         let head = "12 layout picture(s) have no image and are drawn as a grey box: Logo 1 (1, north.png); ";
@@ -260,6 +275,27 @@ mod tests {
         assert!(said[1].starts_with(undrawable), "{}", said[1]);
         assert!(said[1].contains("drawn as a grey box: Inset (13); read one"), "{}", said[1]);
         assert!(pictures_notices(&[]).is_empty());
+    }
+
+    /// A long name is cut to 100 characters and "…"; in a report, the name and its layout's are
+    /// each cut, so the layout is still named.
+    #[test]
+    fn a_long_picture_name_is_cut_and_keeps_its_layout() {
+        let long = "n".repeat(150);
+        let gap = |layout: Option<&str>| PictureGap {
+            id: 4,
+            name: long.clone(),
+            layout: layout.map(String::from),
+            file: Some("north.png".to_string()),
+            why: PictureLoss::NoImage,
+        };
+        let alone = pictures_notices(&[gap(None)]);
+        let cut = format!(": {}… (4, north.png);", "n".repeat(100));
+        assert!(alone[0].contains(&cut), "{}", alone[0]);
+        let in_report = pictures_notices(&[gap(Some("L"))]);
+        assert!(in_report[0].contains(&format!("{}… in layout 'L' (4, north.png);", "n".repeat(100))), "{}", in_report[0]);
+        let long_layout = pictures_notices(&[PictureGap { layout: Some("l".repeat(150)), ..gap(None) }]);
+        assert!(long_layout[0].contains(&format!(" in layout '{}…' (4, north.png);", "l".repeat(100))), "{}", long_layout[0]);
     }
 
     /// A picture is decoded once while it is unchanged, however often its page is drawn and

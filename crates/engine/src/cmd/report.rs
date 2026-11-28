@@ -1255,7 +1255,7 @@ fn say_report_pictures(s: &mut Session, pages: &[rustgis_render::report::Page], 
         seen.push(*li);
         let Some(layout) = s.project.layouts.get(*li) else { continue };
         for mut gap in rustgis_render::layout::pictures_not_drawn(layout) {
-            gap.name = format!("{} in layout '{}'", gap.name, layout.name);
+            gap.layout = Some(layout.name.clone());
             gaps.push(gap);
         }
     }

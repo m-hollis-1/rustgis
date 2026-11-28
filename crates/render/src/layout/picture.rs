@@ -82,9 +82,11 @@ pub struct PictureGap {
 }
 
 /// The visible pictures of `layout` whose image doesn't draw ([`picture_draws`]), drawn as a grey
-/// box, in the order of its elements. A hidden picture draws nothing and isn't listed.
+/// box, in the order of its elements. A hidden picture draws nothing and isn't listed, nor is one
+/// with none of its box on the page ([`on_page`], the test a legend's pictures are waited by):
+/// the page shows none of its grey box.
 pub fn pictures_not_drawn(layout: &Layout) -> Vec<PictureGap> {
-    let gaps = layout.elements.iter().filter(|e| e.visible).filter_map(|e| {
+    let gaps = layout.elements.iter().filter(|e| e.visible && on_page(layout, e)).filter_map(|e| {
         let ElementKind::Picture { image, .. } = &e.kind else { return None };
         if picture_draws(image) {
             return None;
@@ -249,6 +251,54 @@ mod tests {
             ]
         );
         assert!(gaps.iter().all(|g| g.name == "Picture"));
+    }
+
+    /// Only a picture whose box has some of the page under it is listed: one partly on the page
+    /// draws part of its grey box; one wholly off it, or only touching its edge, draws none.
+    #[test]
+    fn a_picture_off_the_page_is_not_listed() {
+        // Each box, whether it is listed, and whether it is far enough from the page's edge for
+        // the page to show its grey box just when it is listed (the box's outline is drawn
+        // across its edge, so half of it reaches the page from a box only touching it).
+        let boxes: [((f64, f64, f64, f64), bool, bool); 15] = [
+            ((10.0, 10.0, 20.0, 10.0), true, true),
+            ((90.0, 10.0, 20.0, 10.0), true, true),
+            ((-10.0, -5.0, 20.0, 10.0), true, true),
+            ((10.0, 75.0, 20.0, 10.0), true, true),
+            ((100.0, 10.0, 20.0, 10.0), false, false),
+            ((-20.0, 10.0, 20.0, 10.0), false, false),
+            ((10.0, 80.0, 20.0, 10.0), false, false),
+            ((10.0, -10.0, 20.0, 10.0), false, false),
+            ((110.0, 10.0, 20.0, 10.0), false, true),
+            ((-40.0, 10.0, 20.0, 10.0), false, true),
+            ((10.0, 90.0, 20.0, 10.0), false, true),
+            ((10.0, -30.0, 20.0, 10.0), false, true),
+            // Sizes only a hand-edited file has, before `Layout::clamp`: none, or turned back.
+            ((10.0, 10.0, 0.0, 0.0), true, false),
+            ((10.0, 10.0, -5.0, 10.0), true, false),
+            ((10.0, 10.0, f64::NAN, 10.0), false, false),
+        ];
+        let page = |at: (f64, f64, f64, f64)| {
+            let mut l = Layout::new("Pictures", 100.0, 80.0);
+            l.add("Picture", (10.0, 10.0, 20.0, 10.0), ElementKind::Picture { image: String::new(), source: None });
+            if let Some(e) = l.elements.first_mut() {
+                (e.x, e.y, e.w, e.h) = at;
+            }
+            l
+        };
+        let draw = |l: &Layout| render(l, &mut Vec::new(), 96.0, &PageInfo::default()).unwrap();
+        let blank = draw(&Layout::new("Pictures", 100.0, 80.0));
+        for (at, listed, clear) in boxes {
+            let l = page(at);
+            assert_eq!(pictures_not_drawn(&l).len(), usize::from(listed), "{at:?}");
+            if clear {
+                assert_eq!(draw(&l).data() != blank.data(), listed, "{at:?}");
+            }
+        }
+        // `Layout::clamp`, which every layout read or edited goes through, gives a box a size.
+        let mut l = page((10.0, 10.0, f64::NAN, 10.0));
+        l.clamp();
+        assert_eq!(pictures_not_drawn(&l).len(), 1);
     }
 
     /// One notice per kind, counted, the first ten named with their file's name, never a folder.

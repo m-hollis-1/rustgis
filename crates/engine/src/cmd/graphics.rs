@@ -401,13 +401,23 @@ fn color(p: &Value, k: &str) -> Result<Option<String>, String> {
 
 /// The picture's bytes as base64, from `image` or a file `path`.
 pub(crate) fn picture(p: &Value) -> Result<String, String> {
-    let b64 = match (ps(p, "image"), ps(p, "path")) {
-        (Some(b), _) => b.trim().to_string(),
-        (None, Some(path)) => {
-            base64::engine::general_purpose::STANDARD.encode(read_picture_file(path, MAX_PICTURE).map_err(PictureFileError::message)?)
-        }
-        (None, None) => return Err("a picture needs an image or a path".into()),
-    };
+    match (ps(p, "image"), ps(p, "path")) {
+        (Some(b), _) => checked_picture(b.trim().to_string()),
+        (None, Some(path)) => picture_file(path),
+        (None, None) => Err("a picture needs an image or a path".into()),
+    }
+}
+
+/// The bytes of the picture file at `path` as base64: read by [`read_picture_file`], at most
+/// 16 MiB, and a PNG or JPEG.
+pub(crate) fn picture_file(path: &str) -> Result<String, String> {
+    checked_picture(
+        base64::engine::general_purpose::STANDARD.encode(read_picture_file(path, MAX_PICTURE).map_err(PictureFileError::message)?),
+    )
+}
+
+/// `b64` when it is at most 16 MiB of a PNG or JPEG image.
+fn checked_picture(b64: String) -> Result<String, String> {
     if b64.len() > MAX_PICTURE / 3 * 4 + 4 {
         return Err("the picture is too large".into());
     }

@@ -459,6 +459,18 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
     if new_columns.is_some() && !is_legend {
         return Err(ONLY_LEGEND_COLUMNS.into());
     }
+    // A picture's new image, or its file read again, before anything changes; refused before any
+    // file is read on another element.
+    let new_picture = match kind_now {
+        Some(ElementKind::Picture { .. }) => picture_given(p)?,
+        _ if gives_picture(p) => return Err(ONLY_PICTURE_FILE.into()),
+        _ => None,
+    };
+    let unremembered = new_picture.as_ref().is_some_and(|g| g.unremembered);
+    // Nothing given that changes anything (every key null, or none): no step to undo.
+    if !changes && p.get("locked").is_none_or(Value::is_null) {
+        s.request_only = true;
+    }
     let l = active(s, p)?;
     let e = l.element_mut(id).ok_or_else(|| format!("no element {id}"))?;
     // A text or scale bar with no ink isn't measured: given a colour that shows it, it is told
@@ -715,6 +727,11 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *field = f;
             }
         }
+        ElementKind::Picture { image, source } => {
+            if let Some(g) = new_picture {
+                (*image, *source) = (g.image, g.source);
+            }
+        }
         _ => {}
     }
     // Told what it leaves out, or whether it lists every class, it says again which rasters it
@@ -722,6 +739,9 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
     let excluding =
         matches!(&e.kind, ElementKind::Legend { .. }) && (p.get("exclude").is_some_and(|v| !v.is_null()) || b(p, "allClasses").is_some());
     let fit = tells_legend_fit(&e.kind, p);
+    if unremembered {
+        s.notify(picture_unremembered(), false);
+    }
     if fit {
         say_legend_fit(s, li, id);
     }

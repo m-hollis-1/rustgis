@@ -1,0 +1,32 @@
+{
+  "format": 2,
+  "name": "Picture files",
+  "requires": ["layout-picture-source"],
+  "active_map": 0,
+  "maps": [
+    {
+      "name": "Map",
+      "layers": [],
+      "basemap": "Paper",
+      "camera": {"center": {"x": 0, "y": 0}, "res": 30000}
+    }
+  ],
+  "layouts": [
+    {
+      "name": "Logo",
+      "width": 200,
+      "height": 100,
+      "elements": [
+        {"id": 1, "name": "North", "x": 5, "y": 5, "w": 40, "h": 20, "kind": {"Picture": {"image": "", "source": "/data/logos/north.png"}}}
+      ]
+    },
+    {
+      "name": "Inset",
+      "width": 200,
+      "height": 100,
+      "elements": [
+        {"id": 1, "name": "Inset", "x": 5, "y": 5, "w": 20, "h": 20, "kind": {"Picture": {"image": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "source": "/data/logos/inset.png"}}}
+      ]
+    }
+  ]
+}

@@ -236,6 +236,7 @@ pub(crate) fn color(p: &Value, k: &str, d: Rgba) -> Result<Rgba, String> {
 }
 
 pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResult {
+    const NO_PICTURE: &str = "a picture needs an image or a path";
     let kind = ps(p, "kind").ok_or("kind is required")?;
     if kind != "legend" && kind != "scaleBar" && p.get("textSize").is_some_and(|v| !v.is_null()) {
         return Err(ONLY_LAYOUT_TEXT_SIZE.into());
@@ -336,8 +337,14 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         BackgroundParam::Set(b) => Some(b),
         BackgroundParam::Absent | BackgroundParam::Remove => None,
     };
+    // Refused before any file is read.
+    if kind != "picture" && gives_picture(p) {
+        return Err(ONLY_PICTURE_FILE.into());
+    }
     let i = index(s, p)?;
-    let image = if kind == "picture" { Some(crate::cmd::graphics::picture(p)?) } else { None };
+    // A picture's image, read and checked to draw before anything is added.
+    let picture = if kind == "picture" { Some(picture_given(p)?.ok_or(NO_PICTURE)?) } else { None };
+    let unremembered = picture.as_ref().is_some_and(|g| g.unremembered);
     let l = s.project.layouts.get(i).ok_or("no layout")?;
     let (pw, ph) = (l.width, l.height);
     let (name, rect, k) = match kind {
@@ -441,11 +448,10 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
             };
             (if kind == "text" { "Text" } else { "Dynamic Text" }, place(p, l, (15.0, 12.0, 120.0, (size * 0.5).max(8.0)))?, k)
         }
-        "picture" => (
-            "Picture",
-            place(p, l, (pw - 60.0, ph - 50.0, 45.0, 35.0))?,
-            ElementKind::Picture { image: image.unwrap_or_default(), source: None },
-        ),
+        "picture" => {
+            let GivenPicture { image, source, .. } = picture.ok_or(NO_PICTURE)?;
+            ("Picture", place(p, l, (pw - 60.0, ph - 50.0, 45.0, 35.0))?, ElementKind::Picture { image, source })
+        }
         "table" => {
             let frame = frame_of(l, p)?;
             let layer = frame_layer_name(s, l, frame, p)?;
@@ -667,6 +673,9 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
     say_text_statistics(s, i, id);
     if let Some(said) = empty_colorbar {
         s.warn(said);
+    }
+    if unremembered {
+        s.notify(picture_unremembered(), false);
     }
     say_held(s, "Add Element", held_to_limits(p, Shape::of_name(kind)));
     say_name_ignored(s, p, kind);

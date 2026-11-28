@@ -229,7 +229,9 @@ fn pictures_save_and_say_as_before() {
         Err(e) => text.replace(&e.to_string(), "<the system's error>"),
         Ok(_) => text,
     };
-    let images = [(PIN_PNG, "the PNG"), (huge.as_str(), "the 30000 x 1 PNG"), (damaged.as_str(), "the damaged PNG")];
+    let images =
+        [(PIN_PNG, "the PNG"), (PIN_JPEG, "the JPEG"), (huge.as_str(), "the 30000 x 1 PNG"), (damaged.as_str(), "the damaged PNG")];
+    const UNDRAWN: &str = "the picture can't be drawn: its image is damaged or larger than 20000 pixels a side";
     let rectangle = |key: &str, v: Value| {
         let mut p = json!({"kind": "rectangle", "x": 10, "y": 10, "w": 20, "h": 20});
         p[key] = v;
@@ -245,27 +247,30 @@ fn pictures_save_and_say_as_before() {
         ("an image that isn't one", picture("image", json!("bm90IGFuIGltYWdl")), "the picture isn't a PNG or JPEG image"),
         ("an empty image", picture("image", json!("")), "the picture isn't a PNG or JPEG image"),
         ("an image over 16 MiB", picture("image", json!("A".repeat((16 << 20) / 3 * 4 + 8))), "the picture is too large"),
-        // An image that isn't text is read as no image.
-        ("an image that is a number", picture("image", json!(5)), "a picture needs an image or a path"),
+        ("an image that is a number", picture("image", json!(5)), "image is a PNG or JPEG image in base64"),
         ("a path to a missing file", picture("path", json!(at("missing.png"))), "<dir>/missing.png: <the system's error>"),
-        ("an empty path", picture("path", json!("")), ": <the system's error>"),
-        ("a path that is an address", picture("path", json!(address)), "http://example.invalid/a.png: <the system's error>"),
+        ("an empty path", picture("path", json!("")), "path is the path of a PNG or JPEG file"),
+        // Never tried as a file, and not repeated.
+        ("a path that is an address", picture("path", json!(address)), "a picture is read from a file on this computer, not a web address"),
         ("a path to a folder", picture("path", json!(at("folder.png"))), "<dir>/folder.png: not a regular file"),
         ("a path to a text file", picture("path", json!(note)), "the picture isn't a PNG or JPEG image"),
         ("a path to a file of 16 MiB and a byte", picture("path", json!(over)), "the picture is too large"),
-        // A path that isn't text is read as no path.
-        ("a path that is a number", picture("path", json!(5)), "a picture needs an image or a path"),
-        // Given both, the image is used and the path is never read.
-        ("both an image and a path", json!({"kind": "picture", "image": PIN_PNG, "path": note}), "added a picture of the PNG"),
-        // These four are added, and each draws as the grey box: their size reads, but their pixels
-        // can't be drawn (declared over 20000 pixels a side, or cut short).
-        ("an image over 20000 pixels a side", picture("image", json!(huge)), "added a picture of the 30000 x 1 PNG"),
-        ("an image whose pixels don't read", picture("image", json!(damaged)), "added a picture of the damaged PNG"),
-        ("a path to a PNG over 20000 pixels a side", picture("path", json!(huge_file)), "added a picture of the 30000 x 1 PNG"),
-        ("a path to a PNG whose pixels don't read", picture("path", json!(damaged_file)), "added a picture of the damaged PNG"),
-        // Other kinds of element ignore `image` and `path`.
-        ("an image on a rectangle", rectangle("image", json!(PIN_PNG)), "added a rectangle"),
-        ("a path on a rectangle", rectangle("path", json!(at("missing.png"))), "added a rectangle"),
+        ("a path that is a number", picture("path", json!(5)), "path is the path of a PNG or JPEG file"),
+        // Given both, neither is read.
+        (
+            "both an image and a path",
+            json!({"kind": "picture", "image": PIN_PNG, "path": note}),
+            "give a picture an image or a path, not both",
+        ),
+        // These four are refused: their size reads, but their pixels can't be drawn (declared over
+        // 20000 pixels a side, or cut short).
+        ("an image over 20000 pixels a side", picture("image", json!(huge)), UNDRAWN),
+        ("an image whose pixels don't read", picture("image", json!(damaged)), UNDRAWN),
+        ("a path to a PNG over 20000 pixels a side", picture("path", json!(huge_file)), UNDRAWN),
+        ("a path to a PNG whose pixels don't read", picture("path", json!(damaged_file)), UNDRAWN),
+        // Other kinds of element refuse `image` and `path`, before any file is read.
+        ("an image on a rectangle", rectangle("image", json!(PIN_PNG)), "only pictures take an image or a path"),
+        ("a path on a rectangle", rectangle("path", json!(at("missing.png"))), "only pictures take an image or a path"),
     ];
     let which = |s: &Session, id: &Value| match s.project.layouts[li].element(id.as_u64().unwrap() as u32).map(|e| &e.kind) {
         Some(rustgis_map::layout::ElementKind::Picture { image, .. }) => {
@@ -285,25 +290,31 @@ fn pictures_save_and_say_as_before() {
         }
     }
     // What `layout.update` does with `path` and `image` on a picture (the PNG first added): its
-    // answer, the picture afterwards, and the Undo steps it leaves. It takes neither key: the
-    // picture is left as it was, the file never read, and one Undo step is left all the same.
+    // answer, the picture afterwards, and the Undo steps it leaves. Each is taken as one Undo step;
+    // a file it can't read is refused, the picture left as it was and no step left.
     let png_picture = &added[0];
     for (case, key, v, pinned) in [
         (
             "a path to the JPEG's file",
             "path",
             json!(file("jpeg.jpg", &b64(PIN_JPEG))),
-            "answered null; a picture of the PNG after; 1 Undo step(s)",
+            "answered null; a picture of the JPEG after; 1 Undo step(s)",
         ),
-        ("the JPEG as an image", "image", json!(PIN_JPEG), "answered null; a picture of the PNG after; 1 Undo step(s)"),
-        ("a path to a missing file", "path", json!(at("missing.png")), "answered null; a picture of the PNG after; 1 Undo step(s)"),
+        ("the JPEG as an image", "image", json!(PIN_JPEG), "answered null; a picture of the JPEG after; 1 Undo step(s)"),
+        (
+            "a path to a missing file",
+            "path",
+            json!(at("missing.png")),
+            "refused \"<dir>/missing.png: <the system's error>\"; a picture of the JPEG after; 0 Undo step(s)",
+        ),
     ] {
         let depth = s.undo_depth();
+        let path = v.as_str().filter(|_| key == "path").unwrap_or("").to_string();
         let mut p = json!({"layout": li, "element": png_picture});
         p[key] = v;
         let answer = match s.run("layout.update", &p) {
             Ok(r) => format!("answered {r}"),
-            Err(e) => format!("refused {:?}", e.replace(&folder, "<dir>/")),
+            Err(e) => format!("refused {:?}", marked(e, &path).replace(&folder, "<dir>/")),
         };
         let got = format!("{answer}; {} after; {} Undo step(s)", which(&s, png_picture), s.undo_depth() - depth);
         if got != pinned {
@@ -311,4 +322,229 @@ fn pictures_save_and_say_as_before() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A folder of the test's own, removed however it ends, and a session with a layout "L".
+#[cfg(not(target_arch = "wasm32"))]
+fn picture_world(test: &str) -> (Dir, Session) {
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-{test}-{}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let mut s = super::world();
+    s.run("layout.new", &json!({"name": "L"})).unwrap();
+    (dir, s)
+}
+
+/// A `w` x `h` PNG of one colour written to `name` in `dir`: its path, and its image as base64.
+#[cfg(not(target_arch = "wasm32"))]
+fn png_file(dir: &Dir, name: &str, (w, h): (u32, u32), colour: [u8; 3]) -> (String, String) {
+    use base64::Engine as _;
+    let b64 = png_b64(w, h, |_, _| colour);
+    let path = dir.0.join(name);
+    std::fs::write(&path, base64::engine::general_purpose::STANDARD.decode(&b64).unwrap()).unwrap();
+    (path.display().to_string(), b64)
+}
+
+/// The image and file of picture `id` in the layout named `layout`.
+#[cfg(not(target_arch = "wasm32"))]
+fn picture_in(s: &Session, layout: &str, id: &Value) -> (String, Option<String>) {
+    let l = s.project.layouts.iter().find(|l| l.name == layout).unwrap();
+    match &l.element(id.as_u64().unwrap() as u32).unwrap().kind {
+        rustgis_map::layout::ElementKind::Picture { image, source } => (image.clone(), source.clone()),
+        k => panic!("not a picture: {k:?}"),
+    }
+}
+
+/// A picture added from a file remembers it as given; one added from an image has none; no answer
+/// carries the path.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_picture_added_from_a_file_remembers_it() {
+    let (dir, mut s) = picture_world("a-picture-added-from-a-file-remembers-it");
+    let (first, first_b64) = png_file(&dir, "first.png", (40, 20), [0x1F, 0x5C, 0x84]);
+    let added = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap();
+    assert!(!added.to_string().contains("first.png"), "{added}");
+    let id = added["element"].clone();
+    assert_eq!(picture_in(&s, "L", &id), (first_b64.clone(), Some(first.clone())));
+    let bare = s.run("layout.addElement", &json!({"kind": "picture", "image": first_b64})).unwrap()["element"].clone();
+    assert_eq!(picture_in(&s, "L", &bare), (first_b64, None));
+    let l = s.project.layouts.iter().find(|l| l.name == "L").unwrap();
+    let listed = json!(crate::cmd::layout::element_list(l)).to_string();
+    assert!(!listed.contains("first.png"), "{listed}");
+}
+
+/// `layout.update` with a path reads the file again and remembers it; with an image, takes it and
+/// forgets the file. Each is one undo step, undone as one.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_picture_is_read_again_from_a_file_and_relinked() {
+    let (dir, mut s) = picture_world("a-picture-is-read-again-from-a-file-and-relinked");
+    let (first, first_b64) = png_file(&dir, "first.png", (40, 20), [0x1F, 0x5C, 0x84]);
+    let (second, second_b64) = png_file(&dir, "second.png", (30, 30), [0xE8, 0xB0, 0x4A]);
+    let third_b64 = png_b64(10, 20, |_, _| [0x22, 0x88, 0x22]);
+    let id = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].clone();
+    let depth = s.undo_depth();
+    assert_eq!(s.run("layout.update", &json!({"element": id, "path": second})).unwrap(), Value::Null);
+    assert_eq!(picture_in(&s, "L", &id), (second_b64.clone(), Some(second.clone())));
+    assert_eq!(s.undo_depth(), depth + 1);
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(picture_in(&s, "L", &id), (first_b64, Some(first)));
+    s.run("layout.update", &json!({"element": id, "image": third_b64})).unwrap();
+    assert_eq!(picture_in(&s, "L", &id), (third_b64.clone(), None));
+    let (before, depth) = (serde_json::to_value(&s.project).unwrap(), s.undo_depth());
+    s.run("layout.update", &json!({"element": id, "path": null, "image": null})).unwrap();
+    assert_eq!((serde_json::to_value(&s.project).unwrap(), s.undo_depth()), (before, depth), "null changes nothing");
+    assert_eq!(picture_in(&s, "L", &id), (third_b64, None));
+    // A picture an older file holds with no image, only its file, relinked: it draws again.
+    let imported = json!({"name": "Imported", "width": 210.0, "height": 297.0, "elements": [
+        {"id": 1, "name": "Logo", "x": 10.0, "y": 10.0, "w": 40.0, "h": 20.0, "kind": {"Picture": {"image": "", "source": "/data/logos/north.png"}}}
+    ]});
+    s.run("layout.import", &json!({"text": imported.to_string()})).unwrap();
+    let layout = |s: &Session| s.project.layouts.iter().find(|l| l.name == "Imported").unwrap().clone();
+    assert_eq!(rustgis_render::layout::pictures_not_drawn(&layout(&s)).len(), 1);
+    s.run("layout.update", &json!({"layout": "Imported", "element": 1, "path": second})).unwrap();
+    assert_eq!(picture_in(&s, "Imported", &json!(1)), (second_b64, Some(second)));
+    assert!(rustgis_render::layout::pictures_not_drawn(&layout(&s)).is_empty());
+}
+
+/// A missing, unreadable, too large, undrawable or not-a-picture file, or a path of the wrong kind,
+/// is refused, even beside a valid key, and the picture is left as it was, with no undo step.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_bad_file_is_refused_and_the_picture_left_as_it_was() {
+    let (dir, mut s) = picture_world("a-bad-file-is-refused-and-the-picture-left-as-it-was");
+    let (first, first_b64) = png_file(&dir, "first.png", (40, 20), [0x1F, 0x5C, 0x84]);
+    let (second, _) = png_file(&dir, "second.png", (30, 30), [0xE8, 0xB0, 0x4A]);
+    let (huge, _) = png_file(&dir, "huge.png", (30_000, 1), [0x1F, 0x5C, 0x84]);
+    let id = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].clone();
+    s.run("layout.update", &json!({"element": id, "path": second})).unwrap();
+    let at = |name: &str| dir.0.join(name).display().to_string();
+    std::fs::write(at("note.png"), b"not a picture").unwrap();
+    std::fs::write(at("big.png"), vec![0u8; (16 << 20) + 1]).unwrap();
+    std::fs::create_dir_all(at("sub")).unwrap();
+    // The picture, its place, the project, and the Undo steps and unsaved state.
+    let state = |s: &Session| {
+        let l = s.project.layouts.iter().find(|l| l.name == "L").unwrap();
+        let x = l.element(id.as_u64().unwrap() as u32).unwrap().x;
+        (picture_in(s, "L", &id), x, serde_json::to_value(&s.project).unwrap(), s.undo_depth(), s.dirty())
+    };
+    let before = state(&s);
+    let undrawn = "the picture can't be drawn: its image is damaged or larger than 20000 pixels a side";
+    let not_a_path = "path is the path of a PNG or JPEG file";
+    for (path, said) in [
+        // `read_picture_file`'s own "{path}: …".
+        (json!(at("gone.png")), "gone.png"),
+        (json!(at("note.png")), "the picture isn't a PNG or JPEG image"),
+        (json!(huge), undrawn),
+        (json!(at("big.png")), "the picture is too large"),
+        (json!(at("sub")), "not a regular file"),
+        (json!("https://user:secret@example.invalid/logo.png"), "a picture is read from a file on this computer, not a web address"),
+        (json!(5), not_a_path),
+        (json!(""), not_a_path),
+        (json!("  "), not_a_path),
+        (json!(["a.png"]), not_a_path),
+    ] {
+        let e = s.run("layout.update", &json!({"element": id, "path": path, "x": 5})).unwrap_err();
+        assert!(e.contains(said) && !e.contains("secret") && !e.contains("example.invalid"), "{path}: {e}");
+        assert!(state(&s) == before, "{path} changed the picture");
+    }
+    for (p, said) in [
+        (json!({"element": id, "image": 5, "x": 5}), "image is a PNG or JPEG image in base64"),
+        (json!({"element": id, "image": first_b64, "path": first, "x": 5}), "give a picture an image or a path, not both"),
+        (json!({"element": id, "image": "bm90IGFuIGltYWdl", "x": 5}), "the picture isn't a PNG or JPEG image"),
+        (json!({"element": id, "image": png_b64(30_000, 1, |_, _| [9, 9, 9]), "x": 5}), undrawn),
+    ] {
+        let e = s.run("layout.update", &p).unwrap_err();
+        assert_eq!(e, said);
+        assert!(state(&s) == before, "{said}: the picture changed");
+    }
+    // On another kind of element, refused before any file is read; null is not given.
+    let l = s.project.layouts.iter().find(|l| l.name == "L").unwrap();
+    let text = l.elements.iter().find(|e| e.kind.code() == "text").unwrap().id;
+    let before = state(&s);
+    for key in ["path", "image"] {
+        let e = s.run("layout.update", &json!({"element": text, key: first})).unwrap_err();
+        assert_eq!(e, "only pictures take an image or a path");
+        assert!(state(&s) == before, "{key} on a text changed it");
+    }
+    s.run("layout.update", &json!({"element": text, "path": null, "image": null})).unwrap();
+    // Locked, it is refused before its file is read.
+    s.run("layout.update", &json!({"element": id, "locked": true})).unwrap();
+    let before = state(&s);
+    let e = s.run("layout.update", &json!({"element": id, "path": first})).unwrap_err();
+    assert!(e.contains("locked"), "{e}");
+    assert!(state(&s) == before, "a locked picture changed");
+    // Adding: refused, and no element added.
+    let count = |s: &Session| s.project.layouts.iter().find(|l| l.name == "L").unwrap().elements.len();
+    let (n, depth, dirty) = (count(&s), s.undo_depth(), s.dirty());
+    for (p, said) in [
+        (json!({"kind": "text", "text": "T", "path": first}), "only pictures take an image or a path"),
+        (json!({"kind": "rectangle", "image": first_b64}), "only pictures take an image or a path"),
+        (json!({"kind": "picture", "path": huge}), undrawn),
+        (json!({"kind": "picture", "image": first_b64, "path": first}), "give a picture an image or a path, not both"),
+        (
+            json!({"kind": "picture", "path": "https://user:secret@example.invalid/logo.png"}),
+            "a picture is read from a file on this computer, not a web address",
+        ),
+        (json!({"kind": "picture"}), "a picture needs an image or a path"),
+        (json!({"kind": "picture", "path": null, "image": null}), "a picture needs an image or a path"),
+    ] {
+        assert_eq!(s.run("layout.addElement", &p).unwrap_err(), said, "{p}");
+        assert_eq!((count(&s), s.undo_depth(), s.dirty()), (n, depth, dirty), "{p}");
+    }
+}
+
+/// A path the rule doesn't keep: the picture is read, its file not remembered, and that is said.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[test]
+fn a_path_that_is_not_kept_is_read_and_said() {
+    let (dir, mut s) = picture_world("a-path-that-is-not-kept-is-read-and-said");
+    let (first, _) = png_file(&dir, "first.png", (40, 20), [0x1F, 0x5C, 0x84]);
+    let (odd, odd_b64) = png_file(&dir, "logo\u{7}.png", (20, 20), [0x22, 0x88, 0x22]);
+    let unremembered = |s: &Session, mark| s.notices_since(mark).iter().filter(|n| n.text.contains("isn't remembered")).count();
+    let mark = s.notice_mark();
+    let id = s.run("layout.addElement", &json!({"kind": "picture", "path": odd})).unwrap()["element"].clone();
+    assert_eq!(picture_in(&s, "L", &id), (odd_b64.clone(), None));
+    assert_eq!(unremembered(&s, mark), 1);
+    let kept = s.run("layout.addElement", &json!({"kind": "picture", "path": first})).unwrap()["element"].clone();
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": kept, "path": odd})).unwrap();
+    assert_eq!(picture_in(&s, "L", &kept), (odd_b64, None));
+    assert_eq!(unremembered(&s, mark), 1);
+}
+
+/// A project whose pictures' files are of the wrong kind, blank, an address, too long or with
+/// control characters opens, says it repaired them, and saves without them and without the
+/// capability.
+#[test]
+fn a_project_with_a_damaged_picture_file_opens_and_says_so() {
+    let sources = [
+        serde_json::json!(5),
+        serde_json::json!(""),
+        serde_json::json!("https://user:secret@example.invalid/a.png"),
+        serde_json::json!(format!("/{}", "d".repeat(5000))),
+        serde_json::json!("a\u{7}b.png"),
+    ];
+    let elements: Vec<serde_json::Value> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, source)| {
+            let picture = serde_json::json!({"Picture": {"image": "", "source": source}});
+            serde_json::json!({"id": i + 1, "name": "p", "x": 0, "y": 0, "w": 50, "h": 50, "kind": picture})
+        })
+        .collect();
+    let document = serde_json::json!({
+        "format": 2,
+        "name": "Damaged pictures",
+        "active_map": 0,
+        "maps": [{"name": "Map", "layers": [], "basemap": "Paper", "camera": {"center": {"x": 0, "y": 0}, "res": 30000}}],
+        "layouts": [{"name": "Pictures", "width": 297, "height": 210, "elements": elements}]
+    });
+    let mut p = crate::Project::from_json(&document.to_string()).unwrap();
+    let said: Vec<String> = p.take_read_notices(&crate::project::ALL_PARTS).iter().map(|n| n.english()).collect();
+    assert_eq!(said.iter().filter(|n| n.contains("5 layout element(s) with a value out of range")).count(), 1, "{said:?}");
+    assert!(p.layouts[0].elements.iter().all(|e| e.kind.picture_source().is_none()));
+    let saved = serde_json::to_string(&p).unwrap();
+    for absent in ["\"source\"", "secret", "layout-picture-source"] {
+        assert!(!saved.contains(absent), "{absent} in {saved}");
+    }
 }

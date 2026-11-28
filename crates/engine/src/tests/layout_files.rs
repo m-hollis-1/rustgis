@@ -205,6 +205,31 @@ fn a_layout_file_with_a_fitted_legend_says_so_in_its_header() {
     assert!(s.project.layouts[1].elements.iter().any(|e| e.kind.legend_uses_fit()));
 }
 
+/// A layout file with a picture that remembers its file requires `layout-picture-source`, so an
+/// older RustGIS refuses it instead of saving the picture again without its file; one whose
+/// pictures have no file requires nothing.
+#[test]
+fn a_layout_file_with_a_remembered_picture_says_so_in_its_header() {
+    let (mut s, _) = with_layout();
+    let image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    s.run("layout.addElement", &json!({"kind": "picture", "image": image})).unwrap();
+    let (_, plain) = saved_file(&mut s, 0, "plain-picture");
+    assert_eq!(plain["format"], json!(crate::project::FORMAT));
+    assert!(plain.get("requires").is_none(), "{plain}");
+    // A picture an older file holds with no image, only its file, and one with both.
+    let remembered = json!({"name": "Logos", "width": 200, "height": 100, "elements": [
+        {"id": 1, "name": "North", "x": 5, "y": 5, "w": 40, "h": 20, "kind": {"Picture": {"image": "", "source": "/data/logos/north.png"}}},
+        {"id": 2, "name": "Inset", "x": 50, "y": 5, "w": 20, "h": 20, "kind": {"Picture": {"image": image, "source": "/data/logos/inset.png"}}}
+    ]});
+    s.run("layout.import", &json!({"text": remembered.to_string()})).unwrap();
+    let (text, kept) = saved_file(&mut s, 1, "remembered-picture");
+    assert_eq!(kept["requires"], json!(["layout-picture-source"]));
+    // This RustGIS reads it back.
+    s.run("layout.import", &json!({"text": text})).unwrap();
+    let sources: Vec<Option<&str>> = s.project.layouts[2].elements.iter().map(|e| e.kind.picture_source()).collect();
+    assert_eq!(sources, [Some("/data/logos/north.png"), Some("/data/logos/inset.png")]);
+}
+
 /// A layout file with a text placed down its box, spaced or cased requires `layout-text-block`, so
 /// an older RustGIS refuses it instead of drawing the text at the top, at the usual spacing and as
 /// typed; a plain text's file requires nothing.

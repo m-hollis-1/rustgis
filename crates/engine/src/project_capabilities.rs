@@ -177,6 +177,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-section", command_uses_section),
     ("layout-text-size", command_uses_text_size),
     ("layout-legend-fit", command_uses_legend_fit),
+    ("layout-picture-source", command_uses_picture_source),
     ("layout-scale-bar-details", command_uses_scale_bar_details),
     ("dggs-system", command_uses_dggs_system),
     ("label-weight", command_weighs_labels),
@@ -416,6 +417,31 @@ fn command_uses_legend_fit(id: &str, params: &Value) -> bool {
             imported_layout_uses(params, &["\"fit\"", "\"show_layer_names\"", "\"columns\""], legends_fitting)
         }
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_legend_fit)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a picture that keeps the file it was read from: an older reader
+/// would draw it without its file, the word Picture where it has no image, and save it again
+/// without the file.
+fn pictures_with_files(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.picture_source().is_some()
+}
+
+/// A layout command that gives a picture an image or a path, or brings in one that keeps its file:
+/// a saved `layout.update` with `image` or `path` given and not null, which an older reader
+/// ignores, leaving the picture as it was (judged by presence alone,
+/// [`crate::cmd::layout::gives_picture`]: a value the command refuses changes nothing, so it only
+/// asks for the capability sooner, never misses it); a `layout.import` or `report.existingTemplate`
+/// whose layout has a picture with a file the kept rule keeps, so a junk one needs nothing; and a
+/// script with such a line. A `layout.addElement` with a `path` needs nothing: an older reader adds
+/// the same picture, only without remembering its file.
+fn command_uses_picture_source(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.update" => crate::cmd::layout::gives_picture(params),
+        // A layout file, read as `layout.import` reads it, which `report.existingTemplate` also does.
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"source\""], pictures_with_files),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_picture_source)),
         _ => false,
     }
 }
@@ -1141,6 +1167,7 @@ fn layout_capabilities(layouts: &[rustgis_map::layout::Layout]) -> Vec<&'static 
         (elements().any(|e| e.kind.has_sections()), "layout-section"),
         (elements().any(|e| e.kind.has_custom_text_size()), "layout-text-size"),
         (elements().any(legends_fitting), "layout-legend-fit"),
+        (elements().any(pictures_with_files), "layout-picture-source"),
         (elements().any(bar_details), "layout-scale-bar-details"),
         (layouts.iter().any(|l| l.paper.is_some()), "layout-page-color"),
         (elements().any(text_statistics), "layout-text-statistics"),
@@ -1438,6 +1465,7 @@ mod tests {
             (&["layout-section"], "layout.update", json!({"element": 1, "section": {"name": "A", "y": 0}})),
             (&["layout-text-size"], "layout.update", json!({"element": 1, "textSize": 12})),
             (&["layout-legend-fit"], "layout.update", json!({"element": 1, "fit": "adjustSize"})),
+            (&["layout-picture-source"], "layout.update", json!({"element": 1, "path": "logo.png"})),
             (&["dggs-system"], "a5Grid", json!({"system": "H3"})),
             (&["dggs-system"], "a5Aggregate", json!({"system": "S2"})),
             (&["label-weight"], "labels.placement", json!({"weight": 9})),
@@ -2165,6 +2193,74 @@ mod tests {
                 let others: Vec<&Value> = requires.iter().filter(|r| *r != "layout-legend-fit").collect();
                 let expected: Vec<Value> = if bar { vec![json!("layout-scale-bar-details")] } else { vec![] };
                 assert_eq!(others, expected.iter().collect::<Vec<_>>(), "{id} {params}: {requires:?}");
+            }
+        }
+    }
+
+    /// A picture that keeps its file requires the capability in a project and a layout file; a saved
+    /// `layout.update` giving a picture an image or a path does, an `addElement` doesn't, and a
+    /// `layout.import`, `report.existingTemplate` or script line does when its layout keeps one.
+    #[test]
+    fn picture_source_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_picture_source.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-picture-source"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        let sources: Vec<Option<&str>> = reread.layouts.iter().map(|l| l.elements[0].kind.picture_source()).collect();
+        assert_eq!(sources, [Some("/data/logos/north.png"), Some("/data/logos/inset.png")]);
+        assert_eq!(layout_file_bytes(&fixture.layouts[1]).map(|b| String::from_utf8_lossy(&b).contains("layout-picture-source")), Ok(true));
+        // Each picture's file on its own is required.
+        for one in 0..2 {
+            let mut alone = fixture.clone();
+            alone.layouts.remove(1 - one);
+            assert_eq!(serde_json::to_value(&alone).unwrap()["requires"], json!(["layout-picture-source"]), "{one}");
+        }
+        let mut clean = fixture;
+        for l in &mut clean.layouts {
+            if let ElementKind::Picture { source, .. } = &mut l.elements[0].kind {
+                *source = None;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "pictures without a file need nothing: {base}");
+        let layout_text = saved["layouts"][0].to_string();
+        let mut junk = saved["layouts"][0].clone();
+        junk["elements"][0]["kind"]["Picture"]["source"] = json!("https://user:secret@example.invalid/a.png");
+        let script = "layout.update {\"element\": 1, \"path\": \"a.png\"}";
+        for (id, params, required) in [
+            ("layout.update", json!({"element": 1, "path": "/data/logos/north.png"}), true),
+            ("layout.update", json!({"element": 1, "image": "iVBORw0KGgo="}), true),
+            // Refused by the command, which changes nothing: an over-count, never a missing one.
+            ("layout.update", json!({"element": 1, "path": 5}), true),
+            ("layout.update", json!({"element": 1, "path": null, "image": null}), false),
+            ("layout.update", json!({"element": 1, "x": 5}), false),
+            ("layout.addElement", json!({"kind": "picture", "path": "/data/logos/north.png"}), false),
+            ("layout.addElement", json!({"kind": "picture", "image": "iVBORw0KGgo="}), false),
+            ("layout.import", json!({"text": layout_text}), true),
+            ("layout.import", json!({"text": junk.to_string()}), false),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"path": "pictures.rgislayout"}), false),
+            ("report.existingTemplate", json!({"report": "R", "text": layout_text}), true),
+            ("report.existingTemplate", json!({"report": "R", "text": junk.to_string()}), false),
+            ("script.run", json!({"script": script}), true),
+            ("script.run", json!({"script": "layout.update {\"element\": 1, \"x\": 5}"}), false),
+        ] {
+            let mut steps = vec![json!([{"name": "Task", "steps": [{"title": "Picture", "command": id, "params": params}]}])];
+            // A script holds no script.run line.
+            if id != "script.run" {
+                let line = format!("{id} {params}");
+                steps.push(
+                    json!([{"name": "Script", "steps": [{"title": "Picture", "command": "script.run", "params": {"script": line}}]}]),
+                );
+            }
+            for value in steps {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let requires = saved.get("requires").and_then(Value::as_array).cloned().unwrap_or_default();
+                let expected: Vec<Value> = if required { vec![json!("layout-picture-source")] } else { vec![] };
+                assert_eq!(requires, expected, "{id} {params}");
             }
         }
     }

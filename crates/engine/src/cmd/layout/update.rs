@@ -467,8 +467,12 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
         _ => None,
     };
     let unremembered = new_picture.as_ref().is_some_and(|g| g.unremembered);
-    // Nothing given that changes anything (every key null, or none): no step to undo.
-    if !changes && p.get("locked").is_none_or(Value::is_null) {
+    // Only a picture's image or path, each null: nothing is given, so there is no step to undo.
+    let only_null_picture = p.as_object().is_some_and(|o| {
+        o.keys().any(|k| matches!(k.as_str(), "image" | "path"))
+            && o.iter().all(|(k, v)| matches!(k.as_str(), "layout" | "element") || (matches!(k.as_str(), "image" | "path") && v.is_null()))
+    });
+    if only_null_picture {
         s.request_only = true;
     }
     let l = active(s, p)?;

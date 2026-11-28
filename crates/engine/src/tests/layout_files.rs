@@ -89,6 +89,13 @@ fn a_layout_file_requiring_legend_fit_opens() {
 }
 
 #[test]
+fn a_layout_file_requiring_picture_source_opens() {
+    let (mut s, bare) = with_layout();
+    s.run("layout.import", &json!({"text": headed(&bare, 2, json!(["layout-picture-source"]))})).unwrap();
+    assert_eq!(s.project.layouts.len(), 2);
+}
+
+#[test]
 fn a_layout_file_requiring_text_block_opens() {
     let (mut s, bare) = with_layout();
     s.run("layout.import", &json!({"text": headed(&bare, 2, json!(["layout-text-block"]))})).unwrap();
@@ -127,6 +134,7 @@ fn a_saved_layout_file_requires_what_its_elements_use_and_reads_back_the_same() 
         ("section", include_str!("../../../../schema/fixtures/layout_section.rgis")),
         ("legend-text", include_str!("../../../../schema/fixtures/layout_legend_text.rgis")),
         ("legend-fit", include_str!("../../../../schema/fixtures/layout_legend_fit.rgis")),
+        ("picture-source", include_str!("../../../../schema/fixtures/layout_picture_source.rgis")),
         ("scale-grid-text", include_str!("../../../../schema/fixtures/layout_scale_grid_text.rgis")),
         ("page-color", include_str!("../../../../schema/fixtures/layout_page_color.rgis")),
         ("plain", include_str!("../../../../schema/fixtures/layout_no_data.rgis")),

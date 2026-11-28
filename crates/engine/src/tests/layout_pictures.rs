@@ -394,6 +394,14 @@ fn a_picture_is_read_again_from_a_file_and_relinked() {
     s.run("layout.update", &json!({"element": id, "path": null, "image": null})).unwrap();
     assert_eq!((serde_json::to_value(&s.project).unwrap(), s.undo_depth()), (before, depth), "null changes nothing");
     assert_eq!(picture_in(&s, "L", &id), (third_b64, None));
+    // Any other update keeps its Undo step, as it always has, even one that changes nothing.
+    let x = |s: &Session| s.project.layouts.iter().find(|l| l.name == "L").unwrap().element(id.as_u64().unwrap() as u32).unwrap().x;
+    for p in [json!({"element": id}), json!({"element": id, "text": null}), json!({"element": id, "path": null, "x": 12.0})] {
+        let depth = s.undo_depth();
+        s.run("layout.update", &p).unwrap();
+        assert_eq!(s.undo_depth(), depth + 1, "{p}");
+    }
+    assert_eq!(x(&s), 12.0);
     // A picture an older file holds with no image, only its file, relinked: it draws again.
     let imported = json!({"name": "Imported", "width": 210.0, "height": 297.0, "elements": [
         {"id": 1, "name": "Logo", "x": 10.0, "y": 10.0, "w": 40.0, "h": 20.0, "kind": {"Picture": {"image": "", "source": "/data/logos/north.png"}}}
@@ -467,6 +475,7 @@ fn a_bad_file_is_refused_and_the_picture_left_as_it_was() {
         assert!(state(&s) == before, "{key} on a text changed it");
     }
     s.run("layout.update", &json!({"element": text, "path": null, "image": null})).unwrap();
+    assert!(state(&s) == before, "null picture keys on a text changed it");
     // Locked, it is refused before its file is read.
     s.run("layout.update", &json!({"element": id, "locked": true})).unwrap();
     let before = state(&s);

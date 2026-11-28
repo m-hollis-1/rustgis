@@ -77,6 +77,7 @@ mod mapview;
 mod markerimages;
 mod markerpick;
 pub use markerpick::{MarkerImage, marker_file_too_large};
+mod matchcount;
 mod measure_units;
 mod modelbuilder;
 mod navui;
@@ -146,6 +147,8 @@ mod widgets;
 mod workspacepanes;
 mod worldviewui;
 mod zarrui;
+
+use std::sync::Arc;
 
 use rustgis_engine::cmd::service_added::Removal;
 use rustgis_engine::render::rustgis_tiles::failure::Failure;
@@ -342,8 +345,14 @@ type PageRead = Slot<Result<(Vec<u8>, rustgis_engine::data::raster::Raster), Str
 
 /// See [`UiState::window_reads`].
 #[cfg(not(target_arch = "wasm32"))]
-type WindowRead =
-    (u64, String, Value, Slot<Result<rustgis_engine::cmd::layer::CogWindow, String>>, std::sync::Arc<std::sync::atomic::AtomicBool>);
+type WindowRead = (
+    u64,
+    String,
+    Value,
+    Slot<Result<rustgis_engine::cmd::layer::CogWindow, String>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    Option<std::sync::Arc<rustgis_engine::render::rustgis_tiles::cache::Progress>>,
+);
 
 /// A window's turn to be read off the frame, or `None` once `left` says its project was closed or
 /// its download was cancelled: one waiting for its turn then gives up its place at once, without
@@ -494,8 +503,10 @@ pub struct Services {
     /// [`RustGisApp::photos`]. `None` where there is no camera to ask.
     pub take_photo: Option<Box<dyn Fn() -> Result<(), String>>>,
     /// Offers bytes as a download named `file_name`; success means submission to the host's
-    /// download mechanism. Browsers do not expose confirmation that the file was saved.
-    pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
+    /// download mechanism. Browsers do not expose confirmation that the file was saved. The bytes
+    /// may be shared with what the session holds (a raster layer's file), so they aren't copied
+    /// to be offered.
+    pub download: Option<Box<dyn Fn(&str, Arc<Vec<u8>>) -> Result<(), String>>>,
     /// Starts saving a project on a phone: written back to the document given (one the project
     /// was opened from or last saved as, with leave to write it), or through the native picker
     /// when there is none. The shell reports the eventual result through
@@ -1073,9 +1084,10 @@ pub struct UiState {
     /// that can be read in place are added so, others downloaded (the `ui.addUrl` parameters,
     /// and the answer).
     pub cog_probes: Vec<(Value, Option<u64>, Slot<Result<bool, String>>)>,
-    /// Windows of cloud-optimised GeoTIFFs (`"bbox"`) being read on threads: the session's
-    /// download id, the address, the parameters to add it with, where the read lands, and whether
-    /// its project was closed.
+    /// Windows of cloud-optimised GeoTIFFs (`"bbox"`), and the rows of a box of GRIB records
+    /// (`"bytes"` with `"bbox"`, #3055), being read on threads: the session's download id, the
+    /// address, the parameters to add it with, where the read lands, whether its project was
+    /// closed, and how far a GRIB record's requests have come (a window's tiles aren't counted).
     #[cfg(not(target_arch = "wasm32"))]
     pub window_reads: Vec<WindowRead>,
     /// PDF downloads whose page is being drawn on a thread before it is added (#2336): the
@@ -1617,6 +1629,16 @@ pub struct RustGisApp {
     /// Coverage of the last chosen catalog in the active font stack. Cleared when fonts change
     /// or a language is picked again, so checking thousands of letters is never a per-frame loop.
     language_coverage: Option<(i18n::Lang, bool)>,
+    /// Bounded CJK font-scan summary held until the selected interface language is active (or
+    /// known to lack font coverage), so the notice is translated into the active UI language.
+    pending_cjk_scan_notice: Option<rustgis_engine::render::fonts::CjkRootScanSummary>,
+    /// Whether the UI has already reconciled a completed background Linux CJK folder scan.
+    cjk_roots_applied: bool,
+    /// Whether `add_cjk_fallback` missed while an async Linux CJK folder scan was in flight and
+    /// should retry once that scan finishes.
+    cjk_fallback_deferred: bool,
+    #[cfg(test)]
+    test_cjk_roots_state: Option<(bool, bool)>,
     /// The project path last seen, so a change (whoever opened or saved it) updates Last Project.
     seen_project: Option<std::path::PathBuf>,
 }
@@ -1825,6 +1847,7 @@ impl RustGisApp {
         // This front end has the Download Datum Grids setting, so a note about a missing grid can
         // point to it.
         s.offers_grid_downloads = true;
+        rustgis_engine::claim_ui_cjk_scan_notice();
         if s.active_layer.is_none() {
             s.active_layer = s.map().layers.first().map(|l| l.id);
         }
@@ -1925,6 +1948,11 @@ impl RustGisApp {
             label_fonts_indexed: false,
             shown_lang: i18n::Lang::EN,
             language_coverage: None,
+            pending_cjk_scan_notice: None,
+            cjk_roots_applied: rustgis_engine::render::fonts::cjk_roots_ready(),
+            cjk_fallback_deferred: false,
+            #[cfg(test)]
+            test_cjk_roots_state: None,
             seen_project: None,
             autosave: Default::default(),
             save_prompt: Default::default(),
@@ -2155,6 +2183,13 @@ impl RustGisApp {
             let name = format!("script-{region:?}");
             let have = self.extra_fonts.iter().any(|(_, _, r)| *r == Some(region));
             if !have
+                && !self.fonts_failed.contains(&name)
+                && matches!(region, rustgis_engine::render::fonts::ScriptFont::Cjk(_))
+                && self.cjk_scan_in_flight()
+            {
+                return false;
+            }
+            if !have
                 && self.fonts_requested.contains(&name)
                 && !self.fonts_failed.contains(&name)
                 && self.services.fetch_font.is_some()
@@ -2213,19 +2248,96 @@ impl RustGisApp {
         covered
     }
 
+    fn cjk_roots_pending(&self) -> bool {
+        #[cfg(test)]
+        if let Some((pending, _)) = self.test_cjk_roots_state {
+            return pending;
+        }
+        rustgis_engine::render::fonts::cjk_roots_pending()
+    }
+
+    fn cjk_roots_ready(&self) -> bool {
+        #[cfg(test)]
+        if let Some((_, ready)) = self.test_cjk_roots_state {
+            return ready;
+        }
+        rustgis_engine::render::fonts::cjk_roots_ready()
+    }
+
+    fn cjk_scan_in_flight(&self) -> bool {
+        self.cjk_roots_pending() || (!self.cjk_roots_applied && self.cjk_roots_ready())
+    }
+
     /// On the desktop, an installed CJK face as a last-resort fallback, so CJK text (language names
     /// in the picker, place names in data) renders whatever the interface language. The bytes are
-    /// borrowed from the font cache, not copied.
-    fn add_cjk_fallback(&mut self) {
+    /// borrowed from the font cache, not copied. Returns `true` when a face was newly added.
+    fn add_cjk_fallback(&mut self) -> bool {
         use rustgis_engine::render::fonts::{CjkRegion, cjk_font};
         if self.extra_fonts.iter().any(|(n, _, _)| n == "cjk-fallback") {
-            return;
+            return false;
         }
         let found = [CjkRegion::SimplifiedChinese, CjkRegion::Japanese, CjkRegion::Korean].into_iter().find_map(cjk_font);
         if let Some((bytes, index)) = found {
             let face = theme::installed_face(bytes, *index, true);
             self.extra_fonts.push(("cjk-fallback".into(), std::sync::Arc::new(face), None));
+            return true;
         }
+        if self.cjk_scan_in_flight() {
+            self.cjk_fallback_deferred = true;
+        }
+        false
+    }
+
+    /// Captures any CJK font-folder scan diagnostic summary after font lookups run and emits a
+    /// translated notice once the selected interface language is active (or confirmed unavailable).
+    fn flush_cjk_scan_notice(&mut self) {
+        if self.pending_cjk_scan_notice.is_none() {
+            self.pending_cjk_scan_notice = rustgis_engine::render::fonts::take_cjk_scan_summary();
+        }
+        let chosen = self.chosen_lang();
+        let settled = self.shown_lang == chosen || self.language_coverage == Some((chosen, false));
+        if !settled {
+            return;
+        }
+        let Some(summary) = self.pending_cjk_scan_notice.take() else { return };
+        let prev = i18n::current();
+        i18n::set_current(self.shown_lang);
+        let msg = Self::format_cjk_scan_notice(&summary);
+        i18n::set_current(prev);
+        if let Some(msg) = msg {
+            self.session.notify(msg, false);
+        }
+    }
+
+    fn format_cjk_scan_notice(summary: &rustgis_engine::render::fonts::CjkRootScanSummary) -> Option<String> {
+        if summary.is_clean() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if summary.thread_spawn_failed {
+            parts.push(i18n::t_raw("background scan thread could not start").to_string());
+        }
+        if summary.truncated_dirs > 0 {
+            parts.push(i18n::fmt_raw("{count} folder(s) reached the scan limit", &[("count", &summary.truncated_dirs.to_string())]));
+        }
+        if summary.unreadable_dirs > 0 {
+            parts.push(i18n::fmt_raw("{count} unreadable folder(s)", &[("count", &summary.unreadable_dirs.to_string())]));
+        }
+        if summary.entry_errors > 0 {
+            parts.push(i18n::fmt_raw("{count} directory entry error(s)", &[("count", &summary.entry_errors.to_string())]));
+        }
+        let details = parts.join(", ");
+        let msg = match summary.sample_path.as_deref() {
+            Some(path) => i18n::fmt(
+                "CJK font folder search stopped early: {details} (e.g. {path}); some installed CJK fonts may not be found.",
+                &[("details", &details), ("path", &path.display().to_string())],
+            ),
+            None => i18n::fmt(
+                "CJK font folder search stopped early: {details}; some installed CJK fonts may not be found.",
+                &[("details", &details)],
+            ),
+        };
+        Some(msg)
     }
 
     /// On the desktop, an installed symbol face as a last-resort fallback, so marks the interface
@@ -2265,7 +2377,7 @@ impl RustGisApp {
     /// Makes sure the current language's script has a font: an installed face on the desktop, a
     /// download on the web.
     fn ensure_script_font(&mut self) {
-        use rustgis_engine::render::fonts::{script_font, script_font_url};
+        use rustgis_engine::render::fonts::{ScriptFont, script_font, script_font_url};
         // Switching between script languages reorders the faces already loaded.
         if self.current_region() != self.installed_region {
             self.fonts_dirty = true;
@@ -2276,12 +2388,19 @@ impl RustGisApp {
         {
             return;
         }
-        self.fonts_requested.push(name.clone());
         if let Some((bytes, index)) = script_font(region) {
-            let face = theme::installed_face(bytes, *index, matches!(region, rustgis_engine::render::fonts::ScriptFont::Cjk(_)));
+            self.fonts_requested.push(name.clone());
+            let face = theme::installed_face(bytes, *index, matches!(region, ScriptFont::Cjk(_)));
             self.extra_fonts.push((name, std::sync::Arc::new(face), Some(region)));
             self.fonts_dirty = true;
-        } else if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(region)) {
+            return;
+        }
+        if matches!(region, ScriptFont::Cjk(_)) && self.cjk_scan_in_flight() {
+            // Linux CJK folder scan is running off the UI thread; retry once it finishes.
+            return;
+        }
+        self.fonts_requested.push(name);
+        if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(region)) {
             fetch(url);
         } else {
             log::warn!("no {region:?} font installed; text in that script may not display");
@@ -2376,9 +2495,10 @@ impl RustGisApp {
     /// CJK font installed).
     fn ensure_data_cjk_font(&mut self, ctx: &egui::Context) {
         use rustgis_engine::render::fonts::{CjkRegion, CjkScript, ScriptFont, script_font_url, take_missing_cjk};
-        if self.fonts_dirty || self.fonts_pending {
+        if self.fonts_dirty || self.fonts_pending || self.cjk_scan_in_flight() {
             return;
         }
+        let fetching = self.services.fetch_font.is_some();
         let samples = rustgis_engine::render::fonts::peek_missing_text();
         let missing: Vec<_> = take_missing_cjk()
             .into_iter()
@@ -2392,7 +2512,6 @@ impl RustGisApp {
             return;
         }
         let han = if missing.contains(&CjkScript::Han) { self.han_region() } else { CjkRegion::SimplifiedChinese };
-        let fetching = self.services.fetch_font.is_some();
         if !fetching {
             for script in missing {
                 if self.cjk_scripts_handled.contains(&script) {
@@ -2819,7 +2938,7 @@ impl RustGisApp {
             }
         };
         let file = format!("{stem}.rgis");
-        if let Err(e) = self.services.download.as_ref().ok_or(tl!("no download service"))?(&file, text.into_bytes()) {
+        if let Err(e) = self.services.download.as_ref().ok_or(tl!("no download service"))?(&file, Arc::new(text.into_bytes())) {
             self.session.project.name = old;
             return Err(e);
         }
@@ -2849,7 +2968,7 @@ impl RustGisApp {
     fn download(&mut self, name: &str, bytes: Vec<u8>) -> bool {
         match &self.services.download {
             Some(d) => {
-                if let Err(e) = d(name, bytes) {
+                if let Err(e) = d(name, Arc::new(bytes)) {
                     self.session.notify(e, true);
                     return false;
                 }
@@ -2883,14 +3002,19 @@ impl RustGisApp {
                 Some(download) => download(&name, bytes),
                 None => Err(tl!("this build has no download service").into()),
             };
-            // gp.fileDelivered reports delivery failures from its history record. The app also
-            // reports acknowledgment failures before dispatch, without repeating engine notices.
+            // gp.fileDelivered reports delivery failures itself. The app also reports
+            // acknowledgment failures before dispatch, without repeating engine notices.
+            // Asked before the acknowledgment forgets the file.
+            let export = self.session.is_export_file(id);
             let completed = self.acknowledge_gp_file(id, delivered.as_ref().err().map(String::as_str));
             let result = delivered.and(completed);
-            self.gp.last = Some(match &result {
-                Ok(_) => (true, self.session.project.gp_history.last().map(|h| h.messages.clone()).unwrap_or_default()),
-                Err(error) => (false, vec![error.clone()]),
-            });
+            // An export isn't a tool run: the Geoprocessing pane keeps showing the last one.
+            if !export {
+                self.gp.last = Some(match &result {
+                    Ok(_) => (true, self.session.project.gp_history.last().map(|h| h.messages.clone()).unwrap_or_default()),
+                    Err(error) => (false, vec![error.clone()]),
+                });
+            }
             requested = complete_gp_file(requested, id, &result);
         }
         requested
@@ -3864,6 +3988,18 @@ impl RustGisApp {
                 o.remove("request");
                 if let Some(Value::Object(window)) = window {
                     o.extend(window);
+                }
+                // The rows of a box of a GRIB record (#3055): the range marked on the address is
+                // its `"bytes"` again, and an address whose name doesn't say GRIB is one by
+                // `"format"`, as it was asked.
+                let marked = o.get("url").and_then(Value::as_str).map(rustgis_engine::render::rustgis_tiles::cache::split_range);
+                if let Some((url, Some((first, last)))) = marked.map(|(u, r)| (u.to_string(), r)) {
+                    let named = rustgis_engine::data::raster::grib::is_grib_name(url.split(['?', '#']).next().unwrap_or(&url));
+                    o.insert("url".into(), json!(url));
+                    o.insert("bytes".into(), json!([first, last]));
+                    if !named {
+                        o.insert("format".into(), json!("grib"));
+                    }
                 }
             }
             finished = again;
@@ -6233,7 +6369,10 @@ impl RustGisApp {
             let range = rustgis_engine::cmd::layer::byte_range(p, url)?;
             // A window of a cloud-optimised GeoTIFF is read off the frame (below), with no
             // probe: it is refused unless it is one. In the browser the command refuses it.
-            let window = cfg!(not(target_arch = "wasm32")) && p.get("bbox").is_some_and(|v| !v.is_null());
+            // With a range, the rows of the box of a GRIB record are read off the frame the same
+            // way (#3055), the range marked on the address. A `false` box is no box, as the
+            // command reads it.
+            let window = cfg!(not(target_arch = "wasm32")) && p.get("bbox").is_some_and(|v| !v.is_null() && v.as_bool() != Some(false));
             if !window && url.to_ascii_lowercase().split(['?', '#']).next().is_some_and(|u| u.ends_with(".pmtiles")) {
                 let before = self.session.sources.generation;
                 let result = if let Some(id) = claim {
@@ -6587,7 +6726,7 @@ impl RustGisApp {
         {
             let mut read = Vec::new();
             let session = &self.session;
-            self.ui.window_reads.retain(|(id, url, p, slot, left)| match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.ui.window_reads.retain(|(id, url, p, slot, left, _)| match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 Some(r) => {
                     read.push((*id, url.clone(), p.clone(), r));
                     false
@@ -6620,7 +6759,7 @@ impl RustGisApp {
         let downloads = self.ui.downloads.iter().map(|d| shown(d.id, &d.url, Some(&d.progress)));
         #[cfg(not(target_arch = "wasm32"))]
         let downloads = downloads
-            .chain(self.ui.window_reads.iter().map(|(id, url, ..)| shown(*id, url, None)))
+            .chain(self.ui.window_reads.iter().map(|(id, url, _, _, _, progress)| shown(*id, url, progress.as_ref())))
             .chain(self.ui.page_reads.iter().map(|(l, ..)| shown(l.id, &l.url, None)))
             .chain(self.ui.page_queue.iter().map(|(l, ..)| shown(l.id, &l.url, None)));
         let mut under_way: Vec<_> = downloads.collect();
@@ -6641,7 +6780,7 @@ impl RustGisApp {
         #[cfg(not(target_arch = "wasm32"))]
         let cancelled = cancelled.or_else(|| {
             let i = self.ui.window_reads.iter().position(|d| d.0 == id)?;
-            let (_, url, p, _, left) = self.ui.window_reads.remove(i);
+            let (_, url, p, _, left, _) = self.ui.window_reads.remove(i);
             left.store(true, std::sync::atomic::Ordering::Relaxed);
             Some((url, p))
         });
@@ -6725,15 +6864,30 @@ impl RustGisApp {
         let land = slot.clone();
         let left = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let leaving = left.clone();
+        // A GRIB record's rows (#3055) are whole requests on this thread: counted, as a download
+        // is, and stopped at their next bytes once cancelled or no longer wanted by their claim
+        // (a window's tiles look at `left` themselves).
+        let rows = rustgis_engine::cmd::layer::asks_rows(p);
+        let progress = rows.then(std::sync::Arc::<rustgis_engine::render::rustgis_tiles::cache::Progress>::default);
+        let counted = progress.clone();
+        let claimed = claim.and_then(|id| self.session.download_still(id)).filter(|_| rows);
+        let watched = left.clone();
+        let wanted: Option<rustgis_engine::render::rustgis_tiles::cache::Still> =
+            rows.then(|| std::sync::Arc::new(move || !watched.load(std::sync::atomic::Ordering::Relaxed)) as _);
         // Its requests stay in the session's diagnostics.
         let diagnostics = self.session.diagnostics.capture();
         let spawned = std::thread::Builder::new().name("cog-window".into()).spawn(move || {
             let _diagnostics = diagnostics.enter();
             let turn = window_turn(&leaving);
             let read = if turn.is_some() {
+                use rustgis_engine::render::rustgis_tiles::cache;
                 // On a thread no command's catch reaches: a bug must not leave it running forever.
                 let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rustgis_engine::cmd::layer::read_cog_window_until(&asked, &leaving)
+                    cache::with_optional_still(claimed, || {
+                        cache::with_optional_still(wanted, || {
+                            cache::with_progress(counted, || rustgis_engine::cmd::layer::read_cog_window_until(&asked, &leaving))
+                        })
+                    })
                 }));
                 let read = read.unwrap_or_else(|_| Err(tl!("Reading the window failed unexpectedly").to_string()));
                 // Stopped by `left`: said as one given up before its turn is. A read that failed
@@ -6772,7 +6926,7 @@ impl RustGisApp {
         let shown = rustgis_engine::sources::address_in_message(&url);
         self.session.notify(i18n::fmt("Reading {url}…", &[("url", &shown)]), false);
         let id = claim.unwrap_or_else(|| self.session.download_started());
-        self.ui.window_reads.push((id, url, q, slot, left));
+        self.ui.window_reads.push((id, url, q, slot, left, progress));
         Ok(Value::Null)
     }
 
@@ -7364,6 +7518,18 @@ impl RustGisApp {
             }
             None
         }));
+        // Reconcile a completed off-thread Linux CJK folder scan before requesting script fonts.
+        if !self.cjk_roots_applied && self.cjk_roots_ready() {
+            self.cjk_roots_applied = true;
+            if self.cjk_fallback_deferred {
+                self.cjk_fallback_deferred = false;
+                if self.add_cjk_fallback() {
+                    self.fonts_dirty = true;
+                }
+            }
+            self.map.invalidate();
+            self.layout.redraw();
+        }
         self.ensure_script_font();
         self.ensure_data_cjk_font(ctx);
         self.ensure_other_script_fonts(ctx);
@@ -7547,6 +7713,11 @@ impl RustGisApp {
             theme::install_fonts(ctx, &self.extra_fonts, self.installed_region);
             self.fonts_pending = true;
         }
+        if self.cjk_roots_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else if !self.cjk_roots_applied && self.cjk_roots_ready() {
+            ctx.request_repaint();
+        }
         // Switch the drawn language once its font can draw it; until then keep the previous one.
         let chosen = self.chosen_lang();
         if self.shown_lang != chosen {
@@ -7557,6 +7728,7 @@ impl RustGisApp {
                 ctx.request_repaint();
             }
         }
+        self.flush_cjk_scan_notice();
         self.refresh_themes(ctx);
         if self.ui.dark_follows_system
             && let Some(system) = ctx.system_theme()
@@ -7705,8 +7877,16 @@ impl RustGisApp {
             autosave::tick(self, &ctx);
         }
         // Missing text first drawn this frame needs a next logic pass even without input.
-        // Handled requests wait for their result instead of keeping an idle window repainting.
-        if rustgis_engine::render::fonts::peek_missing_cjk().iter().any(|s| !self.cjk_scripts_handled.contains(s))
+        // Handled requests (or CJK misses waiting on an in-flight Linux folder scan) wait for
+        // their result instead of keeping an idle window repainting every frame; if a scan
+        // started (or completed) during `ui`, schedule the poll or immediate reconciliation.
+        if self.cjk_roots_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else if !self.cjk_roots_applied && self.cjk_roots_ready() {
+            ctx.request_repaint();
+        }
+        if (!self.cjk_scan_in_flight()
+            && rustgis_engine::render::fonts::peek_missing_cjk().iter().any(|s| !self.cjk_scripts_handled.contains(s)))
             || rustgis_engine::render::fonts::peek_missing_text()
                 .iter()
                 .any(|(s, _)| !matches!(s, rustgis_engine::render::fonts::ScriptFont::Cjk(_)) && !self.other_scripts_handled.contains(s))
@@ -8232,12 +8412,166 @@ mod language_coverage_tests {
         frame(&mut app, &ctx);
         assert_eq!(app.lang(), i18n::Lang::EN, "a valid font with no Persian must not activate Persian");
     }
+
+    #[test]
+    fn cjk_scan_notice_waits_for_selected_language_before_emitting() {
+        use rustgis_engine::render::fonts::CjkRootScanSummary;
+
+        let mut app = RustGisApp::with_sample();
+        assert!(rustgis_engine::ui_owns_cjk_scan_notice(), "UI shell claims process-wide ownership of the CJK scan notice");
+        app.run("ui.language", json!({"code": "de"})).unwrap();
+        app.pending_cjk_scan_notice = Some(CjkRootScanSummary {
+            truncated_dirs: 2,
+            unreadable_dirs: 0,
+            entry_errors: 1,
+            thread_spawn_failed: false,
+            sample_path: Some(std::path::PathBuf::from("/run/host/fonts")),
+        });
+        let ctx = egui::Context::default();
+        let mark = app.session.notice_mark();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label("Host text before RustGIS");
+            app.logic(ui.ctx());
+        });
+        output.textures_delta.clear();
+        assert_eq!(app.lang(), i18n::Lang::EN);
+        assert!(app.pending_cjk_scan_notice.is_some(), "retain summary until shown_lang switches");
+        assert!(
+            !app.session.notices_since(mark).iter().any(|n| n.text.contains("/run/host/fonts")),
+            "must not emit scan notice before shown_lang settles"
+        );
+
+        frame(&mut app, &ctx);
+        assert_eq!(app.lang().code(), "de");
+        assert!(app.pending_cjk_scan_notice.is_none());
+        let matching: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.text.contains("/run/host/fonts")).collect();
+        assert_eq!(matching.len(), 1, "{matching:?}");
+
+        // If the chosen language cannot be drawn, flush the pending notice once coverage fails.
+        let (mut missing_app, missing_ctx) = without_script_font("ja");
+        missing_app.pending_cjk_scan_notice = Some(CjkRootScanSummary {
+            truncated_dirs: 0,
+            unreadable_dirs: 1,
+            entry_errors: 0,
+            thread_spawn_failed: false,
+            sample_path: Some(std::path::PathBuf::from("/run/host/user-fonts")),
+        });
+        let missing_mark = missing_app.session.notice_mark();
+        frame(&mut missing_app, &missing_ctx);
+        assert_eq!(missing_app.lang(), i18n::Lang::EN);
+        assert!(missing_app.pending_cjk_scan_notice.is_none(), "summary must flush once chosen language fails coverage");
+        assert!(
+            missing_app.session.notices_since(missing_mark).iter().any(|n| n.text.contains("/run/host/user-fonts")),
+            "{:?}",
+            missing_app.session.notices_since(missing_mark)
+        );
+    }
+
+    #[test]
+    fn cjk_language_waits_for_async_cjk_root_scan_before_reporting_unavailable() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::isolate_account_test("language_coverage_tests::cjk_language_waits_for_async_cjk_root_scan_before_reporting_unavailable") {
+            return;
+        }
+        let (mut app, ctx) = without_script_font("ja");
+        // Keep `fonts_requested` populated so host macOS/Windows fonts are not pulled in, while
+        // clearing `fonts_failed` so `can_draw` behaves as an in-flight Linux CJK scan.
+        app.fonts_failed.clear();
+        app.cjk_roots_applied = false;
+        app.test_cjk_roots_state = Some((true, false));
+        let mark = app.session.notice_mark();
+
+        frame(&mut app, &ctx);
+        assert_eq!(app.lang(), i18n::Lang::EN);
+        assert!(app.language_coverage.is_none(), "must not cache failure while CJK root scan is pending");
+        assert!(!app.cjk_roots_applied);
+        assert!(
+            !app.session.notices_since(mark).iter().any(|n| n.text.contains("can't display")),
+            "must not emit missing-font notice before CJK root scan finishes: {:?}",
+            app.session.notices_since(mark)
+        );
+
+        // Once the background scan finishes with no Japanese font found, coverage is evaluated
+        // and the unavailability notice is emitted once.
+        app.test_cjk_roots_state = Some((false, true));
+        frame(&mut app, &ctx);
+        assert!(app.cjk_roots_applied);
+        assert_eq!(app.lang(), i18n::Lang::EN);
+        assert_eq!(app.language_coverage, Some((app.chosen_lang(), false)));
+        let unavailable: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.text.contains("can't display")).collect();
+        assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+
+        // While a scan is pending, data-CJK downloads are also deferred even when fetch_font is set.
+        let (mut dl_app, dl_ctx) = without_script_font("en");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = asked.clone();
+        dl_app.services.fetch_font = Some(Box::new(move |url| sink.lock().unwrap().push(url.to_string())));
+        dl_app.cjk_roots_applied = false;
+        dl_app.test_cjk_roots_state = Some((true, false));
+        rustgis_engine::render::fonts::note_missing_cjk('か');
+        let mut output = dl_ctx.run_ui(egui::RawInput::default(), |ui| dl_app.ensure_data_cjk_font(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(asked.lock().unwrap().is_empty(), "must not start font download while CJK folder scan is in flight");
+
+        // A scan started during `ui` (after `logic` already ran) must still schedule a delayed
+        // repaint poll without busy-spinning, and completing during `ui` must wake immediately.
+        let immediate = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delayed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (imm_sink, del_sink) = (immediate.clone(), delayed.clone());
+        dl_ctx.set_repaint_observer(move |req| {
+            if req.delay.is_zero() {
+                imm_sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else if req.delay <= std::time::Duration::from_millis(50) {
+                del_sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        dl_app.fonts_frames = 2;
+        dl_app.label_fonts_indexed = true;
+        dl_app.chrome = Some(|_, _| {});
+        dl_app.test_cjk_roots_state = Some((false, false));
+        let _ = rustgis_engine::render::fonts::take_missing_cjk();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0))),
+            ..Default::default()
+        };
+        for _ in 0..8 {
+            let mut output = dl_ctx.run_ui(raw_input.clone(), |ui| {
+                dl_app.logic(ui.ctx());
+                dl_app.ui(ui);
+            });
+            output.textures_delta.clear();
+        }
+        dl_app.cjk_roots_applied = false;
+        dl_app.test_cjk_roots_state = Some((true, false));
+        rustgis_engine::render::fonts::note_missing_cjk('か');
+        let mut output = dl_ctx.run_ui(raw_input.clone(), |ui| {
+            immediate.store(0, std::sync::atomic::Ordering::SeqCst);
+            delayed.store(0, std::sync::atomic::Ordering::SeqCst);
+            dl_app.ui(ui);
+        });
+        output.textures_delta.clear();
+        assert_eq!(immediate.load(std::sync::atomic::Ordering::SeqCst), 0, "in-flight scan must not busy-spin immediate repaints");
+        assert!(delayed.load(std::sync::atomic::Ordering::SeqCst) > 0, "in-flight scan must schedule a delayed poll at end of ui");
+
+        dl_app.test_cjk_roots_state = Some((false, true));
+        let mut output = dl_ctx.run_ui(raw_input, |ui| {
+            immediate.store(0, std::sync::atomic::Ordering::SeqCst);
+            dl_app.ui(ui);
+        });
+        output.textures_delta.clear();
+        assert!(immediate.load(std::sync::atomic::Ordering::SeqCst) > 0, "completed scan during ui must wake immediately");
+
+        // Drain missing CJK bit cleanly so other tests start clean.
+        let _ = rustgis_engine::render::fonts::take_missing_cjk();
+    }
 }
 
 #[cfg(test)]
 mod cjk_download_tests {
     /// Initializes the font stack before a poll can recheck actual missing characters.
     fn poll_cjk(app: &mut super::RustGisApp) {
+        // Download tests emulate a browser/environment with no Linux CJK folder scan in flight.
+        app.test_cjk_roots_state = Some((false, false));
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.ensure_data_cjk_font(ui.ctx()));
         output.textures_delta.clear();
@@ -8881,6 +9215,21 @@ mod record_tests {
         assert_eq!(steps.len(), 1, "{:?}", app.session.notices);
         assert_eq!(steps[0].command, "layer.addUrl");
         assert_eq!(steps[0].params, json!({"url": "https://example.com/data", "name": "W", "bbox": "view", "cellSize": 30, "cog": true}));
+        // The rows of a box of a GRIB record (#3055): the range marked on the address goes back
+        // to "bytes", so the step reads the same rows again.
+        let url = "https://example.com/run/PREC.grb";
+        let ranged = rustgis_engine::cmd::layer::ranged_address(url, (88, 4971));
+        let p = json!({"id": 2, "url": ranged, "name": "Rain", "request": 8, "window": {"bbox": [-51, -23, -39, -14]}});
+        app.record_step("layer.addDownload", &p, None);
+        let steps = app.ws.recording.as_ref().unwrap();
+        assert_eq!(steps[1].params, json!({"url": url, "bytes": [88, 4971], "name": "Rain", "bbox": [-51, -23, -39, -14]}));
+        // An address whose name doesn't say GRIB keeps "format", without which its range is refused.
+        let unnamed = "https://example.com/record?id=2";
+        let p = json!({"id": 3, "url": rustgis_engine::cmd::layer::ranged_address(unnamed, (0, 87)), "window": {"bbox": [10, 59, 11, 60]}});
+        app.record_step("layer.addDownload", &p, None);
+        let step = &app.ws.recording.as_ref().unwrap()[2].params;
+        assert_eq!(step, &json!({"url": unnamed, "bytes": [0, 87], "format": "grib", "bbox": [10, 59, 11, 60]}));
+        assert_eq!(rustgis_engine::cmd::layer::byte_range(step, unnamed), Ok(Some((0, 87))), "replayed, the range is read");
     }
 
     /// `ui.addUrl` with `"bbox"`: a slow server doesn't hold the
@@ -8944,7 +9293,7 @@ mod record_tests {
     fn too_many_windows_under_way_are_refused() {
         let mut app = RustGisApp::with_sample();
         for _ in 0..crate::MAX_WINDOW_READS {
-            app.ui.window_reads.push((0, String::new(), serde_json::Value::Null, Default::default(), Default::default()));
+            app.ui.window_reads.push((0, String::new(), serde_json::Value::Null, Default::default(), Default::default(), None));
         }
         let e = app.run("ui.addUrl", json!({"url": "https://x.org/a.tif?token=hidden-1330", "bbox": [1, 2, 3, 4]})).unwrap_err();
         assert!(e.contains("x.org/a.tif") && e.contains("16 windows") && !e.contains("hidden-1330"), "{e}");
@@ -9016,6 +9365,48 @@ mod record_tests {
             std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: legacy settling delay after releasing cancelled window reads
         }
         assert!(app.session.map().layer_by_name("Cancelled").is_none());
+    }
+
+    /// The rows of a box of a GRIB record (`"bytes"` with `"bbox"`, #3055) are read off the frame
+    /// as a window is, the range marked on the address: listed with how much of their requests has
+    /// come, and Cancel drops them, said, with nothing added once the server answers after all.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_rows_of_a_grib_record_are_read_off_the_frame_and_cancelled() {
+        use std::sync::atomic::Ordering;
+        let _turn = crate::fetching::turn();
+        let slow = crate::fetching::slow_ranges(vec![0; 8192]);
+        slow.open.store(false, Ordering::Relaxed);
+        let mut app = RustGisApp::with_sample();
+        let url = format!("{}/run/PREC.grb", slow.origin);
+        let asked = std::time::Instant::now();
+        let p = json!({"url": url, "bytes": [0, 8191], "bbox": [10.6, 22.7, 12.4, 25.3], "name": "Rows"});
+        app.run("ui.addUrl", p).unwrap();
+        assert!(asked.elapsed() < std::time::Duration::from_secs(5), "asking for it held the frame");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while slow.held.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no request held");
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: polling for the held first read
+        }
+        let under_way = app.downloads_under_way();
+        assert_eq!(under_way.len(), 1, "{under_way:?}");
+        assert!(under_way[0].shown.contains("PREC.grb") && under_way[0].progress.is_some(), "{under_way:?}");
+        assert!(app.ui.window_reads[0].1.contains(rustgis_engine::render::rustgis_tiles::cache::RANGE), "{}", app.ui.window_reads[0].1);
+        app.cancel_download(under_way[0].id);
+        assert!(app.ui.window_reads.is_empty() && app.downloads_under_way().is_empty());
+        let said = |n: &rustgis_engine::Notice| n.text.contains("PREC.grb") && n.text.contains("cancelled") && !n.error;
+        assert!(app.session.notices.iter().any(said), "{:?}", app.session.notices);
+        // The server answers after all: the read's thread ends (its turn comes free once it has
+        // landed whatever it read, or given up), and only then is nothing added looked for.
+        slow.open.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::WINDOW_TURN.try_lock().is_err() {
+            assert!(std::time::Instant::now() < deadline, "the cancelled read never ended");
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: polling for the cancelled read's thread to end
+        }
+        app.poll_data_downloads();
+        assert!(app.ui.window_reads.is_empty() && app.downloads_under_way().is_empty());
+        assert!(app.session.map().layer_by_name("Rows").is_none());
     }
 
     /// Cancel drops a whole file's download as one that failed: said, and not added when its
@@ -9898,7 +10289,7 @@ mod download_service_tests {
         let downloaded = file.clone();
         let mut app = RustGisApp::with_sample().with_services(Services {
             download: Some(Box::new(move |_, bytes| {
-                *downloaded.lock().unwrap() = bytes;
+                *downloaded.lock().unwrap() = std::sync::Arc::unwrap_or_clone(bytes);
                 Ok(())
             })),
             ..Default::default()
@@ -9923,7 +10314,7 @@ mod download_service_tests {
         let downloaded = file.clone();
         let mut app = RustGisApp::with_sample().with_services(Services {
             download: Some(Box::new(move |_, bytes| {
-                *downloaded.lock().unwrap() = bytes;
+                *downloaded.lock().unwrap() = std::sync::Arc::unwrap_or_clone(bytes);
                 Ok(())
             })),
             ..Default::default()
@@ -9961,7 +10352,7 @@ mod download_service_tests {
                     if !accept {
                         return Err("browser rejected download".into());
                     }
-                    taken.lock().unwrap().push((name.to_string(), bytes));
+                    taken.lock().unwrap().push((name.to_string(), bytes.to_vec()));
                     Ok(())
                 })),
                 ..Default::default()
@@ -10032,7 +10423,7 @@ mod download_service_tests {
         use rustgis_engine::geom::Coord;
         // A NaN accepted, a NaN refused, and finite numbers only (nothing to say).
         for (accept, first) in [(true, f64::NAN), (false, f64::NAN), (true, 2.5)] {
-            let download: Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>> =
+            let download: Box<dyn Fn(&str, std::sync::Arc<Vec<u8>>) -> Result<(), String>> =
                 if accept { Box::new(|_, _| Ok(())) } else { Box::new(|_, _| Err("browser rejected download".into())) };
             let mut app = RustGisApp::with_sample().with_services(Services { download: Some(download), ..Default::default() });
             let mut ds = Dataset::new("Gauges", GeometryType::Point, vec![Field::new("level", FieldType::Double)]);
@@ -10059,7 +10450,7 @@ mod download_service_tests {
         use rustgis_engine::geom::Coord;
         let changed = |app: &RustGisApp| app.session.notices.iter().filter(|n| n.text.contains("changed to fit a Shapefile")).count();
         let with = |accept: bool| {
-            let download: Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>> =
+            let download: Box<dyn Fn(&str, std::sync::Arc<Vec<u8>>) -> Result<(), String>> =
                 if accept { Box::new(|_, _| Ok(())) } else { Box::new(|_, _| Err("browser rejected download".into())) };
             let mut app = RustGisApp::with_sample().with_services(Services { download: Some(download), ..Default::default() });
             let mut ds = Dataset::new(

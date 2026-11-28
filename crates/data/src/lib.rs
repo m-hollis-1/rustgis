@@ -5,6 +5,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod address;
+pub mod capped;
 pub mod citygml;
 pub mod cityjson;
 mod citymodel;
@@ -472,6 +473,26 @@ fn held_in_lonlat() -> raster::Crs {
 }
 
 impl Dataset {
+    /// Whether saving this dataset serializes a [`raster::Crs`] requiring `crs-wkt`
+    /// (`raster::Crs::needs_wkt`); windowed datasets omit `held_in` when serialized.
+    /// Exhaustively destructured so any new `Crs`-bearing field forces an explicit decision.
+    pub fn needs_wkt(&self) -> bool {
+        let Self {
+            name: _,
+            geometry_type: _,
+            fields: _,
+            features: _,
+            source: _,
+            crs,
+            crs_incomplete: _,
+            zm_dropped: _,
+            windowed,
+            held_in,
+            shown_in: _,
+        } = self;
+        crs.is_some_and(raster::Crs::needs_wkt) || (!*windowed && held_in.needs_wkt())
+    }
+
     /// The coordinate system its geometry is in ([`Dataset::held_in`]): the system a file was read
     /// in, else longitude/latitude (WGS 84). Drawing converts geometry from it
     /// ([`raster::Crs::to`]). Longitude/latitude never fails to convert, and [`Dataset::hold_in`]
@@ -771,6 +792,10 @@ pub struct ReadReport {
     /// The extrusion the reader suggests for the layer (a city model's volumes): applied when the
     /// layer is added, and only then; a reload keeps the layer's own.
     pub extrusion: Option<SuggestedExtrusion>,
+    /// A zip's table read with `CsvOptions::columns_optional` that lacked a column named (`x`, `y` or
+    /// `WKT`, and its name): read without the columns given. Not in `messages`: the zip reader takes it
+    /// and says it once for all its tables.
+    pub columns_lacking: Option<Box<(&'static str, String)>>,
 }
 
 /// An extrusion a reader suggests for a layer of polygons: heights from one field, on a base from
@@ -1382,6 +1407,20 @@ impl Dataset {
         self.fields.push(Field::new(name, ty));
         self.features.add_column(Value::Null);
         self.fields.len() - 1
+    }
+
+    /// [`Dataset::ensure_field`] for several fields, returning their indices in order. The missing
+    /// ones are added together, so each row changes once however many there are.
+    pub fn ensure_fields<const N: usize>(&mut self, fields: [(&str, FieldType); N]) -> [usize; N] {
+        let before = self.fields.len();
+        let at = fields.map(|(name, ty)| {
+            self.field_index(name).unwrap_or_else(|| {
+                self.fields.push(Field::new(name, ty));
+                self.fields.len() - 1
+            })
+        });
+        self.features.add_columns(self.fields.len() - before, Value::Null);
+        at
     }
 
     /// The features `rows` keeps, by position; a row past its end counts, so `&[]` keeps them all.

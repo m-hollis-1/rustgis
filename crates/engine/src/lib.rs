@@ -686,6 +686,23 @@ impl RoomMade {
     }
 }
 
+/// What a command run worked on, as its parameters name it, for the messages it says: a layer, a
+/// table or an input by name, cut short. File paths are left out, as they can hold a login.
+fn run_target(params: &Value) -> Option<String> {
+    let name = ["layer", "table", "input", "map"].iter().find_map(|key| params.get(*key).and_then(Value::as_str))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // As a message is: addresses, credentials and the values of the logins in use masked.
+    let name = Session::redacted(name).into_string();
+    let mut cut: String = name.chars().take(80).collect();
+    if cut.len() < name.len() {
+        cut.push('…');
+    }
+    Some(cut)
+}
+
 /// An undo or redo step: the project before it, the layout open then, its label, who made it,
 /// which state of the project it is ([`Session::dirty`]), and the identities of its feature
 /// allocations for memory accounting. File origins accompany changes made by the command only:
@@ -1041,6 +1058,9 @@ pub struct Session {
     pub(crate) depth: u32,
     /// Only the command's registered id, never its parameters. Nested commands restore this.
     pub(crate) diagnostic_source: Option<&'static str>,
+    /// The top-level command running, as the messages it says remember it, and how many have run.
+    run: Option<rustgis_data::diagnostics::Run>,
+    runs: u64,
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
@@ -1064,6 +1084,9 @@ pub struct Session {
     /// Exercises the browser delivery path with real tools in native engine tests.
     #[cfg(test)]
     queue_gp_files: bool,
+    /// A smaller limit than [`cmd::exports::MAX_DOWNLOAD_BYTES`] for a test to reach.
+    #[cfg(test)]
+    pub(crate) download_cap: Option<usize>,
     /// Asynchronous runs started and not yet complete: (id, job, resolved params, start time).
     #[cfg(feature = "geolibre")]
     pub(crate) started: Vec<(u64, rustgis_geolibre::Job, serde_json::Value, u64, policy::Continuation)>,
@@ -1553,6 +1576,8 @@ impl Session {
             put_aside: None,
             depth: 0,
             diagnostic_source: None,
+            run: None,
+            runs: 0,
             restorable: 0,
             published_syncs: Vec::new(),
             actor: None,
@@ -1581,6 +1606,8 @@ impl Session {
             file_outputs: Vec::new(),
             #[cfg(test)]
             queue_gp_files: false,
+            #[cfg(test)]
+            download_cap: None,
             request_only: false,
             shared_steps: StepTally::default(),
             leave_downloads: false,
@@ -1798,10 +1825,87 @@ impl Session {
         r
     }
 
-    /// Takes tool files awaiting download. Metadata stays until `gp.fileDelivered` acknowledges
-    /// delivery, so producing bytes alone never records a successful run. Another caller's
-    /// queued files stay untouched until their owner or the native host takes them.
-    pub fn take_gp_files(&mut self) -> Vec<(u64, String, Vec<u8>)> {
+    /// Whether the files commands make reach the user as downloads: the browser has no filesystem
+    /// to write a path in, so a tool's file output and an export queue their bytes for the front
+    /// end ([`Session::take_gp_files`]).
+    pub(crate) fn downloads_files(&self) -> bool {
+        #[cfg(test)]
+        if self.queue_gp_files {
+            return true;
+        }
+        cfg!(target_arch = "wasm32")
+    }
+
+    /// The most bytes the files waiting for download may hold in all.
+    pub(crate) fn download_cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.download_cap {
+            return cap;
+        }
+        cmd::exports::MAX_DOWNLOAD_BYTES
+    }
+
+    /// Where files are downloaded, the room for one more; `None` where they are written. Refused
+    /// when no more can wait, before any of it is made.
+    pub(crate) fn download_room(&self) -> Result<Option<cmd::exports::Room>, String> {
+        if !self.downloads_files() {
+            return Ok(None);
+        }
+        let waiting = self.waiting_download_bytes();
+        let bytes = self.download_cap().saturating_sub(waiting);
+        if self.waiting_download_count() >= cmd::exports::MAX_DOWNLOADS || bytes == 0 {
+            return Err(cmd::gp::queue_full(self.download_cap()));
+        }
+        Ok(Some(cmd::exports::Room { bytes, waiting }))
+    }
+
+    /// The files waiting for download: this project's, and those of a project a command replaced,
+    /// kept until the command ends in case it gives that project back.
+    fn waiting_downloads(&self) -> impl Iterator<Item = &cmd::gp::PendingFile> {
+        self.file_outputs.iter().chain(self.put_aside.iter().flat_map(|aside| aside.file_outputs.iter()))
+    }
+
+    /// How many files wait for download, those put aside with a replaced project included.
+    pub(crate) fn waiting_download_count(&self) -> usize {
+        self.waiting_downloads().count()
+    }
+
+    /// The bytes the files waiting for download hold, those put aside included.
+    pub(crate) fn waiting_download_bytes(&self) -> usize {
+        self.waiting_downloads().filter_map(|f| f.bytes.as_ref()).map(|bytes| bytes.capacity()).sum()
+    }
+
+    /// Whether pending download `id` is an export's: no geoprocessing run records it.
+    pub fn is_export_file(&self, id: u64) -> bool {
+        self.file_outputs.iter().any(|file| file.id == id && file.is_export())
+    }
+
+    /// Says which queued downloads among `files` are dropped, and `why`: the exports in one
+    /// notice (the desktop would have written their files by now), the tools' file outputs in
+    /// another (a run is recorded only once its file is delivered, so these go unrecorded).
+    fn say_dropped_downloads<'a>(&mut self, files: impl IntoIterator<Item = &'a cmd::gp::PendingFile>, why: &str) {
+        let (exports, tools): (Vec<_>, Vec<_>) = files.into_iter().partition(|file| file.is_export());
+        let names = |files: Vec<&cmd::gp::PendingFile>| files.iter().map(|file| file.file_name.clone()).collect::<Vec<_>>();
+        let (exports, tools) = (names(exports), names(tools));
+        if !exports.is_empty() {
+            self.notify(format!("{} export(s) not downloaded, {why}: {}", exports.len(), listed(&exports)), true);
+        }
+        if !tools.is_empty() {
+            self.notify(
+                format!(
+                    "{} tool output file(s) not downloaded, {why}, so their runs aren't in the geoprocessing history: {}",
+                    tools.len(),
+                    listed(&tools)
+                ),
+                true,
+            );
+        }
+    }
+
+    /// Takes tool and export files awaiting download. Metadata stays until `gp.fileDelivered`
+    /// acknowledges delivery, so producing bytes alone never records a successful run. Another
+    /// caller's queued files stay untouched until their owner or the native host takes them.
+    pub fn take_gp_files(&mut self) -> Vec<(u64, String, std::sync::Arc<Vec<u8>>)> {
         let mut live = Vec::new();
         let mut refused: Vec<(String, Vec<String>)> = Vec::new();
         for mut file in std::mem::take(&mut self.file_outputs) {
@@ -1912,6 +2016,12 @@ impl Session {
             // A command may change a map's projection, or add layers to it.
             if s.depth == 0 {
                 s.note_shown_systems();
+                if !ui_owns_cjk_scan_notice()
+                    && let Some(summary) = take_cjk_scan_summary_for_session()
+                    && let Some(msg) = summary.notice()
+                {
+                    s.notify(msg, false);
+                }
             }
             // Native sessions without a drawing loop recover their own failed overviews.
             // Named callers and sealed completions do not initiate unrelated maintenance.
@@ -1935,6 +2045,21 @@ impl Session {
         // Restored on every path, including panics outside `guarded`, so a later notice is not
         // attributed to an aborted command. Mirrors the capture scope's restore-on-drop.
         let previous = std::mem::replace(&mut self.diagnostic_source, source);
+        // A run of its own for a top-level command: its messages are grouped by it, and the pane can
+        // undo back to before it.
+        let previous_run = outermost.then(|| {
+            self.runs = self.runs.wrapping_add(1);
+            let run = rustgis_data::diagnostics::Run {
+                id: self.runs,
+                // The registered command's own id, never the text asked for: an unknown one could
+                // hold anything, a login included.
+                command: source.unwrap_or("unknown command").to_string(),
+                before: self.state,
+                after: None,
+                target: run_target(params),
+            };
+            self.run.replace(run)
+        });
         let history_deferred = std::mem::replace(&mut self.undo_memory.deferred, true);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let notice_mark = self.notice_mark();
@@ -2021,6 +2146,14 @@ impl Session {
             res
         }));
         self.diagnostic_source = previous;
+        if let Some(run) = previous_run {
+            // Undo makes no step of its own: it moves back one, so "before" it isn't a step to take
+            // back. Redo's step is its own, and undoing it returns to before it.
+            if let Some(ended) = self.run.as_ref().filter(|_| id != "edit.undo") {
+                self.diagnostics.finish_run(ended.id, self.state);
+            }
+            self.run = run;
+        }
         self.undo_memory.deferred = history_deferred;
         // Every top-level invocation consumes its key, even a refusal or panic before guarded.
         if outermost {
@@ -2451,6 +2584,8 @@ impl Session {
             },
             _ => res,
         };
+        // Queued for download in a project the command opened, then gave up for the one before.
+        let mut opened_files = Vec::new();
         match (&res, snapshot) {
             // A command that only left a request for the front end (a download in the browser,
             // [`Session::request_url`]) changed nothing: no undo step, nothing to save yet. The
@@ -2532,7 +2667,7 @@ impl Session {
                 // Replaced during the command: what it held beside itself (its undo history, its
                 // trust, its unsaved state) comes back with it.
                 if self.opened != opened {
-                    self.give_back(opened);
+                    opened_files = self.give_back(opened);
                 }
                 if let Some(files) = files {
                     self.file_identity = files.identity;
@@ -2589,7 +2724,11 @@ impl Session {
             self.restore_url_request_checkpoint(requests);
             (self.plugin_retries, self.url_waits) = retry_state;
             // Keep only still-present old identities: drained bytes and terminal refusals stay consumed.
-            self.file_outputs.retain(|file| file_outputs.contains(&file.id));
+            let (kept, mut dropped): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.file_outputs).into_iter().partition(|file| file_outputs.contains(&file.id));
+            self.file_outputs = kept;
+            dropped.append(&mut opened_files);
+            self.say_dropped_downloads(&dropped, "as the command that made them failed");
         }
         let quiet = std::mem::take(&mut self.quiet_failure);
         if let Err(e) = &res
@@ -2599,7 +2738,9 @@ impl Session {
         }
         // The command, and those it ran, are done: a replaced project stays replaced.
         if self.depth == 0 {
-            self.put_aside = None;
+            if let Some(replaced) = self.put_aside.take() {
+                self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
+            }
             self.published_syncs.clear();
             // Frame maintenance and some policy adapters run a guard without command dispatch.
             // Otherwise the command epilogue trims once, after any maintenance steps.
@@ -2691,9 +2832,10 @@ impl Session {
     }
 
     /// Gives back what project `opened` held beside itself, when it is restored. Every field is
-    /// named (no `..`): one added to [`PutAside`] and not given back doesn't compile.
-    fn give_back(&mut self, opened: u64) {
-        let Some(a) = self.put_aside.take_if(|a| a.opened == opened) else { return };
+    /// named (no `..`): one added to [`PutAside`] and not given back doesn't compile. Returns the
+    /// files waiting for download that those given back take the place of.
+    fn give_back(&mut self, opened: u64) -> Vec<cmd::gp::PendingFile> {
+        let Some(a) = self.put_aside.take_if(|a| a.opened == opened) else { return Vec::new() };
         let PutAside {
             constructions,
             opened: _,
@@ -2760,7 +2902,7 @@ impl Session {
         self.opened_package = opened_package;
         self.file_identity = file_identity;
         (self.pending, self.plugin_runs, self.plugin_retries, self.url_waits) = (pending, plugin_runs, plugin_retries, url_waits);
-        self.file_outputs = file_outputs;
+        let replaced = std::mem::replace(&mut self.file_outputs, file_outputs);
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
         self.downloaded_reach = downloaded_reach;
         self.restore_policy_work(policy_work);
@@ -2779,6 +2921,7 @@ impl Session {
         {
             self.sql_results = sql_results;
         }
+        replaced
     }
 
     /// Says what reading raster layers' pixels lost when it wasn't said as each was added (pixels
@@ -3616,7 +3759,7 @@ impl Session {
         if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
             return;
         }
-        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss);
+        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss, self.run.clone());
         self.notices.push(Notice {
             text: text.into_string(),
             error: severity == rustgis_data::diagnostics::Severity::Error,
@@ -3696,6 +3839,23 @@ impl Session {
         self.redo.iter().rev().map(|step| step.2)
     }
 
+    /// How many Undo steps take back the change of a run that went from the state `before` to
+    /// `after` (a message's [`Run`](rustgis_data::diagnostics::Run)), with the changes made since:
+    /// `None` when the history no longer holds that change as a step of its own. A change makes a
+    /// state no other has, so an edit made after undoing it, from the same state before, isn't taken
+    /// for it; and the step Undo lands on must be `before`, so a run whose step was merged into an
+    /// earlier one, or that made no step, isn't taken back past that earlier command.
+    pub fn undo_steps_back_past(&self, before: u64, after: u64) -> Option<usize> {
+        let steps = if self.state == after {
+            1
+        } else {
+            // The step after the change keeps the state the change left.
+            self.undo.len() - self.undo.iter().rposition(|step| step.4 == after)? + 1
+        };
+        let landing = self.undo.len().checked_sub(steps)?;
+        (self.undo.get(landing)?.4 == before).then_some(steps)
+    }
+
     /// Identifies the current position and the history it belongs to. Editing and then undoing
     /// the edit returns to the same state with a different redo stack.
     pub fn history_position(&self) -> (u64, u64) {
@@ -3713,7 +3873,8 @@ impl Session {
     /// Forgets undo/redo and extent history and marks the project clean (after new/open, or a
     /// front end setting up how the project starts): what [`PutAside`] holds, dropped.
     pub fn clear_history(&mut self) {
-        drop(self.take_project_state());
+        let replaced = self.take_project_state();
+        self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
         self.undo_memory.clear();
         self.project_starts = self.project_starts.wrapping_add(1);
         // A state of its own: undo back past a replacement made within a command (a task's step)
@@ -4350,4 +4511,43 @@ impl Session {
         }
         self.project.gp_history.push(record);
     }
+}
+
+/// Process-wide ownership of the one-shot CJK font-folder scan summary. Set by a UI front end so
+/// neither the live session nor any temporary `Session::new` copy consumes the summary inside
+/// [`Session::run`] before the UI can translate and emit it.
+static UI_OWNS_CJK_SCAN_NOTICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as having a UI front end that takes and translates the one-shot CJK
+/// font-folder scan summary itself, leaving it untouched in [`Session::run`].
+pub fn claim_ui_cjk_scan_notice() {
+    UI_OWNS_CJK_SCAN_NOTICE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a UI front end owns taking and translating the process-wide CJK scan summary.
+pub fn ui_owns_cjk_scan_notice() -> bool {
+    #[cfg(test)]
+    if let Some(overridden) = TEST_UI_OWNS_CJK_SCAN_NOTICE.get() {
+        return overridden;
+    }
+    UI_OWNS_CJK_SCAN_NOTICE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local override for [`take_cjk_scan_summary_for_session`] so tests can exercise
+    /// `Session::run`'s CJK scan notice wiring in parallel without mutating the global font cache.
+    static TEST_CJK_SCAN_SUMMARY: std::cell::RefCell<Option<Option<rustgis_render::fonts::CjkRootScanSummary>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Thread-local override for [`ui_owns_cjk_scan_notice`] so parallel unit tests can cover
+    /// headless sessions even after another test claims UI ownership.
+    static TEST_UI_OWNS_CJK_SCAN_NOTICE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn take_cjk_scan_summary_for_session() -> Option<rustgis_render::fonts::CjkRootScanSummary> {
+    #[cfg(test)]
+    if let Some(summary) = TEST_CJK_SCAN_SUMMARY.with_borrow_mut(|slot| slot.as_mut().map(Option::take)) {
+        return summary;
+    }
+    rustgis_render::fonts::take_cjk_scan_summary()
 }

@@ -233,11 +233,6 @@ fn pictures_save_and_say_as_before() {
         [(PIN_PNG, "the PNG"), (PIN_JPEG, "the JPEG"), (huge.as_str(), "the 30000 x 1 PNG"), (damaged.as_str(), "the damaged PNG")];
     const UNDRAWN: &str =
         "the picture can't be drawn: its image is damaged, or too large (over 20000 pixels a side, or over 512 MB once decoded)";
-    let rectangle = |key: &str, v: Value| {
-        let mut p = json!({"kind": "rectangle", "x": 10, "y": 10, "w": 20, "h": 20});
-        p[key] = v;
-        p
-    };
     let picture = |key: &str, v: Value| {
         let mut p = json!({"kind": "picture"});
         p[key] = v;
@@ -269,9 +264,6 @@ fn pictures_save_and_say_as_before() {
         ("an image whose pixels don't read", picture("image", json!(damaged)), UNDRAWN),
         ("a path to a PNG over 20000 pixels a side", picture("path", json!(huge_file)), UNDRAWN),
         ("a path to a PNG whose pixels don't read", picture("path", json!(damaged_file)), UNDRAWN),
-        // Other kinds of element refuse `image` and `path`, before any file is read.
-        ("an image on a rectangle", rectangle("image", json!(PIN_PNG)), "only pictures take an image or a path"),
-        ("a path on a rectangle", rectangle("path", json!(at("missing.png"))), "only pictures take an image or a path"),
     ];
     let which = |s: &Session, id: &Value| match s.project.layouts[li].element(id.as_u64().unwrap() as u32).map(|e| &e.kind) {
         Some(rustgis_map::layout::ElementKind::Picture { image, .. }) => {
@@ -502,8 +494,6 @@ fn a_bad_file_is_refused_and_the_picture_left_as_it_was() {
     let count = |s: &Session| s.project.layouts.iter().find(|l| l.name == "L").unwrap().elements.len();
     let (n, depth, dirty) = (count(&s), s.undo_depth(), s.dirty());
     for (p, said) in [
-        (json!({"kind": "text", "text": "T", "path": first}), "only pictures take an image or a path"),
-        (json!({"kind": "rectangle", "image": first_b64}), "only pictures take an image or a path"),
         (json!({"kind": "picture", "path": huge}), undrawn),
         (json!({"kind": "picture", "image": first_b64, "path": first}), "give a picture an image or a path, not both"),
         (

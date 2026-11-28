@@ -1,9 +1,12 @@
 //! Vector readers and writers: GeoJSON, CSV (with longitude/latitude columns) and Shapefile.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{Map, Value as Json, json};
 
+use crate::capped::Limit;
 use crate::raster::{Crs, planetary};
 use crate::{Coord, DataError, Dataset, Field, FieldType, Geometry, GeometryType, ReadReport, Result, Value};
 
@@ -293,7 +296,7 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
     let plain =
         |v: Vec<(Dataset, ReadReport)>| v.into_iter().map(|(dataset, report)| LayerRead { dataset, report, styles: Vec::new() }).collect();
     let mut out: Vec<LayerRead> = match ext.as_str() {
-        "zip" => read_zip_layers(file_name, bytes, None)?,
+        "zip" => read_zip_layers(file_name, bytes, &CsvOptions::default())?,
         "kml" | "kmz" => crate::kml::read(file_name, bytes)?
             .into_iter()
             .map(|l| LayerRead { dataset: l.dataset, report: l.report, styles: l.styles })
@@ -1038,6 +1041,18 @@ pub fn write_bytes_noted(
     crs: Crs,
     name: &str,
 ) -> Result<(Vec<u8>, usize, Vec<crate::loss::Note>, rustgis_geom::Extent)> {
+    write_bytes_noted_within(ds, ext, crs, name, &Limit::none())
+}
+
+/// [`write_bytes_noted`] within `limit`: the file, and a zipped format's files before they are
+/// zipped, are refused as soon as they would pass it.
+pub fn write_bytes_noted_within(
+    ds: &Dataset,
+    ext: &str,
+    crs: Crs,
+    name: &str,
+    limit: &Limit,
+) -> Result<(Vec<u8>, usize, Vec<crate::loss::Note>, rustgis_geom::Extent)> {
     let ext = ext.to_ascii_lowercase();
     if crs != Crs::LonLat {
         if !holds_a_system(&ext) {
@@ -1046,11 +1061,11 @@ pub fn write_bytes_noted(
         check_projected(&ext, crs)?;
     }
     if crs == ds.coord_crs() {
-        let (bytes, left_out) = projected_bytes(ds, &ext, crs)?;
+        let (bytes, left_out) = projected_bytes_within(ds, &ext, crs, limit)?;
         return Ok((bytes, left_out, Vec::new(), ds.lonlat_extent()));
     }
     let (projected, unplaced, placed) = project_leaving_out_placed(ds, crs)?;
-    let (bytes, left_out) = projected_bytes(&projected, &ext, crs)?;
+    let (bytes, left_out) = projected_bytes_within(&projected, &ext, crs, limit)?;
     let notes = unplaced_export_note(name, &ds.name, unplaced, crs).into_iter().collect();
     Ok((bytes, left_out, notes, lonlat_extent_placed(ds, crs, placed)))
 }
@@ -1066,31 +1081,83 @@ fn lonlat_extent_placed(ds: &Dataset, crs: Crs, placed: Option<rustgis_geom::Ext
 
 /// [`write_bytes_in`] for a dataset already in `crs`'s coordinates.
 fn projected_bytes(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)> {
+    projected_bytes_within(ds, ext, crs, &Limit::none())
+}
+
+/// [`projected_bytes`] within `limit` ([`write_bytes_noted_within`]).
+fn projected_bytes_within(ds: &Dataset, ext: &str, crs: Crs, limit: &Limit) -> Result<(Vec<u8>, usize)> {
     crate::progress::begin(ds.features.len());
-    Ok(match ext {
-        "geojson" | "json" => {
-            let mut w = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields)?;
-            w.write(&ds.features)?;
-            (w.finish()?, 0)
-        }
-        "csv" => (to_csv_in(ds, crs)?.into_bytes(), 0),
-        "fgb" => (crate::source::fgb::write_in(ds, crs)?, without_geometry(ds)),
-        "parquet" | "geoparquet" => (crate::source::parquet::write_in(ds, crs)?, 0),
-        "kml" => (crate::interop::to_kml(ds, name_field(ds))?.into_bytes(), without_geometry(ds)),
-        "kmz" => {
-            let kml = crate::interop::to_kml(ds, name_field(ds))?.into_bytes();
-            (crate::zip::write(&[("doc.kml".to_string(), kml)]).map_err(DataError::Format)?, without_geometry(ds))
-        }
-        "gpx" => (crate::interop::to_gpx(ds, name_field(ds))?.into_bytes(), gpx_left_out(ds)),
-        "shp" | "zip" => {
-            let (parts, left_out) = shapefile_parts_in(ds, crs)?;
-            let base: String = ds.name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') { c } else { '_' }).collect();
-            let base = if base.trim().is_empty() { "layer".to_string() } else { base };
-            let entries: Vec<(String, Vec<u8>)> = parts.into_iter().map(|(e, b)| (format!("{base}.{e}"), b)).collect();
-            (crate::zip::write(&entries).map_err(DataError::Format)?, left_out)
-        }
-        other => return Err(DataError::Unsupported(other.to_string())),
-    })
+    let mut out = limit.buffer();
+    let made = (|| {
+        Ok(match ext {
+            "geojson" | "json" => {
+                write_geojson(ds, &mut out)?;
+                (out.into_inner(), 0)
+            }
+            "csv" => {
+                write_csv(ds, crs, &mut out)?;
+                (out.into_inner(), 0)
+            }
+            "fgb" => {
+                let left_out = without_geometry(ds);
+                crate::source::fgb::write_features(&ds.name, ds.geometry_type, &ds.fields, crs, &mut out, &mut |add| add(&ds.features))?;
+                (out.into_inner(), left_out)
+            }
+            "parquet" | "geoparquet" => {
+                crate::source::parquet::write_features(ds.geometry_type, &ds.fields, crs, &mut out, &mut |add| add(&ds.features))?;
+                (out.into_inner(), 0)
+            }
+            "kml" => {
+                crate::interop::write_kml(ds, name_field(ds), &mut out)?;
+                (out.into_inner(), without_geometry(ds))
+            }
+            "kmz" => {
+                crate::interop::write_kml(ds, name_field(ds), &mut out)?;
+                let kml = out.into_inner();
+                (zipped(&[("doc.kml".to_string(), kml)], limit)?, without_geometry(ds))
+            }
+            "gpx" => {
+                crate::interop::write_gpx(ds, name_field(ds), &mut out)?;
+                (out.into_inner(), gpx_left_out(ds))
+            }
+            "shp" | "zip" => {
+                let (parts, left_out, _) = shapefile_parts_within(ds, crs, None, limit)?;
+                let base: String =
+                    ds.name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') { c } else { '_' }).collect();
+                let base = if base.trim().is_empty() { "layer".to_string() } else { base };
+                let entries: Vec<(String, Vec<u8>)> = parts.into_iter().map(|(e, b)| (format!("{base}.{e}"), b)).collect();
+                (zipped(&entries, limit)?, left_out)
+            }
+            other => return Err(DataError::Unsupported(other.to_string())),
+        })
+    })();
+    limit.whole(made)
+}
+
+/// A zip of `entries`, which were held to `limit` as they were made: they stay counted against it
+/// while the archive is made, and the archive is written within what they leave, so the two
+/// together never pass it (besides one entry's compressed bytes at a time).
+fn zipped(entries: &[(String, Vec<u8>)], limit: &Limit) -> Result<Vec<u8>> {
+    let parts: usize = entries.iter().map(|(_, bytes)| bytes.capacity()).sum();
+    let _parts = limit.hold(parts)?;
+    let mut out = limit.buffer();
+    let made = crate::zip::write_to(entries, &mut out).map_err(DataError::Format);
+    limit.whole(made.map(|()| out.into_inner()))
+}
+
+/// The text `data.convert` makes of a dataset in longitude/latitude, in `format` (`geojson`,
+/// `csv`, `kml`, `gpx`, else WKT in a CSV), within `limit`. KML and GPX name placemarks by the
+/// field `name_field`.
+pub fn text_bytes_within(ds: &Dataset, format: &str, name_field: Option<usize>, limit: &Limit) -> Result<Vec<u8>> {
+    let mut out = limit.buffer();
+    let made = match format {
+        "geojson" => write_geojson(ds, &mut out),
+        "csv" => write_csv(ds, Crs::LonLat, &mut out),
+        "kml" => crate::interop::write_kml(ds, name_field, &mut out),
+        "gpx" => crate::interop::write_gpx(ds, name_field, &mut out),
+        _ => crate::interop::write_wkt_csv(ds, &mut out),
+    };
+    limit.whole(made.map(|()| out.into_inner()))
 }
 
 /// Writes a dataset by extension (`.geojson`/`.json`, `.csv`, `.fgb`, `.gpkg` on the desktop,
@@ -1726,25 +1793,75 @@ pub fn geometry_from_geojson(mut g: &Json) -> Option<Geometry> {
     }
 }
 
+/// A geometry as a GeoJSON geometry object.
 pub fn geometry_to_geojson(g: &Geometry) -> Json {
-    fn c(c: &Coord) -> Json {
-        json!([c.x, c.y])
+    // Making a value can't fail: every key is text.
+    serde_json::to_value(GeoJsonGeometry(g)).unwrap_or_default()
+}
+
+/// A geometry as its GeoJSON object serializes, a coordinate at a time: written to a file, no
+/// copy of it is made. Its members are in sorted order, as a [`Json`] object holds them.
+struct GeoJsonGeometry<'a>(&'a Geometry);
+
+impl Serialize for GeoJsonGeometry<'_> {
+    /// A line or polygon of one part is the single kind, any other number the `Multi` one.
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut object = s.serialize_map(Some(2))?;
+        let kind = match self.0 {
+            Geometry::Point(p) => {
+                object.serialize_entry("coordinates", &[p.x, p.y])?;
+                "Point"
+            }
+            Geometry::MultiPoint(v) => {
+                object.serialize_entry("coordinates", &Positions(v))?;
+                "MultiPoint"
+            }
+            Geometry::Line(parts) if let [only] = parts.as_slice() => {
+                object.serialize_entry("coordinates", &Positions(only))?;
+                "LineString"
+            }
+            Geometry::Line(parts) => {
+                object.serialize_entry("coordinates", &Rings(parts))?;
+                "MultiLineString"
+            }
+            Geometry::Polygon(polys) if let [only] = polys.as_slice() => {
+                object.serialize_entry("coordinates", &Rings(only))?;
+                "Polygon"
+            }
+            Geometry::Polygon(polys) => {
+                object.serialize_entry("coordinates", &Polygons(polys))?;
+                "MultiPolygon"
+            }
+        };
+        object.serialize_entry("type", kind)?;
+        object.end()
     }
-    fn l(v: &[Coord]) -> Json {
-        Json::Array(v.iter().map(c).collect())
+}
+
+/// A line's or ring's positions, `[x, y]` each.
+struct Positions<'a>(&'a [Coord]);
+
+impl Serialize for Positions<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(|c| [c.x, c.y]))
     }
-    match g {
-        Geometry::Point(p) => json!({"type": "Point", "coordinates": c(p)}),
-        Geometry::MultiPoint(v) => json!({"type": "MultiPoint", "coordinates": l(v)}),
-        Geometry::Line(parts) if let [only] = parts.as_slice() => json!({"type": "LineString", "coordinates": l(only)}),
-        Geometry::Line(parts) => json!({"type": "MultiLineString", "coordinates": parts.iter().map(|p| l(p)).collect::<Vec<_>>()}),
-        Geometry::Polygon(polys) if let [only] = polys.as_slice() => {
-            json!({"type": "Polygon", "coordinates": only.iter().map(|r| l(r)).collect::<Vec<_>>()})
-        }
-        Geometry::Polygon(polys) => json!({"type": "MultiPolygon", "coordinates": polys
-            .iter()
-            .map(|rings| rings.iter().map(|r| l(r)).collect::<Vec<_>>())
-            .collect::<Vec<_>>()}),
+}
+
+/// The lines of a MultiLineString, or the rings of a polygon.
+struct Rings<'a>(&'a [Vec<Coord>]);
+
+impl Serialize for Rings<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(|r| Positions(r)))
+    }
+}
+
+/// The polygons of a MultiPolygon.
+struct Polygons<'a>(&'a [Vec<Vec<Coord>>]);
+
+impl Serialize for Polygons<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(|p| Rings(p)))
     }
 }
 
@@ -2320,18 +2437,67 @@ pub fn to_geojson(ds: &Dataset) -> Json {
 /// A GeoJSON text conversion with per-feature progress and cancellation, of `ds`'s coordinates as
 /// they are: the caller converts a dataset held in another system first ([`Dataset::in_lonlat`]).
 pub fn to_geojson_text(ds: &Dataset) -> Result<String> {
-    let mut writer = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields)?;
+    let mut out = Vec::new();
+    write_geojson(ds, &mut out)?;
+    String::from_utf8(out).map_err(|e| DataError::Format(e.to_string()))
+}
+
+/// [`to_geojson_text`]'s collection, written to `out`, buffered: its serializer writes a few
+/// bytes at a time.
+fn write_geojson(ds: &Dataset, out: &mut impl std::io::Write) -> Result<()> {
+    let mut writer = GeoJsonWriter::new(std::io::BufWriter::new(out), &ds.name, &ds.fields)?;
     writer.write(&ds.features)?;
-    String::from_utf8(writer.finish()?).map_err(|e| DataError::Format(e.to_string()))
+    std::io::Write::flush(&mut writer.finish()?)?;
+    Ok(())
 }
 
 /// A feature as a GeoJSON Feature, its attributes named by `fields`.
-fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
-    let mut props = Map::new();
-    for (field, v) in fields.iter().zip(&f.attrs) {
-        props.insert(field.name.clone(), v.to_json());
+fn feature_to_geojson(fields: &[Field], feature: &crate::Feature) -> Json {
+    // Making a value can't fail: every key is text.
+    serde_json::to_value(GeoJsonFeature { fields, feature }).unwrap_or_default()
+}
+
+/// [`feature_to_geojson`]'s object as it serializes, from the row itself: its geometry and text
+/// are written as they are walked, so a large feature is never held a second time, and a sink
+/// that refuses a write stops it there. Its members are in sorted order, as a [`Json`] object
+/// holds them.
+struct GeoJsonFeature<'a> {
+    fields: &'a [Field],
+    feature: &'a crate::Feature,
+}
+
+impl Serialize for GeoJsonFeature<'_> {
+    /// The properties borrow their names and values from the fields and the row.
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let f = self.feature;
+        // By name, in order; of two fields with one name, the last one's value.
+        let properties: BTreeMap<&str, Property> =
+            self.fields.iter().zip(&f.attrs).map(|(field, v)| (field.name.as_str(), Property(v))).collect();
+        let mut object = s.serialize_map(Some(4))?;
+        object.serialize_entry("geometry", &f.geometry.as_ref().map(GeoJsonGeometry))?;
+        object.serialize_entry("id", &f.id)?;
+        object.serialize_entry("properties", &properties)?;
+        object.serialize_entry("type", "Feature")?;
+        object.end()
     }
-    json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(geometry_to_geojson)})
+}
+
+/// An attribute value as a GeoJSON property: what [`Value::to_json`] gives, its text not copied.
+struct Property<'a>(&'a Value);
+
+impl Serialize for Property<'_> {
+    /// A date or date-time is written as its text.
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self.0 {
+            Value::Null => s.serialize_unit(),
+            Value::Int(i) => s.serialize_i64(*i),
+            // JSON writes a number that isn't finite as null.
+            Value::Float(f) => s.serialize_f64(*f),
+            Value::Text(t) => s.serialize_str(t),
+            Value::Bool(b) => s.serialize_bool(*b),
+            v @ (Value::Date(_) | Value::DateTime(_)) => s.collect_str(v),
+        }
+    }
 }
 
 /// Writes a GeoJSON FeatureCollection a run of features at a time, for exports that never hold
@@ -2359,7 +2525,8 @@ impl<W: std::io::Write> GeoJsonWriter<W> {
             if !std::mem::take(&mut self.first) {
                 self.out.write_all(b",")?;
             }
-            serde_json::to_writer(&mut self.out, &feature_to_geojson(&self.fields, f)).map_err(|e| DataError::Format(e.to_string()))?;
+            let feature = GeoJsonFeature { fields: &self.fields, feature: f };
+            serde_json::to_writer(&mut self.out, &feature).map_err(|e| DataError::Format(e.to_string()))?;
         }
         Ok(())
     }
@@ -2530,6 +2697,9 @@ pub struct CsvOptions {
     pub crs: Option<crate::raster::Crs>,
     /// The field separator (otherwise the most common of `,`, `;`, tab and `|` in the header).
     pub delimiter: Option<u8>,
+    /// For a zip's members, which don't all hold the columns named: a table that lacks a named `x`, `y` or `wkt` column is read as it would be
+    /// without them, and says so, instead of being refused. Set by the zip reader; false elsewhere, where a column that isn't there is an error.
+    pub columns_optional: bool,
 }
 
 /// The separator of a delimited text file: the most common of `,`, `;`, tab and `|` in its first
@@ -3055,15 +3225,32 @@ pub(crate) fn read_rows(
     workbook: Option<(&[Option<FieldType>], &[usize])>,
 ) -> Result<(Dataset, ReadReport)> {
     let types = workbook.map(|(types, _)| types);
+    let position = |n: &str| headers.iter().position(|h| h.trim().eq_ignore_ascii_case(n));
     let named = |n: &Option<String>, what: &str| -> Result<Option<usize>> {
         match n.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            Some(n) => headers
-                .iter()
-                .position(|h| h.trim().eq_ignore_ascii_case(n))
-                .map(Some)
-                .ok_or_else(|| DataError::Format(format!("no {what} column '{n}' (columns: {})", headers.join(", ")))),
+            Some(n) => {
+                position(n).map(Some).ok_or_else(|| DataError::Format(format!("no {what} column '{n}' (columns: {})", headers.join(", "))))
+            }
             None => Ok(None),
         }
+    };
+    // A zip's members don't all hold the columns the caller named: one that lacks any is read as it would be without them, and its report says
+    // which (`ReadReport::columns_lacking`), for the zip to say once for all its members.
+    let lacking = opts
+        .columns_optional
+        .then(|| {
+            [("x", &opts.x), ("y", &opts.y), ("WKT", &opts.wkt)].into_iter().find_map(|(what, n)| {
+                let n = n.as_deref().map(str::trim).filter(|n| !n.is_empty())?;
+                position(n).is_none().then(|| (what, n.to_string()))
+            })
+        })
+        .flatten();
+    let without;
+    let opts = if lacking.is_some() {
+        without = CsvOptions { x: None, y: None, wkt: None, ..opts.clone() };
+        &without
+    } else {
+        opts
     };
     let (x, y) = (named(&opts.x, "x")?, named(&opts.y, "y")?);
     let wkt_given = named(&opts.wkt, "WKT")?;
@@ -3096,6 +3283,7 @@ pub(crate) fn read_rows(
         })
         .collect();
     let mut report = ReadReport { skipped: malformed, ..ReadReport::default() };
+    report.columns_lacking = lacking.map(Box::new);
     if xy.is_none()
         && wkt.is_none()
         && let Some(note) = unmatched_coordinates_note(headers)
@@ -3531,9 +3719,17 @@ pub fn to_csv(ds: &Dataset) -> Result<String> {
 /// As [`to_csv`], for a dataset whose coordinates are in `crs`: a projected system's go in x and y
 /// columns ([`csv_projected_names`]).
 pub fn to_csv_in(ds: &Dataset, crs: Crs) -> Result<String> {
-    let mut w = CsvWriter::new(Vec::new(), &ds.fields, ds.geometry_type, crs)?;
+    let mut out = Vec::new();
+    write_csv(ds, crs, &mut out)?;
+    String::from_utf8(out).map_err(|e| DataError::Format(e.to_string()))
+}
+
+/// [`to_csv_in`]'s text, written to `out`.
+fn write_csv(ds: &Dataset, crs: Crs, out: &mut impl std::io::Write) -> Result<()> {
+    let mut w = CsvWriter::new(out, &ds.fields, ds.geometry_type, crs)?;
     w.write(&ds.features)?;
-    String::from_utf8(w.finish()?).map_err(|e| DataError::Format(e.to_string()))
+    w.finish()?;
+    Ok(())
 }
 
 /// Writes CSV a run of features at a time: a header of the fields, and for a point layer
@@ -3836,7 +4032,7 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
 }
 
 /// Reads a ZIP, optionally overriding the source CRS of its Shapefiles, delimited text, workbooks
-/// and LandXML.
+/// and LandXML (the columns and separator of its tables are [`read_zip_layers`]'s).
 /// Other formats retain their own coordinate systems; a CityJSON model takes it only when it names none RustGIS
 /// knows. The override is applied before reading any shapes. Cancellation is checked between
 /// archive members and records; inflating one member cannot be interrupted mid-decompression.
@@ -3844,19 +4040,33 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     read_zip_budget(file_name, bytes, crs, &mut csv_memory_budget())
 }
 
-/// [`read_zip_in`] with each layer's KML styles, for adding the layers drawn as their files say.
-pub fn read_zip_layers(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<LayerRead>> {
-    read_zip_layers_budget(file_name, bytes, crs, &mut csv_memory_budget())
+/// [`read_zip_in`] with each layer's KML styles, for adding the layers drawn as their files say,
+/// and with `opts` for the zip's delimited members and its workbooks' first sheets: the `x`, `y`
+/// and `wkt` columns and the `delimiter` apply as when the member is added by itself, and `crs`
+/// as [`read_zip_in`] says. A table that lacks a column named is read without them, with a notice
+/// naming it and the column; other members ignore the columns and the delimiter.
+pub fn read_zip_layers(file_name: &str, bytes: &[u8], opts: &CsvOptions) -> Result<Vec<LayerRead>> {
+    read_zip_layers_budget(file_name, bytes, opts, &mut csv_memory_budget())
 }
 
 /// [`read_zip_layers_budget`] without the styles.
 fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut usize) -> Result<Vec<(Dataset, ReadReport)>> {
-    Ok(read_zip_layers_budget(file_name, bytes, crs, budget)?.into_iter().map(|l| (l.dataset, l.report)).collect())
+    Ok(read_zip_layers_budget(file_name, bytes, &CsvOptions { crs, ..Default::default() }, budget)?
+        .into_iter()
+        .map(|l| (l.dataset, l.report))
+        .collect())
 }
 
 /// Delimited, dBASE and workbook members share one allowance, including gzip members whose text
 /// is nested in ZIP.
-fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut usize) -> Result<Vec<LayerRead>> {
+fn read_zip_layers_budget(file_name: &str, bytes: &[u8], opts: &CsvOptions, budget: &mut usize) -> Result<Vec<LayerRead>> {
+    let crs = opts.crs;
+    // The tables' options: not every member holds the columns given.
+    let member = CsvOptions { columns_optional: true, ..opts.clone() };
+    let columns_given = [&opts.x, &opts.y, &opts.wkt].into_iter().any(|n| n.as_deref().is_some_and(|n| !n.trim().is_empty()));
+    // The tables read with columns given, and those of them that lacked a column named, each with which.
+    let mut tables_given = 0usize;
+    let mut tables_lacking: Vec<String> = Vec::new();
     let max = max_bytes();
     if bytes.len() as u64 > max {
         return Err(DataError::Format(file_size_error(file_name, max)));
@@ -3980,6 +4190,7 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budge
         let plain = |reads: Vec<(Dataset, ReadReport)>| {
             reads.into_iter().map(|(dataset, report)| LayerRead { dataset, report, styles: Vec::new() }).collect::<Vec<_>>()
         };
+        let mut table = false;
         // A city model has many layers.
         let read = if ext_of(&n) == "dbf" {
             let cpg = take(&mut entries, &stem(&n), "cpg").map(|(_, b)| b);
@@ -3988,12 +4199,13 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budge
         } else if is_city_model(leaf, &b) {
             read_city_member(leaf, &b, crs).map(plain)
         } else if is_delimited_name(leaf) {
-            read_delimited_bytes_budget(leaf, &b, &CsvOptions { crs, ..Default::default() }, budget).map(|r| plain(vec![r]))
+            table = true;
+            read_delimited_bytes_budget(leaf, &b, &member, budget).map(|r| plain(vec![r]))
         } else if crate::sheets::is_sheet_name(leaf) {
+            table = true;
             // A workbook's first sheet, as a workbook added by itself is read, within the allowance.
             let name = Path::new(leaf).file_stem().and_then(|s| s.to_str()).unwrap_or("sheet");
-            crate::sheets::read(&b, name, None, &CsvOptions { crs, ..Default::default() })
-                .and_then(|r| charge_retained([&r.0], leaf, budget).map(|()| plain(vec![r])))
+            crate::sheets::read(&b, name, None, &member).and_then(|r| charge_retained([&r.0], leaf, budget).map(|()| plain(vec![r])))
         } else if let Some(crs) = crs.filter(|_| {
             crate::landxml::is_landxml_name(leaf)
                 || (ext_of(&n) == "xml"
@@ -4039,6 +4251,12 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budge
                         continue;
                     }
                     layer.dataset.source = Some(format!("{file_name}/{n}"));
+                    if table && columns_given {
+                        tables_given += 1;
+                        if let Some((what, column)) = layer.report.columns_lacking.take().map(|b| *b) {
+                            tables_lacking.push(format!("{n} (no {what} column '{column}')"));
+                        }
+                    }
                     out.push(layer);
                 }
             }
@@ -4049,14 +4267,17 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budge
     }
     // At most this many skipped members are named; the rest are counted.
     const NAMED_SKIPPED: usize = 20;
-    let mut skipped = if skipped.len() > NAMED_SKIPPED {
-        let more = skipped.len() - NAMED_SKIPPED;
-        let mut named: Vec<String> = skipped.into_iter().take(NAMED_SKIPPED).collect();
-        named.push(format!("and {more} more"));
-        named
-    } else {
-        skipped
+    let cap = |list: Vec<String>| {
+        if list.len() > NAMED_SKIPPED {
+            let more = list.len() - NAMED_SKIPPED;
+            let mut named: Vec<String> = list.into_iter().take(NAMED_SKIPPED).collect();
+            named.push(format!("and {more} more"));
+            named
+        } else {
+            list
+        }
     };
+    let mut skipped = cap(skipped);
     if geodatabase.get() {
         skipped.push("File Geodatabase contents (unzip the archive and add the .gdb folder on the desktop)".into());
     }
@@ -4086,6 +4307,17 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budge
         && let Some(overlays) = overlays
     {
         first.report.messages.push(format!("{file_name}: {overlays}"));
+    }
+    // One notice for every table that lacked a column named, with how many took the columns given.
+    if let Some(first) = out.first_mut()
+        && !tables_lacking.is_empty()
+    {
+        let took = tables_given.saturating_sub(tables_lacking.len());
+        let tables = if tables_given == 1 { "table" } else { "tables" };
+        first.report.messages.push(format!(
+            "{file_name}: the x, y or WKT columns given were used by {took} of {tables_given} {tables}; the rest were read without them, lacking a column named: {}",
+            cap(tables_lacking).join("; ")
+        ));
     }
     if let Some(first) = out.first_mut()
         && !skipped.is_empty()
@@ -6128,8 +6360,17 @@ pub(crate) fn shapefile_parts_styled(
     crs: Crs,
     style: Option<&DbfStyle>,
 ) -> Result<(Vec<(&'static str, Vec<u8>)>, usize, Vec<String>)> {
+    shapefile_parts_within(ds, crs, style, &Limit::none())
+}
+
+/// [`shapefile_parts_styled`], the `.shp`, `.shx` and `.dbf` together within `limit`.
+fn shapefile_parts_within(
+    ds: &Dataset,
+    crs: Crs,
+    style: Option<&DbfStyle>,
+    limit: &Limit,
+) -> Result<(Vec<(&'static str, Vec<u8>)>, usize, Vec<String>)> {
     use shapefile::dbase::{FieldName, FieldValue, Record, TableWriterBuilder};
-    use std::io::Cursor;
     let fmt = |e: shapefile::Error| DataError::Format(format!("Shapefile: {e}"));
     let names = dbf_names(&ds.fields);
     let dbf_name = |n: &str| FieldName::try_from(n).map_err(|e| DataError::Format(format!("Shapefile: field {n}: {e}")));
@@ -6185,7 +6426,7 @@ pub(crate) fn shapefile_parts_styled(
 
     let pt = |c: &Coord| shapefile::Point::new(c.x, c.y);
     let finite = |c: &&Coord| c.x.is_finite() && c.y.is_finite();
-    let (mut shp, mut shx, mut dbf) = (Cursor::new(Vec::new()), Cursor::new(Vec::new()), Cursor::new(Vec::new()));
+    let (mut shp, mut shx, mut dbf) = (limit.buffer(), limit.buffer(), limit.buffer());
     let mut left_out = 0;
     let mut written = 0;
     {
@@ -7102,6 +7343,86 @@ mod tests {
         let back = read_geojson(&to_geojson(&ds).to_string(), "t").unwrap().0;
         assert_eq!(back.features.len(), 2);
         assert_eq!(back.value(1, 0), &Value::Text("B".into()));
+    }
+
+    /// The text of every geometry shape and value type: keys sorted, the last of two fields of one
+    /// name kept, and a number that isn't finite written as null.
+    #[test]
+    fn geojson_text_of_every_geometry_and_value_is_pinned() {
+        let fields = ["z", "int", "float \"q\"", "text", "bool", "day", "when", "z"].map(|n| Field::new(n, FieldType::Text));
+        let mut ds = Dataset::new("Shapes \"1\"\n", GeometryType::None, fields.to_vec());
+        let c = Coord::new;
+        let (a, b) = (c(1.5, -2.0), c(0.1 + 0.2, 1e-7));
+        let ring = vec![c(0.0, 0.0), c(4.0, 0.0), c(4.0, 4.0), c(0.0, 0.0)];
+        let hole = vec![c(1.0, 1.0), c(2.0, 1.0), c(1.0, 1.0)];
+        let geometries = [
+            None,
+            Some(Geometry::Point(a)),
+            Some(Geometry::Point(c(f64::NAN, f64::NEG_INFINITY))),
+            Some(Geometry::MultiPoint(vec![])),
+            Some(Geometry::MultiPoint(vec![a, b])),
+            Some(Geometry::Line(vec![])),
+            Some(Geometry::Line(vec![vec![]])),
+            Some(Geometry::Line(vec![vec![c(-0.0, 1e300)]])),
+            Some(Geometry::Line(vec![vec![a, b], vec![]])),
+            Some(Geometry::Polygon(vec![])),
+            Some(Geometry::Polygon(vec![vec![]])),
+            Some(Geometry::Polygon(vec![vec![ring.clone(), hole.clone()]])),
+            Some(Geometry::Polygon(vec![vec![ring, hole], vec![]])),
+        ];
+        let values = vec![
+            Value::Text("first z".into()),
+            Value::Int(i64::MIN),
+            Value::Float(2.0),
+            Value::Text("a\"b\\c\n\t\u{1}é€/".into()),
+            Value::Bool(true),
+            Value::Date(crate::date::Date::parse("2026-03-05").unwrap()),
+            Value::DateTime(crate::date::DateTime::parse("2026-03-05T12:30:00.5+02:00").unwrap()),
+            Value::Null,
+        ];
+        let others = [f64::NAN, f64::INFINITY, -0.0, 1e300, 5e-324].map(Value::Float);
+        for (i, g) in geometries.into_iter().enumerate() {
+            let mut row = values.clone();
+            if let Some(v) = i.checked_sub(1).and_then(|i| others.get(i)) {
+                row[2] = v.clone();
+                row[7] = Value::Int(7);
+            }
+            ds.push(g, row);
+        }
+        let ring = "[[0.0,0.0],[4.0,0.0],[4.0,4.0],[0.0,0.0]],[[1.0,1.0],[2.0,1.0],[1.0,1.0]]";
+        let geometries = [
+            "null".to_string(),
+            r#"{"coordinates":[1.5,-2.0],"type":"Point"}"#.into(),
+            r#"{"coordinates":[null,null],"type":"Point"}"#.into(),
+            r#"{"coordinates":[],"type":"MultiPoint"}"#.into(),
+            r#"{"coordinates":[[1.5,-2.0],[0.30000000000000004,1e-7]],"type":"MultiPoint"}"#.into(),
+            r#"{"coordinates":[],"type":"MultiLineString"}"#.into(),
+            r#"{"coordinates":[],"type":"LineString"}"#.into(),
+            r#"{"coordinates":[[-0.0,1e+300]],"type":"LineString"}"#.into(),
+            r#"{"coordinates":[[[1.5,-2.0],[0.30000000000000004,1e-7]],[]],"type":"MultiLineString"}"#.into(),
+            r#"{"coordinates":[],"type":"MultiPolygon"}"#.into(),
+            r#"{"coordinates":[],"type":"Polygon"}"#.into(),
+            format!(r#"{{"coordinates":[{ring}],"type":"Polygon"}}"#),
+            format!(r#"{{"coordinates":[[{ring}],[]],"type":"MultiPolygon"}}"#),
+        ];
+        let numbers = ["2.0", "null", "null", "-0.0", "1e+300", "5e-324"];
+        let features: Vec<String> = geometries
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let float = numbers.get(i).unwrap_or(&"2.0");
+                let z = if (1..=5).contains(&i) { "7" } else { "null" };
+                let id = ds.features[i].id;
+                let properties = format!(
+                    r#"{{"bool":true,"day":"2026-03-05","float \"q\"":{float},"int":-9223372036854775808,"text":"a\"b\\c\n\t\u0001é€/","when":"2026-03-05T12:30:00.500+02:00","z":{z}}}"#
+                );
+                format!(r#"{{"geometry":{g},"id":{id},"properties":{properties},"type":"Feature"}}"#)
+            })
+            .collect();
+        let features = format!("[{}]", features.join(","));
+        let expected = format!(r#"{{"type":"FeatureCollection","name":"Shapes \"1\"\n","features":{features}}}"#);
+        assert_eq!(to_geojson_text(&ds).unwrap(), expected);
+        assert_eq!(to_geojson(&ds)["features"].to_string(), features);
     }
 
     #[test]
@@ -9395,6 +9716,139 @@ mod tests {
         // Without overlays, nothing is said.
         let plain = crate::zip::write(&[("a.gpx".into(), br#"<?xml version="1.0"?><gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><wpt lat="1" lon="2"/></gpx>"#.to_vec())]).unwrap();
         assert!(read_zip("p.zip", &plain).unwrap().iter().all(|(_, r)| r.messages.is_empty()));
+    }
+
+    /// A zip's tables read as they do by themselves with the same options, on edge values too.
+    #[test]
+    fn a_zips_tables_read_as_they_do_alone_with_the_options() {
+        let csv = "id,LongitudeOR,LatitudeOR\n1,10,20\n2,1e400,5\n3,NaN,5\n4,,5\n5,12,22\n";
+        let opts = CsvOptions { x: Some("LongitudeOR".into()), y: Some(" latitudeor ".into()), ..Default::default() };
+        let book = crate::sheets::xlsx(&[("ALL", &[&["id", "LongitudeOR", "LatitudeOR"], &["1", "10", "20"], &["2", "1e400", "5"]])]);
+        let zip = crate::zip::write(&[
+            ("a.csv".into(), csv.as_bytes().to_vec()),
+            ("b.csv.gz".into(), gzip_csv(csv.as_bytes())),
+            ("c.xlsx".into(), book.clone()),
+            ("empty.csv".into(), b"id,LongitudeOR,LatitudeOR\n".to_vec()),
+        ])
+        .unwrap();
+        let read = read_zip_layers("t.zip", &zip, &opts).unwrap();
+        assert_eq!(read.len(), 4);
+        let alone = [
+            read_delimited_bytes("a.csv", csv.as_bytes(), &opts).unwrap(),
+            read_delimited_bytes("b.csv.gz", &gzip_csv(csv.as_bytes()), &opts).unwrap(),
+            crate::sheets::read(&book, "c", None, &opts).unwrap(),
+        ];
+        for (layer, (ds, report)) in read.iter().zip(&alone) {
+            assert_eq!(layer.dataset.features, ds.features, "{}", layer.dataset.name);
+            assert_eq!(layer.dataset.fields, ds.fields);
+            assert_eq!(layer.report.messages, report.messages);
+            assert_eq!(layer.report.skipped, report.skipped);
+        }
+        // The rows at 1e400 (infinity), NaN and the empty cell stay without a point, and are counted.
+        let first = read.first();
+        assert_eq!(first.map(|l| l.dataset.features.iter().filter(|f| f.geometry.is_some()).count()), Some(2));
+        assert_eq!(first.map(|l| l.report.skipped), Some(3));
+        // A header with the columns and no rows gives no point and nothing to say about columns.
+        assert!(
+            read.last().is_some_and(|l| l.dataset.features.is_empty() && !l.report.messages.iter().any(|m| m.contains("read without")))
+        );
+    }
+
+    /// A table without the column named is read without the columns given, and says so; the
+    /// others take them. Clean input says nothing.
+    #[test]
+    fn a_zip_member_lacking_a_column_given_is_read_without_the_columns_and_says_so() {
+        let have = b"id,LongitudeOR,LatitudeOR\n1,10,20\n".to_vec();
+        let only_x = b"id,longitude,latitude,LongitudeOR\n1,10,20,30\n".to_vec();
+        let zip =
+            crate::zip::write(&[("a.csv".into(), have.clone()), ("b.csv".into(), only_x), ("c.csv".into(), b"id,name\n1,x\n".to_vec())])
+                .unwrap();
+        let opts = CsvOptions { x: Some("LongitudeOR".into()), y: Some("LatitudeOR".into()), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &opts).unwrap();
+        let said = |name: &str| {
+            read.iter()
+                .find(|l| l.dataset.name == name)
+                .map(|l| l.report.messages.iter().map(|m| m.as_str().to_string()).collect::<Vec<_>>())
+        };
+        // One notice for the zip, on its first layer, with how many tables took the columns and the others named.
+        let all: Vec<String> = read.iter().flat_map(|l| l.report.messages.iter().map(|m| m.as_str().to_string())).collect();
+        let lacking: Vec<&String> = all.iter().filter(|m| m.contains("lacking a column named")).collect();
+        assert_eq!(
+            lacking,
+            [
+                "t.zip: the x, y or WKT columns given were used by 1 of 3 tables; the rest were read without them, lacking a column named: b.csv (no y column 'LatitudeOR'); c.csv (no x column 'LongitudeOR')"
+            ],
+            "{all:?}"
+        );
+        assert!(read.first().is_some_and(|l| l.report.messages.iter().any(|m| m.as_str().contains("lacking a column named"))));
+        assert_eq!(said("c"), Some(vec![]), "the other layers say nothing of it");
+        assert!(read.iter().all(|l| l.report.columns_lacking.is_none()));
+        // By detection `b` is still points, as it is without the columns given.
+        assert_eq!(read.iter().find(|l| l.dataset.name == "b").map(|l| l.dataset.geometry_type), Some(GeometryType::Point));
+        assert_eq!(read.iter().find(|l| l.dataset.name == "c").map(|l| l.dataset.geometry_type), Some(GeometryType::None));
+        // Alone, a missing column is still an error.
+        assert!(read_delimited_bytes("c.csv", b"id,name\n1,x\n", &opts).is_err());
+        // The same zip without the columns given reads as before.
+        let plain = read_zip("t.zip", &zip).unwrap();
+        assert!(plain.iter().all(|(_, r)| !r.messages.iter().any(|m| m.contains("lacking a column named"))));
+        // Every table having them says nothing about them.
+        let clean = crate::zip::write(&[("a.csv".into(), have.clone()), ("b.csv".into(), have)]).unwrap();
+        let read = read_zip_layers("t.zip", &clean, &opts).unwrap();
+        assert!(read.iter().all(|l| l.report.messages.is_empty()), "{:?}", read.iter().map(|l| &l.report.messages).collect::<Vec<_>>());
+    }
+
+    /// A WKT column missing from some tables, or from all, is said once; the tables are still read.
+    #[test]
+    fn a_zips_missing_wkt_column_is_said_once_for_some_or_all_tables() {
+        let opts = CsvOptions { wkt: Some("footprint".into()), ..Default::default() };
+        let notices = |zip: &[u8]| -> (usize, Vec<String>) {
+            let read = read_zip_layers("t.zip", zip, &opts).unwrap();
+            let all = read.iter().flat_map(|l| l.report.messages.iter().map(|m| m.as_str().to_string())).collect::<Vec<_>>();
+            (read.len(), all.into_iter().filter(|m| m.contains("lacking a column named")).collect())
+        };
+        let some =
+            crate::zip::write(&[("a.csv".into(), b"id,footprint\n1,POINT (1 2)\n".to_vec()), ("b.csv".into(), b"id,name\n1,x\n".to_vec())])
+                .unwrap();
+        assert_eq!(
+            notices(&some),
+            (2, vec!["t.zip: the x, y or WKT columns given were used by 1 of 2 tables; the rest were read without them, lacking a column named: b.csv (no WKT column 'footprint')".to_string()])
+        );
+        let none =
+            crate::zip::write(&[("a.csv".into(), b"id,name\n1,x\n".to_vec()), ("b.csv".into(), b"id,name\n2,y\n".to_vec())]).unwrap();
+        assert_eq!(
+            notices(&none),
+            (2, vec!["t.zip: the x, y or WKT columns given were used by 0 of 2 tables; the rest were read without them, lacking a column named: a.csv (no WKT column 'footprint'); b.csv (no WKT column 'footprint')".to_string()])
+        );
+        // Many tables, one notice: the names are capped as the skipped members' are.
+        let many: Vec<(String, Vec<u8>)> = (0..MAX_ZIP_LAYERS).map(|i| (format!("t{i:02}.csv"), b"id,name\n1,x\n".to_vec())).collect();
+        let (read, said) = notices(&crate::zip::write(&many).unwrap());
+        assert_eq!((read, said.len()), (MAX_ZIP_LAYERS, 1));
+        assert!(said[0].contains("used by 0 of 32 tables") && said[0].contains("and 12 more"), "{said:?}");
+    }
+
+    /// `wkt` and `delimiter` reach a zip's tables; the other members ignore them.
+    #[test]
+    fn a_zips_wkt_and_delimiter_reach_its_tables() {
+        let zip = crate::zip::write(&[
+            ("a.csv".into(), b"id,footprint\n1,POINT (1 2)\n".to_vec()),
+            ("b.csv".into(), b"a,b\tc\n1,2\t3\n".to_vec()),
+        ])
+        .unwrap();
+        let wkt = CsvOptions { wkt: Some("footprint".into()), delimiter: Some(b','), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &wkt).unwrap();
+        assert_eq!(read.iter().find(|l| l.dataset.name == "a").map(|l| l.dataset.features.len()), Some(1));
+        assert_eq!(read.iter().find(|l| l.dataset.name == "a").map(|l| l.dataset.geometry_type), Some(GeometryType::Point));
+        let tab = CsvOptions { delimiter: Some(b'\t'), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &tab).unwrap();
+        let names = |name: &str| {
+            read.iter().find(|l| l.dataset.name == name).map(|l| l.dataset.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(names("b"), Some(vec!["a,b".to_string(), "c".to_string()]));
+        // `x` without `y` skips a table that has it, and names it, rather than reading it as something else.
+        let lone = CsvOptions { x: Some("id".into()), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &lone).unwrap_or_default();
+        let said: Vec<String> = read.iter().flat_map(|l| l.report.messages.iter().map(|m| m.as_str().to_string())).collect();
+        assert!(said.iter().any(|m| m.contains("a.csv") && m.contains("give both the x and the y column")), "{said:?}");
     }
 
     /// A zipped LandXML file is read in the system the zip is given, as it is by itself.

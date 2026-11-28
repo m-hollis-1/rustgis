@@ -163,6 +163,13 @@ An `--allow` that names no kind or code is refused with status 2, as is `--allow
 Each code has an entry in [Data loss codes](user-guide/loss-codes.md): what it means, where it is
 said and what to do about it. A strict run's message gives the address of each code's entry.
 
+`rustgis-cli explain CODE` says what a code means and what to do, from the text built into
+RustGIS, so it works offline; `rustgis-cli explain` lists every code:
+
+```sh
+rustgis-cli explain changed.rounded
+```
+
 Not every loss has a code yet: losses still reported without one don't stop a strict run.
 
 ## Asking the AI assistant
@@ -181,7 +188,7 @@ rustgis-cli ask --login                             # sign in with ChatGPT to us
 rustgis-cli ask --sample --provider chatgpt "Zoom to Tokyo"
 ```
 
-The provider is `--provider` (`anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, `ollama`, `custom`, `requesty`, `trustedrouter`, `opper`),
+The provider is `--provider` (`anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, `ollama`, `custom`, `requesty`, `trustedrouter`, `opper`, `mistral`),
 else `RUSTGIS_ASSISTANT_PROVIDER`, else the first with a key in the environment, else the app's
 saved provider when `--use-saved-secrets` is set, else Ollama. ChatGPT sign-in is used only when
 that provider is selected. Account management and `--models` do not read saved API keys:

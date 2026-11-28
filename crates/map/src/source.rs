@@ -871,6 +871,63 @@ pub enum Polled {
 }
 
 impl SourceLayer {
+    /// Whether saving this source serializes a [`rustgis_data::raster::Crs`] requiring `crs-wkt`.
+    /// Exhaustively destructured so any new `Crs`-bearing field forces an explicit decision.
+    pub fn needs_wkt(&self) -> bool {
+        let Self {
+            path: _,
+            file_name: _,
+            table: _,
+            shapefile_crs,
+            embedded: _,
+            handle: _,
+            conversion_info: _,
+            conversion_fallback: _,
+            conversion_notes_unsaid: _,
+            unread_dates: _,
+            rounded_dates: _,
+            unread_dates_said: _,
+            rounded_dates_said: _,
+            null_text: _,
+            null_text_said: _,
+            not_utf8: _,
+            not_utf8_in: _,
+            not_utf8_said: _,
+            read_notes: _,
+            read_note_kinds: _,
+            window: _,
+            render_lod: _,
+            render_view: _,
+            render_drawn: _,
+            pending: _,
+            projection: _,
+            ready_cache: _,
+            byte_budget: _,
+            estimated_row_bytes: _,
+            full_read: _,
+            saved_selection: _,
+            grids: _,
+            window_fields: _,
+            query: _,
+            opening: _,
+            error: _,
+            error_said: _,
+            login: _,
+            reconnect_required: _,
+            limit: _,
+            reads: _,
+            display_read_said: _,
+            area_counts: _,
+            area_features: _,
+            gdal: _,
+            duckdb: _,
+            postgis: _,
+            mysql: _,
+            sqlserver: _,
+        } = self;
+        shapefile_crs.is_some_and(rustgis_data::raster::Crs::needs_wkt)
+    }
+
     /// Counts for the installed read, or `None` if its features have since been changed.
     pub fn unavailable_areas(&self, features: &rustgis_data::Features) -> Option<AmbiguousAreas> {
         self.area_features.as_ref().filter(|key| Weak::ptr_eq(key, &features.allocation_key())).map(|_| self.area_counts)
@@ -1839,12 +1896,22 @@ impl SourceLayer {
     /// Every feature of the source, up to the read limit (a source by its web address fetching
     /// what that needs, on the desktop).
     pub fn read_all(&self) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
+        self.read_all_within(None)
+    }
+
+    /// [`SourceLayer::read_all`], within `limit` when given: the most bytes of features, and the
+    /// error past them ([`rustgis_data::source::materialize_up_to`]).
+    pub(crate) fn read_all_within(&self, limit: Option<(u64, &str)>) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
         let h = self.handle.clone().ok_or("the layer's source isn't open")?;
+        let read = |source: &dyn FeatureSource| match limit {
+            Some((budget, refusal)) => rustgis_data::source::materialize_up_to(source, budget, refusal),
+            None => rustgis_data::source::materialize(source),
+        };
         #[cfg(not(target_arch = "wasm32"))]
         if h.remote().is_some() {
-            return rustgis_data::source::materialize(&rustgis_data::source::Fetching(h)).map_err(|e| e.to_string());
+            return read(&rustgis_data::source::Fetching(h)).map_err(|e| e.to_string());
         }
-        let r = rustgis_data::source::materialize(h.as_ref()).map_err(|e| e.to_string());
+        let r = read(h.as_ref()).map_err(|e| e.to_string());
         match r {
             Err(e) if e.contains(rustgis_data::source::remote::NEED) => {
                 Err("the web app reads a file by its address a view at a time: download it to load it whole".into())

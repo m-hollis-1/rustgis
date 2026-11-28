@@ -13,7 +13,7 @@ pub(in crate::cmd::layout) fn restyle(kind: &ElementKind, p: &Value) -> Result<O
             if ["style", "fill", "outline"].iter().all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
-            let style = match ps(p, "style") {
+            let style = match given_name(p, "style", "classic, compass, triangle or star")? {
                 Some(v) => ArrowStyle::from_name(v)
                     .ok_or_else(|| format!("unknown north arrow style '{v}' (classic, compass, triangle or star)"))?,
                 None => *style,
@@ -44,22 +44,20 @@ pub(in crate::cmd::layout) fn restyle(kind: &ElementKind, p: &Value) -> Result<O
             if SCALE_BAR_LOOK_KEYS.iter().chain(SCALE_BAR_KEYS.iter()).all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
-            let style = match ps(p, "style") {
+            let style = match given_name(p, "style", "alternating, stepped or line")? {
                 Some(v) => {
                     ScaleBarStyle::from_name(v).ok_or_else(|| format!("unknown scale bar style '{v}' (alternating, stepped or line)"))?
                 }
                 None => *style,
             };
-            let units = match ps(p, "units") {
+            let units = match given_name(p, "units", "auto, kilometers, meters, miles or feet")? {
                 Some(v) => {
                     ScaleUnits::from_name(v).ok_or_else(|| format!("unknown units '{v}' (auto, kilometers, meters, miles or feet)"))?
                 }
                 None => *units,
             };
-            let divisions = match p.get("divisions") {
-                Some(_) => f(p, "divisions").ok_or("divisions is a number")?.round().clamp(1.0, MAX_SCALE_DIVISIONS as f64) as usize,
-                None => *divisions,
-            };
+            let divisions =
+                given_num(p, "divisions", "a number")?.map_or(*divisions, |n| n.round().clamp(1.0, MAX_SCALE_DIVISIONS as f64) as usize);
             let (color, fill) = (color(p, "color", *c)?, color(p, "fill", *fill)?);
             let text_size = text_size_param(p, "textSize", SCALE_BAR_TEXT_PT)?.unwrap_or(*text_size);
             // Its details, each read before any is set: one part is the division whole.
@@ -185,6 +183,10 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
     // ([`ElementKind::null_resets`]), so they are changes too.
     let current = s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind);
     let bar = matches!(current, Some(ElementKind::ScaleBar { .. }));
+    // A chart's title is read with its options, which refuse one that isn't text.
+    if matches!(current, Some(ElementKind::Legend { .. } | ElementKind::Colorbar { .. })) {
+        given_name(p, "title", "text")?;
+    }
     let null_changes = |k: &str| matches!(k, "dash" | "background" | "border") || current.is_some_and(|kind| kind.null_resets(k));
     let changes = p.as_object().is_some_and(|o| {
         o.iter().any(|(k, v)| (!v.is_null() || null_changes(k.as_str())) && !matches!(k.as_str(), "layout" | "element" | "locked"))
@@ -205,18 +207,18 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
         let l = s.project.layouts.get(li).ok_or("no layout")?;
         match l.element(id).map(|e| &e.kind) {
             Some(ElementKind::Colorbar { frame, .. }) => {
-                let layer = match ps(p, "layer") {
+                let layer = match given_name(p, "layer", "a raster layer's name")? {
                     Some(n) if n.trim().is_empty() => Some(None),
                     Some(n) => Some(colorbar_layer(s, l, *frame, Some(n))?),
                     None => None,
                 };
-                Some((layer, orientation(p)?, tick_side(p)?))
+                Some((layer, orientation(p)?, tick_side(p)?, ticks(p)?))
             }
             _ => None,
         }
     };
     // Set back to no layer: it follows the map's default, which may have nothing to show (#1679).
-    let emptied_colorbar = matches!(&colorbar, Some((Some(None), _, _)));
+    let emptied_colorbar = matches!(&colorbar, Some((Some(None), ..)));
     // A north arrow's or scale bar's new look, and a map frame's grid: `"grid": false` removes it,
     // `true` adds the default one, an object changes the options it names, and null (not set)
     // leaves it as it is.
@@ -505,7 +507,7 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
         *ink = col;
     }
     // A colorbar turned keeps its size: its length and thickness swap, unless given.
-    if let (ElementKind::Colorbar { orientation, .. }, Some((_, Some(o), _))) = (&e.kind, &colorbar)
+    if let (ElementKind::Colorbar { orientation, .. }, Some((_, Some(o), ..))) = (&e.kind, &colorbar)
         && o != orientation
         && f(p, "w").is_none()
         && f(p, "h").is_none()
@@ -612,7 +614,7 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             if let Some(t) = new_title {
                 *title = t;
             }
-            if let Some((new_layer, new_orientation, new_side)) = colorbar {
+            if let Some((new_layer, new_orientation, new_side, new_ticks)) = colorbar {
                 if let Some(nl) = new_layer {
                     *layer = nl;
                 }
@@ -622,9 +624,9 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
                 if let Some(t) = new_side {
                     *tick_side = t;
                 }
-            }
-            if let Some(v) = ticks(p) {
-                *n = v;
+                if let Some(v) = new_ticks {
+                    *n = v;
+                }
             }
             if let Some(v) = b(p, "reverse") {
                 *reverse = v;

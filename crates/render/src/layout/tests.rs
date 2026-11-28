@@ -280,14 +280,48 @@ fn stacked_bars_draw_their_stretches_and_key() {
     short.labelled = true;
     let (w, h) = (200.0 / PT_PER_MM, 40.0 / PT_PER_MM);
     let valued = |orientation| ChartLook { orientation, values: true, ..ChartLook::default() };
-    assert!(chart_crowded(&short, &valued(Orientation::Vertical), w, h));
-    assert!(!chart_crowded(&short, &valued(Orientation::Horizontal), w, h));
-    assert!(!chart_crowded(&stacked(vec![6.0, 4.0]), &ChartLook::default(), w, 120.0 / PT_PER_MM));
+    assert_eq!(chart_crowded(&short, &valued(Orientation::Vertical), w, h), Some(Crowded::Head));
+    assert_eq!(chart_crowded(&short, &valued(Orientation::Horizontal), w, h), None);
+    assert_eq!(chart_crowded(&stacked(vec![6.0, 4.0]), &ChartLook::default(), w, 120.0 / PT_PER_MM), None);
+    // Unstacked, columns without height and bars under a point are told apart; no bar, nothing.
+    let mut plain = short.clone();
+    (plain.key, plain.stretches) = (Vec::new(), Vec::new());
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 20.0 / PT_PER_MM), Some(Crowded::Columns));
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), 1.0 / PT_PER_MM, h * 2.0), Some(Crowded::Thin));
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Horizontal), w, 1.0 / PT_PER_MM), Some(Crowded::Thin));
+    // Columns left some height, under a point of it.
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 28.5 / PT_PER_MM), Some(Crowded::Thin));
+    plain.bars = vec![(0.0, String::new())];
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 1.0 / PT_PER_MM), None);
     // A box narrower than a swatch draws the placeholder too, nothing past its right.
     // Sample above the centered "Chart" label so system font glyph shapes at y=60 don't mask the fill.
     let mut c = Canvas::new(200, 120).unwrap();
     chart(&mut c, Rect::from_xywh(0.0, 0.0, 5.0, 120.0).unwrap(), &stacked(vec![6.0, 4.0]), &ChartLook::default(), INK, 1.0, false);
     assert!(is(&c, 2, 10, Rgba::rgb(0xF0, 0xF1, 0xF3)) && (6..20).all(|x| c.pixmap().pixel(x, 7).is_some_and(|p| p.alpha() == 0)));
+}
+
+/// An unstacked chart in a box too small draws what it did before it was warned of (#3156): as
+/// columns without height its placeholder; across, bars under a point high.
+#[test]
+fn an_unstacked_chart_too_small_draws_as_before() {
+    let data = rustgis_map::layout::ChartData {
+        bars: (0..4).map(|k| (f64::from(k + 1), String::new())).collect(),
+        title: "Shops".into(),
+        labelled: true,
+        ..Default::default()
+    };
+    let draw = |orientation, h: f32| {
+        let mut c = Canvas::new(200, 60).unwrap();
+        let look = ChartLook { orientation, values: true, ..ChartLook::default() };
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, h).unwrap(), &data, &look, INK, 1.0, false);
+        c
+    };
+    let c = draw(Orientation::Vertical, 40.0);
+    assert!(c.pixmap().pixel(100, 5).is_some_and(|p| p.red() == 0xF0 && p.blue() == 0xF3), "the placeholder");
+    // 4 pt under its title: bars a pixel high, no placeholder.
+    let c = draw(Orientation::Horizontal, 20.0);
+    assert!((0..200).all(|x| c.pixmap().pixel(x, 40).is_some_and(|p| p.alpha() == 0)), "nothing under the box");
+    assert!((100..110).any(|x| (15..21).any(|y| c.pixmap().pixel(x, y).is_some_and(|p| p.alpha() > 0))), "its bars");
 }
 
 fn bar_blue(c: &Canvas, x: u32, y: u32) -> bool {
@@ -8065,6 +8099,60 @@ fn a_section_line_past_mercators_reach_is_not_drawn() {
     let end = |lat: f64| section_ends(&map, &cam, (400.0, 200.0), &FrameShape::Rectangle, SectionLine::Horizontal(Coord::new(0.0, lat)));
     assert_eq!(end(89.0), Err("its place isn't one the frame's map shows"));
     assert!(end(85.0).is_ok(), "{:?}", end(85.0));
+}
+
+/// A section line moved across itself is drawn where it was moved to, its place kept along it
+/// whatever the frame's projection or bearing; in a round frame its place goes where the pointer
+/// is when the shape leaves it out. Off the frame, its ground or its projection, it isn't moved.
+#[test]
+fn a_section_line_moves_across_its_frame() {
+    use rustgis_map::Projection;
+    let (w, h) = (400.0, 200.0);
+    let at = Coord::new(-44.66, -22.38);
+    let moved = |map: &Map, (c, scale, bearing, pitch): (Coord, f64, f64, f64), shape: &FrameShape, line, by, along| {
+        section_moved(map, &frame_camera(map, c, scale, bearing, pitch), (w, h), shape, line, by, along)
+    };
+    let rect = FrameShape::Rectangle;
+    let mut albers = Map::new("albers");
+    albers.projection = Projection::Custom("EPSG:10857".into());
+    for (map, bearing) in [(Map::new("m"), 0.0), (Map::new("m"), 40.0), (albers, -30.0)] {
+        let view = (Coord::new(at.x - 0.1, at.y + 0.05), 1e6, bearing, 0.0);
+        let cam = frame_camera(&map, view.0, view.1, view.2, view.3);
+        let px = |at: Coord| cam.try_to_screen(map.to_map(at).unwrap(), w, h).unwrap();
+        let (x, y) = px(at);
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01;
+        let (line, ends) = moved(&map, view, &rect, SectionLine::Horizontal(at), -20.0, 7.0).unwrap();
+        assert!(near(px(line.at()), (x, y - 20.0)) && matches!(line, SectionLine::Horizontal(_)), "{line:?}");
+        assert!(near(ends[0], (0.0, y - 20.0)) && near(ends[1], (w, y - 20.0)), "{ends:?}");
+        let (line, ends) = moved(&map, view, &rect, SectionLine::Vertical(at), 25.0, 7.0).unwrap();
+        assert!(near(px(line.at()), (x + 25.0, y)) && matches!(line, SectionLine::Vertical(_)), "{line:?}");
+        assert!(near(ends[0], (x + 25.0, 0.0)) && near(ends[1], (x + 25.0, h)), "{ends:?}");
+        assert_eq!(moved(&map, view, &rect, SectionLine::Horizontal(at), h, 7.0), None, "below the frame");
+        assert_eq!(moved(&map, view, &rect, SectionLine::Vertical(at), -w, 7.0), None, "left of the frame");
+    }
+    // A place by a round frame's edge, moved up: the shape is narrower there, so it goes to the
+    // pointer, and there is no line where the pointer is off the shape too.
+    let map = Map::new("m");
+    let here = (at, 1e6, 0.0, 0.0);
+    let cam = frame_camera(&map, at, 1e6, 0.0, 0.0);
+    let edge = SectionLine::Horizontal(map.to_lonlat(cam.to_map(110.0, h / 2.0, w, h)).unwrap());
+    let (line, _) = moved(&map, here, &FrameShape::Circle, edge, -80.0, 210.0).unwrap();
+    let (x, y) = cam.try_to_screen(map.to_map(line.at()).unwrap(), w, h).unwrap();
+    assert!((x - 210.0).abs() < 0.01 && (y - 20.0).abs() < 0.01, "{x} {y}");
+    assert_eq!(moved(&map, here, &FrameShape::Circle, edge, -80.0, 110.0), None);
+    // Across 180°, the place keeps within the longitudes a command takes.
+    let line = SectionLine::Vertical(Coord::new(179.5, 0.0));
+    let (line, _) = moved(&map, (Coord::new(179.5, 0.0), 1e7, 0.0, 0.0), &rect, line, 60.0, 100.0).unwrap();
+    assert!((-180.0..-175.0).contains(&line.at().x), "{line:?}");
+    // Not over the horizon, nor off the globe.
+    let tilted = (at, 5e4, 0.0, 80.0);
+    assert!(moved(&map, tilted, &rect, SectionLine::Horizontal(at), 20.0, 200.0).is_some());
+    assert_eq!(moved(&map, tilted, &rect, SectionLine::Horizontal(at), -99.0, 200.0), None);
+    let mut globe = Map::new("g");
+    globe.projection = Projection::Globe;
+    let whole = (at, 5e8, 0.0, 0.0);
+    assert!(moved(&globe, whole, &rect, SectionLine::Vertical(at), 20.0, 100.0).is_some());
+    assert_eq!(moved(&globe, whole, &rect, SectionLine::Vertical(at), 190.0, 100.0), None);
 }
 
 /// A frame's section lines are drawn over its map in their colour, dashed, with their names at

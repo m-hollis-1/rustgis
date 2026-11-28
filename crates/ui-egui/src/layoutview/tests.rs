@@ -2528,3 +2528,156 @@ fn number_key_is_one_per_layout_element_and_field() {
     assert_ne!(super::number_key(1, 7, "rows"), super::number_key(1, 8, "rows"));
     assert_ne!(super::number_key(1, 7, "rows"), super::number_key(1, 7, "columns"));
 }
+
+/// A 4 x 4 PNG of one opaque colour, as the bytes of its file.
+fn png_bytes([r, g, b]: [u8; 3]) -> Vec<u8> {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([r, g, b, 255])).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    png.into_inner()
+}
+
+/// The layout view with the Format pane beside it, drawn after a first frame that installs the
+/// fonts.
+fn format_harness(app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp> {
+    let mut fonts = false;
+    egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        move |ui, app: &mut RustGisApp| {
+            if !fonts {
+                crate::theme::install_fonts(ui.ctx(), &[], None);
+                fonts = true;
+                return;
+            }
+            with_format(app, ui);
+        },
+        app,
+    )
+}
+
+/// A picture's file in the Format pane: its name shown (the folders only on hover), opening sends
+/// nothing, Choose File… cancelled sends nothing, a file picked is read and remembered in one undo
+/// step, and a file that isn't a picture changes nothing.
+#[test]
+fn a_pictures_file_is_shown_and_chosen_again_in_one_undo_step() {
+    use egui_kittest::kittest::Queryable;
+    let dir = tempfile::tempdir().unwrap();
+    let at = |name: &str| dir.path().join(name).display().to_string();
+    let (first, second, note) = (at("first.png"), at("second.png"), at("note.png"));
+    std::fs::write(&first, png_bytes([0x1F, 0x5C, 0x84])).unwrap();
+    std::fs::write(&second, png_bytes([0xE8, 0xB0, 0x4A])).unwrap();
+    std::fs::write(&note, "a note, not a picture").unwrap();
+    crate::dialogs::PICKED.with(|p| *p.borrow_mut() = None);
+    let mut app = RustGisApp::with_sample();
+    app.run("layout.new", json!({"name": "Logo"})).unwrap();
+    let li = app.session.active_layout.unwrap();
+    let added = app.run("layout.addElement", json!({"layout": li, "kind": "picture", "path": first})).unwrap();
+    let id = added["element"].as_u64().unwrap() as u32;
+    app.layout.selected = Some(id);
+    // The picture's kept file and its image.
+    let picture = |app: &RustGisApp| {
+        let kind = &app.session.project.layouts[li].element(id).unwrap().kind;
+        let ElementKind::Picture { image, .. } = kind else { panic!("{kind:?}") };
+        (kind.picture_source().map(String::from), image.clone())
+    };
+    let mut h = format_harness(app);
+    let depth = h.state().session.undo_depth();
+    h.run_steps(3);
+    assert_eq!(h.state().session.undo_depth(), depth, "opening the pane changed nothing");
+    let (source, first_image) = picture(h.state());
+    assert_eq!(source.as_deref(), Some(first.as_str()));
+    h.get_by_label("first.png");
+    assert!(h.query_by_label(&first).is_none(), "the folders show only on hover");
+    // Choose File… once the dialog has answered `picked` (cancelled when `None`).
+    let choose = |h: &mut egui_kittest::Harness<'_, RustGisApp>, picked: Option<&str>| {
+        crate::dialogs::PICKED.with(|p| *p.borrow_mut() = picked.map(String::from));
+        h.get_by_label("Choose File…").click();
+        h.run_steps(3);
+        assert!(crate::dialogs::PICKED.with(|p| p.borrow().is_none()), "the dialog was asked");
+    };
+    choose(&mut h, None);
+    assert_eq!(h.state().session.undo_depth(), depth, "a cancelled dialog sends nothing");
+    assert_eq!(picture(h.state()), (Some(first.clone()), first_image.clone()));
+    choose(&mut h, Some(&second));
+    let (source, second_image) = picture(h.state());
+    assert_eq!(source.as_deref(), Some(second.as_str()));
+    assert_ne!(second_image, first_image, "the picked file is read");
+    assert_eq!(h.state().session.undo_depth(), depth + 1, "one step");
+    h.get_by_label("second.png");
+    assert!(h.query_by_label("first.png").is_none());
+    let mark = h.state().session.notice_mark();
+    choose(&mut h, Some(&note));
+    assert_eq!(picture(h.state()), (Some(second.clone()), second_image), "a file that isn't a picture changes nothing");
+    assert_eq!(h.state().session.undo_depth(), depth + 1, "a refused file is no step");
+    let refused: Vec<String> = h.state().session.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+    assert!(refused.iter().any(|t| t.contains("isn't a PNG or JPEG image")), "{refused:?}");
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert_eq!(picture(h.state()), (Some(first.clone()), first_image));
+    // A picture added from an image has no file.
+    use base64::Engine as _;
+    let image = base64::engine::general_purpose::STANDARD.encode(png_bytes([0x30, 0x90, 0x40]));
+    let added = h.state_mut().run("layout.addElement", json!({"layout": li, "kind": "picture", "image": image})).unwrap();
+    h.state_mut().layout.selected = added["element"].as_u64().map(|v| v as u32);
+    h.run_steps(3);
+    h.get_by_label("No file");
+    assert!(h.query_by_label("first.png").is_none());
+    crate::dialogs::PICKED.with(|p| *p.borrow_mut() = None);
+}
+
+/// A text element has no picture rows.
+#[test]
+fn a_text_element_has_no_picture_rows() {
+    use egui_kittest::kittest::Queryable;
+    crate::dialogs::PICKED.with(|p| *p.borrow_mut() = None);
+    let mut app = RustGisApp::with_sample();
+    app.run("layout.new", json!({"name": "Words"})).unwrap();
+    let li = app.session.active_layout.unwrap();
+    let added = app.run("layout.addElement", json!({"layout": li, "kind": "text", "text": "Title"})).unwrap();
+    app.layout.selected = added["element"].as_u64().map(|v| v as u32);
+    let mut h = format_harness(app);
+    h.run_steps(3);
+    h.get_by_label("Name");
+    assert!(h.query_by_label("Choose File…").is_none());
+    assert!(h.query_by_label("No file").is_none());
+}
+
+/// The layout view says the pictures it draws as a grey box once, again only when that changes,
+/// and forgets it when none is left.
+#[test]
+fn the_layout_view_says_a_picture_drawn_as_a_grey_box_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let logo = dir.path().join("logo.png").display().to_string();
+    std::fs::write(&logo, png_bytes([0x1F, 0x5C, 0x84])).unwrap();
+    let mut app = RustGisApp::with_sample();
+    let mut grey = Layout::new("Grey", 297.0, 210.0);
+    let source = Some("/data/logos/north.png".to_string());
+    grey.add("North", (10.0, 10.0, 30.0, 15.0), ElementKind::Picture { image: String::new(), source });
+    app.run("layout.import", json!({"text": serde_json::to_string(&grey).unwrap()})).unwrap();
+    let li = app.session.project.layouts.iter().position(|l| l.name == "Grey").unwrap();
+    // What the view says of the layout's pictures when its page is drawn twice as it is.
+    let said = |app: &mut RustGisApp| -> Vec<String> {
+        let mark = app.session.notice_mark();
+        let layout = app.session.project.layouts[li].clone();
+        super::say_pictures_not_drawn(app, &layout);
+        super::say_pictures_not_drawn(app, &layout);
+        let notices = app.session.notices_since(mark);
+        notices.iter().map(|n| n.text.clone()).filter(|t| t.contains("layout picture(s)")).collect()
+    };
+    let first = said(&mut app);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(first[0].starts_with("1 layout picture(s) have no image") && first[0].contains("north.png"), "{first:?}");
+    assert!(!first[0].contains("/data/logos"), "never the folders: {first:?}");
+    assert!(app.layout.picture_warning.is_some());
+    // A second grey picture: the text changes, so it is said again, once.
+    app.session.project.layouts[li].add("Blank", (50.0, 10.0, 30.0, 15.0), ElementKind::Picture { image: String::new(), source: None });
+    let second = said(&mut app);
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].starts_with("2 layout picture(s) have no image"), "{second:?}");
+    // Both read from a file again: nothing more is said, and the notice is forgotten.
+    let pictures: Vec<u32> =
+        app.session.project.layouts[li].elements.iter().filter(|e| matches!(e.kind, ElementKind::Picture { .. })).map(|e| e.id).collect();
+    assert_eq!(pictures.len(), 2);
+    for id in pictures {
+        app.run("layout.update", json!({"layout": li, "element": id, "path": logo})).unwrap();
+    }
+    assert_eq!(said(&mut app), Vec::<String>::new());
+    assert_eq!(app.layout.picture_warning, None);
+}

@@ -59,6 +59,22 @@ pub(crate) fn say_frame_shadows(app: &mut RustGisApp, said: &rustgis_engine::ren
     }
 }
 
+/// Says the pictures of `layout` drawn as a grey box (see
+/// [`rustgis_engine::render::layout::pictures_not_drawn`]), each kind once, again only when what
+/// is said of them changes, and forgets it once none is left. Their images are decoded through the
+/// cache the page draws from.
+pub(crate) fn say_pictures_not_drawn(app: &mut RustGisApp, layout: &Layout) {
+    use rustgis_engine::render::layout::{pictures_not_drawn, pictures_notices};
+    let notices = pictures_notices(&pictures_not_drawn(layout));
+    let note = Some(notices.join("\n")).filter(|n| !n.is_empty());
+    if note != app.layout.picture_warning {
+        for notice in notices {
+            app.session.warn(notice);
+        }
+        app.layout.picture_warning = note;
+    }
+}
+
 /// The key a preview drawn for `base` is kept under: with the tile cache's generation read before
 /// it was drawn (`drawn_at`) when its frames drew without cast shadows still being worked out (on
 /// the interface's thread, which doesn't wait for them), so it is drawn again as they land, even
@@ -117,6 +133,8 @@ pub struct LayoutView {
     text_warning: Option<String>,
     /// The last notice of the section lines the page's frames don't draw.
     section_warning: Option<String>,
+    /// The last notice of the pictures the page draws as a grey box.
+    picture_warning: Option<String>,
     /// The texts of the layout drawn (by its index) cut off on its page, with their lines left
     /// out of their box, as the Format pane tells them (#2346).
     text_losses: Option<(usize, Vec<rustgis_engine::render::layout::TextLoss>)>,
@@ -210,6 +228,7 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
         app.layout.viewed = None;
         app.layout.text_warning = None;
         app.layout.section_warning = None;
+        app.layout.picture_warning = None;
         app.layout.text_losses = None;
         app.layout.views.clear();
     }
@@ -287,6 +306,7 @@ impl LayoutView {
         }
         self.text_warning = None;
         self.section_warning = None;
+        self.picture_warning = None;
         self.text_losses = None;
         if let Some(old) = self.viewed.replace(name.to_string()) {
             self.views.insert(old, (self.zoom, self.pan));
@@ -428,6 +448,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 app.layout.section_warning = note;
             }
+            say_pictures_not_drawn(app, &layout);
             // The Format pane is drawn before the page: a count that changed shows on the next
             // frame, without waiting for an input event.
             let losses = Some((li, losses));

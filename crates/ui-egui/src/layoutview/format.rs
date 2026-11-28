@@ -5,6 +5,7 @@ mod colorbar;
 mod frame;
 mod legend;
 mod north;
+mod picture;
 mod scalebar;
 mod shapes;
 mod table;
@@ -20,6 +21,7 @@ use egui::{Color32, Ui, vec2};
 use frame::*;
 use legend::*;
 use north::*;
+use picture::*;
 use rustgis_engine::map::layout::{
     Element, ElementKind, INK, LAYOUT_TEXT_SIZE, Layout, MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, Orientation,
 };
@@ -234,12 +236,12 @@ pub(super) fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li:
                     ElementKind::Colorbar { .. } => colorbar_rows(app, ui, layout, li, &e, &update),
                     ElementKind::MapFrame { .. } => frame_rows(app, ui, li, &e, &update),
                     ElementKind::NorthArrow { .. } => north_arrow_rows(app, ui, &e, &update),
+                    ElementKind::Picture { .. } => picture_rows(app, ui, &e, &update),
                     ElementKind::ScaleBar { .. } => scale_bar_rows(app, ui, layout, li, &e, &update),
                     ElementKind::Chart { .. } => chart_rows(app, ui, layout, li, &e, &update),
                     ElementKind::Table { .. } => table_rows(app, ui, li, &e, &update),
                     ElementKind::Rectangle { .. } | ElementKind::Ellipse { .. } => shape_rows(app, ui, li, &e, &update),
                     ElementKind::Line { .. } => line_rows(app, ui, li, &e, &update),
-                    _ => {}
                 }
                 // A legend's, colorbar's, table's or chart's ink (#2257), on and off as a background
                 // is: off is the default dark grey, which isn't the same as a dark grey ink (a table
